@@ -1,0 +1,82 @@
+# ==============================================================================
+# .gitignore for FluxProxy (Tauri v2 + Rust + React/Vite/TypeScript)
+# ==============================================================================
+
+# --- Node / Frontend (Vite, React, npm) ---
+node_modules/
+dist/
+dist-ssr/
+*.local
+.npm/
+.eslintcache
+.stylelintcache
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+*.log
+
+# Environment variables & secrets
+.env
+.env.production
+.env.development
+.env.local
+.env.*.local
+
+# --- Rust & Tauri ---
+# Rust build artifacts
+target/
+src-tauri/target/
+**/*.rs.bk
+
+# Tauri v2 generated files and schemas
+src-tauri/gen/schemas/
+src-tauri/gen/android/
+src-tauri/gen/ios/
+
+# --- MITM Proxy / Certificates & Security (CRITICAL) ---
+# Do not commit generated Root CA certificates or private keys!
+*.pem
+*.crt
+*.key
+*.pfx
+*.p12
+*.cer
+ca/
+certs/
+
+# --- Local Databases & Network Capture Dumps ---
+# SQLite session storage and WAL journals
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+# Traffic dumps / captures
+*.har
+*.saz
+dumps/
+
+# --- IDE & Editor Artifacts ---
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+
+# --- OS generated files ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+[Dd]esktop.ini
