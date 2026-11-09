@@ -5,6 +5,10 @@ import type {
   ToolbarGroupId,
   UiLayoutPreferences,
 } from "../types/proxy";
+import {
+  SETTINGS_APPLIED_EVENT,
+  type FluxUserSettingsProfile,
+} from "../types/settings";
 
 export interface ColumnDefinition {
   id: ColumnId;
@@ -165,6 +169,7 @@ export const DEFAULT_TOOLBAR_GROUPS: Record<ToolbarGroupId, boolean> = {
 };
 
 export const DEFAULT_LAYOUT_PREFS: UiLayoutPreferences = {
+  compactToolbar: false,
   sidebarCollapsed: false,
   inspectorCollapsed: false,
   inspectorPosition: "bottom",
@@ -190,6 +195,7 @@ export function useUiPreferences() {
   const [layout, setLayout] = useState<UiLayoutPreferences>(() => {
     const saved = loadJson<Partial<UiLayoutPreferences>>(LS_LAYOUT_KEY, {});
     return {
+      compactToolbar: Boolean(saved.compactToolbar ?? false),
       sidebarCollapsed: Boolean(saved.sidebarCollapsed ?? false),
       inspectorCollapsed: Boolean(saved.inspectorCollapsed ?? false),
       inspectorPosition:
@@ -287,6 +293,48 @@ export function useUiPreferences() {
     }
   }, [columnWidths]);
 
+  useEffect(() => {
+    const handleSettingsApplied = (event: Event) => {
+      const detail = (event as CustomEvent<FluxUserSettingsProfile>).detail;
+      if (!detail?.ui) return;
+      setLayout({
+        compactToolbar: Boolean(detail.ui.compactToolbar),
+        sidebarCollapsed: Boolean(detail.ui.sidebarCollapsed),
+        inspectorCollapsed: Boolean(detail.ui.inspectorCollapsed),
+        inspectorPosition:
+          detail.ui.inspectorPosition === "right" ? "right" : "bottom",
+      });
+      setToolbarGroups({
+        ...DEFAULT_TOOLBAR_GROUPS,
+        ...detail.ui.toolbarGroups,
+      });
+      setVisibleColumns({
+        ...DEFAULT_VISIBLE_COLUMNS,
+        ...detail.ui.visibleColumns,
+      });
+      setColumnWidths({
+        ...DEFAULT_COLUMN_WIDTHS,
+        ...detail.ui.columnWidths,
+      });
+    };
+
+    window.addEventListener(SETTINGS_APPLIED_EVENT, handleSettingsApplied);
+    return () => {
+      window.removeEventListener(SETTINGS_APPLIED_EVENT, handleSettingsApplied);
+    };
+  }, []);
+
+  const setCompactToolbar = useCallback((compact: boolean) => {
+    setLayout((prev) => ({ ...prev, compactToolbar: compact }));
+  }, []);
+
+  const toggleCompactToolbar = useCallback(() => {
+    setLayout((prev) => ({
+      ...prev,
+      compactToolbar: !prev.compactToolbar,
+    }));
+  }, []);
+
   const toggleSidebar = useCallback(() => {
     setLayout((prev) => ({
       ...prev,
@@ -378,6 +426,9 @@ export function useUiPreferences() {
 
   return {
     layout,
+    compactToolbar: layout.compactToolbar,
+    setCompactToolbar,
+    toggleCompactToolbar,
     sidebarCollapsed: layout.sidebarCollapsed,
     inspectorCollapsed: layout.inspectorCollapsed,
     inspectorPosition: layout.inspectorPosition,

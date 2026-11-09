@@ -51,6 +51,10 @@ const SHORTCUT_GROUPS: {
       { keys: "Ctrl+B", description: "Свернуть / развернуть боковую панель (Sidebar)" },
       { keys: "Ctrl+Shift+M", description: "Connect Mobile Device — iOS / Android Wi-Fi Proxy + QR" },
       { keys: "Ctrl+E", description: "Открыть Text Wizard & JWT Decoder" },
+      {
+        keys: "Ctrl+, / Cmd+,",
+        description: "Открыть настройки и профиль (Preferences)",
+      },
       { keys: "Ctrl+K", description: "Открыть палитру команд (Command Palette)" },
     ],
   },

@@ -144,6 +144,7 @@ class BrowserPreviewEngine {
     string,
     { bodyBase64: string; bodyText: string | null; bodySize: number }
   >();
+  private autoResponderEnabled = true;
   private rules: AutoResponderRule[] = [...DEFAULT_AUTORESPONDER_RULES];
   private filterConfig: ProxyFilterBackendConfig = structuredClone(
     DEFAULT_BACKEND_FILTER_CONFIG
@@ -194,6 +195,34 @@ class BrowserPreviewEngine {
           this.filterConfig.dropNonMatchingOnCapture = Boolean(
             JSON.parse(rawDrop)
           );
+        }
+        const rawPort = window.localStorage.getItem("fluxproxy.proxyPort.v1");
+        if (rawPort !== null) {
+          const parsedPort = Number(JSON.parse(rawPort));
+          if (
+            Number.isInteger(parsedPort) &&
+            parsedPort >= 1 &&
+            parsedPort <= 65535
+          ) {
+            this.port = parsedPort;
+          }
+        }
+        const rawAutoResp = window.localStorage.getItem(
+          "fluxproxy.autoResponder.v1"
+        );
+        if (rawAutoResp !== null) {
+          const parsedAutoResp = JSON.parse(rawAutoResp) as {
+            enabled?: unknown;
+            rules?: unknown;
+          };
+          if (parsedAutoResp && typeof parsedAutoResp === "object") {
+            if (typeof parsedAutoResp.enabled === "boolean") {
+              this.autoResponderEnabled = parsedAutoResp.enabled;
+            }
+            if (Array.isArray(parsedAutoResp.rules)) {
+              this.rules = parsedAutoResp.rules as AutoResponderRule[];
+            }
+          }
         }
       } catch {
         // ignore storage errors in preview
@@ -710,6 +739,7 @@ class BrowserPreviewEngine {
     url: string,
     headers: { name: string; value: string }[]
   ): AutoResponderRule | undefined {
+    if (!this.autoResponderEnabled) return undefined;
     return this.rules.find((r) => {
       if (!r.enabled) return false;
       if (
@@ -866,6 +896,13 @@ class BrowserPreviewEngine {
     if (auto && this.running && !this.systemProxyEnabled) {
       this.systemProxyEnabled = true;
       this.systemProxyError = null;
+    }
+    return this.getStatus();
+  }
+
+  setPort(port: number): ProxyStatus {
+    if (Number.isInteger(port) && port >= 1 && port <= 65535) {
+      this.port = port;
     }
     return this.getStatus();
   }
@@ -1111,6 +1148,41 @@ class BrowserPreviewEngine {
     return cappedBatch;
   }
 
+  private persistAutoResponderStorage() {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        "fluxproxy.autoResponder.v1",
+        JSON.stringify({
+          enabled: this.autoResponderEnabled,
+          rules: this.rules,
+        })
+      );
+    } catch {
+      // ignore storage quota errors
+    }
+  }
+
+  isAutoResponderEnabled(): boolean {
+    return this.autoResponderEnabled;
+  }
+
+  setAutoResponderEnabled(enabled: boolean): boolean {
+    this.autoResponderEnabled = enabled;
+    this.persistAutoResponderStorage();
+    return this.autoResponderEnabled;
+  }
+
+  setAutoResponderConfig(
+    enabled: boolean,
+    rules: AutoResponderRule[]
+  ): AutoResponderRule[] {
+    this.autoResponderEnabled = enabled;
+    this.rules = structuredClone(rules);
+    this.persistAutoResponderStorage();
+    return [...this.rules];
+  }
+
   listRules(): AutoResponderRule[] {
     return [...this.rules];
   }
@@ -1122,11 +1194,13 @@ class BrowserPreviewEngine {
     } else {
       this.rules.push(rule);
     }
+    this.persistAutoResponderStorage();
     return [...this.rules];
   }
 
   deleteRule(id: string): AutoResponderRule[] {
     this.rules = this.rules.filter((r) => r.id !== id);
+    this.persistAutoResponderStorage();
     return [...this.rules];
   }
 
@@ -1837,6 +1911,10 @@ export const proxyBridge = {
     return previewEngine.setAutoSystemProxy(auto);
   },
 
+  setPreviewPort(port: number): ProxyStatus {
+    return previewEngine.setPort(port);
+  },
+
   async getSessions(): Promise<SessionSummary[]> {
     if (isTauriRuntime()) {
       return invoke<SessionSummary[]>("get_sessions");
@@ -1975,16 +2053,81 @@ export const proxyBridge = {
     return previewEngine.listRules();
   },
 
+  async getAutoResponderEnabled(): Promise<boolean> {
+    if (isTauriRuntime()) {
+      try {
+        return await invoke<boolean>("get_autoresponder_enabled");
+      } catch {
+        return previewEngine.isAutoResponderEnabled();
+      }
+    }
+    return previewEngine.isAutoResponderEnabled();
+  },
+
+  async setAutoResponderEnabled(enabled: boolean): Promise<boolean> {
+    previewEngine.setAutoResponderEnabled(enabled);
+    if (isTauriRuntime()) {
+      try {
+        return await invoke<boolean>("set_autoresponder_enabled", { enabled });
+      } catch {
+        return enabled;
+      }
+    }
+    return enabled;
+  },
+
+  async setAutoResponderConfig(
+    enabled: boolean,
+    rules: AutoResponderRule[]
+  ): Promise<AutoResponderRule[]> {
+    const cloned = structuredClone(rules);
+    previewEngine.setAutoResponderConfig(enabled, cloned);
+    if (isTauriRuntime()) {
+      try {
+        return await invoke<AutoResponderRule[]>("set_autoresponder_config", {
+          enabled,
+          rules: cloned,
+        });
+      } catch {
+        // Graceful fallback if running against an older compiled binary
+        const existing = await invoke<AutoResponderRule[]>("list_rules");
+        for (const oldRule of existing) {
+          await invoke("delete_rule", { id: oldRule.id });
+        }
+        const effective = enabled
+          ? cloned
+          : cloned.map((r) => ({ ...r, enabled: false }));
+        for (const r of effective) {
+          await invoke("upsert_rule", { rule: r });
+        }
+        return cloned;
+      }
+    }
+    return cloned;
+  },
+
   async upsertRule(rule: AutoResponderRule): Promise<AutoResponderRule[]> {
     if (isTauriRuntime()) {
-      return invoke<AutoResponderRule[]>("upsert_rule", { rule });
+      const updated = await invoke<AutoResponderRule[]>("upsert_rule", {
+        rule,
+      });
+      previewEngine.setAutoResponderConfig(
+        previewEngine.isAutoResponderEnabled(),
+        updated
+      );
+      return updated;
     }
     return previewEngine.upsertRule(rule);
   },
 
   async deleteRule(id: string): Promise<AutoResponderRule[]> {
     if (isTauriRuntime()) {
-      return invoke<AutoResponderRule[]>("delete_rule", { id });
+      const updated = await invoke<AutoResponderRule[]>("delete_rule", { id });
+      previewEngine.setAutoResponderConfig(
+        previewEngine.isAutoResponderEnabled(),
+        updated
+      );
+      return updated;
     }
     return previewEngine.deleteRule(id);
   },
@@ -2003,6 +2146,25 @@ export const proxyBridge = {
       return invoke<ProxyFilterBackendConfig>("update_filter_backend_config", {
         config,
       });
+    }
+    return previewEngine.updateFilterBackendConfig(config);
+  },
+
+  async updateProxyFilterConfig(
+    config: ProxyFilterBackendConfig
+  ): Promise<ProxyFilterBackendConfig> {
+    if (isTauriRuntime()) {
+      try {
+        return await invoke<ProxyFilterBackendConfig>(
+          "update_proxy_filter_config",
+          { config }
+        );
+      } catch {
+        return invoke<ProxyFilterBackendConfig>(
+          "update_filter_backend_config",
+          { config }
+        );
+      }
     }
     return previewEngine.updateFilterBackendConfig(config);
   },
@@ -2218,6 +2380,41 @@ export const proxyBridge = {
       });
     }
     return previewEngine.savePreviewBody(sessionId, isResponse, filePath);
+  },
+
+  async exportSettingsJsonFile(
+    filePath: string,
+    jsonContent: string
+  ): Promise<void> {
+    if (isTauriRuntime()) {
+      try {
+        await invoke<number>("export_settings_file", {
+          filePath,
+          contents: jsonContent,
+        });
+        return;
+      } catch {
+        // Fallback to browser download if native command unavailable
+      }
+    }
+    triggerBrowserDownload(
+      new TextEncoder().encode(jsonContent),
+      filePath,
+      "application/json;charset=utf-8"
+    );
+  },
+
+  async readSettingsJsonFile(filePath: string): Promise<string> {
+    if (!isTauriRuntime() || filePath.startsWith("preview://")) {
+      const file = previewPickedFiles.get(filePath);
+      if (!file) {
+        throw new Error("Выбранный файл настроек не найден");
+      }
+      previewPickedFiles.delete(filePath);
+      const raw = await file.text();
+      return raw.replace(/^\uFEFF/, "");
+    }
+    return invoke<string>("import_settings_file", { filePath });
   },
 
   async subscribeNativeFileDrop(

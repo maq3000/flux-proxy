@@ -432,6 +432,7 @@ export type ToolbarGroupId =
 export type InspectorDockPosition = "bottom" | "right";
 
 export interface UiLayoutPreferences {
+  compactToolbar: boolean;
   sidebarCollapsed: boolean;
   inspectorCollapsed: boolean;
   inspectorPosition: InspectorDockPosition;

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
 use regex::Regex;
@@ -7,6 +8,7 @@ use crate::models::{AutoResponderRule, HeaderPair, RuleMatchTarget};
 /// Thread-safe rule evaluation engine for AutoResponder mocking, status overrides,
 /// and artificial network latency injection.
 pub struct RuleEngine {
+    enabled: AtomicBool,
     rules: RwLock<Vec<AutoResponderRule>>,
 }
 
@@ -19,8 +21,17 @@ impl Default for RuleEngine {
 impl RuleEngine {
     pub fn new() -> Self {
         Self {
+            enabled: AtomicBool::new(true),
             rules: RwLock::new(Vec::new()),
         }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
     }
 
     pub fn list_rules(&self) -> Vec<AutoResponderRule> {
@@ -59,6 +70,9 @@ impl RuleEngine {
         url: &str,
         headers: &[HeaderPair],
     ) -> Option<AutoResponderRule> {
+        if !self.is_enabled() {
+            return None;
+        }
         let guard = self.rules.read().ok()?;
         for rule in guard.iter() {
             if !rule.enabled {

@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useId, useState } from "react";
 import Editor from "@monaco-editor/react";
 import { Clock, Plus, Save, Sliders, Trash2 } from "lucide-react";
 import type {
@@ -8,6 +8,8 @@ import type {
 } from "../types/proxy";
 
 interface AutoResponderPanelProps {
+  enabled?: boolean;
+  onToggleEnabled?: (enabled: boolean) => Promise<void> | void;
   rules: AutoResponderRule[];
   resolvedTheme: "dark" | "light";
   onUpsertRule: (rule: AutoResponderRule) => Promise<void>;
@@ -15,11 +17,14 @@ interface AutoResponderPanelProps {
 }
 
 export const AutoResponderPanel: React.FC<AutoResponderPanelProps> = ({
+  enabled = true,
+  onToggleEnabled,
   rules,
   resolvedTheme,
   onUpsertRule,
   onDeleteRule,
 }) => {
+  const masterToggleId = useId();
   const [selectedRuleId, setSelectedRuleId] = useState<string | null>(
     rules[0]?.id ?? null
   );
@@ -64,15 +69,47 @@ export const AutoResponderPanel: React.FC<AutoResponderPanelProps> = ({
               AutoResponder Rules
             </span>
           </div>
-          <button
-            type="button"
-            onClick={() => void handleCreateRule()}
-            className="inline-flex items-center gap-1 rounded bg-sky-600 px-2 py-1 text-xs font-medium text-white hover:bg-sky-500"
-          >
-            <Plus className="h-3.5 w-3.5" />
-            <span>Add Rule</span>
-          </button>
+          <div className="flex items-center gap-2">
+            {onToggleEnabled && (
+              <label
+                htmlFor={masterToggleId}
+                className="inline-flex cursor-pointer select-none items-center gap-1.5 rounded border border-hairline bg-elevated px-2 py-0.5 text-[11px] font-medium text-fg"
+              >
+                <input
+                  id={masterToggleId}
+                  type="checkbox"
+                  checked={enabled}
+                  onChange={(e) => void onToggleEnabled(e.target.checked)}
+                  className="checkbox-native"
+                />
+                <span>{enabled ? "On" : "Off"}</span>
+              </label>
+            )}
+            <button
+              type="button"
+              onClick={() => void handleCreateRule()}
+              className="inline-flex items-center gap-1 rounded bg-sky-600 px-2 py-1 text-xs font-medium text-white hover:bg-sky-500"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              <span>Add Rule</span>
+            </button>
+          </div>
         </div>
+
+        {!enabled && (
+          <div className="flex items-center justify-between gap-2 border-b border-hairline bg-status4xx-bg px-3 py-1.5 text-[11px] text-status4xx-fg">
+            <span>AutoResponder отключён глобально</span>
+            {onToggleEnabled && (
+              <button
+                type="button"
+                onClick={() => void onToggleEnabled(true)}
+                className="shrink-0 rounded border border-status4xx-fg/40 px-1.5 py-0.5 text-[10px] font-semibold hover:brightness-110"
+              >
+                Включить
+              </button>
+            )}
+          </div>
+        )}
 
         <div className="flex-1 overflow-y-auto p-2 space-y-1">
           {rules.length === 0 ? (

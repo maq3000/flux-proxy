@@ -40,6 +40,9 @@ interface MenuBarProps {
   onSaveSqlite: () => void;
   onLoadSqlite: () => void;
   onClearSessions: () => void;
+  onExportSettingsProfile: () => void;
+  onImportSettingsProfile: () => void;
+  onOpenPreferences: () => void;
   // Edit
   onCopyUrl: () => void;
   onCopyCurl: () => void;
@@ -76,6 +79,8 @@ interface MenuBarProps {
   onToggleDockedComposer: () => void;
   followTail: boolean;
   onToggleFollowTail: () => void;
+  compactToolbar?: boolean;
+  onToggleCompactToolbar?: () => void;
   toolbarGroups: Record<ToolbarGroupId, boolean>;
   onToggleToolbarGroup: (groupId: ToolbarGroupId) => void;
   onResetToolbarGroups: () => void;
@@ -270,6 +275,9 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onSaveSqlite,
   onLoadSqlite,
   onClearSessions,
+  onExportSettingsProfile,
+  onImportSettingsProfile,
+  onOpenPreferences,
   onCopyUrl,
   onCopyCurl,
   onCopyRequestHeaders,
@@ -303,6 +311,8 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onToggleDockedComposer,
   followTail,
   onToggleFollowTail,
+  compactToolbar = false,
+  onToggleCompactToolbar,
   toolbarGroups,
   onToggleToolbarGroup,
   onResetToolbarGroups,
@@ -1010,6 +1020,28 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                   Ctrl+X
                 </span>
               </button>
+              <hr />
+              <button
+                type="button"
+                onClick={(e) => activateCommand(e, onExportSettingsProfile)}
+              >
+                <span>Export Settings Profile (JSON)...</span>
+              </button>
+              <button
+                type="button"
+                onClick={(e) => activateCommand(e, onImportSettingsProfile)}
+              >
+                <span>Import Settings Profile...</span>
+              </button>
+              <button
+                type="button"
+                onClick={(e) => activateCommand(e, onOpenPreferences)}
+              >
+                <span>Preferences...</span>
+                <span className="hint" aria-hidden="true">
+                  Ctrl+,
+                </span>
+              </button>
             </div>
           </div>
 
@@ -1350,6 +1382,22 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                   {...({ focusgroup: "menu nomemory" } as Record<string, string>)}
                   aria-labelledby={toolbarSubTriggerId}
                 >
+                  {onToggleCompactToolbar && (
+                    <>
+                      <button
+                        type="button"
+                        role="menuitemcheckbox"
+                        aria-checked={compactToolbar}
+                        onKeyDown={checkboxKeyDown}
+                        onClick={(e) =>
+                          activateCheckbox(e, onToggleCompactToolbar, true)
+                        }
+                      >
+                        <span>Compact Toolbar</span>
+                      </button>
+                      <hr />
+                    </>
+                  )}
                   {TOOLBAR_GROUP_DEFINITIONS.map((grp) => (
                     <button
                       key={grp.id}

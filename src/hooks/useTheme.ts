@@ -1,4 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
+import {
+  SETTINGS_APPLIED_EVENT,
+  type FluxUserSettingsProfile,
+} from "../types/settings";
 
 export type ThemePreference = "dark" | "light" | "system";
 
@@ -62,11 +66,22 @@ export function useTheme() {
         syncMetaColorScheme(next);
       }
     };
+    const handleSettingsApplied = (event: Event) => {
+      const detail = (event as CustomEvent<FluxUserSettingsProfile>).detail;
+      const next = detail?.ui?.theme;
+      if (next === "dark" || next === "light" || next === "system") {
+        setPreferenceState(next);
+        syncMetaColorScheme(next);
+      }
+    };
+
     window.addEventListener("storage", handleStorage);
+    window.addEventListener(SETTINGS_APPLIED_EVENT, handleSettingsApplied);
 
     return () => {
       mq.removeEventListener("change", handleChange);
       window.removeEventListener("storage", handleStorage);
+      window.removeEventListener(SETTINGS_APPLIED_EVENT, handleSettingsApplied);
     };
   }, []);
 

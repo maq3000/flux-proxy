@@ -179,6 +179,33 @@ pub async fn delete_rule(
 }
 
 #[tauri::command]
+pub async fn get_autoresponder_enabled(
+    state: State<'_, AppState>,
+) -> Result<bool, ProxyError> {
+    Ok(state.controller.context.rules.is_enabled())
+}
+
+#[tauri::command]
+pub async fn set_autoresponder_enabled(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<bool, ProxyError> {
+    state.controller.context.rules.set_enabled(enabled);
+    Ok(state.controller.context.rules.is_enabled())
+}
+
+#[tauri::command]
+pub async fn set_autoresponder_config(
+    enabled: bool,
+    rules: Vec<AutoResponderRule>,
+    state: State<'_, AppState>,
+) -> Result<Vec<AutoResponderRule>, ProxyError> {
+    state.controller.context.rules.set_enabled(enabled);
+    state.controller.context.rules.set_rules(rules);
+    Ok(state.controller.context.rules.list_rules())
+}
+
+#[tauri::command]
 pub async fn execute_composed_request(
     request: ComposedRequest,
     state: State<'_, AppState>,
@@ -195,6 +222,14 @@ pub async fn get_filter_backend_config(
 
 #[tauri::command]
 pub async fn update_filter_backend_config(
+    config: ProxyFilterBackendConfig,
+    state: State<'_, AppState>,
+) -> Result<ProxyFilterBackendConfig, ProxyError> {
+    Ok(state.controller.context.filters.update_config(config))
+}
+
+#[tauri::command]
+pub async fn update_proxy_filter_config(
     config: ProxyFilterBackendConfig,
     state: State<'_, AppState>,
 ) -> Result<ProxyFilterBackendConfig, ProxyError> {
@@ -436,4 +471,27 @@ pub async fn save_session_body_file(
     })
     .await
     .map_err(|e| ProxyError::Custom(format!("Save body task join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn export_settings_file(
+    file_path: String,
+    contents: String,
+) -> Result<usize, ProxyError> {
+    tokio::task::spawn_blocking(move || {
+        write_raw_bytes_to_file(&PathBuf::from(file_path), contents.as_bytes())
+    })
+    .await
+    .map_err(|e| ProxyError::Custom(format!("Export settings task join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn import_settings_file(file_path: String) -> Result<String, ProxyError> {
+    tokio::task::spawn_blocking(move || {
+        let raw = std::fs::read_to_string(&PathBuf::from(&file_path))
+            .map_err(|e| ProxyError::Custom(format!("Не удалось прочитать файл {file_path}: {e}")))?;
+        Ok(raw.trim_start_matches('\u{feff}').to_owned())
+    })
+    .await
+    .map_err(|e| ProxyError::Custom(format!("Import settings task join error: {e}")))?
 }

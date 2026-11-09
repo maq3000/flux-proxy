@@ -21,6 +21,10 @@ import {
   SessionDiffView,
 } from "./components/SessionDiffView";
 import { SessionInspector } from "./components/SessionInspector";
+import {
+  SettingsImportPreviewModal,
+  SettingsModal,
+} from "./components/SettingsModal";
 import { ShortcutsModal } from "./components/ShortcutsModal";
 import { Sidebar } from "./components/Sidebar";
 import {
@@ -33,6 +37,17 @@ import { useProxySessions } from "./hooks/useProxySessions";
 import { useTheme } from "./hooks/useTheme";
 import { useUiPreferences } from "./hooks/useUiPreferences";
 import { buildCurlCommand, buildHeadersBlock } from "./lib/formatters";
+import {
+  applySettingsProfile,
+  buildSettingsImportPreview,
+  exportCurrentSettingsProfile,
+  isLikelyFluxSettingsProfile,
+  parseAndValidateSettingsJsonText,
+  registerLiveSettingsSnapshotGetter,
+  resetAllSettingsToDefault,
+  SETTINGS_APPLIED_EVENT,
+  SETTINGS_STORAGE_KEYS,
+} from "./lib/settingsManager";
 import { isTauriRuntime, proxyBridge } from "./lib/tauriBridge";
 import type {
   ActiveNavSection,
@@ -41,11 +56,20 @@ import type {
   FilterDrawerTab,
   SessionSummary,
 } from "./types/proxy";
+import type {
+  FluxUserSettingsProfile,
+  SettingsImportPreviewSummary,
+  SettingsModalTab,
+} from "./types/settings";
 
 export const App: React.FC = () => {
   const { preference, resolvedTheme, setTheme, toggleLightDark } = useTheme();
   const {
+    compactToolbar,
+    setCompactToolbar,
+    toggleCompactToolbar,
     sidebarCollapsed,
+    setSidebarCollapsed,
     inspectorCollapsed,
     inspectorPosition,
     toggleSidebar,
@@ -105,6 +129,7 @@ export const App: React.FC = () => {
     hostListFilter,
     setHostListFilter,
     compiledHostList,
+    customPresets,
     allPresets,
     activePreset,
     activePresetId,
@@ -137,12 +162,15 @@ export const App: React.FC = () => {
     sessionRetentionLimit,
     setSessionRetentionLimit,
     dropNonMatching,
+    setDropNonMatching,
     toggleDropNonMatching,
     storageStats,
     toggleProxy,
+    setProxyPort,
     setAllowRemote,
     toggleAllowRemote,
     toggleSystemProxy,
+    setAutoSystemProxy,
     toggleAutoSystemProxy,
     clearAllSessions,
     saveToSqlite,
@@ -166,7 +194,15 @@ export const App: React.FC = () => {
   const [composerDraft, setComposerDraft] = useState<ComposedRequest | null>(
     null
   );
+  const [autoResponderEnabled, setAutoResponderEnabled] = useState(true);
   const [rules, setRules] = useState<AutoResponderRule[]>([]);
+  const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+  const [settingsInitialTab, setSettingsInitialTab] =
+    useState<SettingsModalTab>("general");
+  const [pendingImportState, setPendingImportState] = useState<{
+    profile: FluxUserSettingsProfile;
+    preview: SettingsImportPreviewSummary;
+  } | null>(null);
   const [certModalOpen, setCertModalOpen] = useState(false);
   const [mobileModalOpen, setMobileModalOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -183,10 +219,116 @@ export const App: React.FC = () => {
   const [diffModalOpen, setDiffModalOpen] = useState(false);
   const [inlineDiffDismissed, setInlineDiffDismissed] = useState(false);
 
-  // Drag-and-Drop Archive Import (.har, .saz, .json) State
+  // Drag-and-Drop Archive & Settings Profile Import (.har, .saz, .json) State
   const [fileDropActive, setFileDropActive] = useState(false);
   const [fileDropLabel, setFileDropLabel] = useState<string | null>(null);
   const htmlDragDepthRef = useRef(0);
+
+  const openPreferencesAt = useCallback((tab: SettingsModalTab = "general") => {
+    setSettingsInitialTab(tab);
+    setSettingsModalOpen(true);
+  }, []);
+
+  const openImportPreviewFromJsonText = useCallback(
+    (jsonText: string, fileName: string) => {
+      try {
+        const report = parseAndValidateSettingsJsonText(jsonText);
+        const preview = buildSettingsImportPreview(report.profile, {
+          fileName,
+          warnings: report.warnings,
+          migratedFromVersion: report.migratedFromVersion,
+        });
+        setPendingImportState({
+          profile: report.profile,
+          preview,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        showToast(`⚠️ Ошибка профиля настроек (${fileName}): ${message}`);
+      }
+    },
+    [showToast]
+  );
+
+  const handleExportSettingsProfile = useCallback(async () => {
+    try {
+      const exported = await exportCurrentSettingsProfile();
+      if (exported) {
+        showToast(
+          `💾 Профиль настроек сохранён (schemaVersion: ${exported.schemaVersion})`
+        );
+      }
+    } catch (err) {
+      showToast(
+        `⚠️ Не удалось экспортировать настройки: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  }, [showToast]);
+
+  const handleImportSettingsProfileDialog = useCallback(async () => {
+    try {
+      const chosenPath = await proxyBridge.pickOpenFileDialog({
+        title: "Import FluxProxy Settings Profile (.json)",
+        filters: [
+          {
+            name: "FluxProxy Settings Profile (*.json)",
+            extensions: ["json"],
+          },
+          { name: "All Files (*.*)", extensions: ["*"] },
+        ],
+      });
+      if (!chosenPath) return;
+      const baseName = chosenPath.split(/[\\/]/).pop() ?? chosenPath;
+      const jsonText = await proxyBridge.readSettingsJsonFile(chosenPath);
+      openImportPreviewFromJsonText(jsonText, baseName);
+    } catch (err) {
+      showToast(
+        `⚠️ Ошибка чтения файла настроек: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  }, [openImportPreviewFromJsonText, showToast]);
+
+  const handleConfirmImportSettingsProfile = useCallback(async () => {
+    if (!pendingImportState) return;
+    const { profile, preview } = pendingImportState;
+    try {
+      await applySettingsProfile(profile);
+      setPendingImportState(null);
+      showToast(
+        `✅ Профиль настроек применён: пресетов ${preview.userPresetsCount}, правил ${preview.totalRulesCount}, колонок ${preview.visibleColumnsCount}/${preview.totalColumnsCount}`
+      );
+    } catch (err) {
+      showToast(
+        `⚠️ Ошибка применения профиля настроек: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  }, [pendingImportState, showToast]);
+
+  const handleResetAllSettings = useCallback(
+    async (skipConfirm = true) => {
+      try {
+        const didReset = await resetAllSettingsToDefault({ skipConfirm });
+        if (didReset) {
+          showToast(
+            "🔄 Все настройки FluxProxy сброшены к значениям по умолчанию"
+          );
+        }
+      } catch (err) {
+        showToast(
+          `⚠️ Не удалось сбросить настройки: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
+    },
+    [showToast]
+  );
 
   useEffect(() => {
     let mounted = true;
@@ -217,13 +359,35 @@ export const App: React.FC = () => {
           );
           if (supported.length === 0) {
             showToast(
-              "⚠️ Перетащите архив .har, .saz (Fiddler Classic) или .json"
+              "⚠️ Перетащите архив .har, .saz (Fiddler Classic) или профиль .json"
             );
             return;
           }
-          setActiveSection("traffic");
           void (async () => {
             for (const filePath of supported) {
+              const baseName = filePath.split(/[\\/]/).pop() ?? filePath;
+              if (/\.json$/i.test(filePath)) {
+                try {
+                  const text = await proxyBridge.readSettingsJsonFile(filePath);
+                  if (/fluxproxy[-_]?settings/i.test(baseName)) {
+                    openImportPreviewFromJsonText(text, baseName);
+                    continue;
+                  }
+                  const parsed = JSON.parse(text) as unknown;
+                  if (isLikelyFluxSettingsProfile(parsed)) {
+                    openImportPreviewFromJsonText(text, baseName);
+                    continue;
+                  }
+                } catch {
+                  if (/fluxproxy[-_]?settings/i.test(baseName)) {
+                    showToast(
+                      `⚠️ Невалидный JSON в файле настроек ${baseName}`
+                    );
+                    continue;
+                  }
+                }
+              }
+              setActiveSection("traffic");
               await importArchiveFromPath(filePath);
             }
           })();
@@ -241,7 +405,7 @@ export const App: React.FC = () => {
       mounted = false;
       if (unlistenDrop) unlistenDrop();
     };
-  }, [importArchiveFromPath, showToast]);
+  }, [importArchiveFromPath, openImportPreviewFromJsonText, showToast]);
 
   const isExternalArchiveDrag = useCallback(
     (dt: DataTransfer | null): boolean => {
@@ -304,17 +468,43 @@ export const App: React.FC = () => {
       const files = Array.from(e.dataTransfer.files);
       const supported = files.filter((f) => /\.(har|saz|json)$/i.test(f.name));
       if (supported.length === 0) {
-        showToast("⚠️ Перетащите архив .har, .saz (Fiddler Classic) или .json");
+        showToast(
+          "⚠️ Перетащите архив .har, .saz (Fiddler Classic) или профиль .json"
+        );
         return;
       }
-      setActiveSection("traffic");
       void (async () => {
         for (const file of supported) {
+          if (/\.json$/i.test(file.name)) {
+            try {
+              const text = await file.text();
+              if (/fluxproxy[-_]?settings/i.test(file.name)) {
+                openImportPreviewFromJsonText(text, file.name);
+                continue;
+              }
+              const parsed = JSON.parse(text) as unknown;
+              if (isLikelyFluxSettingsProfile(parsed)) {
+                openImportPreviewFromJsonText(text, file.name);
+                continue;
+              }
+            } catch {
+              if (/fluxproxy[-_]?settings/i.test(file.name)) {
+                showToast(`⚠️ Невалидный JSON в файле настроек ${file.name}`);
+                continue;
+              }
+            }
+          }
+          setActiveSection("traffic");
           await importArchiveFromDroppedFile(file);
         }
       })();
     },
-    [importArchiveFromDroppedFile, isExternalArchiveDrag, showToast]
+    [
+      importArchiveFromDroppedFile,
+      isExternalArchiveDrag,
+      openImportPreviewFromJsonText,
+      showToast,
+    ]
   );
 
   const effectiveSelectedIds = useMemo(
@@ -356,8 +546,138 @@ export const App: React.FC = () => {
   const [selectedBpId, setSelectedBpId] = useState<string | null>(null);
   const lastAutoOpenedBpRef = useRef<string | null>(null);
 
+  const persistAutoResponderStorage = useCallback(
+    (enabledVal: boolean, rulesVal: AutoResponderRule[]) => {
+      try {
+        window.localStorage.setItem(
+          SETTINGS_STORAGE_KEYS.autoResponder,
+          JSON.stringify({ enabled: enabledVal, rules: rulesVal })
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+    },
+    []
+  );
+
+  const handleSetAutoResponderEnabled = useCallback(
+    async (nextEnabled: boolean) => {
+      const applied = await proxyBridge.setAutoResponderEnabled(nextEnabled);
+      setAutoResponderEnabled(applied);
+      persistAutoResponderStorage(applied, rules);
+      showToast(
+        applied
+          ? "▶ AutoResponder включён"
+          : "⏸ AutoResponder отключён глобально"
+      );
+    },
+    [persistAutoResponderStorage, rules, showToast]
+  );
+
   useEffect(() => {
-    void proxyBridge.listRules().then(setRules);
+    let active = true;
+
+    const initAutoResponder = async () => {
+      try {
+        const rawStored = window.localStorage.getItem(
+          SETTINGS_STORAGE_KEYS.autoResponder
+        );
+        if (rawStored) {
+          const parsed = JSON.parse(rawStored) as {
+            enabled?: boolean;
+            rules?: AutoResponderRule[];
+          };
+          if (parsed && Array.isArray(parsed.rules)) {
+            const enabledFlag =
+              typeof parsed.enabled === "boolean" ? parsed.enabled : true;
+            const syncedRules = await proxyBridge.setAutoResponderConfig(
+              enabledFlag,
+              parsed.rules
+            );
+            if (!active) return;
+            setAutoResponderEnabled(enabledFlag);
+            setRules(syncedRules);
+            return;
+          }
+        }
+      } catch {
+        // fallback to backend defaults
+      }
+
+      const [initialEnabled, initialRules] = await Promise.all([
+        proxyBridge.getAutoResponderEnabled(),
+        proxyBridge.listRules(),
+      ]);
+      if (!active) return;
+      setAutoResponderEnabled(initialEnabled);
+      setRules(initialRules);
+      persistAutoResponderStorage(initialEnabled, initialRules);
+    };
+
+    void initAutoResponder();
+
+    const onSettingsApplied = (event: Event) => {
+      const detail = (event as CustomEvent<FluxUserSettingsProfile>).detail;
+      if (!detail?.autoResponder) return;
+      setAutoResponderEnabled(Boolean(detail.autoResponder.enabled));
+      setRules(structuredClone(detail.autoResponder.rules));
+    };
+
+    window.addEventListener(SETTINGS_APPLIED_EVENT, onSettingsApplied);
+    return () => {
+      active = false;
+      window.removeEventListener(SETTINGS_APPLIED_EVENT, onSettingsApplied);
+    };
+  }, [persistAutoResponderStorage]);
+
+  // Register live snapshot getter so `exportCurrentSettingsProfile()` captures live React state
+  const liveSnapshotRef = useRef<() => Partial<FluxUserSettingsProfile>>(
+    () => ({})
+  );
+  liveSnapshotRef.current = () => ({
+    ui: {
+      theme: preference,
+      compactToolbar,
+      sidebarCollapsed,
+      inspectorCollapsed,
+      inspectorPosition,
+      followTail,
+      columnWidths,
+      visibleColumns,
+      toolbarGroups,
+    },
+    filters: {
+      activePresetId,
+      userPresets: customPresets,
+      noiseThresholds: thresholds,
+      hostFilters: hostListFilter,
+      matrixEnabled,
+      filterRules,
+    },
+    proxy: {
+      port: status.port,
+      autoSystemProxy: status.autoSystemProxy,
+      allowRemote: Boolean(
+        status.allowRemote || status.bindAddr === "0.0.0.0"
+      ),
+      tlsInterceptMode: backendFilterConfig.tlsInterceptMode,
+      tlsBypassRules: backendFilterConfig.tlsBypassRules,
+      tlsTargetRules: backendFilterConfig.tlsTargetRules,
+      headerMutations: backendFilterConfig.headerMutations,
+      tlsBypassEnabled: backendFilterConfig.tlsBypassEnabled,
+      headerMutationsEnabled: backendFilterConfig.headerMutationsEnabled,
+      stripAltSvc: backendFilterConfig.stripAltSvc,
+      sessionRetentionLimit,
+      dropNonMatching,
+    },
+    autoResponder: {
+      enabled: autoResponderEnabled,
+      rules,
+    },
+  });
+
+  useEffect(() => {
+    return registerLiveSettingsSnapshotGetter(() => liveSnapshotRef.current());
   }, []);
 
   // Automatically surface the Monaco Breakpoint Interceptor when a new live packet is parked
@@ -664,6 +984,18 @@ export const App: React.FC = () => {
         return;
       }
 
+      // Ctrl+, / Cmd+, -> Preferences & Settings Profile Modal
+      if (
+        ctrlOrMeta &&
+        !e.altKey &&
+        !e.shiftKey &&
+        (e.key === "," || e.code === "Comma")
+      ) {
+        e.preventDefault();
+        setSettingsModalOpen((prev) => !prev);
+        return;
+      }
+
       // Ctrl+S / Cmd+S -> Save All Sessions As... (.har, .saz, .json)
       if (
         ctrlOrMeta &&
@@ -966,10 +1298,11 @@ export const App: React.FC = () => {
       };
       const updated = await proxyBridge.upsertRule(newRule);
       setRules(updated);
+      persistAutoResponderStorage(autoResponderEnabled, updated);
       setActiveSection("rules");
       showToast(`Created AutoResponder rule from Session #${session.id}`);
     },
-    [showToast]
+    [autoResponderEnabled, persistAutoResponderStorage, showToast]
   );
 
   const commands: PaletteCommand[] = useMemo(
@@ -1373,6 +1706,34 @@ export const App: React.FC = () => {
         label: "Set Theme: Follow OS System Preference",
         perform: () => setTheme("system"),
       },
+      {
+        id: "open-preferences",
+        category: "Settings",
+        label: "Preferences... — Открыть настройки и управление профилем",
+        shortcut: "Ctrl+,",
+        perform: () => openPreferencesAt("general"),
+      },
+      {
+        id: "export-settings-profile",
+        category: "Settings",
+        label:
+          "Export Settings Profile (JSON)... — Сохранить fluxproxy-settings-v1.json",
+        perform: () => void handleExportSettingsProfile(),
+      },
+      {
+        id: "import-settings-profile",
+        category: "Settings",
+        label:
+          "Import Settings Profile... — Загрузить профиль настроек с превью",
+        perform: () => void handleImportSettingsProfileDialog(),
+      },
+      {
+        id: "reset-all-settings-defaults",
+        category: "Settings",
+        label:
+          "Reset All Settings to Defaults... — Сбросить все настройки к дефолтам",
+        perform: () => void handleResetAllSettings(false),
+      },
     ],
     [
       applyPreset,
@@ -1389,8 +1750,11 @@ export const App: React.FC = () => {
       exportAllSessionsAs,
       exportSelectedSessionsAs,
       generateStress10k,
+      handleExportSettingsProfile,
+      handleImportSettingsProfileDialog,
       handleInspectInHex,
       handleOpenCustomRetentionLimit,
+      handleResetAllSettings,
       importArchiveDialog,
       inspectorCollapsed,
       isForceNoCacheActive,
@@ -1399,6 +1763,7 @@ export const App: React.FC = () => {
       openBreakpointsAt,
       openDiffWithPairSmart,
       openFilterDrawerAt,
+      openPreferencesAt,
       openTextWizardAt,
       pausedBreakpoints.length,
       replaySessions,
@@ -1441,7 +1806,9 @@ export const App: React.FC = () => {
     [backendFilterConfig.tlsTargetRules]
   );
 
-  const activeRulesCount = rules.filter((r) => r.enabled).length;
+  const activeRulesCount = autoResponderEnabled
+    ? rules.filter((r) => r.enabled).length
+    : 0;
   const breakpointsArmed =
     breakpointConfig.breakBeforeRequest ||
     breakpointConfig.breakAfterResponse ||
@@ -1592,6 +1959,9 @@ export const App: React.FC = () => {
         onSaveSqlite={() => void saveToSqlite()}
         onLoadSqlite={() => void loadFromSqlite()}
         onClearSessions={() => void clearAllSessions()}
+        onExportSettingsProfile={() => void handleExportSettingsProfile()}
+        onImportSettingsProfile={() => void handleImportSettingsProfileDialog()}
+        onOpenPreferences={() => openPreferencesAt("general")}
         onCopyUrl={() => copyUrlsForIds(effectiveSelectedIds)}
         onCopyCurl={() => {
           if (selectedId !== null) void copySessionAsCurl(selectedId);
@@ -1652,6 +2022,8 @@ export const App: React.FC = () => {
         }}
         followTail={followTail}
         onToggleFollowTail={() => setFollowTail((v) => !v)}
+        compactToolbar={compactToolbar}
+        onToggleCompactToolbar={toggleCompactToolbar}
         toolbarGroups={toolbarGroups}
         onToggleToolbarGroup={toggleToolbarGroup}
         onResetToolbarGroups={resetToolbarGroups}
@@ -1758,6 +2130,7 @@ export const App: React.FC = () => {
             onOpenSessionDiff={() => openDiffWithPairSmart()}
             followTail={followTail}
             onToggleFollowTail={() => setFollowTail((v) => !v)}
+            compactToolbar={compactToolbar}
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={toggleSidebar}
             inspectorCollapsed={inspectorCollapsed}
@@ -1958,16 +2331,20 @@ export const App: React.FC = () => {
 
             {activeSection === "rules" && (
               <AutoResponderPanel
+                enabled={autoResponderEnabled}
+                onToggleEnabled={handleSetAutoResponderEnabled}
                 rules={rules}
                 resolvedTheme={resolvedTheme}
                 onUpsertRule={async (rule) => {
                   const next = await proxyBridge.upsertRule(rule);
                   setRules(next);
+                  persistAutoResponderStorage(autoResponderEnabled, next);
                   showToast(`Saved rule "${rule.name}"`);
                 }}
                 onDeleteRule={async (id) => {
                   const next = await proxyBridge.deleteRule(id);
                   setRules(next);
+                  persistAutoResponderStorage(autoResponderEnabled, next);
                   showToast("Deleted AutoResponder rule");
                 }}
               />
@@ -2109,6 +2486,94 @@ export const App: React.FC = () => {
       <ShortcutsModal
         open={shortcutsModalOpen}
         onClose={() => setShortcutsModalOpen(false)}
+      />
+
+      <SettingsModal
+        open={settingsModalOpen}
+        initialTab={settingsInitialTab}
+        onClose={() => setSettingsModalOpen(false)}
+        themePreference={preference}
+        onSetTheme={setTheme}
+        compactToolbar={compactToolbar}
+        onSetCompactToolbar={setCompactToolbar}
+        sidebarCollapsed={sidebarCollapsed}
+        onSetSidebarCollapsed={setSidebarCollapsed}
+        inspectorCollapsed={inspectorCollapsed}
+        onSetInspectorCollapsed={setInspectorCollapsed}
+        inspectorPosition={inspectorPosition}
+        onSetInspectorPosition={setInspectorPosition}
+        followTail={followTail}
+        onSetFollowTail={setFollowTail}
+        toolbarGroups={toolbarGroups}
+        onToggleToolbarGroup={toggleToolbarGroup}
+        onResetToolbarGroups={resetToolbarGroups}
+        visibleColumns={visibleColumns}
+        onToggleColumnVisibility={toggleColumnVisibility}
+        columnWidths={columnWidths}
+        onSetColumnWidth={setColumnWidth}
+        onResetColumns={resetColumns}
+        activePresetId={activePresetId}
+        userPresets={customPresets}
+        onApplyPreset={(presetId) => {
+          if (presetId) {
+            applyPreset(presetId);
+          } else {
+            resetAdvancedFilters();
+          }
+        }}
+        onSaveCustomPreset={saveCustomPreset}
+        onDeleteCustomPreset={deleteCustomPreset}
+        matrixEnabled={matrixEnabled}
+        onSetMatrixEnabled={setMatrixEnabled}
+        filterRules={filterRules}
+        noiseThresholds={thresholds}
+        onSetNoiseThresholds={setThresholds}
+        hostFilters={hostListFilter}
+        onSetHostFilters={setHostListFilter}
+        onResetAdvancedFilters={resetAdvancedFilters}
+        onOpenFilterDrawer={() => openFilterDrawerAt("matrix")}
+        status={status}
+        onSetProxyPort={setProxyPort}
+        onSetAutoSystemProxy={setAutoSystemProxy}
+        onSetAllowRemote={setAllowRemote}
+        sessionRetentionLimit={sessionRetentionLimit}
+        onSetSessionRetentionLimit={setSessionRetentionLimit}
+        dropNonMatching={dropNonMatching}
+        onSetDropNonMatching={setDropNonMatching}
+        backendFilterConfig={backendFilterConfig}
+        onUpdateBackendFilterConfig={updateBackendFilterConfig}
+        onSetTlsInterceptMode={setTlsInterceptMode}
+        onOpenTlsDrawer={() => openFilterDrawerAt("tlsBypass")}
+        onOpenHeadersDrawer={() => openFilterDrawerAt("headers")}
+        autoResponderEnabled={autoResponderEnabled}
+        onSetAutoResponderEnabled={handleSetAutoResponderEnabled}
+        autoResponderRules={rules}
+        onUpsertAutoResponderRule={async (rule) => {
+          const next = await proxyBridge.upsertRule(rule);
+          setRules(next);
+          persistAutoResponderStorage(autoResponderEnabled, next);
+          showToast(`Saved rule "${rule.name}"`);
+        }}
+        onDeleteAutoResponderRule={async (id) => {
+          const next = await proxyBridge.deleteRule(id);
+          setRules(next);
+          persistAutoResponderStorage(autoResponderEnabled, next);
+          showToast("Deleted AutoResponder rule");
+        }}
+        onOpenAutoResponderStudio={() => setActiveSection("rules")}
+        onExportProfile={handleExportSettingsProfile}
+        onImportProfileDialog={handleImportSettingsProfileDialog}
+        onImportFromRawJsonText={(jsonText, label) =>
+          openImportPreviewFromJsonText(jsonText, label ?? "pasted-settings.json")
+        }
+        onResetAllToDefaults={() => handleResetAllSettings(true)}
+        onNotify={showToast}
+      />
+
+      <SettingsImportPreviewModal
+        preview={pendingImportState?.preview ?? null}
+        onCancel={() => setPendingImportState(null)}
+        onConfirm={handleConfirmImportSettingsProfile}
       />
 
       <SessionAnnotationModal

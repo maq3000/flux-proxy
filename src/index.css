@@ -653,3 +653,11 @@ dialog.drawer-dialog::backdrop {
 .retention-custom-input:user-valid {
   border-color: var(--status-2xx-fg);
 }
+
+/* Compact toolbar mode (ui.compactToolbar) without shrinking popover menu items */
+.compact-toolbar > div button:not([popover] *),
+.compact-toolbar > div label:not([popover] *),
+.compact-toolbar > div form:not([popover] *),
+.compact-toolbar > div input[type="search"] {
+  height: 1.5rem;
+}
