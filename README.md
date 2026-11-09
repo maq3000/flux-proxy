@@ -341,11 +341,9 @@ curl -x http://127.0.0.1:8888 https://httpbin.org/get -k
 - ✅ Централизованное окно настроек (`Preferences`) и версионированные JSON-профили конфигурации.
 
 ### Ближайшие этапы разработки:
-- 🔜 **P0 (Critical)** — Прозрачная распаковка сжатия **Zstandard (`zstd`, RFC 8878)** в прокси-ядре и поддержка Zstd в TextWizard.
-- 🔜 **P0 (High)** — Доработка компактного режима тулбара, расширение меню шапки колонок (`Auto-fit`) и быстрые шорткаты вкладок инспектора.
-- 🔜 **P1** — **Selective MITM 2.0** (пакетный редактор TLS-правил, 10 курируемых Quick-Packs, счетчики срабатываний).
-- 🔜 **P1** — **Python Scripting Engine** (пользовательские скрипты модификации трафика `on_request` / `on_response`).
-- 🔜 **P1** — **Composer 2.0** (умная вставка «Paste cURL» и генерация кода для JS, Python, Go, Rust) + покрытие тестами **Vitest & CI/CD**.
+- 🔜 **P0 (Critical)** — Прозрачная распаковка сжатия **Zstandard (`zstd`, RFC 8878)** и **привязка к конкретному IP / сетевому интерфейсу LAN** с мульти-биндом.
+- 🔜 **P0 (High)** — Компактный тулбар (`Ctrl+Shift+T`), **очистка PII / секретов при экспорте**, мастер самопроверки **«Proxy Doctor»** и шорткаты инспектора.
+- 🔜 **P1** — **Selective MITM 2.0**, клиентские сертификаты (**mTLS**), **Python Scripting Engine**, **Composer 2.0** («Paste cURL»), генератор **OpenAPI 3.0 / Swagger** и тесты **Vitest & CI/CD**.
 - 🔜 **P2** — **HOSTS Remapping** (виртуальный DNS), **Bandwidth Throttling** (эмуляция 3G/LTE), **Waterfall Timeline**, статистика трафика, **Upstream Proxy** и ручная отправка WebSocket-сообщений.
 
 ---
