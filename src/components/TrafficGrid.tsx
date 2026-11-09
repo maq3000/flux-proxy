@@ -1,10 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
+  Archive,
   ArrowLeftRight,
   Copy,
+  Download,
   Eraser,
   FileCode2,
+  FileText,
   Flame,
   GitCompareArrows,
   Maximize2,
@@ -63,6 +66,11 @@ interface TrafficGridProps {
   onAnnotateSessions: (ids: number[]) => void;
   onSendToComposer: (id: number) => void;
   onCreateRuleFromSession: (session: SessionSummary) => void;
+  onExportSelectedSessions?: (
+    ids: number[],
+    format: "har" | "saz" | "raw"
+  ) => void;
+  onSaveSessionBody?: (id: number, isResponse: boolean) => void;
   onFilterByProcess?: (processName: string) => void;
   onFilterByClientIp?: (clientIp: string) => void;
   onAlwaysInspectHost?: (hostOrPattern: string) => void;
@@ -191,6 +199,20 @@ function openFixedContextPopover(
   } else {
     pop.classList.add(":popover-open");
   }
+
+  // Re-clamp using actual rendered dimensions so tall menus never clip off-screen
+  const actualW = pop.offsetWidth || estWidth;
+  const actualH = pop.offsetHeight || estHeight;
+  const finalLeft = Math.max(
+    8,
+    Math.min(clientX, window.innerWidth - actualW - 8)
+  );
+  const finalTop = Math.max(
+    8,
+    Math.min(clientY, window.innerHeight - actualH - 8)
+  );
+  pop.style.setProperty("--ctx-menu-left", `${Math.round(finalLeft)}px`);
+  pop.style.setProperty("--ctx-menu-top", `${Math.round(finalTop)}px`);
 }
 
 export const TrafficGrid: React.FC<TrafficGridProps> = ({
@@ -219,6 +241,8 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
   onAnnotateSessions,
   onSendToComposer,
   onCreateRuleFromSession,
+  onExportSelectedSessions,
+  onSaveSessionBody,
   onFilterByProcess,
   onFilterByClientIp,
   onAlwaysInspectHost,
@@ -1369,6 +1393,85 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
               <FileCode2 className="h-3.5 w-3.5 shrink-0 text-muted" />
               <span className="truncate">Copy Response Headers</span>
             </button>
+          )}
+
+          {ctxSession && (onExportSelectedSessions || onSaveSessionBody) && (
+            <>
+              <hr />
+
+              {onExportSelectedSessions && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    closeContextMenu();
+                    onExportSelectedSessions(ctxTargetIds, "har");
+                  }}
+                >
+                  <Archive className="h-3.5 w-3.5 shrink-0 text-accent" />
+                  <span className="truncate">
+                    Save Selected as HAR (.har)
+                    {ctxTargetIds.length > 1 ? ` (${ctxTargetIds.length})` : ""}
+                  </span>
+                </button>
+              )}
+
+              {onExportSelectedSessions && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    closeContextMenu();
+                    onExportSelectedSessions(ctxTargetIds, "saz");
+                  }}
+                >
+                  <Archive className="h-3.5 w-3.5 shrink-0 text-status3xx-fg" />
+                  <span className="truncate">
+                    Save Selected as Fiddler SAZ (.saz)
+                    {ctxTargetIds.length > 1 ? ` (${ctxTargetIds.length})` : ""}
+                  </span>
+                </button>
+              )}
+
+              {onSaveSessionBody && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    closeContextMenu();
+                    onSaveSessionBody(ctxSession.id, false);
+                  }}
+                >
+                  <Download className="h-3.5 w-3.5 shrink-0 text-muted" />
+                  <span className="truncate">Save Request Body As...</span>
+                </button>
+              )}
+
+              {onSaveSessionBody && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    closeContextMenu();
+                    onSaveSessionBody(ctxSession.id, true);
+                  }}
+                >
+                  <Download className="h-3.5 w-3.5 shrink-0 text-status2xx-fg" />
+                  <span className="truncate">Save Response Body As...</span>
+                </button>
+              )}
+
+              {onExportSelectedSessions && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    closeContextMenu();
+                    onExportSelectedSessions([ctxSession.id], "raw");
+                  }}
+                >
+                  <FileText className="h-3.5 w-3.5 shrink-0 text-muted" />
+                  <span className="truncate">
+                    Save Full Raw HTTP Message (.txt)
+                  </span>
+                </button>
+              )}
+            </>
           )}
 
           <hr />

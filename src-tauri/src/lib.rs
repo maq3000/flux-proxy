@@ -112,6 +112,12 @@ pub fn run() {
             commands::set_drop_non_matching,
             commands::get_memory_storage_stats,
             commands::load_session_body,
+            commands::export_sessions_file,
+            commands::import_sessions_file,
+            commands::import_sessions_bytes,
+            commands::save_session_body_file,
+            commands::pick_save_file_dialog,
+            commands::pick_open_file_dialog,
         ])
         .build(tauri::generate_context!())
         .expect("error while building FluxProxy Tauri application");
