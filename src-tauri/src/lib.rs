@@ -95,6 +95,7 @@ pub fn run() {
             commands::update_session_annotations,
             commands::get_ca_info,
             commands::install_root_ca,
+            commands::uninstall_root_ca,
             commands::list_rules,
             commands::upsert_rule,
             commands::delete_rule,

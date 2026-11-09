@@ -124,12 +124,26 @@ pub async fn update_session_annotations(
 
 #[tauri::command]
 pub async fn get_ca_info(state: State<'_, AppState>) -> Result<CaCertificateInfo, ProxyError> {
-    Ok(state.controller.context.ca.info())
+    let ca = state.controller.context.ca.clone();
+    tokio::task::spawn_blocking(move || ca.info_with_trust_status())
+        .await
+        .map_err(|e| ProxyError::Custom(format!("CA info task join error: {e}")))
 }
 
 #[tauri::command]
 pub async fn install_root_ca(state: State<'_, AppState>) -> Result<String, ProxyError> {
-    state.controller.context.ca.install_into_os_trust_store()
+    let ca = state.controller.context.ca.clone();
+    tokio::task::spawn_blocking(move || ca.install_into_os_trust_store())
+        .await
+        .map_err(|e| ProxyError::Custom(format!("CA install task join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn uninstall_root_ca(state: State<'_, AppState>) -> Result<String, ProxyError> {
+    let ca = state.controller.context.ca.clone();
+    tokio::task::spawn_blocking(move || ca.uninstall_from_os_trust_store())
+        .await
+        .map_err(|e| ProxyError::Custom(format!("CA uninstall task join error: {e}")))?
 }
 
 #[tauri::command]

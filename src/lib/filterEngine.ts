@@ -306,6 +306,7 @@ export const DEFAULT_BACKEND_FILTER_CONFIG: ProxyFilterBackendConfig = {
       urlPattern: "*",
     },
   ],
+  stripAltSvc: true,
   hostListSync: {
     enabled: false,
     mode: "whitelist",
@@ -1753,18 +1754,32 @@ export function matchTlsBypassInPreview(
   return matchHostRuleList(config.tlsBypassRules, host, port);
 }
 
+function isAltSvcDiscoveryHeader(name: string): boolean {
+  const lower = name.trim().toLowerCase();
+  return lower === "alt-svc" || lower === "alternate-protocol";
+}
+
 export function applyHeaderMutationsInPreview(
   direction: HeaderMutationDirection,
   url: string,
   headers: HeaderPair[],
   config: ProxyFilterBackendConfig
 ): { headers: HeaderPair[]; mutated: boolean } {
-  if (!config.headerMutationsEnabled) {
-    return { headers, mutated: false };
-  }
-
   let mutated = false;
   let next = [...headers];
+
+  if (direction === "response" && config.stripAltSvc !== false) {
+    const before = next.length;
+    next = next.filter((h) => !isAltSvcDiscoveryHeader(h.name));
+    if (next.length !== before) {
+      mutated = true;
+    }
+  }
+
+  if (!config.headerMutationsEnabled) {
+    return { headers: next, mutated };
+  }
+
   const urlLower = url.toLowerCase();
 
   for (const rule of config.headerMutations) {
@@ -1808,6 +1823,14 @@ export function applyHeaderMutationsInPreview(
       const target = rule.headerName.trim();
       if (!target) continue;
       next.push({ name: target, value: rule.headerValue });
+      mutated = true;
+    }
+  }
+
+  if (direction === "response" && config.stripAltSvc !== false) {
+    const before = next.length;
+    next = next.filter((h) => !isAltSvcDiscoveryHeader(h.name));
+    if (next.length !== before) {
       mutated = true;
     }
   }

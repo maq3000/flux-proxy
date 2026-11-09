@@ -160,7 +160,25 @@ impl ProxyFilterEngine {
         match_host_rule_list(&guard.config.tls_bypass_rules, host, port)
     }
 
-    /// Applies lightweight header mutations (`Remove`, `Set`, `Append`) in-place.
+    /// Returns whether automatic `Alt-Svc` / `Alternate-Protocol` response header stripping is active.
+    pub fn is_strip_alt_svc_enabled(&self) -> bool {
+        self.state
+            .read()
+            .map(|g| g.config.strip_alt_svc)
+            .unwrap_or(true)
+    }
+
+    /// Removes `Alt-Svc` and `Alternate-Protocol` headers in-place when `strip_alt_svc` is enabled,
+    /// preventing browsers from upgrading connections to HTTP/3 (QUIC / UDP 443) and bypassing the proxy.
+    pub fn strip_alt_svc_headers(&self, headers: &mut Vec<HeaderPair>) -> bool {
+        if !self.is_strip_alt_svc_enabled() {
+            return false;
+        }
+        strip_alt_svc_vec(headers)
+    }
+
+    /// Applies lightweight header mutations (`Remove`, `Set`, `Append`) in-place, plus automatic
+    /// `Alt-Svc` / `Alternate-Protocol` stripping on responses when `strip_alt_svc` is enabled.
     /// Returns `true` if at least one header was modified, added, or stripped.
     pub fn apply_header_mutations(
         &self,
@@ -171,11 +189,18 @@ impl ProxyFilterEngine {
         let Ok(guard) = self.state.read() else {
             return false;
         };
-        if !guard.config.header_mutations_enabled {
-            return false;
-        }
 
         let mut mutated = false;
+        if direction == HeaderMutationDirection::Response && guard.config.strip_alt_svc {
+            if strip_alt_svc_vec(headers) {
+                mutated = true;
+            }
+        }
+
+        if !guard.config.header_mutations_enabled {
+            return mutated;
+        }
+
         let url_lower = url.to_ascii_lowercase();
 
         for rule in &guard.config.header_mutations {
@@ -232,8 +257,27 @@ impl ProxyFilterEngine {
             }
         }
 
+        if direction == HeaderMutationDirection::Response && guard.config.strip_alt_svc {
+            if strip_alt_svc_vec(headers) {
+                mutated = true;
+            }
+        }
+
         mutated
     }
+}
+
+/// Returns `true` if `name` is an HTTP/3 / QUIC discovery header (`alt-svc` or `alternate-protocol`),
+/// matched case-insensitively.
+pub fn is_alt_svc_header(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.eq_ignore_ascii_case("alt-svc") || trimmed.eq_ignore_ascii_case("alternate-protocol")
+}
+
+fn strip_alt_svc_vec(headers: &mut Vec<HeaderPair>) -> bool {
+    let before = headers.len();
+    headers.retain(|h| !is_alt_svc_header(&h.name));
+    headers.len() != before
 }
 
 /// Evaluates a list of `TlsBypassRule` items against `(host, port)`.
@@ -852,6 +896,7 @@ pub fn default_backend_config() -> ProxyFilterBackendConfig {
                 url_pattern: "*".into(),
             },
         ],
+        strip_alt_svc: true,
         host_list_sync: HostListBackendSyncConfig::default(),
     }
 }
@@ -1128,5 +1173,86 @@ mod tests {
             engine.evaluate_connect_tunnel("telemetry.noise.net", 443),
             ConnectTunnelDecision::Passthrough(PassthroughReason::NotInHostsWhitelist)
         );
+    }
+
+    #[test]
+    fn strips_alt_svc_and_alternate_protocol_by_default_even_when_mutations_disabled() {
+        let engine = ProxyFilterEngine::new();
+        assert!(engine.is_strip_alt_svc_enabled());
+
+        let mut cfg = engine.get_config();
+        assert!(cfg.strip_alt_svc);
+        cfg.header_mutations_enabled = false;
+        engine.update_config(cfg);
+
+        let mut resp_headers = vec![
+            HeaderPair {
+                name: "Content-Type".into(),
+                value: "application/json".into(),
+            },
+            HeaderPair {
+                name: "Alt-Svc".into(),
+                value: "h3=\":443\"; ma=86400, h3-29=\":443\"; ma=86400".into(),
+            },
+            HeaderPair {
+                name: "alternate-protocol".into(),
+                value: "443:quic".into(),
+            },
+            HeaderPair {
+                name: "Cache-Control".into(),
+                value: "no-store".into(),
+            },
+        ];
+
+        let mutated = engine.apply_header_mutations(
+            HeaderMutationDirection::Response,
+            "https://www.google.com/search?q=rust",
+            &mut resp_headers,
+        );
+        assert!(mutated);
+        assert_eq!(resp_headers.len(), 2);
+        assert!(!resp_headers.iter().any(|h| is_alt_svc_header(&h.name)));
+        assert_eq!(resp_headers[0].name, "Content-Type");
+        assert_eq!(resp_headers[1].name, "Cache-Control");
+    }
+
+    #[test]
+    fn preserves_alt_svc_headers_when_strip_alt_svc_is_disabled() {
+        let engine = ProxyFilterEngine::new();
+        let mut cfg = engine.get_config();
+        cfg.strip_alt_svc = false;
+        engine.update_config(cfg);
+        assert!(!engine.is_strip_alt_svc_enabled());
+
+        let mut resp_headers = vec![
+            HeaderPair {
+                name: "alt-svc".into(),
+                value: "h3=\":443\"; ma=2592000".into(),
+            },
+            HeaderPair {
+                name: "Alternate-Protocol".into(),
+                value: "443:quic,p=1".into(),
+            },
+        ];
+
+        let mutated = engine.apply_header_mutations(
+            HeaderMutationDirection::Response,
+            "https://cloudflare.com/",
+            &mut resp_headers,
+        );
+        assert!(!mutated);
+        assert_eq!(resp_headers.len(), 2);
+
+        // Also verify serde backward-compatibility default (`strip_alt_svc = true` when omitted)
+        let legacy_json = r#"{
+            "tlsInterceptMode": "interceptAll",
+            "tlsBypassEnabled": true,
+            "tlsBypassRules": [],
+            "headerMutationsEnabled": true,
+            "headerMutations": []
+        }"#;
+        let parsed: ProxyFilterBackendConfig =
+            serde_json::from_str(legacy_json).expect("deserialize legacy config");
+        assert!(parsed.strip_alt_svc);
     }
 }

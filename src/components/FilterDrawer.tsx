@@ -1823,8 +1823,32 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({
               </button>
             </div>
 
-            {/* One-Click Quick Controls: Cache Bypass + User-Agent Spoofing */}
+            {/* One-Click Quick Controls: HTTP/3 QUIC Block + Cache Bypass + User-Agent Spoofing */}
             <div className="grid grid-cols-1 gap-3 rounded-md border border-hairline bg-canvas p-3 sm:grid-cols-2">
+              <label className="flex cursor-pointer items-start gap-2.5 sm:col-span-2 border-b border-hairline pb-2.5">
+                <input
+                  type="checkbox"
+                  checked={backendConfig.stripAltSvc ?? true}
+                  onChange={(e) =>
+                    void onBackendConfigChange({
+                      ...backendConfig,
+                      stripAltSvc: e.target.checked,
+                    })
+                  }
+                  className="checkbox-native mt-0.5"
+                />
+                <div className="min-w-0">
+                  <span className="block text-xs font-semibold text-fg">
+                    Блокировать переход на HTTP/3 (QUIC / UDP 443)
+                  </span>
+                  <span className="block text-[11px] text-muted">
+                    Автоматически удаляет заголовки{" "}
+                    <code className="font-mono">Alt-Svc</code> и{" "}
+                    <code className="font-mono">Alternate-Protocol</code> из HTTP/1.1 и HTTP/2 ответов, предотвращая обход локального TCP-прокси браузерами
+                  </span>
+                </div>
+              </label>
+
               <label className="flex cursor-pointer items-start gap-2.5">
                 <input
                   type="checkbox"

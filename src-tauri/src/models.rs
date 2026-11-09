@@ -190,6 +190,10 @@ pub struct HostListBackendSyncConfig {
     pub raw_text: String,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyFilterBackendConfig {
@@ -201,6 +205,8 @@ pub struct ProxyFilterBackendConfig {
     pub tls_target_rules: Vec<TlsBypassRule>,
     pub header_mutations_enabled: bool,
     pub header_mutations: Vec<HeaderMutationRule>,
+    #[serde(default = "default_true", alias = "strip_alt_svc")]
+    pub strip_alt_svc: bool,
     #[serde(default)]
     pub host_list_sync: HostListBackendSyncConfig,
 }
@@ -223,6 +229,8 @@ pub struct CaCertificateInfo {
     pub sha256_fingerprint: String,
     pub subject: String,
     pub valid_until: String,
+    #[serde(default)]
+    pub is_trusted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
