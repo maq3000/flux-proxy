@@ -36,6 +36,7 @@ import {
   TOOLBAR_GROUP_DEFINITIONS,
   TRAFFIC_COLUMNS,
 } from "../hooks/useUiPreferences";
+import { SESSION_RETENTION_PRESETS } from "../types/proxy";
 import type {
   BreakpointConfig,
   ColumnId,
@@ -45,6 +46,11 @@ import type {
   TlsInterceptMode,
   ToolbarGroupId,
 } from "../types/proxy";
+
+function formatRetentionOptionLabel(limit: number | null): string {
+  if (limit === null) return "All Sessions";
+  return limit.toString().replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+}
 
 interface TopToolbarProps {
   status: ProxyStatus;
@@ -91,6 +97,13 @@ interface TopToolbarProps {
   visibleColumns: Record<ColumnId, boolean>;
   onToggleColumnVisibility: (colId: ColumnId) => void;
   onResetColumns: () => void;
+  // Ring Buffer Retention & Capture-Stage Drop
+  sessionRetentionLimit: number | null;
+  onSetSessionRetentionLimit: (limit: number | null) => void;
+  dropNonMatching: boolean;
+  onToggleDropNonMatching: () => void;
+  droppedSessionsCount: number;
+  customRetentionTriggerSeq?: number;
   // Proxy & Storage
   onToggleProxy: () => void;
   onToggleAllowRemote: () => void;
@@ -227,6 +240,12 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   visibleColumns,
   onToggleColumnVisibility,
   onResetColumns,
+  sessionRetentionLimit,
+  onSetSessionRetentionLimit,
+  dropNonMatching,
+  onToggleDropNonMatching,
+  droppedSessionsCount,
+  customRetentionTriggerSeq = 0,
   onToggleProxy,
   onToggleAllowRemote,
   onToggleSystemProxy,
@@ -251,6 +270,12 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   const columnsPopoverId = useId();
   const overflowTriggerId = useId();
   const overflowMenuId = useId();
+  const keepTriggerId = useId();
+  const keepMenuId = useId();
+  const customLimitInputId = useId();
+  const customLimitHintId = useId();
+  const customLimitErrorId = useId();
+  const dropNonMatchingCheckboxId = useId();
 
   const sysChevronRef = useRef<HTMLButtonElement>(null);
   const sysPopoverRef = useRef<HTMLDivElement>(null);
@@ -260,10 +285,43 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   const columnsPopoverRef = useRef<HTMLDivElement>(null);
   const overflowBtnRef = useRef<HTMLButtonElement>(null);
   const overflowMenuRef = useRef<HTMLDivElement>(null);
+  const keepBtnRef = useRef<HTMLButtonElement>(null);
+  const keepMenuRef = useRef<HTMLDivElement>(null);
+  const customLimitFormRef = useRef<HTMLFormElement>(null);
+  const customLimitInputRef = useRef<HTMLInputElement>(null);
 
   const [copiedEnv, setCopiedEnv] = useState(false);
   const [quickTargetDraft, setQuickTargetDraft] = useState("");
   const [overflowExpanded, setOverflowExpanded] = useState(false);
+  const [keepExpanded, setKeepExpanded] = useState(false);
+  const [customInlineOpen, setCustomInlineOpen] = useState(false);
+  const [customLimitDraft, setCustomLimitDraft] = useState(() =>
+    String(sessionRetentionLimit ?? 1000)
+  );
+  const [customLimitError, setCustomLimitError] = useState<string | null>(null);
+
+  const isCustomRetentionValue =
+    sessionRetentionLimit !== null &&
+    !(SESSION_RETENTION_PRESETS as readonly number[]).includes(
+      sessionRetentionLimit
+    );
+
+  const openCustomInlineInput = () => {
+    setCustomLimitDraft(String(sessionRetentionLimit ?? 1000));
+    setCustomLimitError(null);
+    setCustomInlineOpen(true);
+    window.requestAnimationFrame(() => {
+      customLimitInputRef.current?.focus();
+      customLimitInputRef.current?.select();
+    });
+  };
+
+  useEffect(() => {
+    if (customRetentionTriggerSeq > 0) {
+      openCustomInlineInput();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [customRetentionTriggerSeq]);
 
   const hasSysProxyWarning = Boolean(status.systemProxyError);
   const isRemoteAllowed = Boolean(
@@ -346,6 +404,103 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
       menu.classList.remove(":popover-open");
     }
     setOverflowExpanded(false);
+  };
+
+  const closeKeepMenu = () => {
+    const menu = keepMenuRef.current;
+    if (!menu) return;
+    if ("popover" in HTMLElement.prototype) {
+      if (menu.matches(":popover-open")) menu.hidePopover();
+    } else {
+      menu.classList.remove(":popover-open");
+    }
+    setKeepExpanded(false);
+  };
+
+  useEffect(() => {
+    const menu = keepMenuRef.current;
+    const trigger = keepBtnRef.current;
+    if (!menu || !trigger) return;
+
+    const cleanups: (() => void)[] = [];
+
+    const onToggle = () => {
+      const open =
+        ("popover" in HTMLElement.prototype && menu.matches(":popover-open")) ||
+        menu.classList.contains(":popover-open");
+      setKeepExpanded(open);
+      if (open) {
+        positionToolbarPopoverFallback(trigger, menu, false);
+      }
+    };
+    menu.addEventListener("toggle", onToggle);
+    cleanups.push(() => menu.removeEventListener("toggle", onToggle));
+
+    const group = menu.querySelector<HTMLElement>('[focusgroup~="menu"]');
+    if (
+      group &&
+      typeof HTMLElement !== "undefined" &&
+      !("focusGroup" in HTMLElement.prototype)
+    ) {
+      group.setAttribute("role", "menu");
+      group
+        .querySelectorAll<HTMLButtonElement>("button:not([role])")
+        .forEach((btn) => btn.setAttribute("role", "menuitem"));
+
+      const onKeyDown = (event: KeyboardEvent) => {
+        if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+          return;
+        }
+        const items = Array.from(
+          group.querySelectorAll<HTMLButtonElement>("button")
+        ).filter((b) => !b.disabled);
+        if (items.length === 0) return;
+        const current = items.indexOf(
+          document.activeElement as HTMLButtonElement
+        );
+        const next =
+          event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? items.length - 1
+              : current < 0
+                ? 0
+                : (current +
+                    (event.key === "ArrowUp" ? -1 : 1) +
+                    items.length) %
+                  items.length;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        items[next]?.focus({ preventScroll: true });
+      };
+      group.addEventListener("keydown", onKeyDown, true);
+      cleanups.push(() => group.removeEventListener("keydown", onKeyDown, true));
+    }
+
+    return () => cleanups.forEach((fn) => fn());
+  }, [customInlineOpen]);
+
+  const validateCustomLimitValue = (raw: string): number | null => {
+    const clean = raw.replace(/\s+/g, "").trim();
+    if (!/^[1-9]\d*$/.test(clean)) return null;
+    const num = Number(clean);
+    if (!Number.isSafeInteger(num) || num <= 0 || num > 5_000_000) return null;
+    return num;
+  };
+
+  const handleCustomLimitSubmit = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const parsed = validateCustomLimitValue(customLimitDraft);
+    if (parsed === null) {
+      setCustomLimitError("Введите целое число > 0");
+      customLimitInputRef.current?.classList.add("user-invalid-fallback");
+      customLimitInputRef.current?.focus();
+      return;
+    }
+    customLimitInputRef.current?.classList.remove("user-invalid-fallback");
+    setCustomLimitError(null);
+    setCustomInlineOpen(false);
+    onSetSessionRetentionLimit(parsed);
   };
 
   const handleCopyCliEnv = async () => {
@@ -431,6 +586,236 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
             </button>
           </div>
         )}
+
+        {/* Fiddler-style Ring Buffer Keep Selector + Inline Custom Input + Drop Non-Matching */}
+        <div className="flex items-center gap-1 border-l border-hairline pl-1.5">
+          {customInlineOpen ? (
+            <form
+              ref={customLimitFormRef}
+              onSubmit={handleCustomLimitSubmit}
+              className="inline-flex h-7 items-center gap-1 rounded-md border border-strong bg-canvas px-1.5"
+            >
+              <label
+                htmlFor={customLimitInputId}
+                className="text-[11px] font-medium text-muted"
+              >
+                Keep:
+              </label>
+              <span id={customLimitHintId} className="sr-only">
+                Целое число сессий больше 0 (например, 777)
+              </span>
+              <input
+                ref={customLimitInputRef}
+                id={customLimitInputId}
+                name="sessionRetentionLimit"
+                type="text"
+                inputMode="numeric"
+                enterKeyHint="done"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
+                required
+                pattern="[1-9][0-9]*"
+                value={customLimitDraft}
+                aria-describedby={customLimitHintId}
+                aria-errormessage={
+                  customLimitError ? customLimitErrorId : undefined
+                }
+                aria-invalid={customLimitError ? "true" : undefined}
+                onChange={(e) => {
+                  setCustomLimitDraft(e.target.value);
+                  if (customLimitError) {
+                    setCustomLimitError(null);
+                  }
+                  e.currentTarget.classList.remove("user-invalid-fallback");
+                  e.currentTarget.setCustomValidity("");
+                }}
+                onBlur={(e) => {
+                  if (
+                    e.relatedTarget instanceof Node &&
+                    customLimitFormRef.current?.contains(e.relatedTarget)
+                  ) {
+                    return;
+                  }
+                  const parsed = validateCustomLimitValue(e.currentTarget.value);
+                  if (parsed === null) {
+                    setCustomLimitError("> 0");
+                    e.currentTarget.classList.add("user-invalid-fallback");
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && e.nativeEvent.isComposing) {
+                    e.preventDefault();
+                    return;
+                  }
+                  if (e.key === "Escape") {
+                    e.preventDefault();
+                    setCustomLimitError(null);
+                    setCustomInlineOpen(false);
+                  }
+                }}
+                placeholder="> 0"
+                className="retention-custom-input h-5 w-16 rounded border border-hairline bg-elevated px-1.5 font-mono text-[11px] text-fg tabular-nums focus:border-accent focus:outline-none"
+              />
+              {customLimitError && (
+                <span
+                  id={customLimitErrorId}
+                  role="status"
+                  aria-live="polite"
+                  className="font-mono text-[10px] font-semibold text-status5xx-fg"
+                >
+                  ⚠ {customLimitError}
+                </span>
+              )}
+              <button
+                type="submit"
+                title="Применить ручной лимит сессий (Enter)"
+                aria-label="Apply custom session limit"
+                className="inline-flex h-5 w-5 items-center justify-center rounded bg-accent/15 text-accent hover:bg-accent/25"
+              >
+                <Check className="h-3 w-3" />
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setCustomLimitError(null);
+                  setCustomInlineOpen(false);
+                }}
+                title="Отмена ручного ввода (Esc)"
+                aria-label="Cancel custom session limit"
+                className="inline-flex h-5 w-5 items-center justify-center rounded text-subtle hover:bg-hover hover:text-fg"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </form>
+          ) : (
+            <>
+              <button
+                ref={keepBtnRef}
+                id={keepTriggerId}
+                type="button"
+                aria-haspopup="menu"
+                aria-expanded={keepExpanded}
+                title="Лимит кольцевого буфера сессий в памяти (FIFO Ring Buffer)"
+                onClick={(e) =>
+                  toggleInvokerFallback(
+                    e,
+                    keepBtnRef.current,
+                    keepMenuRef.current,
+                    false
+                  )
+                }
+                {...({
+                  commandfor: keepMenuId,
+                  command: "toggle-popover",
+                } as Record<string, string>)}
+                className={`inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs transition-colors ${
+                  keepExpanded || isCustomRetentionValue
+                    ? "border-accent/45 bg-selected text-fg"
+                    : "border-hairline bg-elevated text-muted hover:border-strong hover:text-fg"
+                }`}
+              >
+                <span className="text-[11px] text-muted">Keep:</span>
+                <span className="font-mono text-[11px] font-semibold text-fg tabular-nums">
+                  {formatRetentionOptionLabel(sessionRetentionLimit)}
+                </span>
+                <ChevronDown className="h-3 w-3 text-muted" aria-hidden="true" />
+              </button>
+
+              <div
+                ref={keepMenuRef}
+                id={keepMenuId}
+                {...({ popover: "auto" } as Record<string, string>)}
+                onPointerMove={(e) => {
+                  const btn = (e.target as HTMLElement).closest("button");
+                  if (btn && !btn.disabled) {
+                    btn.focus({ preventScroll: true });
+                  }
+                }}
+                className="desktop-menu z-50 hidden min-w-48 rounded-lg border border-strong bg-surface text-fg shadow-popover"
+              >
+                <div
+                  {...({ focusgroup: "menu nomemory" } as Record<string, string>)}
+                  aria-labelledby={keepTriggerId}
+                >
+                  <div role="group" aria-label="Session Retention Limit">
+                    <button
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={sessionRetentionLimit === null}
+                      onClick={() => {
+                        closeKeepMenu();
+                        onSetSessionRetentionLimit(null);
+                      }}
+                    >
+                      <span>All Sessions</span>
+                    </button>
+                    {SESSION_RETENTION_PRESETS.map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={sessionRetentionLimit === preset}
+                        onClick={() => {
+                          closeKeepMenu();
+                          onSetSessionRetentionLimit(preset);
+                        }}
+                      >
+                        <span className="font-mono tabular-nums">
+                          {formatRetentionOptionLabel(preset)}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                  <hr />
+                  <button
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={isCustomRetentionValue}
+                    onClick={() => {
+                      closeKeepMenu();
+                      openCustomInlineInput();
+                    }}
+                  >
+                    <span>Custom...</span>
+                    {isCustomRetentionValue && (
+                      <span className="hint" aria-hidden="true">
+                        {formatRetentionOptionLabel(sessionRetentionLimit)}
+                      </span>
+                    )}
+                  </button>
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* Drop Non-Matching Checkbox / Badge-Button */}
+          <label
+            htmlFor={dropNonMatchingCheckboxId}
+            title="Не сохранять в память запросы, отсеянные фильтром"
+            className={`inline-flex h-7 cursor-pointer select-none items-center gap-1.5 rounded-md border px-2 text-xs transition-colors ${
+              dropNonMatching
+                ? "border-status4xx-fg/45 bg-status4xx-bg text-status4xx-fg hover:brightness-110"
+                : "border-hairline bg-elevated text-muted hover:border-strong hover:text-fg"
+            }`}
+          >
+            <input
+              id={dropNonMatchingCheckboxId}
+              type="checkbox"
+              checked={dropNonMatching}
+              onChange={onToggleDropNonMatching}
+              className="checkbox-native"
+            />
+            <span className="whitespace-nowrap text-[11px] font-medium">
+              Drop Non-Matching
+            </span>
+            {droppedSessionsCount > 0 && (
+              <span className="rounded-full bg-canvas/80 px-1.5 font-mono text-[10px] font-semibold tabular-nums text-fg">
+                {droppedSessionsCount.toLocaleString()}
+              </span>
+            )}
+          </label>
+        </div>
 
         {/* Optional Group: OS System Proxy & Selective TLS MITM */}
         {toolbarGroups.proxyMode && (

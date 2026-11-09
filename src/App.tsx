@@ -133,6 +133,11 @@ export const App: React.FC = () => {
     applyQuickExecBpu,
     resolvePausedBreakpoint,
     resumeAllBreakpoints,
+    sessionRetentionLimit,
+    setSessionRetentionLimit,
+    dropNonMatching,
+    toggleDropNonMatching,
+    storageStats,
     toggleProxy,
     setAllowRemote,
     toggleAllowRemote,
@@ -160,6 +165,7 @@ export const App: React.FC = () => {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsModalOpen, setShortcutsModalOpen] = useState(false);
   const [hexTriggerSeq, setHexTriggerSeq] = useState(0);
+  const [customRetentionTriggerSeq, setCustomRetentionTriggerSeq] = useState(0);
   const [filterDrawerOpen, setFilterDrawerOpen] = useState(false);
   const [filterDrawerTab, setFilterDrawerTab] =
     useState<FilterDrawerTab>("matrix");
@@ -321,6 +327,11 @@ export const App: React.FC = () => {
     setSelectedId,
   ]);
 
+  const handleOpenCustomRetentionLimit = useCallback(() => {
+    setActiveSection("traffic");
+    setCustomRetentionTriggerSeq((n) => n + 1);
+  }, []);
+
   const copyUrlsForIds = useCallback(
     (ids: number[]) => {
       if (ids.length === 0) {
@@ -349,8 +360,21 @@ export const App: React.FC = () => {
 
   const copySessionAsCurl = useCallback(
     async (sessionId: number) => {
-      const detail = await proxyBridge.getSessionDetail(sessionId);
+      let detail = await proxyBridge.getSessionDetail(sessionId);
       if (!detail) return;
+      if (detail.requestBodyOffloaded) {
+        try {
+          const loaded = await proxyBridge.loadSessionBody(sessionId, false);
+          detail = {
+            ...detail,
+            requestBodyBase64: loaded.bodyBase64,
+            requestBodyText: loaded.bodyText,
+            requestBodyOffloaded: false,
+          };
+        } catch {
+          // Proceed with headers/URL if offloaded body cannot be read
+        }
+      }
       const curl = buildCurlCommand(detail);
       await navigator.clipboard?.writeText(curl).catch(() => undefined);
       showToast(`Скопирована команда cURL для сессии #${sessionId}`);
@@ -722,13 +746,22 @@ export const App: React.FC = () => {
     async (sessionId: number, openStandalone = false) => {
       const detail = await proxyBridge.getSessionDetail(sessionId);
       if (!detail) return;
+      let requestBody = detail.requestBodyText ?? "";
+      if (detail.requestBodyOffloaded) {
+        try {
+          const loaded = await proxyBridge.loadSessionBody(sessionId, false);
+          requestBody = loaded.bodyText ?? "";
+        } catch {
+          // Keep empty body fallback if offloaded payload cannot be retrieved
+        }
+      }
       setComposerDraft({
         method: detail.summary.method,
         url: detail.summary.url,
         headers: detail.requestHeaders.filter(
           (h) => h.name.toLowerCase() !== "content-length"
         ),
-        body: detail.requestBodyText ?? "",
+        body: requestBody,
         followRedirects: true,
       });
       if (openStandalone) {
@@ -1102,6 +1135,38 @@ export const App: React.FC = () => {
         perform: () => void loadFromSqlite(),
       },
       {
+        id: "toggle-drop-non-matching",
+        category: "Storage",
+        label: dropNonMatching
+          ? "Disable Drop Non-Matching Traffic on Capture"
+          : "Enable Drop Non-Matching Traffic on Capture (Save RAM)",
+        perform: () => void toggleDropNonMatching(),
+      },
+      {
+        id: "retention-all",
+        category: "Storage",
+        label: "Session Retention Limit: Keep All Sessions (Unlimited)",
+        perform: () => void setSessionRetentionLimit(null),
+      },
+      {
+        id: "retention-1000",
+        category: "Storage",
+        label: "Session Retention Limit: Keep 1,000 Sessions",
+        perform: () => void setSessionRetentionLimit(1000),
+      },
+      {
+        id: "retention-10000",
+        category: "Storage",
+        label: "Session Retention Limit: Keep 10,000 Sessions (Default)",
+        perform: () => void setSessionRetentionLimit(10000),
+      },
+      {
+        id: "retention-custom",
+        category: "Storage",
+        label: "Session Retention Limit: Enter Custom Limit...",
+        perform: handleOpenCustomRetentionLimit,
+      },
+      {
         id: "theme-dark",
         category: "Theme",
         label: "Set Theme: Dark",
@@ -1130,9 +1195,11 @@ export const App: React.FC = () => {
       deleteSessions,
       disableAllBreakpoints,
       dockedComposer,
+      dropNonMatching,
       effectiveSelectedIds,
       generateStress10k,
       handleInspectInHex,
+      handleOpenCustomRetentionLimit,
       inspectorCollapsed,
       isForceNoCacheActive,
       loadFromSqlite,
@@ -1149,6 +1216,7 @@ export const App: React.FC = () => {
       selectedId,
       setInspectorPosition,
       setQuickCategory,
+      setSessionRetentionLimit,
       setTheme,
       showToast,
       sidebarCollapsed,
@@ -1162,6 +1230,7 @@ export const App: React.FC = () => {
       toggleAllowRemote,
       toggleBreakAfterResponse,
       toggleBreakBeforeRequest,
+      toggleDropNonMatching,
       toggleForceNoCache,
       toggleInspector,
       toggleProxy,
@@ -1379,6 +1448,13 @@ export const App: React.FC = () => {
         onOpenCompressionCodec={() => openTextWizardAt("compression")}
         onOpenMobileSetup={() => setMobileModalOpen(true)}
         onOpenCertificates={() => setCertModalOpen(true)}
+        sessionRetentionLimit={sessionRetentionLimit}
+        onSetSessionRetentionLimit={(limit) =>
+          void setSessionRetentionLimit(limit)
+        }
+        onOpenCustomRetentionLimit={handleOpenCustomRetentionLimit}
+        dropNonMatching={dropNonMatching}
+        onToggleDropNonMatching={() => void toggleDropNonMatching()}
         onGenerateStress10k={generateStress10k}
         onOpenCommandPalette={() => setPaletteOpen(true)}
         onOpenShortcutsModal={() => setShortcutsModalOpen(true)}
@@ -1491,6 +1567,14 @@ export const App: React.FC = () => {
               }))
             }
             onOpenTlsModeDrawer={() => openFilterDrawerAt("tlsBypass")}
+            sessionRetentionLimit={sessionRetentionLimit}
+            onSetSessionRetentionLimit={(limit) =>
+              void setSessionRetentionLimit(limit)
+            }
+            dropNonMatching={dropNonMatching}
+            onToggleDropNonMatching={() => void toggleDropNonMatching()}
+            droppedSessionsCount={storageStats.droppedSessionsCount}
+            customRetentionTriggerSeq={customRetentionTriggerSeq}
             onClearSessions={() => void clearAllSessions()}
             onSaveSqlite={() => void saveToSqlite()}
             onLoadSqlite={() => void loadFromSqlite()}
@@ -1748,15 +1832,47 @@ export const App: React.FC = () => {
 
         <div className="flex shrink-0 items-center gap-3">
           {toastMessage && (
-            <span className="max-w-[340px] truncate text-accent">
+            <span className="max-w-[300px] truncate text-accent">
               {toastMessage}
             </span>
           )}
           <button
             type="button"
+            onClick={handleOpenCustomRetentionLimit}
+            title={`Кольцевой буфер (Ring Buffer): ${
+              sessionRetentionLimit === null
+                ? "All Sessions (без ограничений)"
+                : `Keep ${sessionRetentionLimit.toLocaleString("en-US")} сессий`
+            } • Drop Non-Matching: ${
+              dropNonMatching ? "ON" : "OFF"
+            } — нажмите для настройки лимита`}
+            className="shrink-0 tabular-nums text-muted transition-colors hover:text-fg"
+          >
+            RAM:{" "}
+            <strong className="font-semibold text-fg">
+              {storageStats.ramSessions.toLocaleString("en-US")}
+            </strong>{" "}
+            ses | SQLite:{" "}
+            <strong className="font-semibold text-fg">
+              {(storageStats.sqliteSizeBytes / (1024 * 1024)).toFixed(1)} MB
+            </strong>{" "}
+            | Dropped:{" "}
+            <strong
+              className={`font-semibold ${
+                storageStats.droppedSessionsCount > 0
+                  ? "text-status4xx-fg"
+                  : "text-fg"
+              }`}
+            >
+              {storageStats.droppedSessionsCount.toLocaleString("en-US")}
+            </strong>
+          </button>
+          <span className="hidden text-subtle 2xl:inline">•</span>
+          <button
+            type="button"
             onClick={() => setShortcutsModalOpen(true)}
             title="Открыть полный справочник горячих клавиш (?)"
-            className="hidden text-subtle hover:text-fg xl:inline"
+            className="hidden text-subtle hover:text-fg 2xl:inline"
           >
             F12 Capture • Space Inspect • R Replay • M Mark • U Unmark • Del • Ctrl+F • ?
           </button>

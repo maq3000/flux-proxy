@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Editor from "@monaco-editor/react";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import {
@@ -7,7 +7,10 @@ import {
   Columns3,
   Copy,
   Cpu,
+  Database,
+  Download,
   GitCompareArrows,
+  Loader2,
   MessageSquarePlus,
   OctagonPause,
   PanelBottom,
@@ -37,10 +40,12 @@ import {
   hasProtobufOrGrpcContentType,
   isSseSession,
 } from "../lib/protocolInspectors";
+import { proxyBridge } from "../lib/tauriBridge";
 import type {
   HeaderPair,
   InspectorDockPosition,
   InspectorTab,
+  LoadedSessionBody,
   SessionDetail,
 } from "../types/proxy";
 import { HexViewer } from "./HexViewer";
@@ -133,12 +138,122 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
     "vertical" | "horizontal"
   >(() => (inspectorPosition === "bottom" ? "horizontal" : "vertical"));
 
+  // Lazy-loaded heavy payload state (> 2 MB bodies offloaded to SQLite for OOM protection)
+  const [loadedRespEntry, setLoadedRespEntry] = useState<{
+    sessionId: number;
+    payload: LoadedSessionBody;
+  } | null>(null);
+  const [loadingRespBody, setLoadingRespBody] = useState(false);
+  const [respBodyError, setRespBodyError] = useState<string | null>(null);
+
+  const [loadedReqEntry, setLoadedReqEntry] = useState<{
+    sessionId: number;
+    payload: LoadedSessionBody;
+  } | null>(null);
+  const [loadingReqBody, setLoadingReqBody] = useState(false);
+  const [reqBodyError, setReqBodyError] = useState<string | null>(null);
+
+  const activeSessionIdRef = useRef<number | null>(detail?.summary.id ?? null);
+  activeSessionIdRef.current = detail?.summary.id ?? null;
+
+  useEffect(() => {
+    setLoadingRespBody(false);
+    setRespBodyError(null);
+    setLoadingReqBody(false);
+    setReqBodyError(null);
+  }, [detail?.summary.id]);
+
+  const effectiveDetail = useMemo<SessionDetail | null>(() => {
+    if (!detail) return null;
+    const respPayload =
+      loadedRespEntry?.sessionId === detail.summary.id
+        ? loadedRespEntry.payload
+        : null;
+    const reqPayload =
+      loadedReqEntry?.sessionId === detail.summary.id
+        ? loadedReqEntry.payload
+        : null;
+    if (!respPayload && !reqPayload) return detail;
+    return {
+      ...detail,
+      ...(reqPayload
+        ? {
+            requestBodyBase64: reqPayload.bodyBase64,
+            requestBodyText: reqPayload.bodyText,
+            requestBodyOffloaded: false,
+          }
+        : {}),
+      ...(respPayload
+        ? {
+            responseBodyBase64: respPayload.bodyBase64,
+            responseBodyText: respPayload.bodyText,
+            bodyOffloaded: false,
+          }
+        : {}),
+    };
+  }, [detail, loadedReqEntry, loadedRespEntry]);
+
+  const handleLoadResponseBody = useCallback(async () => {
+    const sessionId = detail?.summary.id;
+    if (sessionId == null || loadingRespBody) return;
+    setLoadingRespBody(true);
+    setRespBodyError(null);
+    try {
+      const payload = await proxyBridge.loadSessionBody(sessionId, true);
+      if (activeSessionIdRef.current === sessionId) {
+        setLoadedRespEntry({ sessionId, payload });
+      }
+    } catch (err) {
+      if (activeSessionIdRef.current === sessionId) {
+        setRespBodyError(
+          err instanceof Error
+            ? err.message
+            : String(err ?? "Не удалось загрузить тело ответа из SQLite")
+        );
+      }
+    } finally {
+      if (activeSessionIdRef.current === sessionId) {
+        setLoadingRespBody(false);
+      }
+    }
+  }, [detail?.summary.id, loadingRespBody]);
+
+  const handleLoadRequestBody = useCallback(async () => {
+    const sessionId = detail?.summary.id;
+    if (sessionId == null || loadingReqBody) return;
+    setLoadingReqBody(true);
+    setReqBodyError(null);
+    try {
+      const payload = await proxyBridge.loadSessionBody(sessionId, false);
+      if (activeSessionIdRef.current === sessionId) {
+        setLoadedReqEntry({ sessionId, payload });
+      }
+    } catch (err) {
+      if (activeSessionIdRef.current === sessionId) {
+        setReqBodyError(
+          err instanceof Error
+            ? err.message
+            : String(err ?? "Не удалось загрузить тело запроса из SQLite")
+        );
+      }
+    } finally {
+      if (activeSessionIdRef.current === sessionId) {
+        setLoadingReqBody(false);
+      }
+    }
+  }, [detail?.summary.id, loadingReqBody]);
+
   const monacoTheme = resolvedTheme === "dark" ? "vs-dark" : "light";
 
   useEffect(() => {
     if (externalHexTrigger > 0) {
       setRespTab("hex");
-      if (!detail?.responseBodyBase64 && detail?.requestBodyBase64) {
+      if (
+        !effectiveDetail?.responseBodyBase64 &&
+        !effectiveDetail?.bodyOffloaded &&
+        (effectiveDetail?.requestBodyBase64 ||
+          effectiveDetail?.requestBodyOffloaded)
+      ) {
         setReqTab("hex");
       }
     }
@@ -164,51 +279,62 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
   };
 
   const queryParams = useMemo(
-    () => (detail ? parseQueryParams(detail.summary.url) : []),
-    [detail]
+    () => (effectiveDetail ? parseQueryParams(effectiveDetail.summary.url) : []),
+    [effectiveDetail]
   );
   const reqCookies = useMemo(
-    () => (detail ? parseCookies(detail.requestHeaders, false) : []),
-    [detail]
+    () =>
+      effectiveDetail
+        ? parseCookies(effectiveDetail.requestHeaders, false)
+        : [],
+    [effectiveDetail]
   );
   const respCookies = useMemo(
-    () => (detail ? parseCookies(detail.responseHeaders, true) : []),
-    [detail]
+    () =>
+      effectiveDetail
+        ? parseCookies(effectiveDetail.responseHeaders, true)
+        : [],
+    [effectiveDetail]
   );
 
   const authSummary = useMemo(
-    () => (detail ? analyzeAuth(detail) : null),
-    [detail]
+    () => (effectiveDetail ? analyzeAuth(effectiveDetail) : null),
+    [effectiveDetail]
   );
   const cacheSummary = useMemo(
-    () => (detail ? analyzeCaching(detail) : null),
-    [detail]
+    () => (effectiveDetail ? analyzeCaching(effectiveDetail) : null),
+    [effectiveDetail]
   );
 
   const hasReqMultipart = useMemo(
     () =>
-      detail
+      effectiveDetail
         ? hasMultipartOrFormPayload(
-            detail.requestHeaders,
-            detail.requestBodyBase64
+            effectiveDetail.requestHeaders,
+            effectiveDetail.requestBodyBase64
           )
         : false,
-    [detail]
+    [effectiveDetail]
   );
   const hasReqProto = useMemo(
-    () => (detail ? hasProtobufOrGrpcContentType(detail.requestHeaders) : false),
-    [detail]
+    () =>
+      effectiveDetail
+        ? hasProtobufOrGrpcContentType(effectiveDetail.requestHeaders)
+        : false,
+    [effectiveDetail]
   );
   const hasRespProto = useMemo(
     () =>
-      detail ? hasProtobufOrGrpcContentType(detail.responseHeaders) : false,
-    [detail]
+      effectiveDetail
+        ? hasProtobufOrGrpcContentType(effectiveDetail.responseHeaders)
+        : false,
+    [effectiveDetail]
   );
   const isSse = useMemo(
-    () => (detail ? isSseSession(detail) : false),
-    [detail]
+    () => (effectiveDetail ? isSseSession(effectiveDetail) : false),
+    [effectiveDetail]
   );
-  const wsCount = detail?.websocketFrames.length ?? 0;
+  const wsCount = effectiveDetail?.websocketFrames.length ?? 0;
 
   // Smart default tab selection when switching to specialized protocol sessions (SSE, WS, gRPC, Multipart, Image)
   useEffect(() => {
@@ -308,8 +434,14 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
     );
   }
 
-  const { summary } = detail;
+  if (!effectiveDetail) {
+    return null;
+  }
+
+  const { summary } = effectiveDetail;
   const isImage = summary.contentType.toLowerCase().startsWith("image/");
+  const isReqOffloaded = Boolean(effectiveDetail.requestBodyOffloaded);
+  const isRespOffloaded = Boolean(effectiveDetail.bodyOffloaded);
   const respStatusColor =
     summary.status >= 500 || summary.status === 502 || summary.status === 504
       ? "text-status5xx-fg"
@@ -323,15 +455,15 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
 
   const handleSendSessionToWizard = () => {
     if (!onOpenTextWizard) return;
-    const authHdr = detail.requestHeaders.find(
+    const authHdr = effectiveDetail.requestHeaders.find(
       (h) => h.name.toLowerCase() === "authorization"
     );
     if (authHdr && authHdr.value.toLowerCase().startsWith("bearer ")) {
       onOpenTextWizard(authHdr.value.slice(7).trim(), "jwt");
       return;
     }
-    if (detail.responseBodyText) {
-      onOpenTextWizard(detail.responseBodyText, "base64");
+    if (effectiveDetail.responseBodyText) {
+      onOpenTextWizard(effectiveDetail.responseBodyText, "base64");
       return;
     }
     onOpenTextWizard(summary.url, "url");
@@ -649,22 +781,42 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                 );
               })}
             </div>
-            <button
-              type="button"
-              onClick={() =>
-                void navigator.clipboard?.writeText(buildRawHttpRequest(detail))
-              }
-              title="Copy Raw Request"
-              className="shrink-0 rounded p-1 text-subtle hover:text-fg"
-            >
-              <Copy className="h-3 w-3" />
-            </button>
+            <div className="flex shrink-0 items-center gap-1">
+              {isReqOffloaded && (
+                <button
+                  type="button"
+                  onClick={() => void handleLoadRequestBody()}
+                  disabled={loadingReqBody}
+                  title="Тело запроса (> 2 МБ) выгружено в SQLite для защиты от OOM — нажмите для подгрузки"
+                  className="inline-flex items-center gap-1 rounded border border-status4xx-fg/35 bg-status4xx-bg px-1.5 py-0.5 font-mono text-[10px] text-status4xx-fg hover:brightness-110 disabled:opacity-60"
+                >
+                  {loadingReqBody ? (
+                    <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                  ) : (
+                    <Database className="h-2.5 w-2.5" />
+                  )}
+                  <span>Offloaded (&gt;2 MB)</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() =>
+                  void navigator.clipboard?.writeText(
+                    buildRawHttpRequest(effectiveDetail)
+                  )
+                }
+                title="Copy Raw Request"
+                className="shrink-0 rounded p-1 text-subtle hover:text-fg"
+              >
+                <Copy className="h-3 w-3" />
+              </button>
+            </div>
           </div>
 
           <div className="flex-1 overflow-hidden bg-canvas">
             {reqTab === "headers" && (
               <KeyValueTable
-                items={detail.requestHeaders}
+                items={effectiveDetail.requestHeaders}
                 emptyLabel="No request headers"
               />
             )}
@@ -679,75 +831,126 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
             )}
             {reqTab === "auth" && (
               <AuthInspectorPanel
-                detail={detail}
+                detail={effectiveDetail}
                 onOpenTextWizard={onOpenTextWizard}
               />
             )}
-            {reqTab === "multipart" && (
-              <MultipartInspectorPanel
-                headers={detail.requestHeaders}
-                bodyBase64={detail.requestBodyBase64}
-                bodyText={detail.requestBodyText}
-              />
-            )}
-            {reqTab === "protobuf" && (
-              <ProtobufGrpcPanel
-                headers={detail.requestHeaders}
-                bodyBase64={detail.requestBodyBase64}
-                monacoTheme={monacoTheme}
-              />
-            )}
-            {reqTab === "raw" && (
-              <Editor
-                height="100%"
-                language="http"
-                theme={monacoTheme}
-                value={buildRawHttpRequest(detail)}
-                options={{
-                  readOnly: true,
-                  minimap: { enabled: false },
-                  fontSize: 12,
-                  wordWrap: "on",
-                  scrollBeyondLastLine: false,
-                }}
-              />
-            )}
-            {reqTab === "json" && (
-              <Editor
-                height="100%"
-                language="json"
-                theme={monacoTheme}
-                value={
-                  tryFormatJson(detail.requestBodyText).formatted ||
-                  "// Empty or non-JSON request body"
-                }
-                options={{
-                  readOnly: true,
-                  minimap: { enabled: false },
-                  fontSize: 12,
-                  wordWrap: "on",
-                  scrollBeyondLastLine: false,
-                }}
-              />
-            )}
-            {reqTab === "xml" && (
-              <Editor
-                height="100%"
-                language="xml"
-                theme={monacoTheme}
-                value={detail.requestBodyText || "<!-- Empty request body -->"}
-                options={{
-                  readOnly: true,
-                  minimap: { enabled: false },
-                  fontSize: 12,
-                  wordWrap: "on",
-                  scrollBeyondLastLine: false,
-                }}
-              />
-            )}
-            {reqTab === "hex" && (
-              <HexViewer base64Data={detail.requestBodyBase64} />
-            )}
+            {reqTab === "multipart" &&
+              (isReqOffloaded ? (
+                <OffloadedBodyNotice
+                  kind="request"
+                  loading={loadingReqBody}
+                  error={reqBodyError}
+                  onLoad={() => void handleLoadRequestBody()}
+                />
+              ) : (
+                <MultipartInspectorPanel
+                  headers={effectiveDetail.requestHeaders}
+                  bodyBase64={effectiveDetail.requestBodyBase64}
+                  bodyText={effectiveDetail.requestBodyText}
+                />
+              ))}
+            {reqTab === "protobuf" &&
+              (isReqOffloaded ? (
+                <OffloadedBodyNotice
+                  kind="request"
+                  loading={loadingReqBody}
+                  error={reqBodyError}
+                  onLoad={() => void handleLoadRequestBody()}
+                />
+              ) : (
+                <ProtobufGrpcPanel
+                  headers={effectiveDetail.requestHeaders}
+                  bodyBase64={effectiveDetail.requestBodyBase64}
+                  monacoTheme={monacoTheme}
+                />
+              ))}
+            {reqTab === "raw" &&
+              (isReqOffloaded ? (
+                <OffloadedBodyNotice
+                  kind="request"
+                  loading={loadingReqBody}
+                  error={reqBodyError}
+                  onLoad={() => void handleLoadRequestBody()}
+                />
+              ) : (
+                <Editor
+                  height="100%"
+                  language="http"
+                  theme={monacoTheme}
+                  value={buildRawHttpRequest(effectiveDetail)}
+                  options={{
+                    readOnly: true,
+                    minimap: { enabled: false },
+                    fontSize: 12,
+                    wordWrap: "on",
+                    scrollBeyondLastLine: false,
+                  }}
+                />
+              ))}
+            {reqTab === "json" &&
+              (isReqOffloaded ? (
+                <OffloadedBodyNotice
+                  kind="request"
+                  loading={loadingReqBody}
+                  error={reqBodyError}
+                  onLoad={() => void handleLoadRequestBody()}
+                />
+              ) : (
+                <Editor
+                  height="100%"
+                  language="json"
+                  theme={monacoTheme}
+                  value={
+                    tryFormatJson(effectiveDetail.requestBodyText).formatted ||
+                    "// Empty or non-JSON request body"
+                  }
+                  options={{
+                    readOnly: true,
+                    minimap: { enabled: false },
+                    fontSize: 12,
+                    wordWrap: "on",
+                    scrollBeyondLastLine: false,
+                  }}
+                />
+              ))}
+            {reqTab === "xml" &&
+              (isReqOffloaded ? (
+                <OffloadedBodyNotice
+                  kind="request"
+                  loading={loadingReqBody}
+                  error={reqBodyError}
+                  onLoad={() => void handleLoadRequestBody()}
+                />
+              ) : (
+                <Editor
+                  height="100%"
+                  language="xml"
+                  theme={monacoTheme}
+                  value={
+                    effectiveDetail.requestBodyText ||
+                    "<!-- Empty request body -->"
+                  }
+                  options={{
+                    readOnly: true,
+                    minimap: { enabled: false },
+                    fontSize: 12,
+                    wordWrap: "on",
+                    scrollBeyondLastLine: false,
+                  }}
+                />
+              ))}
+            {reqTab === "hex" &&
+              (isReqOffloaded ? (
+                <OffloadedBodyNotice
+                  kind="request"
+                  loading={loadingReqBody}
+                  error={reqBodyError}
+                  onLoad={() => void handleLoadRequestBody()}
+                />
+              ) : (
+                <HexViewer base64Data={effectiveDetail.requestBodyBase64} />
+              ))}
           </div>
         </Panel>
 
@@ -777,7 +980,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                       : t.id === "auth" && authSummary?.hasAuth
                         ? " •"
                         : t.id === "sse" && isSse
-                          ? ` (${detail.sseEvents?.length || "•"})`
+                          ? ` (${effectiveDetail.sseEvents?.length || "•"})`
                           : t.id === "ws" && wsCount > 0
                             ? ` (${wsCount})`
                             : t.id === "protobuf" && hasRespProto
@@ -804,24 +1007,43 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                 );
               })}
             </div>
-            <button
-              type="button"
-              onClick={() =>
-                void navigator.clipboard?.writeText(
-                  detail.responseBodyText ?? buildRawHttpResponse(detail)
-                )
-              }
-              title="Copy Response Body"
-              className="shrink-0 rounded p-1 text-subtle hover:text-fg"
-            >
-              <Copy className="h-3 w-3" />
-            </button>
+            <div className="flex shrink-0 items-center gap-1">
+              {isRespOffloaded && (
+                <button
+                  type="button"
+                  onClick={() => void handleLoadResponseBody()}
+                  disabled={loadingRespBody}
+                  title={`Тело ответа (${formatBytes(summary.bodySize)}) выгружено в SQLite для защиты от OOM — нажмите для ленивой подгрузки`}
+                  className="inline-flex items-center gap-1 rounded border border-status4xx-fg/35 bg-status4xx-bg px-1.5 py-0.5 font-mono text-[10px] text-status4xx-fg hover:brightness-110 disabled:opacity-60"
+                >
+                  {loadingRespBody ? (
+                    <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                  ) : (
+                    <Database className="h-2.5 w-2.5" />
+                  )}
+                  <span>Offloaded ({formatBytes(summary.bodySize)})</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() =>
+                  void navigator.clipboard?.writeText(
+                    effectiveDetail.responseBodyText ??
+                      buildRawHttpResponse(effectiveDetail)
+                  )
+                }
+                title="Copy Response Body"
+                className="shrink-0 rounded p-1 text-subtle hover:text-fg"
+              >
+                <Copy className="h-3 w-3" />
+              </button>
+            </div>
           </div>
 
           <div className="flex-1 overflow-hidden bg-canvas">
             {respTab === "headers" && (
               <KeyValueTable
-                items={detail.responseHeaders}
+                items={effectiveDetail.responseHeaders}
                 emptyLabel="No response headers"
               />
             )}
@@ -831,100 +1053,210 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                 emptyLabel="No Set-Cookie headers in response"
               />
             )}
-            {respTab === "caching" && <CachingInspectorPanel detail={detail} />}
+            {respTab === "caching" && (
+              <CachingInspectorPanel detail={effectiveDetail} />
+            )}
             {respTab === "auth" && (
               <AuthInspectorPanel
-                detail={detail}
+                detail={effectiveDetail}
                 onOpenTextWizard={onOpenTextWizard}
               />
             )}
             {respTab === "sse" && (
-              <SseInspectorPanel detail={detail} monacoTheme={monacoTheme} />
-            )}
-            {respTab === "ws" && (
-              <WebSocketFramesPanel frames={detail.websocketFrames} />
-            )}
-            {respTab === "protobuf" && (
-              <ProtobufGrpcPanel
-                headers={detail.responseHeaders}
-                bodyBase64={detail.responseBodyBase64}
+              <SseInspectorPanel
+                detail={effectiveDetail}
                 monacoTheme={monacoTheme}
               />
             )}
-            {respTab === "raw" && (
-              <Editor
-                height="100%"
-                language="http"
-                theme={monacoTheme}
-                value={buildRawHttpResponse(detail)}
-                options={{
-                  readOnly: true,
-                  minimap: { enabled: false },
-                  fontSize: 12,
-                  wordWrap: "on",
-                  scrollBeyondLastLine: false,
-                }}
-              />
+            {respTab === "ws" && (
+              <WebSocketFramesPanel frames={effectiveDetail.websocketFrames} />
             )}
-            {respTab === "json" && (
-              <Editor
-                height="100%"
-                language="json"
-                theme={monacoTheme}
-                value={
-                  tryFormatJson(detail.responseBodyText).formatted ||
-                  "// Empty response payload"
-                }
-                options={{
-                  readOnly: true,
-                  minimap: { enabled: false },
-                  fontSize: 12,
-                  wordWrap: "on",
-                  scrollBeyondLastLine: false,
-                }}
-              />
-            )}
-            {respTab === "xml" && (
-              <Editor
-                height="100%"
-                language="xml"
-                theme={monacoTheme}
-                value={detail.responseBodyText || "<!-- Empty response payload -->"}
-                options={{
-                  readOnly: true,
-                  minimap: { enabled: false },
-                  fontSize: 12,
-                  wordWrap: "on",
-                  scrollBeyondLastLine: false,
-                }}
-              />
-            )}
-            {respTab === "image" && (
-              <div className="flex h-full flex-col items-center justify-center gap-3 overflow-auto p-4 checkerboard-bg">
-                {isImage && detail.responseBodyBase64 ? (
-                  <>
-                    <img
-                      src={`data:${summary.contentType.split(";")[0]};base64,${detail.responseBodyBase64}`}
-                      alt={summary.path}
-                      className="max-h-[75%] max-w-[90%] rounded border border-strong shadow-popover"
-                    />
-                    <span className="rounded bg-surface/90 px-2.5 py-1 font-mono text-[11px] text-muted ring-1 ring-hairline">
-                      {summary.contentType} • {formatBytes(summary.bodySize)}
+            {respTab === "protobuf" &&
+              (isRespOffloaded ? (
+                <OffloadedBodyNotice
+                  kind="response"
+                  sizeBytes={summary.bodySize}
+                  loading={loadingRespBody}
+                  error={respBodyError}
+                  onLoad={() => void handleLoadResponseBody()}
+                />
+              ) : (
+                <ProtobufGrpcPanel
+                  headers={effectiveDetail.responseHeaders}
+                  bodyBase64={effectiveDetail.responseBodyBase64}
+                  monacoTheme={monacoTheme}
+                />
+              ))}
+            {respTab === "raw" &&
+              (isRespOffloaded ? (
+                <OffloadedBodyNotice
+                  kind="response"
+                  sizeBytes={summary.bodySize}
+                  loading={loadingRespBody}
+                  error={respBodyError}
+                  onLoad={() => void handleLoadResponseBody()}
+                />
+              ) : (
+                <Editor
+                  height="100%"
+                  language="http"
+                  theme={monacoTheme}
+                  value={buildRawHttpResponse(effectiveDetail)}
+                  options={{
+                    readOnly: true,
+                    minimap: { enabled: false },
+                    fontSize: 12,
+                    wordWrap: "on",
+                    scrollBeyondLastLine: false,
+                  }}
+                />
+              ))}
+            {respTab === "json" &&
+              (isRespOffloaded ? (
+                <OffloadedBodyNotice
+                  kind="response"
+                  sizeBytes={summary.bodySize}
+                  loading={loadingRespBody}
+                  error={respBodyError}
+                  onLoad={() => void handleLoadResponseBody()}
+                />
+              ) : (
+                <Editor
+                  height="100%"
+                  language="json"
+                  theme={monacoTheme}
+                  value={
+                    tryFormatJson(effectiveDetail.responseBodyText).formatted ||
+                    "// Empty response payload"
+                  }
+                  options={{
+                    readOnly: true,
+                    minimap: { enabled: false },
+                    fontSize: 12,
+                    wordWrap: "on",
+                    scrollBeyondLastLine: false,
+                  }}
+                />
+              ))}
+            {respTab === "xml" &&
+              (isRespOffloaded ? (
+                <OffloadedBodyNotice
+                  kind="response"
+                  sizeBytes={summary.bodySize}
+                  loading={loadingRespBody}
+                  error={respBodyError}
+                  onLoad={() => void handleLoadResponseBody()}
+                />
+              ) : (
+                <Editor
+                  height="100%"
+                  language="xml"
+                  theme={monacoTheme}
+                  value={
+                    effectiveDetail.responseBodyText ||
+                    "<!-- Empty response payload -->"
+                  }
+                  options={{
+                    readOnly: true,
+                    minimap: { enabled: false },
+                    fontSize: 12,
+                    wordWrap: "on",
+                    scrollBeyondLastLine: false,
+                  }}
+                />
+              ))}
+            {respTab === "image" &&
+              (isRespOffloaded ? (
+                <OffloadedBodyNotice
+                  kind="response"
+                  sizeBytes={summary.bodySize}
+                  loading={loadingRespBody}
+                  error={respBodyError}
+                  onLoad={() => void handleLoadResponseBody()}
+                />
+              ) : (
+                <div className="flex h-full flex-col items-center justify-center gap-3 overflow-auto p-4 checkerboard-bg">
+                  {isImage && effectiveDetail.responseBodyBase64 ? (
+                    <>
+                      <img
+                        src={`data:${summary.contentType.split(";")[0]};base64,${effectiveDetail.responseBodyBase64}`}
+                        alt={summary.path}
+                        className="max-h-[75%] max-w-[90%] rounded border border-strong shadow-popover"
+                      />
+                      <span className="rounded bg-surface/90 px-2.5 py-1 font-mono text-[11px] text-muted ring-1 ring-hairline">
+                        {summary.contentType} • {formatBytes(summary.bodySize)}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="rounded bg-surface/90 px-3 py-1.5 text-xs text-muted ring-1 ring-hairline">
+                      Response Content-Type ({summary.contentType}) is not an image.
                     </span>
-                  </>
-                ) : (
-                  <span className="rounded bg-surface/90 px-3 py-1.5 text-xs text-muted ring-1 ring-hairline">
-                    Response Content-Type ({summary.contentType}) is not an image.
-                  </span>
-                )}
-              </div>
-            )}
-            {respTab === "hex" && (
-              <HexViewer base64Data={detail.responseBodyBase64} />
-            )}
+                  )}
+                </div>
+              ))}
+            {respTab === "hex" &&
+              (isRespOffloaded ? (
+                <OffloadedBodyNotice
+                  kind="response"
+                  sizeBytes={summary.bodySize}
+                  loading={loadingRespBody}
+                  error={respBodyError}
+                  onLoad={() => void handleLoadResponseBody()}
+                />
+              ) : (
+                <HexViewer base64Data={effectiveDetail.responseBodyBase64} />
+              ))}
           </div>
         </Panel>
       </PanelGroup>
+    </div>
+  );
+};
+
+const OffloadedBodyNotice: React.FC<{
+  kind: "request" | "response";
+  sizeBytes?: number;
+  loading: boolean;
+  error: string | null;
+  onLoad: () => void;
+}> = ({ kind, sizeBytes, loading, error, onLoad }) => {
+  const label = kind === "response" ? "ответа" : "запроса";
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">
+      <div className="flex h-9 w-9 items-center justify-center rounded-full border border-status4xx-fg/35 bg-status4xx-bg text-status4xx-fg">
+        <Database className="h-4 w-4" aria-hidden="true" />
+      </div>
+      <div className="max-w-md space-y-1">
+        <p className="text-xs font-semibold text-fg">
+          Тяжёлое тело {label}
+          {sizeBytes && sizeBytes > 0 ? ` (${formatBytes(sizeBytes)})` : " (> 2 МБ)"}{" "}
+          выгружено в SQLite
+        </p>
+        <p className="text-[11px] leading-relaxed text-muted">
+          Для абсолютной защиты от Out Of Memory (OOM) полезная нагрузка свыше 2 МБ
+          не удерживается в оперативной памяти и подгружается лениво по требованию.
+        </p>
+      </div>
+      {error && (
+        <p className="max-w-md rounded border border-status5xx-fg/40 bg-status5xx-bg px-2.5 py-1 font-mono text-[11px] text-status5xx-fg">
+          {error}
+        </p>
+      )}
+      <button
+        type="button"
+        onClick={onLoad}
+        disabled={loading}
+        className="inline-flex items-center gap-1.5 rounded border border-accent/50 bg-accent/15 px-3 py-1.5 text-xs font-medium text-accent transition-colors hover:bg-accent/25 disabled:cursor-wait disabled:opacity-60"
+      >
+        {loading ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+        ) : (
+          <Download className="h-3.5 w-3.5" aria-hidden="true" />
+        )}
+        <span>
+          {loading ? "Загрузка из SQLite..." : `Загрузить тело ${label}`}
+        </span>
+      </button>
     </div>
   );
 };

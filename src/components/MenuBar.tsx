@@ -5,6 +5,7 @@ import {
   TRAFFIC_COLUMNS,
 } from "../hooks/useUiPreferences";
 import type { ThemePreference } from "../hooks/useTheme";
+import { SESSION_RETENTION_PRESETS } from "../types/proxy";
 import type {
   ActiveNavSection,
   BreakpointConfig,
@@ -14,6 +15,11 @@ import type {
   TlsInterceptMode,
   ToolbarGroupId,
 } from "../types/proxy";
+
+function formatMenuRetentionLabel(limit: number | null): string {
+  if (limit === null) return "All Sessions";
+  return limit.toString().replace(/\B(?=(\d{3})+(?!\d))/g, " ");
+}
 
 interface MenuBarProps {
   status: ProxyStatus;
@@ -76,6 +82,11 @@ interface MenuBarProps {
   themePreference: ThemePreference;
   onSetTheme: (pref: ThemePreference) => void;
   // Tools
+  sessionRetentionLimit: number | null;
+  onSetSessionRetentionLimit: (limit: number | null) => void;
+  onOpenCustomRetentionLimit: () => void;
+  dropNonMatching: boolean;
+  onToggleDropNonMatching: () => void;
   onReplaySelected: () => void;
   onSendSelectedToComposer: () => void;
   onOpenSessionDiff: () => void;
@@ -294,6 +305,11 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onResetColumns,
   themePreference,
   onSetTheme,
+  sessionRetentionLimit,
+  onSetSessionRetentionLimit,
+  onOpenCustomRetentionLimit,
+  dropNonMatching,
+  onToggleDropNonMatching,
   onReplaySelected,
   onSendSelectedToComposer,
   onOpenSessionDiff,
@@ -331,11 +347,14 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   const toolbarSubMenuRef = useRef<HTMLDivElement>(null);
   const columnsSubTriggerRef = useRef<HTMLButtonElement>(null);
   const columnsSubMenuRef = useRef<HTMLDivElement>(null);
+  const retentionSubTriggerRef = useRef<HTMLButtonElement>(null);
+  const retentionSubMenuRef = useRef<HTMLDivElement>(null);
 
   const [activeTabIdx, setActiveTabIdx] = useState(0);
   const [openTopKey, setOpenTopKey] = useState<TopMenuKey | null>(null);
   const [toolbarSubOpen, setToolbarSubOpen] = useState(false);
   const [columnsSubOpen, setColumnsSubOpen] = useState(false);
+  const [retentionSubOpen, setRetentionSubOpen] = useState(false);
 
   const enterOnOpenRef = useRef<WeakSet<HTMLElement>>(new WeakSet());
   const enterLastOnOpenRef = useRef<WeakSet<HTMLElement>>(new WeakSet());
@@ -346,12 +365,14 @@ export const MenuBar: React.FC<MenuBarProps> = ({
       const currentKey = openTopKey;
       hideMenuPopover(toolbarSubMenuRef.current);
       hideMenuPopover(columnsSubMenuRef.current);
+      hideMenuPopover(retentionSubMenuRef.current);
       for (const { key } of TOP_MENUS) {
         hideMenuPopover(menuRefs.current[key]);
       }
       setOpenTopKey(null);
       setToolbarSubOpen(false);
       setColumnsSubOpen(false);
+      setRetentionSubOpen(false);
 
       if (restoreFocusToTrigger && currentKey) {
         const trigger = triggerRefs.current[currentKey];
@@ -479,6 +500,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
     ][] = [
       [toolbarSubTriggerRef, toolbarSubMenuRef, setToolbarSubOpen],
       [columnsSubTriggerRef, columnsSubMenuRef, setColumnsSubOpen],
+      [retentionSubTriggerRef, retentionSubMenuRef, setRetentionSubOpen],
     ];
 
     subPairs.forEach(([trigRef, subRef, setter]) => {
@@ -518,6 +540,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
         }
         hideMenuPopover(toolbarSubMenuRef.current);
         hideMenuPopover(columnsSubMenuRef.current);
+        hideMenuPopover(retentionSubMenuRef.current);
         setOpenTopKey(null);
       }
     };
@@ -568,6 +591,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
     }
     hideMenuPopover(toolbarSubMenuRef.current);
     hideMenuPopover(columnsSubMenuRef.current);
+    hideMenuPopover(retentionSubMenuRef.current);
 
     const nextTrigger = triggerRefs.current[nextKey];
     const nextMenu = menuRefs.current[nextKey];
@@ -586,7 +610,8 @@ export const MenuBar: React.FC<MenuBarProps> = ({
     const target = e.target as HTMLElement;
     const inSubmenu =
       toolbarSubMenuRef.current?.contains(target) ||
-      columnsSubMenuRef.current?.contains(target);
+      columnsSubMenuRef.current?.contains(target) ||
+      retentionSubMenuRef.current?.contains(target);
 
     if (e.key === "Tab") {
       closeAllMenus(false);
@@ -603,6 +628,9 @@ export const MenuBar: React.FC<MenuBarProps> = ({
         } else if (columnsSubMenuRef.current?.contains(target)) {
           columnsSubTriggerRef.current?.focus({ preventScroll: true });
           hideMenuPopover(columnsSubMenuRef.current);
+        } else if (retentionSubMenuRef.current?.contains(target)) {
+          retentionSubTriggerRef.current?.focus({ preventScroll: true });
+          hideMenuPopover(retentionSubMenuRef.current);
         }
         return;
       }
@@ -619,14 +647,17 @@ export const MenuBar: React.FC<MenuBarProps> = ({
     if (
       e.key === "ArrowRight" &&
       (target === toolbarSubTriggerRef.current ||
-        target === columnsSubTriggerRef.current)
+        target === columnsSubTriggerRef.current ||
+        target === retentionSubTriggerRef.current)
     ) {
       e.preventDefault();
       e.stopPropagation();
       const sub =
         target === toolbarSubTriggerRef.current
           ? toolbarSubMenuRef.current
-          : columnsSubMenuRef.current;
+          : target === columnsSubTriggerRef.current
+            ? columnsSubMenuRef.current
+            : retentionSubMenuRef.current;
       if (sub) {
         enterOnOpenRef.current.add(sub);
         showMenuPopover(sub, target);
@@ -738,19 +769,30 @@ export const MenuBar: React.FC<MenuBarProps> = ({
     // Preview submenu when hovering its trigger, or close sibling submenus when hovering other items
     if (btn === toolbarSubTriggerRef.current && toolbarSubMenuRef.current) {
       hideMenuPopover(columnsSubMenuRef.current);
+      hideMenuPopover(retentionSubMenuRef.current);
       showMenuPopover(toolbarSubMenuRef.current, btn);
     } else if (
       btn === columnsSubTriggerRef.current &&
       columnsSubMenuRef.current
     ) {
       hideMenuPopover(toolbarSubMenuRef.current);
+      hideMenuPopover(retentionSubMenuRef.current);
       showMenuPopover(columnsSubMenuRef.current, btn);
     } else if (
-      !toolbarSubMenuRef.current?.contains(btn) &&
-      !columnsSubMenuRef.current?.contains(btn)
+      btn === retentionSubTriggerRef.current &&
+      retentionSubMenuRef.current
     ) {
       hideMenuPopover(toolbarSubMenuRef.current);
       hideMenuPopover(columnsSubMenuRef.current);
+      showMenuPopover(retentionSubMenuRef.current, btn);
+    } else if (
+      !toolbarSubMenuRef.current?.contains(btn) &&
+      !columnsSubMenuRef.current?.contains(btn) &&
+      !retentionSubMenuRef.current?.contains(btn)
+    ) {
+      hideMenuPopover(toolbarSubMenuRef.current);
+      hideMenuPopover(columnsSubMenuRef.current);
+      hideMenuPopover(retentionSubMenuRef.current);
     }
   };
 
@@ -767,6 +809,14 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   const toolbarSubMenuId = `${baseId}-sub-toolbar-menu`;
   const columnsSubTriggerId = `${baseId}-sub-columns-trig`;
   const columnsSubMenuId = `${baseId}-sub-columns-menu`;
+  const retentionSubTriggerId = `${baseId}-sub-retention-trig`;
+  const retentionSubMenuId = `${baseId}-sub-retention-menu`;
+
+  const isCustomMenuRetention =
+    sessionRetentionLimit !== null &&
+    !(SESSION_RETENTION_PRESETS as readonly number[]).includes(
+      sessionRetentionLimit
+    );
 
   const renderTopTrigger = (key: TopMenuKey, label: string, idx: number) => {
     const isExpanded = openTopKey === key;
@@ -1517,6 +1567,105 @@ export const MenuBar: React.FC<MenuBarProps> = ({
               >
                 <span>Load Sessions from SQLite</span>
               </button>
+
+              {/* Submenu: Session Retention Limit... */}
+              <button
+                ref={retentionSubTriggerRef}
+                id={retentionSubTriggerId}
+                type="button"
+                aria-haspopup="menu"
+                aria-expanded={retentionSubOpen}
+                {...({
+                  commandfor: retentionSubMenuId,
+                  command: "toggle-popover",
+                } as Record<string, string>)}
+                onPointerLeave={(e) =>
+                  startSubmenuSafeTriangle(retentionSubMenuRef.current, e)
+                }
+                onClick={(e) =>
+                  handleTriggerClickFallback(
+                    e,
+                    retentionSubMenuRef.current,
+                    retentionSubTriggerRef.current
+                  )
+                }
+              >
+                <span>Session Retention Limit...</span>
+                <span className="hint" aria-hidden="true">
+                  {formatMenuRetentionLabel(sessionRetentionLimit)} ›
+                </span>
+              </button>
+              <div
+                ref={retentionSubMenuRef}
+                id={retentionSubMenuId}
+                {...({ popover: "auto" } as Record<string, string>)}
+                className="z-50 hidden min-w-56 rounded-lg border border-strong bg-surface text-fg shadow-popover"
+              >
+                <div
+                  {...({ focusgroup: "menu nomemory" } as Record<string, string>)}
+                  aria-labelledby={retentionSubTriggerId}
+                >
+                  <div role="group" aria-label="Session Retention Limit">
+                    <button
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={sessionRetentionLimit === null}
+                      onClick={(e) =>
+                        activateCommand(e, () =>
+                          onSetSessionRetentionLimit(null)
+                        )
+                      }
+                    >
+                      <span>Keep: All Sessions</span>
+                    </button>
+                    {SESSION_RETENTION_PRESETS.map((preset) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={sessionRetentionLimit === preset}
+                        onClick={(e) =>
+                          activateCommand(e, () =>
+                            onSetSessionRetentionLimit(preset)
+                          )
+                        }
+                      >
+                        <span>
+                          Keep: {formatMenuRetentionLabel(preset)}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                  <hr />
+                  <button
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={isCustomMenuRetention}
+                    onClick={(e) =>
+                      activateCommand(e, onOpenCustomRetentionLimit)
+                    }
+                  >
+                    <span>Custom...</span>
+                    {isCustomMenuRetention && (
+                      <span className="hint" aria-hidden="true">
+                        {formatMenuRetentionLabel(sessionRetentionLimit)}
+                      </span>
+                    )}
+                  </button>
+                  <hr />
+                  <button
+                    type="button"
+                    role="menuitemcheckbox"
+                    aria-checked={dropNonMatching}
+                    onKeyDown={checkboxKeyDown}
+                    onClick={(e) => activateCheckbox(e, onToggleDropNonMatching)}
+                  >
+                    <span>Drop Non-Matching on Capture</span>
+                  </button>
+                </div>
+              </div>
+
+              <hr />
               <button
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenMobileSetup)}

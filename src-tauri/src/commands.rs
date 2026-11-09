@@ -3,9 +3,9 @@ use tauri::State;
 
 use crate::models::{
     AutoResponderRule, BreakpointAction, BreakpointConfig, BreakpointResolution,
-    CaCertificateInfo, CodecOperation, CodecTransformResult, ComposedRequest,
+    CaCertificateInfo, CodecOperation, CodecTransformResult, ComposedRequest, LoadedSessionBody,
     NetworkInterfaceInfo, PausedBreakpointItem, ProxyError, ProxyFilterBackendConfig, ProxyStatus,
-    SessionDetail, SessionSummary,
+    SessionDetail, SessionSummary, StorageStats,
 };
 use crate::proxy::codec::execute_codec_transform;
 use crate::proxy::network::list_network_interfaces;
@@ -243,4 +243,50 @@ pub async fn codec_transform(
     input_is_base64: Option<bool>,
 ) -> Result<CodecTransformResult, ProxyError> {
     execute_codec_transform(operation, &input, input_is_base64.unwrap_or(false))
+}
+
+#[tauri::command]
+pub async fn set_session_retention_limit(
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<(), ProxyError> {
+    state.controller.context.store.set_retention_limit(limit)
+}
+
+#[tauri::command]
+pub async fn set_drop_non_matching(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<(), ProxyError> {
+    state
+        .controller
+        .context
+        .filters
+        .set_drop_non_matching(enabled);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_memory_storage_stats(
+    state: State<'_, AppState>,
+) -> Result<StorageStats, ProxyError> {
+    let drop_enabled = state
+        .controller
+        .context
+        .filters
+        .is_drop_non_matching_enabled();
+    Ok(state.controller.context.store.storage_stats(drop_enabled))
+}
+
+#[tauri::command]
+pub async fn load_session_body(
+    id: u64,
+    is_response: bool,
+    state: State<'_, AppState>,
+) -> Result<LoadedSessionBody, ProxyError> {
+    state
+        .controller
+        .context
+        .store
+        .load_session_body(id, is_response)
 }

@@ -4,9 +4,9 @@ use std::sync::RwLock;
 use regex::Regex;
 
 use crate::models::{
-    HeaderMutationDirection, HeaderMutationOp, HeaderMutationRule, HeaderPair,
-    HostListBackendSyncConfig, HostListFilterMode, ProxyFilterBackendConfig, TlsBypassRule,
-    TlsInterceptMode,
+    CaptureFilterRule, HeaderMutationDirection, HeaderMutationOp, HeaderMutationRule, HeaderPair,
+    HostListBackendSyncConfig, HostListFilterMode, NoiseThresholdsBackendConfig,
+    ProxyFilterBackendConfig, SessionSummary, TlsBypassRule, TlsInterceptMode,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,14 +45,51 @@ struct CompiledBackendHostList {
     user_regexes: Vec<Regex>,
 }
 
+#[derive(Default)]
+struct CompiledCaptureHostList {
+    enabled: bool,
+    mode: HostListFilterMode,
+    active_count: usize,
+    matches_everything: bool,
+    exact_hosts: HashSet<String>,
+    exact_host_ports: HashSet<String>,
+    exact_scheme_hosts: HashSet<String>,
+    exact_scheme_host_ports: HashSet<String>,
+    wildcard_domains: HashSet<String>,
+    host_glob_regex: Option<Regex>,
+    host_port_glob_regex: Option<Regex>,
+    host_path_regex: Option<Regex>,
+    full_url_regex: Option<Regex>,
+    path_only_regex: Option<Regex>,
+    user_regexes: Vec<Regex>,
+}
+
+struct CompiledCaptureCondition {
+    rule: CaptureFilterRule,
+    regex: Option<Regex>,
+    numeric_target: Option<f64>,
+    lower_value: String,
+}
+
+#[derive(Default)]
+struct CompiledCaptureMatrix {
+    include_groups: Vec<Vec<CompiledCaptureCondition>>,
+    exclude_groups: Vec<Vec<CompiledCaptureCondition>>,
+}
+
 struct FilterEngineState {
     config: ProxyFilterBackendConfig,
     compiled_host_list: CompiledBackendHostList,
+    compiled_capture_host_list: CompiledCaptureHostList,
+    compiled_capture_matrix: CompiledCaptureMatrix,
+    compiled_query_regex: Option<Regex>,
+    static_asset_ext_re: Regex,
 }
 
 /// Real-time proxy filter subsystem handling:
 /// 1. SSL/TLS Selective MITM Pass-Through (`InterceptAll` with Bypass list, `TargetedOnly` Allowlist, and synced Bulk Hosts List via `copy_bidirectional`)
 /// 2. Lightweight Request & Response Header Mutations (e.g. cache-bypass ETag/If-Modified-Since stripping, User-Agent spoofing)
+/// 3. Capture-stage streaming session filter (`drop_non_matching_on_capture`) preventing unwanted/noisy sessions from entering RAM or IPC
 pub struct ProxyFilterEngine {
     state: RwLock<FilterEngineState>,
 }
@@ -66,12 +103,8 @@ impl Default for ProxyFilterEngine {
 impl ProxyFilterEngine {
     pub fn new() -> Self {
         let initial_cfg = default_backend_config();
-        let compiled_host_list = compile_backend_host_list(&initial_cfg.host_list_sync);
         Self {
-            state: RwLock::new(FilterEngineState {
-                config: initial_cfg,
-                compiled_host_list,
-            }),
+            state: RwLock::new(build_filter_engine_state(initial_cfg)),
         }
     }
 
@@ -83,12 +116,215 @@ impl ProxyFilterEngine {
     }
 
     pub fn update_config(&self, next: ProxyFilterBackendConfig) -> ProxyFilterBackendConfig {
-        let compiled_host_list = compile_backend_host_list(&next.host_list_sync);
+        let next_state = build_filter_engine_state(next.clone());
         if let Ok(mut guard) = self.state.write() {
-            guard.config = next.clone();
-            guard.compiled_host_list = compiled_host_list;
+            *guard = next_state;
         }
         next
+    }
+
+    pub fn set_drop_non_matching(&self, enabled: bool) {
+        if let Ok(mut guard) = self.state.write() {
+            guard.config.drop_non_matching_on_capture = enabled;
+        }
+    }
+
+    pub fn is_drop_non_matching_enabled(&self) -> bool {
+        self.state
+            .read()
+            .map(|g| g.config.drop_non_matching_on_capture)
+            .unwrap_or(false)
+    }
+
+    /// Fast lock-minimal predicate invoked on request completion in `server.rs` when deciding
+    /// whether to store a session in `TrafficStore` and emit it over IPC (`proxy://sessions-batch`).
+    pub fn evaluate_should_store_session(&self, summary: &SessionSummary) -> bool {
+        let Ok(guard) = self.state.read() else {
+            return true;
+        };
+
+        if !guard.config.drop_non_matching_on_capture {
+            return true;
+        }
+
+        let host_clean = extract_clean_hostname(&summary.host);
+        if matches!(
+            host_clean.as_str(),
+            "flux.proxy" | "cert.flux.proxy" | "fluxproxy.local"
+        ) {
+            return true;
+        }
+
+        // 1. Noise Thresholds
+        let th = &guard.config.noise_thresholds;
+        if th.hide_304_not_modified && summary.status == 304 {
+            return false;
+        }
+        if th.hide_options_preflight && summary.method.eq_ignore_ascii_case("OPTIONS") {
+            return false;
+        }
+        if th.hide_connect_tunnels
+            && (summary.method.eq_ignore_ascii_case("CONNECT") || summary.tls_bypassed)
+        {
+            return false;
+        }
+        if let Some(min_b) = th.min_body_size_bytes {
+            if summary.body_size < min_b {
+                return false;
+            }
+        }
+        if let Some(max_b) = th.max_body_size_bytes {
+            if summary.body_size > max_b {
+                return false;
+            }
+        }
+        if th.only_slow_requests && summary.duration_ms < th.time_heat_warning_ms {
+            return false;
+        }
+        if th.hide_static_assets {
+            let ct = summary.content_type.to_ascii_lowercase();
+            if ct.starts_with("image/")
+                || ct.starts_with("font/")
+                || ct.contains("text/css")
+                || guard.static_asset_ext_re.is_match(&summary.path)
+            {
+                return false;
+            }
+        }
+
+        // 2. Synced Capture Bulk Hosts & URL List (or fallback to `host_list_sync` if `capture_host_list` wasn't populated)
+        let active_capture_hl = if guard.compiled_capture_host_list.enabled
+            && guard.compiled_capture_host_list.active_count > 0
+        {
+            Some(&guard.compiled_capture_host_list)
+        } else {
+            None
+        };
+
+        let mut explicitly_whitelisted = false;
+        if let Some(hl) = active_capture_hl {
+            let matched = matches_compiled_capture_host_list(summary, &host_clean, hl);
+            match hl.mode {
+                HostListFilterMode::Whitelist => {
+                    if !matched {
+                        return false;
+                    }
+                    explicitly_whitelisted = true;
+                }
+                HostListFilterMode::Blacklist => {
+                    if matched {
+                        return false;
+                    }
+                }
+            }
+        } else if guard.compiled_host_list.enabled && guard.compiled_host_list.active_count > 0 {
+            let port = extract_session_port(summary);
+            if let Some(ConnectTunnelDecision::Passthrough(_)) =
+                evaluate_compiled_host_list_connect(&guard.compiled_host_list, &host_clean, port)
+            {
+                return false;
+            }
+            if guard.compiled_host_list.mode == HostListFilterMode::Whitelist {
+                explicitly_whitelisted = true;
+            }
+        }
+
+        // 3. Toolbar Quick Category & Text/RegExp Search Query (when active)
+        if let Some(ref cat) = guard.config.quick_category {
+            let cat_str = cat.trim();
+            if !cat_str.is_empty() && !cat_str.eq_ignore_ascii_case("all") {
+                let ct = summary.content_type.to_ascii_lowercase();
+                let is_ws = summary.status == 101
+                    || summary.scheme.eq_ignore_ascii_case("ws")
+                    || summary.scheme.eq_ignore_ascii_case("wss")
+                    || summary.protocol.contains("WS")
+                    || ct.contains("websocket");
+                let is_err = summary.status >= 400 || summary.error.is_some();
+                let cat_ok = match cat_str {
+                    "json" => {
+                        !is_err
+                            && !is_ws
+                            && !ct.contains("text/event-stream")
+                            && !ct.starts_with("image/")
+                            && (ct.contains("json")
+                                || ct.contains("graphql")
+                                || ct.contains("grpc")
+                                || ct.contains("protobuf")
+                                || summary.path.starts_with("/api/")
+                                || summary.path.starts_with("/v1/"))
+                    }
+                    "images" => !is_err && !is_ws && ct.starts_with("image/"),
+                    "sse" => !is_err && !is_ws && ct.contains("text/event-stream"),
+                    "xhr" => {
+                        ct.contains("json")
+                            || ct.contains("xml")
+                            || ct.contains("graphql")
+                            || ct.contains("grpc")
+                            || ct.contains("protobuf")
+                            || ct.contains("event-stream")
+                    }
+                    "ws" => !is_err && is_ws,
+                    "errors" => is_err,
+                    "mocked" => summary.is_mocked || summary.breakpoint_modified,
+                    "marked" => summary.comment.is_some() || summary.marked_color.is_some(),
+                    _ => true,
+                };
+                if !cat_ok {
+                    return false;
+                }
+            }
+        }
+
+        if let Some(ref raw_q) = guard.config.filter_query {
+            let q = raw_q.trim();
+            if !q.is_empty() {
+                let haystack = format!(
+                    "{} {} {} {} {} {} {}",
+                    summary.url,
+                    summary.method,
+                    summary.status,
+                    summary.content_type,
+                    summary.process_name.as_deref().unwrap_or(""),
+                    summary.client_ip.as_deref().unwrap_or(""),
+                    summary.comment.as_deref().unwrap_or("")
+                );
+                if guard.config.use_regex_query.unwrap_or(false) {
+                    if let Some(ref re) = guard.compiled_query_regex {
+                        if !re.is_match(&haystack) {
+                            return false;
+                        }
+                    }
+                } else if !haystack.to_lowercase().contains(&q.to_lowercase()) {
+                    return false;
+                }
+            }
+        }
+
+        // 4. Filter Rules Matrix (Include / Exclude with AND / OR DNF grouping)
+        let mut explicitly_included = false;
+        if guard.config.capture_matrix_enabled {
+            if !guard.compiled_capture_matrix.exclude_groups.is_empty()
+                && eval_capture_dnf_groups(summary, &guard.compiled_capture_matrix.exclude_groups)
+            {
+                return false;
+            }
+            if !guard.compiled_capture_matrix.include_groups.is_empty() {
+                if !eval_capture_dnf_groups(summary, &guard.compiled_capture_matrix.include_groups)
+                {
+                    return false;
+                }
+                explicitly_included = true;
+            }
+        }
+
+        // 5. Built-in OS Background Noise Guard (`svchost`, Windows/macOS telemetry & connectivity probes)
+        // Dropped automatically when `Drop Non-Matching` is active unless explicitly whitelisted/included.
+        if !explicitly_whitelisted && !explicitly_included && is_background_os_noise(summary, &host_clean)
+        {
+            return false;
+        }
+
+        true
     }
 
     /// Evaluates how an incoming `CONNECT host:port` tunnel should be handled according to
@@ -898,7 +1134,541 @@ pub fn default_backend_config() -> ProxyFilterBackendConfig {
         ],
         strip_alt_svc: true,
         host_list_sync: HostListBackendSyncConfig::default(),
+        drop_non_matching_on_capture: false,
+        capture_host_list: HostListBackendSyncConfig::default(),
+        noise_thresholds: NoiseThresholdsBackendConfig {
+            hide_304_not_modified: false,
+            hide_options_preflight: false,
+            hide_connect_tunnels: false,
+            hide_static_assets: false,
+            min_body_size_bytes: None,
+            max_body_size_bytes: None,
+            time_heat_warning_ms: 500,
+            only_slow_requests: false,
+        },
+        capture_matrix_enabled: false,
+        capture_filter_rules: Vec::new(),
+        quick_category: None,
+        filter_query: None,
+        use_regex_query: None,
     }
+}
+
+fn build_filter_engine_state(config: ProxyFilterBackendConfig) -> FilterEngineState {
+    let compiled_host_list = compile_backend_host_list(&config.host_list_sync);
+    let compiled_capture_host_list = compile_capture_host_list(&config.capture_host_list);
+    let compiled_capture_matrix = compile_capture_matrix(&config.capture_filter_rules);
+    let compiled_query_regex = if config.use_regex_query.unwrap_or(false) {
+        config
+            .filter_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .and_then(|q| Regex::new(&format!("(?i){q}")).ok())
+    } else {
+        None
+    };
+    let static_asset_ext_re =
+        Regex::new(r"(?i)\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|css|map)(\?|$)").unwrap();
+
+    FilterEngineState {
+        config,
+        compiled_host_list,
+        compiled_capture_host_list,
+        compiled_capture_matrix,
+        compiled_query_regex,
+        static_asset_ext_re,
+    }
+}
+
+fn extract_clean_hostname(raw_host: &str) -> String {
+    let trimmed = raw_host.trim();
+    let (h, _) = split_authority_pattern(trimmed);
+    h.trim_matches(['[', ']']).to_ascii_lowercase()
+}
+
+fn extract_session_port(summary: &SessionSummary) -> u16 {
+    let (_, port_opt) = split_authority_pattern(summary.host.trim());
+    if let Some(p_str) = port_opt {
+        if let Ok(p) = p_str.parse::<u16>() {
+            return p;
+        }
+    }
+    if let Ok(parsed) = reqwest::Url::parse(&summary.url) {
+        if let Some(p) = parsed.port_or_known_default() {
+            return p;
+        }
+    }
+    if summary.scheme.eq_ignore_ascii_case("http") || summary.scheme.eq_ignore_ascii_case("ws") {
+        80
+    } else {
+        443
+    }
+}
+
+fn is_background_os_noise(summary: &SessionSummary, host_clean: &str) -> bool {
+    if let Some(ref proc_raw) = summary.process_name {
+        let proc_base = proc_raw
+            .trim()
+            .trim_end_matches(".exe")
+            .trim_end_matches(".EXE")
+            .to_ascii_lowercase();
+        if matches!(
+            proc_base.as_str(),
+            "svchost"
+                | "searchhost"
+                | "compattelrunner"
+                | "widgets"
+                | "wuauclt"
+                | "usoclient"
+                | "trustedinstaller"
+                | "mdnsresponder"
+                | "apsd"
+        ) {
+            return true;
+        }
+    }
+
+    const OS_NOISE_DOMAINS: &[&str] = &[
+        "telemetry.microsoft.com",
+        "vortex.data.microsoft.com",
+        "watson.telemetry.microsoft.com",
+        "settings-win.data.microsoft.com",
+        "oca.microsoft.com",
+        "sqm.microsoft.com",
+        "msftconnecttest.com",
+        "msftncsi.com",
+        "windowsupdate.com",
+        "delivery.mp.microsoft.com",
+    ];
+
+    for &noise_dom in OS_NOISE_DOMAINS {
+        if host_clean == noise_dom
+            || (host_clean.len() > noise_dom.len()
+                && host_clean.ends_with(noise_dom)
+                && host_clean.as_bytes()[host_clean.len() - noise_dom.len() - 1] == b'.')
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn compile_capture_host_list(sync: &HostListBackendSyncConfig) -> CompiledCaptureHostList {
+    let mut out = CompiledCaptureHostList {
+        enabled: sync.enabled,
+        mode: sync.mode,
+        ..Default::default()
+    };
+    if !sync.enabled {
+        return out;
+    }
+
+    let tokens = tokenize_host_list_input(&sync.raw_text);
+    let mut host_glob_sources = Vec::new();
+    let mut host_port_glob_sources = Vec::new();
+    let mut host_path_sources = Vec::new();
+    let mut full_url_sources = Vec::new();
+    let mut path_only_sources = Vec::new();
+
+    for token in tokens {
+        if token.len() >= 6 && token[..6].eq_ignore_ascii_case("regex:") {
+            let expr = token[6..].trim();
+            if !expr.is_empty() {
+                if let Ok(re) = Regex::new(&format!("(?i){expr}")) {
+                    out.user_regexes.push(re);
+                    out.active_count += 1;
+                }
+            }
+            continue;
+        }
+
+        if token == "*" || token == "*/*" {
+            out.matches_everything = true;
+            out.active_count += 1;
+            continue;
+        }
+
+        if token.starts_with('/') {
+            let pat_lower = token.to_ascii_lowercase();
+            out.active_count += 1;
+            if pat_lower.contains('*') || pat_lower.contains('?') {
+                path_only_sources.push(glob_segment_to_regex_src(&pat_lower, "."));
+            } else {
+                let clean_prefix = if pat_lower.len() > 1 && pat_lower.ends_with('/') {
+                    &pat_lower[..pat_lower.len() - 1]
+                } else {
+                    pat_lower.as_str()
+                };
+                path_only_sources.push(format!("{}(?:[/?#].*)?", regex::escape(clean_prefix)));
+            }
+            continue;
+        }
+
+        let mut lower = token.to_ascii_lowercase();
+        let mut scheme: Option<&str> = None;
+        for (prefix, name) in [
+            ("https://", "https"),
+            ("http://", "http"),
+            ("wss://", "wss"),
+            ("ws://", "ws"),
+        ] {
+            if let Some(rest) = lower.strip_prefix(prefix) {
+                scheme = Some(name);
+                lower = rest.to_string();
+                break;
+            }
+        }
+
+        let (authority_raw, path_raw) = match lower.find('/') {
+            Some(idx) => (&lower[..idx], Some(&lower[idx..])),
+            None => (lower.as_str(), None),
+        };
+        let (host_pat, port_pat) = split_authority_pattern(authority_raw);
+        if host_pat.is_empty() {
+            continue;
+        }
+
+        out.active_count += 1;
+
+        let is_whole_host_path = matches!(path_raw, None | Some("/") | Some("/*"));
+        let host_has_wildcard = host_pat.contains('*') || host_pat.contains('?');
+        let port_has_wildcard = port_pat.map_or(false, |p| p.contains('*') || p.contains('?'));
+
+        if is_whole_host_path {
+            if let Some(sc) = scheme {
+                if !host_has_wildcard && !port_has_wildcard {
+                    if let Some(p) = port_pat {
+                        out.exact_scheme_host_ports
+                            .insert(format!("{sc}://{host_pat}:{p}"));
+                    } else {
+                        out.exact_scheme_hosts.insert(format!("{sc}://{host_pat}"));
+                    }
+                } else {
+                    let h_src = compile_host_pattern_src(host_pat);
+                    let p_src = match port_pat {
+                        Some(p) => format!(":{}", glob_segment_to_regex_src(p, "[0-9]")),
+                        None => "(?::[0-9]+)?".to_string(),
+                    };
+                    full_url_sources.push(format!("{}://{}{}(?:/.*)?", regex::escape(sc), h_src, p_src));
+                }
+            } else if !host_has_wildcard && !port_has_wildcard {
+                if let Some(p) = port_pat {
+                    out.exact_host_ports.insert(format!("{host_pat}:{p}"));
+                } else {
+                    out.exact_hosts.insert(host_pat.to_string());
+                }
+            } else if port_pat.is_none() {
+                let simple_suffix = host_pat
+                    .strip_prefix("*.")
+                    .or_else(|| host_pat.strip_prefix('.'))
+                    .filter(|rest| !rest.is_empty() && !rest.contains('*') && !rest.contains('?'));
+                if let Some(suf) = simple_suffix {
+                    out.wildcard_domains.insert(suf.to_string());
+                } else {
+                    host_glob_sources.push(compile_host_pattern_src(host_pat));
+                }
+            } else if let Some(p) = port_pat {
+                let h_src = compile_host_pattern_src(host_pat);
+                host_port_glob_sources.push(format!("{h_src}:{}", glob_segment_to_regex_src(p, "[0-9]")));
+            }
+        } else if let Some(path_part) = path_raw {
+            let h_src = compile_host_pattern_src(host_pat);
+            let p_src = match port_pat {
+                Some(p) => format!(":{}", glob_segment_to_regex_src(p, "[0-9]")),
+                None => "(?::[0-9]+)?".to_string(),
+            };
+            let path_regex = if path_part.contains('*') || path_part.contains('?') {
+                glob_segment_to_regex_src(path_part, ".")
+            } else {
+                let clean_p = if path_part.len() > 1 && path_part.ends_with('/') {
+                    &path_part[..path_part.len() - 1]
+                } else {
+                    path_part
+                };
+                format!("{}(?:[/?#].*)?", regex::escape(clean_p))
+            };
+            if let Some(sc) = scheme {
+                full_url_sources.push(format!("{}://{}{}{}", regex::escape(sc), h_src, p_src, path_regex));
+            } else {
+                host_path_sources.push(format!("{h_src}{p_src}{path_regex}"));
+            }
+        }
+    }
+
+    out.host_glob_regex = build_combined_regex(&host_glob_sources);
+    out.host_port_glob_regex = build_combined_regex(&host_port_glob_sources);
+    out.host_path_regex = build_combined_regex(&host_path_sources);
+    out.full_url_regex = build_combined_regex(&full_url_sources);
+    out.path_only_regex = build_combined_regex(&path_only_sources);
+    out
+}
+
+fn matches_compiled_capture_host_list(
+    summary: &SessionSummary,
+    host_clean: &str,
+    compiled: &CompiledCaptureHostList,
+) -> bool {
+    if !compiled.enabled || compiled.active_count == 0 {
+        return false;
+    }
+    if compiled.matches_everything {
+        return true;
+    }
+    if compiled.exact_hosts.contains(host_clean)
+        || matches_wildcard_domain_set(host_clean, &compiled.wildcard_domains)
+        || compiled
+            .host_glob_regex
+            .as_ref()
+            .map_or(false, |re| re.is_match(host_clean))
+    {
+        return true;
+    }
+
+    let scheme_lower = summary.scheme.to_ascii_lowercase();
+    let port = extract_session_port(summary);
+    let host_port = format!("{host_clean}:{port}");
+    let url_path = if summary.method.eq_ignore_ascii_case("CONNECT") || summary.path.is_empty() {
+        "/"
+    } else {
+        summary.path.as_str()
+    };
+
+    if compiled.exact_host_ports.contains(&host_port)
+        || compiled
+            .exact_scheme_hosts
+            .contains(&format!("{scheme_lower}://{host_clean}"))
+        || compiled
+            .exact_scheme_host_ports
+            .contains(&format!("{scheme_lower}://{host_port}"))
+    {
+        return true;
+    }
+
+    if compiled
+        .host_port_glob_regex
+        .as_ref()
+        .map_or(false, |re| re.is_match(&host_port))
+    {
+        return true;
+    }
+
+    if compiled
+        .path_only_regex
+        .as_ref()
+        .map_or(false, |re| re.is_match(url_path))
+    {
+        return true;
+    }
+
+    if let Some(ref hp_re) = compiled.host_path_regex {
+        if hp_re.is_match(&format!("{host_clean}{url_path}"))
+            || hp_re.is_match(&format!("{host_port}{url_path}"))
+        {
+            return true;
+        }
+    }
+
+    if let Some(ref url_re) = compiled.full_url_regex {
+        let normalized_full = format!("{scheme_lower}://{host_port}{url_path}");
+        if url_re.is_match(&summary.url) || url_re.is_match(&normalized_full) {
+            return true;
+        }
+    }
+
+    for re in &compiled.user_regexes {
+        if re.is_match(&summary.url) || re.is_match(&summary.host) || re.is_match(host_clean) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn parse_threshold_number(raw: &str, field: &str) -> Option<f64> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let unit_candidates = ["gb", "mb", "kb", "ms", "b", "s"];
+    let mut num_part = trimmed.as_str();
+    let mut unit: Option<&str> = None;
+    for cand in unit_candidates {
+        if let Some(stripped) = trimmed.strip_suffix(cand) {
+            let clean = stripped.trim();
+            if clean.parse::<f64>().is_ok() {
+                num_part = clean;
+                unit = Some(cand);
+                break;
+            }
+        }
+    }
+    let num = num_part.parse::<f64>().ok()?;
+    if !num.is_finite() {
+        return None;
+    }
+    if field == "bodySize" {
+        return Some(match unit {
+            Some("gb") => num * 1024.0 * 1024.0 * 1024.0,
+            Some("mb") => num * 1024.0 * 1024.0,
+            Some("kb") => num * 1024.0,
+            _ => num,
+        });
+    }
+    if field == "durationMs" && unit == Some("s") {
+        return Some(num * 1000.0);
+    }
+    Some(num)
+}
+
+fn build_capture_dnf_groups(
+    items: Vec<CompiledCaptureCondition>,
+) -> Vec<Vec<CompiledCaptureCondition>> {
+    let mut groups: Vec<Vec<CompiledCaptureCondition>> = Vec::new();
+    for item in items {
+        if groups.is_empty() || item.rule.logical_op.eq_ignore_ascii_case("OR") {
+            groups.push(vec![item]);
+        } else if let Some(last) = groups.last_mut() {
+            last.push(item);
+        }
+    }
+    groups
+}
+
+fn compile_capture_matrix(rules: &[CaptureFilterRule]) -> CompiledCaptureMatrix {
+    let mut includes = Vec::new();
+    let mut excludes = Vec::new();
+
+    for rule in rules {
+        if !rule.enabled {
+            continue;
+        }
+        let raw_val = rule.value.trim();
+        if raw_val.is_empty() {
+            continue;
+        }
+        let regex = if rule.operator == "regex" {
+            match Regex::new(&format!("(?i){raw_val}")) {
+                Ok(re) => Some(re),
+                Err(_) => continue,
+            }
+        } else {
+            None
+        };
+
+        let cond = CompiledCaptureCondition {
+            rule: rule.clone(),
+            regex,
+            numeric_target: parse_threshold_number(raw_val, &rule.field),
+            lower_value: raw_val.to_lowercase(),
+        };
+
+        if rule.action.eq_ignore_ascii_case("include") {
+            includes.push(cond);
+        } else {
+            excludes.push(cond);
+        }
+    }
+
+    CompiledCaptureMatrix {
+        include_groups: build_capture_dnf_groups(includes),
+        exclude_groups: build_capture_dnf_groups(excludes),
+    }
+}
+
+fn extract_summary_field_str(s: &SessionSummary, field: &str) -> String {
+    match field {
+        "url" => s.url.clone(),
+        "host" => s.host.clone(),
+        "path" => s.path.clone(),
+        "method" => s.method.clone(),
+        "status" => s.status.to_string(),
+        "contentType" => s.content_type.clone(),
+        "processName" => s.process_name.clone().unwrap_or_default(),
+        "processPid" => s.process_pid.map(|p| p.to_string()).unwrap_or_default(),
+        "clientIp" => s.client_ip.clone().unwrap_or_default(),
+        "protocol" => s.protocol.clone(),
+        "bodySize" => s.body_size.to_string(),
+        "durationMs" => s.duration_ms.to_string(),
+        "comment" => s.comment.clone().unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn extract_summary_field_num(s: &SessionSummary, field: &str) -> Option<f64> {
+    match field {
+        "status" => Some(s.status as f64),
+        "bodySize" => Some(s.body_size as f64),
+        "durationMs" => Some(s.duration_ms as f64),
+        "processPid" => s.process_pid.map(|p| p as f64),
+        _ => extract_summary_field_str(s, field).parse::<f64>().ok(),
+    }
+}
+
+fn eval_capture_condition(s: &SessionSummary, cond: &CompiledCaptureCondition) -> bool {
+    let op = cond.rule.operator.as_str();
+    if matches!(op, "gt" | "gte" | "lt" | "lte") {
+        let (Some(actual), Some(target)) = (
+            extract_summary_field_num(s, &cond.rule.field),
+            cond.numeric_target,
+        ) else {
+            return false;
+        };
+        return match op {
+            "gt" => actual > target,
+            "gte" => actual >= target,
+            "lt" => actual < target,
+            _ => actual <= target,
+        };
+    }
+
+    if matches!(op, "equals" | "notEquals")
+        && cond.numeric_target.is_some()
+        && matches!(
+            cond.rule.field.as_str(),
+            "status" | "bodySize" | "durationMs" | "processPid"
+        )
+    {
+        if let (Some(actual), Some(target)) = (
+            extract_summary_field_num(s, &cond.rule.field),
+            cond.numeric_target,
+        ) {
+            let eq = (actual - target).abs() < f64::EPSILON;
+            return if op == "equals" { eq } else { !eq };
+        }
+    }
+
+    let raw_text = extract_summary_field_str(s, &cond.rule.field);
+    if op == "regex" {
+        return cond
+            .regex
+            .as_ref()
+            .map_or(false, |re| re.is_match(&raw_text));
+    }
+
+    let text_lower = raw_text.to_lowercase();
+    match op {
+        "contains" => text_lower.contains(&cond.lower_value),
+        "notContains" => !text_lower.contains(&cond.lower_value),
+        "equals" => text_lower == cond.lower_value,
+        "notEquals" => text_lower != cond.lower_value,
+        "startsWith" => text_lower.starts_with(&cond.lower_value),
+        "endsWith" => text_lower.ends_with(&cond.lower_value),
+        _ => false,
+    }
+}
+
+fn eval_capture_dnf_groups(
+    s: &SessionSummary,
+    groups: &[Vec<CompiledCaptureCondition>],
+) -> bool {
+    for conjunction in groups {
+        if conjunction.iter().all(|c| eval_capture_condition(s, c)) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1254,5 +2024,99 @@ mod tests {
         let parsed: ProxyFilterBackendConfig =
             serde_json::from_str(legacy_json).expect("deserialize legacy config");
         assert!(parsed.strip_alt_svc);
+    }
+
+    fn make_summary_for_filter(
+        method: &str,
+        host: &str,
+        path: &str,
+        status: u16,
+        process_name: Option<&str>,
+    ) -> SessionSummary {
+        SessionSummary {
+            id: 1,
+            status,
+            protocol: "HTTPS/2".into(),
+            scheme: "https".into(),
+            method: method.into(),
+            host: host.into(),
+            path: path.into(),
+            url: format!("https://{host}{path}"),
+            content_type: "application/json".into(),
+            body_size: 256,
+            duration_ms: 48,
+            timestamp: "2026-11-09T09:00:00Z".into(),
+            is_mocked: false,
+            matched_rule_id: None,
+            error: None,
+            process_name: process_name.map(str::to_owned),
+            process_pid: Some(1200),
+            tls_bypassed: false,
+            headers_mutated: false,
+            breakpoint_paused: None,
+            breakpoint_modified: false,
+            comment: None,
+            marked_color: None,
+            client_ip: Some("127.0.0.1".into()),
+        }
+    }
+
+    #[test]
+    fn evaluate_should_store_session_drops_os_noise_host_list_and_thresholds() {
+        let engine = ProxyFilterEngine::new();
+
+        let svchost_telemetry = make_summary_for_filter(
+            "POST",
+            "telemetry.microsoft.com",
+            "/OneCollector/1.0/",
+            200,
+            Some("svchost.exe"),
+        );
+        let api_ok = make_summary_for_filter(
+            "GET",
+            "api.stripe.com",
+            "/v1/payment_intents",
+            200,
+            Some("node.exe"),
+        );
+        let not_modified_304 = make_summary_for_filter(
+            "GET",
+            "api.stripe.com",
+            "/v1/config",
+            304,
+            Some("chrome.exe"),
+        );
+        let other_host = make_summary_for_filter(
+            "GET",
+            "ads.example.net",
+            "/banner",
+            200,
+            Some("chrome.exe"),
+        );
+
+        // Disabled by default -> everything stored
+        assert!(engine.evaluate_should_store_session(&svchost_telemetry));
+        assert!(engine.evaluate_should_store_session(&api_ok));
+
+        // Enable Drop Non-Matching -> svchost & telemetry dropped immediately
+        engine.set_drop_non_matching(true);
+        assert!(engine.is_drop_non_matching_enabled());
+        assert!(!engine.evaluate_should_store_session(&svchost_telemetry));
+        assert!(engine.evaluate_should_store_session(&api_ok));
+
+        // Activate host-list whitelist (*.stripe.com) + hide 304 threshold
+        let mut cfg = engine.get_config();
+        cfg.capture_host_list = HostListBackendSyncConfig {
+            enabled: true,
+            mode: HostListFilterMode::Whitelist,
+            raw_text: "*.stripe.com".into(),
+        };
+        cfg.noise_thresholds.hide_304_not_modified = true;
+        engine.update_config(cfg);
+
+        assert!(engine.evaluate_should_store_session(&api_ok));
+        assert!(!engine.evaluate_should_store_session(&not_modified_304));
+        assert!(!engine.evaluate_should_store_session(&other_host));
+        assert!(!engine.evaluate_should_store_session(&svchost_telemetry));
     }
 }

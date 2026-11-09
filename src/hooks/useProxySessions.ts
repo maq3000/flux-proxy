@@ -12,6 +12,7 @@ import {
 } from "../lib/filterEngine";
 import { getRowSemanticTone } from "../lib/formatters";
 import { DEFAULT_BREAKPOINT_CONFIG, proxyBridge } from "../lib/tauriBridge";
+import { DEFAULT_SESSION_RETENTION_LIMIT } from "../types/proxy";
 import type {
   BreakpointAction,
   BreakpointConfig,
@@ -21,6 +22,7 @@ import type {
   FilterPreset,
   HostListBackendSyncConfig,
   HostListFilterConfig,
+  NoiseThresholdsBackendSyncConfig,
   NoiseThresholdsConfig,
   PausedBreakpointItem,
   ProxyFilterBackendConfig,
@@ -28,6 +30,7 @@ import type {
   QuickFilterCategory,
   SessionDetail,
   SessionSummary,
+  StorageStats,
   TlsBypassRule,
   TlsInterceptMode,
 } from "../types/proxy";
@@ -37,6 +40,50 @@ const LS_ACTIVE_FILTER_STATE_KEY = "fluxproxy.activeFilterState.v1";
 const LS_BACKEND_FILTER_CFG_KEY = "fluxproxy.backendFilterConfig.v1";
 const LS_AUTO_SYSPROXY_KEY = "fluxproxy.autoSystemProxy.v1";
 const LS_BREAKPOINT_CFG_KEY = "fluxproxy.breakpointConfig.v1";
+const LS_RETENTION_LIMIT_KEY = "fluxproxy.sessionRetentionLimit.v1";
+const LS_DROP_NON_MATCHING_KEY = "fluxproxy.dropNonMatching.v1";
+
+function loadPersistedRetentionLimit(): number | null {
+  if (typeof window === "undefined") return DEFAULT_SESSION_RETENTION_LIMIT;
+  try {
+    const raw = window.localStorage.getItem(LS_RETENTION_LIMIT_KEY);
+    if (raw === null) return DEFAULT_SESSION_RETENTION_LIMIT;
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed === null) return null;
+    if (typeof parsed === "number" && Number.isInteger(parsed) && parsed > 0) {
+      return parsed;
+    }
+    return DEFAULT_SESSION_RETENTION_LIMIT;
+  } catch {
+    return DEFAULT_SESSION_RETENTION_LIMIT;
+  }
+}
+
+function buildNoiseThresholdsSyncPayload(
+  th: NoiseThresholdsConfig
+): NoiseThresholdsBackendSyncConfig {
+  return {
+    hide304NotModified: th.hide304NotModified,
+    hideOptionsPreflight: th.hideOptionsPreflight,
+    hideConnectTunnels: th.hideConnectTunnels,
+    hideStaticAssets: th.hideStaticAssets,
+    minBodySizeBytes: th.minBodySizeBytes,
+    maxBodySizeBytes: th.maxBodySizeBytes,
+    timeHeatWarningMs: th.timeHeatWarningMs,
+    onlySlowRequests: th.onlySlowRequests,
+  };
+}
+
+function buildCaptureHostListPayload(
+  cfg: HostListFilterConfig,
+  activeCount: number
+): HostListBackendSyncConfig {
+  return {
+    enabled: Boolean(cfg.enabled && activeCount > 0),
+    mode: cfg.mode,
+    rawText: cfg.rawText,
+  };
+}
 
 interface PersistedFilterState {
   matrixEnabled: boolean;
@@ -151,6 +198,28 @@ export function useProxySessions() {
   const [customPresets, setCustomPresets] = useState<FilterPreset[]>(() =>
     loadPersistedState<FilterPreset[]>(LS_CUSTOM_PRESETS_KEY, [])
   );
+
+  // Ring Buffer Session Retention Limit (null = All Sessions; default = 10,000) & Drop Non-Matching on Capture
+  const [sessionRetentionLimit, setSessionRetentionLimitState] = useState<
+    number | null
+  >(() => loadPersistedRetentionLimit());
+  const sessionRetentionLimitRef = useRef<number | null>(sessionRetentionLimit);
+  sessionRetentionLimitRef.current = sessionRetentionLimit;
+
+  const [dropNonMatching, setDropNonMatchingState] = useState<boolean>(() =>
+    loadPersistedState<boolean>(LS_DROP_NON_MATCHING_KEY, false)
+  );
+  const dropNonMatchingRef = useRef<boolean>(dropNonMatching);
+  dropNonMatchingRef.current = dropNonMatching;
+
+  const [storageStats, setStorageStats] = useState<StorageStats>(() => ({
+    ramSessions: 0,
+    sqliteSizeBytes: 0,
+    droppedSessionsCount: 0,
+    sessionRetentionLimit,
+    dropNonMatching,
+  }));
+
   const [backendFilterConfig, setBackendFilterConfig] =
     useState<ProxyFilterBackendConfig>(() => {
       const saved = loadPersistedState<Partial<ProxyFilterBackendConfig>>(
@@ -160,6 +229,10 @@ export function useProxySessions() {
       const bootHostList: HostListFilterConfig = {
         ...DEFAULT_HOST_LIST_FILTER_CONFIG,
         ...(initialPersisted.hostListFilter ?? {}),
+      };
+      const bootThresholds: NoiseThresholdsConfig = {
+        ...DEFAULT_NOISE_THRESHOLDS,
+        ...initialPersisted.thresholds,
       };
       const bootCompiled = compileHostListFilter(bootHostList);
       return {
@@ -174,6 +247,17 @@ export function useProxySessions() {
           bootHostList,
           bootCompiled.activeCount
         ),
+        dropNonMatchingOnCapture: dropNonMatchingRef.current,
+        captureHostList: buildCaptureHostListPayload(
+          bootHostList,
+          bootCompiled.activeCount
+        ),
+        noiseThresholds: buildNoiseThresholdsSyncPayload(bootThresholds),
+        captureMatrixEnabled: initialPersisted.matrixEnabled,
+        captureFilterRules: initialPersisted.rules,
+        quickCategory: "all",
+        filterQuery: "",
+        useRegexQuery: false,
       };
     });
   const backendFilterConfigRef =
@@ -244,6 +328,26 @@ export function useProxySessions() {
     }, 3200);
   }, []);
 
+  const refreshStorageStats = useCallback(async () => {
+    try {
+      const nextStats = await proxyBridge.getMemoryStorageStats();
+      setStorageStats((prev) => {
+        if (
+          prev.ramSessions === nextStats.ramSessions &&
+          prev.sqliteSizeBytes === nextStats.sqliteSizeBytes &&
+          prev.droppedSessionsCount === nextStats.droppedSessionsCount &&
+          prev.sessionRetentionLimit === nextStats.sessionRetentionLimit &&
+          prev.dropNonMatching === nextStats.dropNonMatching
+        ) {
+          return prev;
+        }
+        return nextStats;
+      });
+    } catch {
+      // ignore transient IPC poll error
+    }
+  }, []);
+
   const flushPendingSessions = useCallback(() => {
     rafHandleRef.current = null;
     const incoming = pendingQueueRef.current;
@@ -251,44 +355,59 @@ export function useProxySessions() {
     pendingQueueRef.current = [];
 
     setSessions((prev) => {
+      let next: SessionSummary[];
       if (prev.length === 0) {
-        return incoming;
-      }
-      // Fast O(N) merge supporting both append of new sessions and in-place updates (e.g. WebSocket frames / TLS Bypass byte totals)
-      const indexById = new Map<number, number>();
-      const next = prev.slice();
-      for (let i = 0; i < next.length; i++) {
-        indexById.set(next[i].id, i);
-      }
-      for (const item of incoming) {
-        const existingIdx = indexById.get(item.id);
-        if (existingIdx !== undefined) {
-          next[existingIdx] = item;
-        } else {
-          indexById.set(item.id, next.length);
-          next.push(item);
+        next = incoming.slice();
+      } else {
+        // Fast O(N) merge supporting both append of new sessions and in-place updates (e.g. WebSocket frames / TLS Bypass byte totals)
+        const indexById = new Map<number, number>();
+        next = prev.slice();
+        for (let i = 0; i < next.length; i++) {
+          indexById.set(next[i].id, i);
         }
+        for (const item of incoming) {
+          const existingIdx = indexById.get(item.id);
+          if (existingIdx !== undefined) {
+            next[existingIdx] = item;
+          } else {
+            indexById.set(item.id, next.length);
+            next.push(item);
+          }
+        }
+      }
+      const limit = sessionRetentionLimitRef.current;
+      if (limit && next.length > limit) {
+        next.splice(0, next.length - limit);
       }
       return next;
     });
-  }, []);
+    void refreshStorageStats();
+  }, [refreshStorageStats]);
 
-  // Initial load + Sync backend filter config (TLS Bypass + Header Mutations) + Real-time Tauri IPC subscription
+  // Initial load + Sync backend filter config (TLS Bypass + Header Mutations + Ring Buffer + Drop Non-Matching) + Real-time Tauri IPC subscription
   useEffect(() => {
     let mounted = true;
     let unlistenFn: (() => void) | null = null;
     let unlistenBpFn: (() => void) | null = null;
 
     async function bootstrap() {
-      // Push persisted TLS Bypass, Header Mutation & Breakpoint rules into Rust / Preview engine on boot
+      // Push persisted retention limit, dropNonMatching, TLS Bypass, Header Mutation & Breakpoint rules into Rust / Preview engine on boot
+      await proxyBridge.setSessionRetentionLimit(
+        sessionRetentionLimitRef.current
+      );
       const [syncedCfg, syncedBpCfg, initialPaused] = await Promise.all([
-        proxyBridge.updateFilterBackendConfig(backendFilterConfig),
+        proxyBridge.updateFilterBackendConfig({
+          ...backendFilterConfigRef.current,
+          dropNonMatchingOnCapture: dropNonMatchingRef.current,
+        }),
         proxyBridge.updateBreakpointConfig(breakpointConfigRef.current),
         proxyBridge.listPausedBreakpoints(),
       ]);
-      const [initialStatus, initialSessions] = await Promise.all([
+      await proxyBridge.setDropNonMatching(dropNonMatchingRef.current);
+      const [initialStatus, initialSessions, initialStats] = await Promise.all([
         proxyBridge.getStatus(),
         proxyBridge.getSessions(),
+        proxyBridge.getMemoryStorageStats(),
       ]);
       let effectiveStatus = initialStatus;
       if (
@@ -315,14 +434,20 @@ export function useProxySessions() {
       setBackendFilterConfig(syncedCfg);
       setBreakpointConfig(syncedBpCfg);
       setPausedBreakpoints(initialPaused);
+      setStorageStats(initialStats);
       statusRef.current = effectiveStatus;
       setStatus(effectiveStatus);
       if (effectiveStatus.systemProxyError) {
         showToast(`⚠️ ${effectiveStatus.systemProxyError}`);
       }
-      setSessions(initialSessions);
-      if (initialSessions.length > 0) {
-        setSelectedId(initialSessions[0].id);
+      const limit = sessionRetentionLimitRef.current;
+      const cappedInitial = initialSessions.slice();
+      if (limit && cappedInitial.length > limit) {
+        cappedInitial.splice(0, cappedInitial.length - limit);
+      }
+      setSessions(cappedInitial);
+      if (cappedInitial.length > 0) {
+        setSelectedId(cappedInitial[0].id);
       }
 
       unlistenFn = await proxyBridge.subscribeSessionBatches((batch) => {
@@ -353,6 +478,16 @@ export function useProxySessions() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flushPendingSessions]);
+
+  // Periodic storage & dropped-sessions telemetry polling (RAM sessions, SQLite bytes, Dropped count)
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      void refreshStorageStats();
+    }, 1500);
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [refreshStorageStats]);
 
   // Periodic OS System Proxy status reconciliation (detects external VPN / OS proxy hijack or reset)
   useEffect(() => {
@@ -565,6 +700,160 @@ export function useProxySessions() {
       window.clearTimeout(timerId);
     };
   }, [hostListFilter, compiledHostList.activeCount, updateBackendFilterConfig]);
+
+  // Sync active Capture Filters (Hosts List, Thresholds, Matrix, Quick Category & Search Query) to Rust for `evaluate_should_store_session`
+  useEffect(() => {
+    const desiredCaptureHl = buildCaptureHostListPayload(
+      hostListFilter,
+      compiledHostList.activeCount
+    );
+    const desiredThresholds = buildNoiseThresholdsSyncPayload(thresholds);
+    const curr = backendFilterConfigRef.current;
+
+    const sameCaptureHl =
+      curr.captureHostList?.enabled === desiredCaptureHl.enabled &&
+      curr.captureHostList?.mode === desiredCaptureHl.mode &&
+      curr.captureHostList?.rawText === desiredCaptureHl.rawText;
+    const sameThresholds =
+      JSON.stringify(curr.noiseThresholds) ===
+      JSON.stringify(desiredThresholds);
+    const sameMatrix =
+      curr.captureMatrixEnabled === matrixEnabled &&
+      JSON.stringify(curr.captureFilterRules ?? []) ===
+        JSON.stringify(filterRules);
+    const sameQuick =
+      (curr.quickCategory ?? "all") === quickCategory &&
+      (curr.filterQuery ?? "") === filterQuery &&
+      Boolean(curr.useRegexQuery) === useRegex &&
+      Boolean(curr.dropNonMatchingOnCapture) === dropNonMatching;
+
+    if (sameCaptureHl && sameThresholds && sameMatrix && sameQuick) {
+      return;
+    }
+
+    const pushCaptureFilters = () => {
+      void updateBackendFilterConfig({
+        ...backendFilterConfigRef.current,
+        dropNonMatchingOnCapture: dropNonMatching,
+        captureHostList: desiredCaptureHl,
+        noiseThresholds: desiredThresholds,
+        captureMatrixEnabled: matrixEnabled,
+        captureFilterRules: filterRules,
+        quickCategory,
+        filterQuery,
+        useRegexQuery: useRegex,
+      });
+    };
+
+    const timerId = window.setTimeout(pushCaptureFilters, 150);
+    return () => {
+      window.clearTimeout(timerId);
+    };
+  }, [
+    dropNonMatching,
+    hostListFilter,
+    compiledHostList.activeCount,
+    thresholds,
+    matrixEnabled,
+    filterRules,
+    quickCategory,
+    filterQuery,
+    useRegex,
+    updateBackendFilterConfig,
+  ]);
+
+  const setSessionRetentionLimit = useCallback(
+    async (limit: number | null) => {
+      if (limit !== null && (!Number.isInteger(limit) || limit <= 0)) {
+        showToast("⚠️ Лимит сессий должен быть целым числом больше 0");
+        return;
+      }
+      sessionRetentionLimitRef.current = limit;
+      setSessionRetentionLimitState(limit);
+      try {
+        window.localStorage.setItem(
+          LS_RETENTION_LIMIT_KEY,
+          JSON.stringify(limit)
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+
+      // Immediately truncate in-memory sessions grid to `limit` (FIFO)
+      setSessions((prev) => {
+        if (!limit || prev.length <= limit) return prev;
+        const next = prev.slice();
+        next.splice(0, next.length - limit);
+        return next;
+      });
+
+      await proxyBridge.setSessionRetentionLimit(limit);
+      await refreshStorageStats();
+      showToast(
+        limit === null
+          ? "♾️ Keep: All Sessions (кольцевой лимит снят)"
+          : `🔄 Keep: ${limit.toLocaleString()} сессий (FIFO кольцевой буфер)`
+      );
+    },
+    [refreshStorageStats, showToast]
+  );
+
+  const setDropNonMatching = useCallback(
+    async (enabled: boolean) => {
+      dropNonMatchingRef.current = enabled;
+      setDropNonMatchingState(enabled);
+      try {
+        window.localStorage.setItem(
+          LS_DROP_NON_MATCHING_KEY,
+          JSON.stringify(enabled)
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+
+      const nextCfg: ProxyFilterBackendConfig = {
+        ...backendFilterConfigRef.current,
+        dropNonMatchingOnCapture: enabled,
+        captureHostList: buildCaptureHostListPayload(
+          hostListFilter,
+          compiledHostList.activeCount
+        ),
+        noiseThresholds: buildNoiseThresholdsSyncPayload(thresholds),
+        captureMatrixEnabled: matrixEnabled,
+        captureFilterRules: filterRules,
+        quickCategory,
+        filterQuery,
+        useRegexQuery: useRegex,
+      };
+      await Promise.all([
+        proxyBridge.setDropNonMatching(enabled),
+        updateBackendFilterConfig(nextCfg),
+      ]);
+      await refreshStorageStats();
+      showToast(
+        enabled
+          ? "🛡️ Drop Non-Matching ВКЛЮЧЁН — отсеянный трафик и системный шум не попадают в RAM"
+          : "Drop Non-Matching отключён — прокси сохраняет все перехваченные сессии"
+      );
+    },
+    [
+      hostListFilter,
+      compiledHostList.activeCount,
+      thresholds,
+      matrixEnabled,
+      filterRules,
+      quickCategory,
+      filterQuery,
+      useRegex,
+      updateBackendFilterConfig,
+      refreshStorageStats,
+      showToast,
+    ]
+  );
+
+  const toggleDropNonMatching = useCallback(async () => {
+    await setDropNonMatching(!dropNonMatchingRef.current);
+  }, [setDropNonMatching]);
 
   const detectedProcesses = useMemo<DetectedProcessItem[]>(() => {
     const map = new Map<string, DetectedProcessItem>();
@@ -1462,6 +1751,7 @@ export function useProxySessions() {
       }
       setDiffLeftDetail(null);
       setDiffRightDetail(null);
+      void refreshStorageStats();
 
       showToast(
         ids.length === 1
@@ -1469,7 +1759,7 @@ export function useProxySessions() {
           : `Удалено сессий: ${ids.length}`
       );
     },
-    [filteredSessions, selectedId, showToast]
+    [filteredSessions, refreshStorageStats, selectedId, showToast]
   );
 
   const replaySessions = useCallback(
@@ -1528,27 +1818,36 @@ export function useProxySessions() {
     setSelectedDetail(null);
     setDiffLeftDetail(null);
     setDiffRightDetail(null);
+    await refreshStorageStats();
     showToast("Cleared all captured sessions");
-  }, [showToast]);
+  }, [refreshStorageStats, showToast]);
 
   const saveToSqlite = useCallback(async () => {
     const count = await proxyBridge.saveSessionsSqlite();
+    await refreshStorageStats();
     showToast(`Persisted ${count.toLocaleString()} sessions to SQLite archive`);
-  }, [showToast]);
+  }, [refreshStorageStats, showToast]);
 
   const loadFromSqlite = useCallback(async () => {
     const loaded = await proxyBridge.loadSessionsSqlite();
-    setSessions(loaded);
-    if (loaded.length > 0 && selectedId === null) {
-      setSelectedId(loaded[0].id);
+    const limit = sessionRetentionLimitRef.current;
+    const next = loaded.slice();
+    if (limit && next.length > limit) {
+      next.splice(0, next.length - limit);
     }
-    showToast(`Loaded ${loaded.length.toLocaleString()} sessions from SQLite`);
-  }, [selectedId, setSelectedId, showToast]);
+    setSessions(next);
+    if (next.length > 0 && selectedId === null) {
+      setSelectedId(next[0].id);
+    }
+    await refreshStorageStats();
+    showToast(`Loaded ${next.length.toLocaleString()} sessions from SQLite`);
+  }, [refreshStorageStats, selectedId, setSelectedId, showToast]);
 
   const generateStress10k = useCallback(() => {
     proxyBridge.generateStressTestSessions(10_000);
+    void refreshStorageStats();
     showToast("Generated +10,000 sessions — test virtualized 60fps scrolling!");
-  }, [showToast]);
+  }, [refreshStorageStats, showToast]);
 
   const updateBreakpointConfig = useCallback(
     async (next: BreakpointConfig) => {
@@ -1799,6 +2098,14 @@ export function useProxySessions() {
     applyQuickExecBpu,
     resolvePausedBreakpoint,
     resumeAllBreakpoints,
+    // Ring Buffer Retention & Drop Non-Matching on Capture
+    sessionRetentionLimit,
+    setSessionRetentionLimit,
+    dropNonMatching,
+    setDropNonMatching,
+    toggleDropNonMatching,
+    storageStats,
+    refreshStorageStats,
     // Core Proxy Actions
     toggleProxy,
     setAllowRemote,
