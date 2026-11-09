@@ -83,6 +83,7 @@ interface TopToolbarProps {
   followTail: boolean;
   onToggleFollowTail: () => void;
   // Layout & View Customization
+  compactToolbar?: boolean;
   sidebarCollapsed: boolean;
   onToggleSidebar: () => void;
   inspectorCollapsed: boolean;
@@ -226,6 +227,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   onOpenSessionDiff,
   followTail,
   onToggleFollowTail,
+  compactToolbar = false,
   sidebarCollapsed,
   onToggleSidebar,
   inspectorCollapsed,
@@ -519,7 +521,13 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   ).length;
 
   return (
-    <header className="no-scrollbar flex h-9 shrink-0 items-center justify-between gap-2 overflow-x-auto border-b border-hairline bg-surface px-2.5">
+    <header
+      className={`no-scrollbar flex shrink-0 items-center justify-between overflow-x-auto border-b border-hairline bg-surface ${
+        compactToolbar
+          ? "compact-toolbar h-7 gap-1 px-1.5"
+          : "h-9 gap-2 px-2.5"
+      }`}
+    >
       {/* Left: Primary Capture / Clear / Stream Controls (+ Optional Proxy & Breakpoints Groups) */}
       <div className="flex shrink-0 items-center gap-1.5">
         {toolbarGroups.capture && (
@@ -531,7 +539,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
               title={
                 status.running
                   ? "Приостановить захват трафика (F12)"
-                  : "Возобновить захват трафика на 127.0.0.1:8888 (F12)"
+                  : `Возобновить захват трафика на ${status.bindAddr}:${status.port} (F12)`
               }
               className={`inline-flex h-7 items-center gap-1.5 rounded-md border px-2 text-xs font-medium transition-colors ${
                 status.running

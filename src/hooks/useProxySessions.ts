@@ -21,6 +21,11 @@ import {
   proxyBridge,
 } from "../lib/tauriBridge";
 import { DEFAULT_SESSION_RETENTION_LIMIT } from "../types/proxy";
+import {
+  PROXY_STATUS_SYNCED_EVENT,
+  SETTINGS_APPLIED_EVENT,
+  type FluxUserSettingsProfile,
+} from "../types/settings";
 import type {
   BreakpointAction,
   BreakpointConfig,
@@ -47,9 +52,32 @@ const LS_CUSTOM_PRESETS_KEY = "fluxproxy.customFilterPresets.v1";
 const LS_ACTIVE_FILTER_STATE_KEY = "fluxproxy.activeFilterState.v1";
 const LS_BACKEND_FILTER_CFG_KEY = "fluxproxy.backendFilterConfig.v1";
 const LS_AUTO_SYSPROXY_KEY = "fluxproxy.autoSystemProxy.v1";
+const LS_ALLOW_REMOTE_KEY = "fluxproxy.allowRemote.v1";
+const LS_PROXY_PORT_KEY = "fluxproxy.proxyPort.v1";
+const LS_FOLLOW_TAIL_KEY = "fluxproxy.followTail.v1";
 const LS_BREAKPOINT_CFG_KEY = "fluxproxy.breakpointConfig.v1";
 const LS_RETENTION_LIMIT_KEY = "fluxproxy.sessionRetentionLimit.v1";
 const LS_DROP_NON_MATCHING_KEY = "fluxproxy.dropNonMatching.v1";
+
+function loadPersistedProxyPort(): number {
+  if (typeof window === "undefined") return 8888;
+  try {
+    const raw = window.localStorage.getItem(LS_PROXY_PORT_KEY);
+    if (!raw) return 8888;
+    const parsed = JSON.parse(raw) as unknown;
+    if (
+      typeof parsed === "number" &&
+      Number.isInteger(parsed) &&
+      parsed >= 1 &&
+      parsed <= 65535
+    ) {
+      return parsed;
+    }
+    return 8888;
+  } catch {
+    return 8888;
+  }
+}
 
 function loadPersistedRetentionLimit(): number | null {
   if (typeof window === "undefined") return DEFAULT_SESSION_RETENTION_LIMIT;
@@ -150,16 +178,21 @@ export function useProxySessions() {
     () => loadPersistedState<boolean | null>(LS_AUTO_SYSPROXY_KEY, null),
     []
   );
+  const initialAllowRemote = useMemo(
+    () => loadPersistedState<boolean | null>(LS_ALLOW_REMOTE_KEY, null),
+    []
+  );
+  const initialPort = useMemo(() => loadPersistedProxyPort(), []);
 
   const [status, setStatus] = useState<ProxyStatus>({
     running: true,
-    bindAddr: "127.0.0.1",
-    port: 8888,
+    bindAddr: initialAllowRemote ? "0.0.0.0" : "127.0.0.1",
+    port: initialPort,
     activeSessions: 0,
     systemProxyEnabled: initialAutoSysProxy ?? true,
     autoSystemProxy: initialAutoSysProxy ?? true,
     systemProxyError: null,
-    allowRemote: false,
+    allowRemote: initialAllowRemote ?? false,
   });
   const statusRef = useRef<ProxyStatus>(status);
   statusRef.current = status;
@@ -169,7 +202,9 @@ export function useProxySessions() {
   const [useRegex, setUseRegex] = useState(false);
   const [quickCategory, setQuickCategory] =
     useState<QuickFilterCategory>("all");
-  const [followTail, setFollowTail] = useState(false);
+  const [followTail, setFollowTail] = useState<boolean>(() =>
+    Boolean(loadPersistedState<boolean>(LS_FOLLOW_TAIL_KEY, false))
+  );
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   // Advanced Filter Matrix, Presets, Thresholds & Backend Config
@@ -325,6 +360,123 @@ export function useProxySessions() {
     }
   }, [customPresets]);
 
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        LS_FOLLOW_TAIL_KEY,
+        JSON.stringify(followTail)
+      );
+    } catch {
+      // ignore storage quota errors
+    }
+  }, [followTail]);
+
+  // Synchronize React hook state when a settings profile is imported or reset
+  useEffect(() => {
+    const handleSettingsApplied = (event: Event) => {
+      const detail = (event as CustomEvent<FluxUserSettingsProfile>).detail;
+      if (!detail) return;
+
+      setFollowTail(Boolean(detail.ui.followTail));
+      setCustomPresets(structuredClone(detail.filters.userPresets));
+      setActivePresetId(detail.filters.activePresetId);
+      const nextMatrixEnabled = detail.filters.matrixEnabled ?? true;
+      const nextFilterRules = structuredClone(detail.filters.filterRules ?? []);
+      const nextThresholds = {
+        ...DEFAULT_NOISE_THRESHOLDS,
+        ...detail.filters.noiseThresholds,
+      };
+      const nextHostList = {
+        ...DEFAULT_HOST_LIST_FILTER_CONFIG,
+        ...detail.filters.hostFilters,
+      };
+      setMatrixEnabled(nextMatrixEnabled);
+      setFilterRules(nextFilterRules);
+      setThresholds(nextThresholds);
+      setHostListFilterState(nextHostList);
+
+      const nextRetention =
+        detail.proxy.sessionRetentionLimit !== undefined
+          ? detail.proxy.sessionRetentionLimit
+          : DEFAULT_SESSION_RETENTION_LIMIT;
+      sessionRetentionLimitRef.current = nextRetention;
+      setSessionRetentionLimitState(nextRetention);
+      setSessions((prev) => {
+        if (!nextRetention || prev.length <= nextRetention) return prev;
+        const copy = prev.slice();
+        copy.splice(0, copy.length - nextRetention);
+        return copy;
+      });
+
+      const nextDropNonMatching = Boolean(
+        detail.proxy.dropNonMatching ?? false
+      );
+      dropNonMatchingRef.current = nextDropNonMatching;
+      setDropNonMatchingState(nextDropNonMatching);
+
+      const compiledHl = compileHostListFilter(nextHostList);
+      const nextBackendCfg: ProxyFilterBackendConfig = {
+        tlsInterceptMode: detail.proxy.tlsInterceptMode,
+        tlsBypassEnabled: detail.proxy.tlsBypassEnabled ?? true,
+        tlsBypassRules: structuredClone(detail.proxy.tlsBypassRules),
+        tlsTargetRules: structuredClone(detail.proxy.tlsTargetRules),
+        headerMutationsEnabled: detail.proxy.headerMutationsEnabled ?? true,
+        headerMutations: structuredClone(detail.proxy.headerMutations),
+        stripAltSvc: detail.proxy.stripAltSvc ?? true,
+        hostListSync: buildHostListSyncPayload(
+          nextHostList,
+          compiledHl.activeCount
+        ),
+        dropNonMatchingOnCapture: nextDropNonMatching,
+        captureHostList: buildCaptureHostListPayload(
+          nextHostList,
+          compiledHl.activeCount
+        ),
+        noiseThresholds: buildNoiseThresholdsSyncPayload(nextThresholds),
+        captureMatrixEnabled: nextMatrixEnabled,
+        captureFilterRules: nextFilterRules,
+        quickCategory: "all",
+        filterQuery: "",
+        useRegexQuery: false,
+      };
+      backendFilterConfigRef.current = nextBackendCfg;
+      setBackendFilterConfig(nextBackendCfg);
+      setFilterQuery("");
+      setUseRegex(false);
+      setQuickCategory("all");
+
+      const nextStatusOptimistic: ProxyStatus = {
+        ...statusRef.current,
+        port: detail.proxy.port,
+        autoSystemProxy: detail.proxy.autoSystemProxy,
+        allowRemote: detail.proxy.allowRemote,
+        bindAddr: detail.proxy.allowRemote ? "0.0.0.0" : "127.0.0.1",
+      };
+      statusRef.current = nextStatusOptimistic;
+      setStatus(nextStatusOptimistic);
+    };
+
+    const handleProxyStatusSynced = (event: Event) => {
+      const nextStatus = (event as CustomEvent<ProxyStatus>).detail;
+      if (!nextStatus) return;
+      statusRef.current = nextStatus;
+      setStatus(nextStatus);
+    };
+
+    window.addEventListener(SETTINGS_APPLIED_EVENT, handleSettingsApplied);
+    window.addEventListener(
+      PROXY_STATUS_SYNCED_EVENT,
+      handleProxyStatusSynced
+    );
+    return () => {
+      window.removeEventListener(SETTINGS_APPLIED_EVENT, handleSettingsApplied);
+      window.removeEventListener(
+        PROXY_STATUS_SYNCED_EVENT,
+        handleProxyStatusSynced
+      );
+    };
+  }, []);
+
   // Coalesce high-frequency Rust IPC batches to animation frames
   const pendingQueueRef = useRef<SessionSummary[]>([]);
   const rafHandleRef = useRef<number | null>(null);
@@ -429,10 +581,44 @@ export function useProxySessions() {
           effectiveStatus = await proxyBridge.setSystemProxy(false);
         }
       }
+      if (
+        initialAllowRemote !== null &&
+        Boolean(
+          effectiveStatus.allowRemote || effectiveStatus.bindAddr === "0.0.0.0"
+        ) !== initialAllowRemote
+      ) {
+        effectiveStatus = await proxyBridge.setAllowRemote(initialAllowRemote);
+      }
+      if (effectiveStatus.port !== initialPort) {
+        const bindHost =
+          effectiveStatus.allowRemote || effectiveStatus.bindAddr === "0.0.0.0"
+            ? "0.0.0.0"
+            : "127.0.0.1";
+        if (effectiveStatus.running) {
+          await proxyBridge.stopProxy();
+          effectiveStatus = await proxyBridge.startProxy(bindHost, initialPort);
+        } else {
+          effectiveStatus = proxyBridge.setPreviewPort(initialPort);
+          effectiveStatus = { ...effectiveStatus, port: initialPort };
+        }
+      }
       try {
         window.localStorage.setItem(
           LS_AUTO_SYSPROXY_KEY,
           JSON.stringify(effectiveStatus.autoSystemProxy)
+        );
+        window.localStorage.setItem(
+          LS_ALLOW_REMOTE_KEY,
+          JSON.stringify(
+            Boolean(
+              effectiveStatus.allowRemote ||
+                effectiveStatus.bindAddr === "0.0.0.0"
+            )
+          )
+        );
+        window.localStorage.setItem(
+          LS_PROXY_PORT_KEY,
+          JSON.stringify(effectiveStatus.port)
         );
       } catch {
         // ignore storage quota errors
@@ -1459,6 +1645,14 @@ export function useProxySessions() {
   const setAllowRemote = useCallback(
     async (allow: boolean) => {
       try {
+        try {
+          window.localStorage.setItem(
+            LS_ALLOW_REMOTE_KEY,
+            JSON.stringify(allow)
+          );
+        } catch {
+          // ignore storage quota errors
+        }
         const nextStatus = await proxyBridge.setAllowRemote(allow);
         statusRef.current = nextStatus;
         setStatus(nextStatus);
@@ -1470,6 +1664,64 @@ export function useProxySessions() {
       } catch (err) {
         showToast(
           `⚠️ Ошибка переключения интерфейса 0.0.0.0: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    },
+    [showToast]
+  );
+
+  const setProxyPort = useCallback(
+    async (nextPort: number) => {
+      if (
+        typeof nextPort !== "number" ||
+        !Number.isInteger(nextPort) ||
+        nextPort < 1 ||
+        nextPort > 65535
+      ) {
+        showToast("⚠️ Порт прокси должен быть целым числом от 1 до 65535");
+        return;
+      }
+
+      try {
+        window.localStorage.setItem(
+          LS_PROXY_PORT_KEY,
+          JSON.stringify(nextPort)
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+
+      const curr = statusRef.current;
+      if (curr.port === nextPort) {
+        showToast(`Порт прокси уже установлен на ${nextPort}`);
+        return;
+      }
+
+      try {
+        const bindHost =
+          curr.allowRemote || curr.bindAddr === "0.0.0.0"
+            ? "0.0.0.0"
+            : "127.0.0.1";
+        let nextStatus: ProxyStatus;
+        if (curr.running) {
+          await proxyBridge.stopProxy();
+          nextStatus = await proxyBridge.startProxy(bindHost, nextPort);
+        } else {
+          nextStatus = proxyBridge.setPreviewPort(nextPort);
+          nextStatus = { ...nextStatus, port: nextPort };
+        }
+        statusRef.current = nextStatus;
+        setStatus(nextStatus);
+        showToast(
+          nextStatus.running
+            ? `🔌 Прокси перезапущен на ${nextStatus.bindAddr}:${nextStatus.port}`
+            : `🔌 Порт прокси изменён на ${nextStatus.port} (вступит в силу при захвате)`
+        );
+      } catch (err) {
+        showToast(
+          `⚠️ Не удалось занять порт ${nextPort}: ${
+            err instanceof Error ? err.message : String(err)
+          }`
         );
       }
     },
@@ -2376,6 +2628,7 @@ export function useProxySessions() {
       setHostListFilterState(updater);
     },
     compiledHostList,
+    customPresets,
     allPresets,
     activePreset,
     activePresetId,
@@ -2416,6 +2669,7 @@ export function useProxySessions() {
     refreshStorageStats,
     // Core Proxy Actions
     toggleProxy,
+    setProxyPort,
     setAllowRemote,
     toggleAllowRemote,
     setSystemProxyEnabled,
