@@ -1,4 +1,7 @@
+use std::path::PathBuf;
 use std::sync::Arc;
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::models::{
@@ -10,6 +13,10 @@ use crate::models::{
 use crate::proxy::codec::execute_codec_transform;
 use crate::proxy::network::list_network_interfaces;
 use crate::proxy::server::ProxyEngineController;
+use crate::storage::export_import::{
+    export_sessions_to_path, import_sessions_from_bytes, import_sessions_from_path,
+    write_raw_bytes_to_file,
+};
 
 pub struct AppState {
     pub controller: Arc<ProxyEngineController>,
@@ -289,4 +296,144 @@ pub async fn load_session_body(
         .context
         .store
         .load_session_body(id, is_response)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileDialogFilter {
+    pub name: String,
+    pub extensions: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn pick_save_file_dialog(
+    title: Option<String>,
+    default_name: Option<String>,
+    filters: Vec<FileDialogFilter>,
+) -> Result<Option<String>, ProxyError> {
+    tokio::task::spawn_blocking(move || {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(t) = title.as_deref() {
+            if !t.is_empty() {
+                dialog = dialog.set_title(t);
+            }
+        }
+        if let Some(name) = default_name.as_deref() {
+            if !name.is_empty() {
+                dialog = dialog.set_file_name(name);
+            }
+        }
+        for f in &filters {
+            let ext_refs: Vec<&str> = f.extensions.iter().map(String::as_str).collect();
+            if !ext_refs.is_empty() {
+                dialog = dialog.add_filter(&f.name, &ext_refs);
+            }
+        }
+        Ok(dialog
+            .save_file()
+            .map(|p| p.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|e| ProxyError::Custom(format!("Native save dialog join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn pick_open_file_dialog(
+    title: Option<String>,
+    filters: Vec<FileDialogFilter>,
+) -> Result<Option<String>, ProxyError> {
+    tokio::task::spawn_blocking(move || {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(t) = title.as_deref() {
+            if !t.is_empty() {
+                dialog = dialog.set_title(t);
+            }
+        }
+        for f in &filters {
+            let ext_refs: Vec<&str> = f.extensions.iter().map(String::as_str).collect();
+            if !ext_refs.is_empty() {
+                dialog = dialog.add_filter(&f.name, &ext_refs);
+            }
+        }
+        Ok(dialog
+            .pick_file()
+            .map(|p| p.to_string_lossy().into_owned()))
+    })
+    .await
+    .map_err(|e| ProxyError::Custom(format!("Native open dialog join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn export_sessions_file(
+    session_ids: Vec<u64>,
+    format: String,
+    file_path: String,
+    state: State<'_, AppState>,
+) -> Result<usize, ProxyError> {
+    let store = state.controller.context.store.clone();
+    tokio::task::spawn_blocking(move || {
+        let sessions = store.collect_sessions_for_export(&session_ids)?;
+        export_sessions_to_path(&sessions, &format, &PathBuf::from(file_path))
+    })
+    .await
+    .map_err(|e| ProxyError::Custom(format!("Export task join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn import_sessions_file(
+    file_path: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<SessionSummary>, ProxyError> {
+    let store = state.controller.context.store.clone();
+    let event_tx = state.controller.context.event_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let details = import_sessions_from_path(&PathBuf::from(file_path))?;
+        let summaries = store.import_sessions(details);
+        for summary in &summaries {
+            let _ = event_tx.send(summary.clone());
+        }
+        Ok(summaries)
+    })
+    .await
+    .map_err(|e| ProxyError::Custom(format!("Import task join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn import_sessions_bytes(
+    file_name: String,
+    data_base64: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<SessionSummary>, ProxyError> {
+    let store = state.controller.context.store.clone();
+    let event_tx = state.controller.context.event_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let cleaned: String = data_base64.chars().filter(|c| !c.is_whitespace()).collect();
+        let raw_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&cleaned)
+            .map_err(|e| ProxyError::Custom(format!("Invalid Base64 archive payload: {e}")))?;
+        let details = import_sessions_from_bytes(&file_name, &raw_bytes)?;
+        let summaries = store.import_sessions(details);
+        for summary in &summaries {
+            let _ = event_tx.send(summary.clone());
+        }
+        Ok(summaries)
+    })
+    .await
+    .map_err(|e| ProxyError::Custom(format!("Import bytes task join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn save_session_body_file(
+    session_id: u64,
+    is_response: bool,
+    file_path: String,
+    state: State<'_, AppState>,
+) -> Result<usize, ProxyError> {
+    let store = state.controller.context.store.clone();
+    tokio::task::spawn_blocking(move || {
+        let bytes = store.extract_raw_body_bytes(session_id, is_response)?;
+        write_raw_bytes_to_file(&PathBuf::from(file_path), &bytes)
+    })
+    .await
+    .map_err(|e| ProxyError::Custom(format!("Save body task join error: {e}")))?
 }

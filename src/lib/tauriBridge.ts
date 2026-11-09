@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type {
   AutoResponderRule,
   BreakpointAction,
@@ -26,12 +27,60 @@ import {
   evaluateShouldStoreSessionInPreview,
   evaluateTlsConnectInPreview,
 } from "./filterEngine";
-import { encodeTextToBase64 } from "./formatters";
+import {
+  buildFullRawHttpMessage,
+  decodeBase64ToBytes,
+  encodeTextToBase64,
+} from "./formatters";
 import {
   buildSimulatedSession,
   DEFAULT_AUTORESPONDER_RULES,
 } from "./mockTraffic";
 import { browserPreviewCodecTransform } from "./textWizard";
+
+export interface FileDialogFilter {
+  name: string;
+  extensions: string[];
+}
+
+export type NativeDragDropPayload =
+  | { type: "enter"; paths: string[] }
+  | { type: "over" }
+  | { type: "drop"; paths: string[] }
+  | { type: "leave" };
+
+function encodeUint8ArrayToBase64(bytes: Uint8Array): string {
+  if (bytes.length === 0) return "";
+  const chunkSize = 0x8000;
+  const parts: string[] = [];
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const sub = bytes.subarray(i, i + chunkSize);
+    parts.push(String.fromCharCode(...sub));
+  }
+  return btoa(parts.join(""));
+}
+
+function triggerBrowserDownload(
+  bytes: Uint8Array,
+  fileName: string,
+  mimeType = "application/octet-stream"
+): void {
+  if (typeof document === "undefined") return;
+  const safeName = fileName.split(/[\\/]/).pop() || "download.bin";
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  const blob = new Blob([copy], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = safeName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+const previewPickedFiles = new Map<string, File>();
 
 export function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -1441,6 +1490,279 @@ class BrowserPreviewEngine {
     this.emitBatch([storedFinal.summary]);
     return storedFinal;
   }
+
+  exportPreviewSessions(
+    sessionIds: number[],
+    format: string,
+    filePath: string
+  ): number {
+    const targetIds =
+      sessionIds.length > 0
+        ? sessionIds
+        : Array.from(this.store.keys()).sort((a, b) => a - b);
+    const list: SessionDetail[] = [];
+    for (const id of targetIds) {
+      const detail = this.getDetail(id);
+      if (!detail) continue;
+      const hydrated = structuredClone(detail);
+      if (hydrated.requestBodyOffloaded) {
+        const off = this.offloadedBodies.get(`${id}:req`);
+        if (off) {
+          hydrated.requestBodyBase64 = off.bodyBase64;
+          hydrated.requestBodyText = off.bodyText;
+          hydrated.requestBodyOffloaded = false;
+        }
+      }
+      if (hydrated.bodyOffloaded) {
+        const off = this.offloadedBodies.get(`${id}:resp`);
+        if (off) {
+          hydrated.responseBodyBase64 = off.bodyBase64;
+          hydrated.responseBodyText = off.bodyText;
+          hydrated.bodyOffloaded = false;
+        }
+      }
+      list.push(hydrated);
+    }
+
+    const fmt = format.replace(/^\./, "").toLowerCase();
+    if (fmt === "raw" || fmt === "txt") {
+      const text = list
+        .map((d) => buildFullRawHttpMessage(d))
+        .join(
+          "\r\n------------------------------------------------------------------\r\n\r\n"
+        );
+      triggerBrowserDownload(
+        new TextEncoder().encode(text),
+        filePath,
+        "text/plain;charset=utf-8"
+      );
+      return list.length;
+    }
+
+    if (fmt === "json") {
+      const json = JSON.stringify(list, null, 2);
+      triggerBrowserDownload(
+        new TextEncoder().encode(json),
+        filePath,
+        "application/json"
+      );
+      return list.length;
+    }
+
+    // Default HAR 1.2 serialization in Browser Preview
+    const har = {
+      log: {
+        version: "1.2",
+        creator: { name: "FluxProxy", version: "0.1.0" },
+        pages: list.length
+          ? [
+              {
+                startedDateTime: list[0].summary.timestamp,
+                id: "page_1",
+                title: "FluxProxy Capture",
+                pageTimings: { onContentLoad: -1, onLoad: -1 },
+              },
+            ]
+          : [],
+        entries: list.map((d) => ({
+          pageref: "page_1",
+          startedDateTime: d.summary.timestamp,
+          time: d.summary.durationMs,
+          request: {
+            method: d.summary.method,
+            url: d.summary.url,
+            httpVersion: d.summary.protocol.includes("2")
+              ? "HTTP/2.0"
+              : "HTTP/1.1",
+            cookies: [],
+            headers: d.requestHeaders,
+            queryString: [],
+            ...(d.requestBodyText
+              ? {
+                  postData: {
+                    mimeType:
+                      d.requestHeaders.find(
+                        (h) => h.name.toLowerCase() === "content-type"
+                      )?.value ?? "application/octet-stream",
+                    params: [],
+                    text: d.requestBodyText,
+                  },
+                }
+              : {}),
+            headersSize: -1,
+            bodySize: d.requestBodyText ? d.requestBodyText.length : 0,
+          },
+          response: {
+            status: d.summary.status,
+            statusText: "OK",
+            httpVersion: d.summary.protocol.includes("2")
+              ? "HTTP/2.0"
+              : "HTTP/1.1",
+            cookies: [],
+            headers: d.responseHeaders,
+            content: {
+              size: d.summary.bodySize,
+              mimeType: d.summary.contentType || "application/octet-stream",
+              ...(d.responseBodyText !== null
+                ? { text: d.responseBodyText }
+                : d.responseBodyBase64
+                  ? { text: d.responseBodyBase64, encoding: "base64" }
+                  : {}),
+            },
+            redirectURL: "",
+            headersSize: -1,
+            bodySize: d.summary.bodySize,
+          },
+          cache: {},
+          timings: {
+            blocked: -1,
+            dns: -1,
+            connect: -1,
+            send: 0,
+            wait: d.summary.durationMs,
+            receive: 0,
+            ssl: -1,
+          },
+          comment: d.summary.comment ?? undefined,
+          _fluxProxy: {
+            protocol: d.summary.protocol,
+            scheme: d.summary.scheme,
+            markedColor: d.summary.markedColor,
+            processName: d.summary.processName,
+            processPid: d.summary.processPid,
+          },
+        })),
+      },
+    };
+    const outName =
+      fmt === "saz" ? filePath.replace(/\.saz$/i, ".har") : filePath;
+    triggerBrowserDownload(
+      new TextEncoder().encode(JSON.stringify(har, null, 2)),
+      outName,
+      "application/json"
+    );
+    return list.length;
+  }
+
+  importPreviewText(text: string): SessionSummary[] {
+    const parsed = JSON.parse(text.replace(/^\uFEFF/, "")) as unknown;
+    const importedSummaries: SessionSummary[] = [];
+
+    if (Array.isArray(parsed)) {
+      for (const item of parsed as SessionDetail[]) {
+        if (!item || typeof item !== "object" || !item.summary) continue;
+        const id = this.nextId++;
+        const next: SessionDetail = {
+          ...item,
+          summary: { ...item.summary, id },
+        };
+        const stored = this.insertIntoStoreWithRingBuffer(next);
+        importedSummaries.push(stored.summary);
+      }
+    } else if (
+      parsed &&
+      typeof parsed === "object" &&
+      "log" in parsed &&
+      parsed.log &&
+      typeof parsed.log === "object" &&
+      "entries" in parsed.log &&
+      Array.isArray((parsed.log as { entries: unknown[] }).entries)
+    ) {
+      const entries = (parsed.log as { entries: Record<string, unknown>[] })
+        .entries;
+      for (const entry of entries) {
+        const id = this.nextId++;
+        const req = (entry.request ?? {}) as Record<string, unknown>;
+        const resp = (entry.response ?? {}) as Record<string, unknown>;
+        const content = (resp.content ?? {}) as Record<string, unknown>;
+        const urlStr = String(req.url ?? "https://localhost/");
+        let scheme = "https";
+        let host = "localhost";
+        let path = "/";
+        try {
+          const u = new URL(urlStr);
+          scheme = u.protocol.replace(":", "") || "https";
+          host = u.host;
+          path = `${u.pathname}${u.search}`;
+        } catch {
+          // keep fallback
+        }
+        const postData = req.postData as Record<string, unknown> | undefined;
+        const reqText =
+          postData && typeof postData.text === "string" ? postData.text : null;
+        const respText =
+          typeof content.text === "string" && content.encoding !== "base64"
+            ? content.text
+            : null;
+        const respB64 =
+          typeof content.text === "string"
+            ? content.encoding === "base64"
+              ? content.text
+              : encodeTextToBase64(content.text)
+            : "";
+
+        const detail: SessionDetail = {
+          summary: {
+            id,
+            status: Number(resp.status ?? 200),
+            protocol: String(req.httpVersion ?? "HTTP/1.1").includes("2")
+              ? `${scheme.toUpperCase()}/2`
+              : `${scheme.toUpperCase()}/1.1`,
+            scheme,
+            method: String(req.method ?? "GET").toUpperCase(),
+            host,
+            path,
+            url: urlStr,
+            contentType: String(content.mimeType ?? "application/octet-stream"),
+            bodySize: Number(content.size ?? 0),
+            durationMs: Math.max(0, Math.round(Number(entry.time ?? 0))),
+            timestamp: String(
+              entry.startedDateTime ?? new Date().toISOString()
+            ),
+            isMocked: false,
+            matchedRuleId: null,
+            error: null,
+            comment: typeof entry.comment === "string" ? entry.comment : null,
+          },
+          requestHeaders: Array.isArray(req.headers)
+            ? (req.headers as { name: string; value: string }[])
+            : [],
+          responseHeaders: Array.isArray(resp.headers)
+            ? (resp.headers as { name: string; value: string }[])
+            : [],
+          requestBodyBase64: reqText ? encodeTextToBase64(reqText) : "",
+          responseBodyBase64: respB64,
+          requestBodyText: reqText,
+          responseBodyText: respText,
+          tlsVersion: scheme === "https" ? "TLS 1.3" : null,
+          clientAddr: "har-import",
+          websocketFrames: [],
+        };
+        const stored = this.insertIntoStoreWithRingBuffer(detail);
+        importedSummaries.push(stored.summary);
+      }
+    }
+
+    if (importedSummaries.length > 0) {
+      this.emitBatch(importedSummaries);
+    }
+    return importedSummaries;
+  }
+
+  async savePreviewBody(
+    sessionId: number,
+    isResponse: boolean,
+    filePath: string
+  ): Promise<number> {
+    const loaded = await this.loadSessionBody(sessionId, isResponse);
+    const bytes = loaded.bodyBase64
+      ? decodeBase64ToBytes(loaded.bodyBase64)
+      : loaded.bodyText
+        ? new TextEncoder().encode(loaded.bodyText)
+        : new Uint8Array(0);
+    triggerBrowserDownload(bytes, filePath);
+    return bytes.byteLength;
+  }
 }
 
 const previewEngine = new BrowserPreviewEngine();
@@ -1775,6 +2097,147 @@ export const proxyBridge = {
       });
     }
     return previewEngine.subscribe(onBatch);
+  },
+
+  async pickSaveFileDialog(options: {
+    title?: string;
+    defaultName?: string;
+    filters: FileDialogFilter[];
+  }): Promise<string | null> {
+    if (isTauriRuntime()) {
+      return invoke<string | null>("pick_save_file_dialog", {
+        title: options.title ?? null,
+        defaultName: options.defaultName ?? null,
+        filters: options.filters,
+      });
+    }
+    return options.defaultName ?? "fluxproxy-capture.har";
+  },
+
+  async pickOpenFileDialog(options: {
+    title?: string;
+    filters: FileDialogFilter[];
+  }): Promise<string | null> {
+    if (isTauriRuntime()) {
+      return invoke<string | null>("pick_open_file_dialog", {
+        title: options.title ?? null,
+        filters: options.filters,
+      });
+    }
+    if (typeof document === "undefined") return null;
+    const exts = Array.from(
+      new Set(
+        options.filters.flatMap((f) =>
+          f.extensions.filter((e) => e !== "*").map((e) => `.${e}`)
+        )
+      )
+    );
+    return new Promise<string | null>((resolve) => {
+      const input = document.createElement("input");
+      input.type = "file";
+      if (exts.length > 0) {
+        input.accept = exts.join(",");
+      }
+      input.onchange = () => {
+        const file = input.files?.[0];
+        if (!file) {
+          resolve(null);
+          return;
+        }
+        const token = `preview://${Date.now()}_${file.name}`;
+        previewPickedFiles.set(token, file);
+        resolve(token);
+      };
+      input.oncancel = () => resolve(null);
+      input.click();
+    });
+  },
+
+  async exportSessionsFile(
+    sessionIds: number[],
+    format: string,
+    filePath: string
+  ): Promise<number> {
+    if (isTauriRuntime()) {
+      return invoke<number>("export_sessions_file", {
+        sessionIds,
+        format,
+        filePath,
+      });
+    }
+    return previewEngine.exportPreviewSessions(sessionIds, format, filePath);
+  },
+
+  async importSessionsFile(filePath: string): Promise<SessionSummary[]> {
+    if (isTauriRuntime()) {
+      return invoke<SessionSummary[]>("import_sessions_file", { filePath });
+    }
+    const file = previewPickedFiles.get(filePath);
+    if (!file) {
+      throw new Error("Файл не найден в режиме Browser Preview");
+    }
+    previewPickedFiles.delete(filePath);
+    if (file.name.toLowerCase().endsWith(".saz")) {
+      throw new Error(
+        "Чтение архивов Fiddler .saz выполняется в нативном Rust-бэкенде Tauri (`cargo tauri dev`)"
+      );
+    }
+    const text = await file.text();
+    return previewEngine.importPreviewText(text);
+  },
+
+  async importSessionsBytes(
+    fileName: string,
+    bytes: Uint8Array
+  ): Promise<SessionSummary[]> {
+    if (isTauriRuntime()) {
+      return invoke<SessionSummary[]>("import_sessions_bytes", {
+        fileName,
+        dataBase64: encodeUint8ArrayToBase64(bytes),
+      });
+    }
+    if (fileName.toLowerCase().endsWith(".saz")) {
+      throw new Error(
+        "Чтение архивов Fiddler .saz выполняется в нативном Rust-бэкенде Tauri (`cargo tauri dev`)"
+      );
+    }
+    const text = new TextDecoder().decode(bytes);
+    return previewEngine.importPreviewText(text);
+  },
+
+  async saveSessionBodyFile(
+    sessionId: number,
+    isResponse: boolean,
+    filePath: string
+  ): Promise<number> {
+    if (isTauriRuntime()) {
+      return invoke<number>("save_session_body_file", {
+        sessionId,
+        isResponse,
+        filePath,
+      });
+    }
+    return previewEngine.savePreviewBody(sessionId, isResponse, filePath);
+  },
+
+  async subscribeNativeFileDrop(
+    onEvent: (payload: NativeDragDropPayload) => void
+  ): Promise<UnlistenFn> {
+    if (!isTauriRuntime()) {
+      return () => {};
+    }
+    return getCurrentWebview().onDragDropEvent((event) => {
+      const p = event.payload;
+      if (p.type === "enter") {
+        onEvent({ type: "enter", paths: p.paths });
+      } else if (p.type === "over") {
+        onEvent({ type: "over" });
+      } else if (p.type === "drop") {
+        onEvent({ type: "drop", paths: p.paths });
+      } else if (p.type === "leave") {
+        onEvent({ type: "leave" });
+      }
+    });
   },
 
   generateStressTestSessions(count = 10_000): SessionSummary[] {

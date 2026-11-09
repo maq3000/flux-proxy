@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Upload } from "lucide-react";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { AutoResponderPanel } from "./components/AutoResponderPanel";
 import {
@@ -146,6 +147,12 @@ export const App: React.FC = () => {
     clearAllSessions,
     saveToSqlite,
     loadFromSqlite,
+    exportAllSessionsAs,
+    exportSelectedSessionsAs,
+    importArchiveDialog,
+    importArchiveFromPath,
+    importArchiveFromDroppedFile,
+    saveSessionBodyAs,
     generateStress10k,
   } = useProxySessions();
 
@@ -175,6 +182,140 @@ export const App: React.FC = () => {
   const [annotationTargetIds, setAnnotationTargetIds] = useState<number[]>([]);
   const [diffModalOpen, setDiffModalOpen] = useState(false);
   const [inlineDiffDismissed, setInlineDiffDismissed] = useState(false);
+
+  // Drag-and-Drop Archive Import (.har, .saz, .json) State
+  const [fileDropActive, setFileDropActive] = useState(false);
+  const [fileDropLabel, setFileDropLabel] = useState<string | null>(null);
+  const htmlDragDepthRef = useRef(0);
+
+  useEffect(() => {
+    let mounted = true;
+    let unlistenDrop: (() => void) | null = null;
+
+    void proxyBridge
+      .subscribeNativeFileDrop((payload) => {
+        if (!mounted) return;
+        if (payload.type === "enter") {
+          const supported = payload.paths.filter((p) =>
+            /\.(har|saz|json)$/i.test(p)
+          );
+          if (supported.length > 0 || payload.paths.length > 0) {
+            const names = (supported.length > 0 ? supported : payload.paths)
+              .map((p) => p.split(/[\\/]/).pop() ?? p)
+              .join(", ");
+            setFileDropLabel(names);
+            setFileDropActive(true);
+          }
+        } else if (payload.type === "leave") {
+          setFileDropActive(false);
+          setFileDropLabel(null);
+        } else if (payload.type === "drop") {
+          setFileDropActive(false);
+          setFileDropLabel(null);
+          const supported = payload.paths.filter((p) =>
+            /\.(har|saz|json)$/i.test(p)
+          );
+          if (supported.length === 0) {
+            showToast(
+              "⚠️ Перетащите архив .har, .saz (Fiddler Classic) или .json"
+            );
+            return;
+          }
+          setActiveSection("traffic");
+          void (async () => {
+            for (const filePath of supported) {
+              await importArchiveFromPath(filePath);
+            }
+          })();
+        }
+      })
+      .then((fn) => {
+        if (mounted) {
+          unlistenDrop = fn;
+        } else {
+          fn();
+        }
+      });
+
+    return () => {
+      mounted = false;
+      if (unlistenDrop) unlistenDrop();
+    };
+  }, [importArchiveFromPath, showToast]);
+
+  const isExternalArchiveDrag = useCallback(
+    (dt: DataTransfer | null): boolean => {
+      if (!dt) return false;
+      const types = Array.from(dt.types);
+      return (
+        types.includes("Files") &&
+        !types.includes("application/x-fluxproxy-session-id")
+      );
+    },
+    []
+  );
+
+  const handleRootDragEnter = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      if (!isExternalArchiveDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      if (!isTauriRuntime()) {
+        htmlDragDepthRef.current += 1;
+        setFileDropActive(true);
+      }
+    },
+    [isExternalArchiveDrag]
+  );
+
+  const handleRootDragOver = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      if (!isExternalArchiveDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+    },
+    [isExternalArchiveDrag]
+  );
+
+  const handleRootDragLeave = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      if (!isExternalArchiveDrag(e.dataTransfer)) return;
+      if (!isTauriRuntime()) {
+        htmlDragDepthRef.current = Math.max(0, htmlDragDepthRef.current - 1);
+        if (htmlDragDepthRef.current === 0) {
+          setFileDropActive(false);
+          setFileDropLabel(null);
+        }
+      }
+    },
+    [isExternalArchiveDrag]
+  );
+
+  const handleRootDrop = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      if (!isExternalArchiveDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      htmlDragDepthRef.current = 0;
+      setFileDropActive(false);
+      setFileDropLabel(null);
+
+      // In Tauri desktop runtime, `onDragDropEvent` handles OS file paths directly from disk
+      if (isTauriRuntime()) return;
+
+      const files = Array.from(e.dataTransfer.files);
+      const supported = files.filter((f) => /\.(har|saz|json)$/i.test(f.name));
+      if (supported.length === 0) {
+        showToast("⚠️ Перетащите архив .har, .saz (Fiddler Classic) или .json");
+        return;
+      }
+      setActiveSection("traffic");
+      void (async () => {
+        for (const file of supported) {
+          await importArchiveFromDroppedFile(file);
+        }
+      })();
+    },
+    [importArchiveFromDroppedFile, isExternalArchiveDrag, showToast]
+  );
 
   const effectiveSelectedIds = useMemo(
     () =>
@@ -523,6 +664,32 @@ export const App: React.FC = () => {
         return;
       }
 
+      // Ctrl+S / Cmd+S -> Save All Sessions As... (.har, .saz, .json)
+      if (
+        ctrlOrMeta &&
+        !e.altKey &&
+        !e.shiftKey &&
+        (keyLower === "s" || e.code === "KeyS") &&
+        !hasOpenModal()
+      ) {
+        e.preventDefault();
+        void exportAllSessionsAs();
+        return;
+      }
+
+      // Ctrl+O / Cmd+O -> Open / Import Archive... (.har, .saz, .json)
+      if (
+        ctrlOrMeta &&
+        !e.altKey &&
+        !e.shiftKey &&
+        (keyLower === "o" || e.code === "KeyO") &&
+        !hasOpenModal()
+      ) {
+        e.preventDefault();
+        void importArchiveDialog();
+        return;
+      }
+
       // Ctrl+F / Cmd+F -> Focus Quick Filter bar (unless inside Monaco Editor or an open modal)
       if (ctrlOrMeta && !e.altKey && !e.shiftKey && keyLower === "f") {
         const inMonaco =
@@ -731,7 +898,9 @@ export const App: React.FC = () => {
     diffModalOpen,
     disableAllBreakpoints,
     effectiveSelectedIds,
+    exportAllSessionsAs,
     handleFocusSearch,
+    importArchiveDialog,
     openAnnotationFor,
     openDiffWithPairSmart,
     replaySessions,
@@ -1123,6 +1292,26 @@ export const App: React.FC = () => {
         perform: () => setCertModalOpen(true),
       },
       {
+        id: "save-all-archive",
+        category: "Storage",
+        label: "Save All Sessions As... (.har, .saz, .json)",
+        shortcut: "Ctrl+S",
+        perform: () => void exportAllSessionsAs(),
+      },
+      {
+        id: "save-selected-archive",
+        category: "Storage",
+        label: "Save Selected Sessions... (.har, .saz, .json)",
+        perform: () => void exportSelectedSessionsAs(),
+      },
+      {
+        id: "import-archive",
+        category: "Storage",
+        label: "Open / Import Archive... (.har, .saz, .json)",
+        shortcut: "Ctrl+O",
+        perform: () => void importArchiveDialog(),
+      },
+      {
         id: "sqlite-save",
         category: "Storage",
         label: "Save Captured Sessions to SQLite Database",
@@ -1197,9 +1386,12 @@ export const App: React.FC = () => {
       dockedComposer,
       dropNonMatching,
       effectiveSelectedIds,
+      exportAllSessionsAs,
+      exportSelectedSessionsAs,
       generateStress10k,
       handleInspectInHex,
       handleOpenCustomRetentionLimit,
+      importArchiveDialog,
       inspectorCollapsed,
       isForceNoCacheActive,
       loadFromSqlite,
@@ -1293,6 +1485,12 @@ export const App: React.FC = () => {
       onAnnotateSessions={openAnnotationFor}
       onSendToComposer={(id) => void loadSessionIntoComposer(id, false)}
       onCreateRuleFromSession={(s) => void handleCreateRuleFromSession(s)}
+      onExportSelectedSessions={(ids, fmt) =>
+        void exportSelectedSessionsAs(ids, fmt)
+      }
+      onSaveSessionBody={(id, isResponse) =>
+        void saveSessionBodyAs(id, isResponse)
+      }
       onFilterByProcess={(proc) => quickFilterByProcess(proc, "include")}
       onFilterByClientIp={(ip) => quickFilterByClientIp(ip, "include")}
       onAlwaysInspectHost={(host) => void quickAlwaysInspectHost(host)}
@@ -1344,11 +1542,37 @@ export const App: React.FC = () => {
         onOpenDiffWithSession={(id) => openDiffWithPairSmart(id)}
         canResumePairDiff={selectedIds.length === 2 && inlineDiffDismissed}
         onResumePairDiff={() => setInlineDiffDismissed(false)}
+        onSaveBodyFile={(id, isResponse) =>
+          void saveSessionBodyAs(id, isResponse)
+        }
       />
     );
 
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden bg-canvas text-fg">
+    <div
+      onDragEnter={handleRootDragEnter}
+      onDragOver={handleRootDragOver}
+      onDragLeave={handleRootDragLeave}
+      onDrop={handleRootDrop}
+      className="relative flex h-screen w-screen flex-col overflow-hidden bg-canvas text-fg"
+    >
+      {fileDropActive && (
+        <div
+          aria-live="polite"
+          className="pointer-events-none fixed inset-0 z-[120] flex items-center justify-center bg-canvas/75 backdrop-blur-xs"
+        >
+          <div className="flex flex-col items-center gap-2.5 rounded-xl border-2 border-dashed border-accent bg-surface/95 px-8 py-6 text-center shadow-popover">
+            <Upload className="h-8 w-8 text-accent" />
+            <p className="text-sm font-semibold text-fg">
+              Отпустите файл для импорта сессий во FluxProxy
+            </p>
+            <p className="font-mono text-xs text-muted">
+              {fileDropLabel || "Поддерживаются форматы .har (HAR 1.2), .saz (Fiddler Classic), .json"}
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Compact Desktop Menu Bar (`File`, `Edit`, `Rules`, `View`, `Tools`, `Help`) */}
       <MenuBar
         status={status}
@@ -1362,6 +1586,9 @@ export const App: React.FC = () => {
         onToggleAllowRemote={() => void toggleAllowRemote()}
         onToggleSystemProxy={() => void toggleSystemProxy()}
         onToggleAutoSystemProxy={() => void toggleAutoSystemProxy()}
+        onSaveAllSessionsAs={() => void exportAllSessionsAs()}
+        onSaveSelectedSessionsAs={() => void exportSelectedSessionsAs()}
+        onImportArchive={() => void importArchiveDialog()}
         onSaveSqlite={() => void saveToSqlite()}
         onLoadSqlite={() => void loadFromSqlite()}
         onClearSessions={() => void clearAllSessions()}

@@ -464,6 +464,9 @@ dialog.drawer-dialog::backdrop {
   left: var(--ctx-menu-left, 0px);
   margin: 0;
   padding: 0;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 [popover].session-context-menu:is(:popover-open, .\:popover-open) {

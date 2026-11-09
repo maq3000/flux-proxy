@@ -34,6 +34,9 @@ interface MenuBarProps {
   onToggleAllowRemote: () => void;
   onToggleSystemProxy: () => void;
   onToggleAutoSystemProxy: () => void;
+  onSaveAllSessionsAs: () => void;
+  onSaveSelectedSessionsAs: () => void;
+  onImportArchive: () => void;
   onSaveSqlite: () => void;
   onLoadSqlite: () => void;
   onClearSessions: () => void;
@@ -261,6 +264,9 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onToggleAllowRemote,
   onToggleSystemProxy,
   onToggleAutoSystemProxy,
+  onSaveAllSessionsAs,
+  onSaveSelectedSessionsAs,
+  onImportArchive,
   onSaveSqlite,
   onLoadSqlite,
   onClearSessions,
@@ -950,6 +956,36 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 onClick={(e) => activateCheckbox(e, onToggleAllowRemote)}
               >
                 <span>Разрешить подключения с удаленных устройств (0.0.0.0)</span>
+              </button>
+              <hr />
+              <button
+                type="button"
+                disabled={totalCount === 0}
+                onClick={(e) => activateCommand(e, onSaveAllSessionsAs)}
+              >
+                <span>Save All Sessions As...</span>
+                <span className="hint" aria-hidden="true">
+                  Ctrl+S
+                </span>
+              </button>
+              <button
+                type="button"
+                disabled={!hasSelection}
+                onClick={(e) => activateCommand(e, onSaveSelectedSessionsAs)}
+              >
+                <span>
+                  Save Selected Sessions...
+                  {selectedCount > 1 ? ` (${selectedCount})` : ""}
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={(e) => activateCommand(e, onImportArchive)}
+              >
+                <span>Open / Import Archive...</span>
+                <span className="hint" aria-hidden="true">
+                  Ctrl+O
+                </span>
               </button>
               <hr />
               <button

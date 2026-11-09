@@ -253,3 +253,78 @@ export function statusReasonPhrase(status: number): string {
   };
   return map[status] ?? "Response";
 }
+
+export function buildFullRawHttpMessage(detail: SessionDetail): string {
+  return `${buildRawHttpRequest(detail)}\r\n\r\n${buildRawHttpResponse(detail)}\r\n`;
+}
+
+export function extensionFromMimeType(
+  mimeType: string | null | undefined,
+  fallback = "bin"
+): string {
+  if (!mimeType) return fallback;
+  const clean = mimeType.split(";")[0].trim().toLowerCase();
+  if (!clean) return fallback;
+
+  if (clean === "application/json" || clean.endsWith("+json")) return "json";
+  if (clean === "text/html" || clean === "application/xhtml+xml") return "html";
+  if (clean === "image/svg+xml") return "svg";
+  if (
+    clean === "text/xml" ||
+    clean === "application/xml" ||
+    clean.endsWith("+xml")
+  ) {
+    return "xml";
+  }
+  if (clean === "image/png") return "png";
+  if (clean === "image/jpeg" || clean === "image/jpg") return "jpg";
+  if (clean === "image/gif") return "gif";
+  if (clean === "image/webp") return "webp";
+  if (clean === "image/avif") return "avif";
+  if (clean === "image/x-icon" || clean === "image/vnd.microsoft.icon") {
+    return "ico";
+  }
+  if (clean === "text/css") return "css";
+  if (
+    clean === "text/javascript" ||
+    clean === "application/javascript" ||
+    clean === "application/x-javascript"
+  ) {
+    return "js";
+  }
+  if (clean === "text/csv") return "csv";
+  if (
+    clean === "text/plain" ||
+    clean === "text/event-stream" ||
+    clean === "application/x-www-form-urlencoded"
+  ) {
+    return "txt";
+  }
+  if (clean === "application/pdf") return "pdf";
+  if (clean === "application/zip") return "zip";
+  if (clean === "application/gzip") return "gz";
+  if (clean === "application/wasm") return "wasm";
+  if (clean === "audio/mpeg") return "mp3";
+  if (clean === "audio/wav") return "wav";
+  if (clean === "audio/ogg") return "ogg";
+  if (clean === "video/mp4") return "mp4";
+  if (clean === "video/webm") return "webm";
+  if (clean === "font/woff2") return "woff2";
+  if (clean === "font/woff") return "woff";
+  if (clean === "font/ttf") return "ttf";
+
+  return fallback;
+}
+
+export function suggestSessionBodyFileName(
+  sessionId: number,
+  isResponse: boolean,
+  mimeType?: string | null
+): { fileName: string; ext: string } {
+  const ext = extensionFromMimeType(mimeType, "bin");
+  const prefix = isResponse ? "response" : "request";
+  return {
+    fileName: `${prefix}_${sessionId}.${ext}`,
+    ext,
+  };
+}

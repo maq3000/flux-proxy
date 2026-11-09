@@ -80,6 +80,7 @@ interface SessionInspectorProps {
   onOpenDiffWithSession?: (id: number) => void;
   canResumePairDiff?: boolean;
   onResumePairDiff?: () => void;
+  onSaveBodyFile?: (sessionId: number, isResponse: boolean) => void;
 }
 
 const REQUEST_TABS: { id: InspectorTab; label: string }[] = [
@@ -131,6 +132,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
   onOpenDiffWithSession,
   canResumePairDiff,
   onResumePairDiff,
+  onSaveBodyFile,
 }) => {
   const [reqTab, setReqTab] = useState<InspectorTab>("headers");
   const [respTab, setRespTab] = useState<InspectorTab>("json");
@@ -798,6 +800,17 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   <span>Offloaded (&gt;2 MB)</span>
                 </button>
               )}
+              {onSaveBodyFile && (
+                <button
+                  type="button"
+                  onClick={() => onSaveBodyFile(summary.id, false)}
+                  title="Save Request Body As..."
+                  aria-label="Save Request Body As..."
+                  className="shrink-0 rounded p-1 text-subtle hover:bg-elevated hover:text-fg"
+                >
+                  <Download className="h-3 w-3" />
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() =>
@@ -1022,6 +1035,17 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                     <Database className="h-2.5 w-2.5" />
                   )}
                   <span>Offloaded ({formatBytes(summary.bodySize)})</span>
+                </button>
+              )}
+              {onSaveBodyFile && (
+                <button
+                  type="button"
+                  onClick={() => onSaveBodyFile(summary.id, true)}
+                  title="Save Response Body As..."
+                  aria-label="Save Response Body As..."
+                  className="shrink-0 rounded p-1 text-subtle hover:bg-elevated hover:text-fg"
+                >
+                  <Download className="h-3 w-3" />
                 </button>
               )}
               <button

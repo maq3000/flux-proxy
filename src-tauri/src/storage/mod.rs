@@ -1,3 +1,4 @@
+pub mod export_import;
 pub mod sqlite;
 
 use std::path::PathBuf;
@@ -368,6 +369,104 @@ impl TrafficStore {
         self.enforce_retention_limit();
         Ok(self.list_summaries())
     }
+
+    /// Loads a `SessionDetail` from RAM or SQLite archive and hydrates any heavy (> 2 MiB)
+    /// offloaded request/response bodies so archive exports (`HAR 1.2` / `SAZ`) are complete.
+    pub fn get_hydrated(&self, id: u64) -> Result<Option<SessionDetail>, ProxyError> {
+        let Some(mut detail) = (match self.get(id) {
+            Some(d) => Some(d),
+            None => self.sqlite.load_session_by_id(id)?,
+        }) else {
+            return Ok(None);
+        };
+
+        if detail.request_body_offloaded || detail.request_body_base64.is_empty() {
+            if let Some(req_bytes) = self.sqlite.load_offloaded_body(id, false)? {
+                detail.request_body_base64 =
+                    base64::engine::general_purpose::STANDARD.encode(&req_bytes);
+                detail.request_body_text = std::str::from_utf8(&req_bytes).ok().map(str::to_owned);
+                detail.request_body_offloaded = false;
+            }
+        }
+
+        if detail.body_offloaded || detail.response_body_base64.is_empty() {
+            if let Some(resp_bytes) = self.sqlite.load_offloaded_body(id, true)? {
+                detail.summary.body_size = detail.summary.body_size.max(resp_bytes.len());
+                detail.response_body_base64 =
+                    base64::engine::general_purpose::STANDARD.encode(&resp_bytes);
+                detail.response_body_text =
+                    std::str::from_utf8(&resp_bytes).ok().map(str::to_owned);
+                detail.body_offloaded = false;
+            }
+        }
+
+        Ok(Some(detail))
+    }
+
+    /// Collects hydrated `SessionDetail` entries for export.
+    /// When `session_ids` is empty, exports all sessions currently in the store ordered by `id`.
+    pub fn collect_sessions_for_export(
+        &self,
+        session_ids: &[u64],
+    ) -> Result<Vec<SessionDetail>, ProxyError> {
+        let mut target_ids: Vec<u64> = if session_ids.is_empty() {
+            self.sessions.iter().map(|entry| *entry.key()).collect()
+        } else {
+            session_ids.to_vec()
+        };
+        target_ids.sort_unstable();
+        target_ids.dedup();
+
+        let mut out = Vec::with_capacity(target_ids.len());
+        for id in target_ids {
+            if let Some(detail) = self.get_hydrated(id)? {
+                out.push(detail);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Extracts raw binary/text body bytes for saving directly to disk without Base64 overhead
+    /// when a payload was offloaded to SQLite.
+    pub fn extract_raw_body_bytes(
+        &self,
+        id: u64,
+        is_response: bool,
+    ) -> Result<Vec<u8>, ProxyError> {
+        if let Some(raw_bytes) = self.sqlite.load_offloaded_body(id, is_response)? {
+            return Ok(raw_bytes);
+        }
+
+        let maybe_detail = match self.get(id) {
+            Some(d) => Some(d),
+            None => self.sqlite.load_session_by_id(id)?,
+        };
+
+        if let Some(detail) = maybe_detail {
+            return Ok(export_import::decode_detail_body_bytes(&detail, is_response));
+        }
+
+        Err(ProxyError::Custom(format!(
+            "Сессия #{id} не найдена ни в RAM, ни в SQLite"
+        )))
+    }
+
+    /// Allocates fresh sequential IDs for imported sessions, inserts them into the store
+    /// (offloading > 2 MiB payloads automatically), and returns their `SessionSummary` list.
+    pub fn import_sessions(&self, imported: Vec<SessionDetail>) -> Vec<SessionSummary> {
+        let mut summaries = Vec::with_capacity(imported.len());
+        for mut detail in imported {
+            let new_id = self.allocate_id();
+            detail.summary.id = new_id;
+            detail.body_offloaded = false;
+            detail.request_body_offloaded = false;
+            self.insert(detail);
+            if let Some(stored) = self.sessions.get(&new_id) {
+                summaries.push(stored.summary.clone());
+            }
+        }
+        summaries
+    }
 }
 
 fn extract_heavy_payload_bytes(body_b64: &str, body_text: Option<&str>) -> Option<Vec<u8>> {
@@ -559,6 +658,21 @@ mod tests {
         assert!(loaded.is_response);
         assert_eq!(loaded.body_size, heavy_len);
         assert_eq!(loaded.body_text.as_deref(), Some(heavy_json.as_str()));
+
+        // Export hydration & raw body extraction also preserve the full >2 MiB payload
+        let raw_extracted = store
+            .extract_raw_body_bytes(id, true)
+            .expect("extract offloaded raw bytes");
+        assert_eq!(raw_extracted.len(), heavy_len);
+
+        let hydrated_export = store
+            .collect_sessions_for_export(&[id])
+            .expect("collect hydrated sessions");
+        assert_eq!(hydrated_export.len(), 1);
+        assert_eq!(
+            hydrated_export[0].response_body_text.as_deref(),
+            Some(heavy_json.as_str())
+        );
 
         drop(store);
         cleanup_temp_db(&db_path);

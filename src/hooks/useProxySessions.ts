@@ -10,8 +10,16 @@ import {
   matchHostRuleList,
   normalizeHostToken,
 } from "../lib/filterEngine";
-import { getRowSemanticTone } from "../lib/formatters";
-import { DEFAULT_BREAKPOINT_CONFIG, proxyBridge } from "../lib/tauriBridge";
+import {
+  formatBytes,
+  getRowSemanticTone,
+  suggestSessionBodyFileName,
+} from "../lib/formatters";
+import {
+  DEFAULT_BREAKPOINT_CONFIG,
+  type FileDialogFilter,
+  proxyBridge,
+} from "../lib/tauriBridge";
 import { DEFAULT_SESSION_RETENTION_LIMIT } from "../types/proxy";
 import type {
   BreakpointAction,
@@ -1843,6 +1851,306 @@ export function useProxySessions() {
     showToast(`Loaded ${next.length.toLocaleString()} sessions from SQLite`);
   }, [refreshStorageStats, selectedId, setSelectedId, showToast]);
 
+  const mergeImportedSummaries = useCallback(
+    (imported: SessionSummary[]) => {
+      if (imported.length === 0) return;
+      setSessions((prev) => {
+        const indexById = new Map<number, number>();
+        const next = prev.slice();
+        for (let i = 0; i < next.length; i++) {
+          indexById.set(next[i].id, i);
+        }
+        for (const item of imported) {
+          const idx = indexById.get(item.id);
+          if (idx !== undefined) {
+            next[idx] = item;
+          } else {
+            indexById.set(item.id, next.length);
+            next.push(item);
+          }
+        }
+        const limit = sessionRetentionLimitRef.current;
+        if (limit && next.length > limit) {
+          next.splice(0, next.length - limit);
+        }
+        return next;
+      });
+      setSelectedId(imported[0].id);
+    },
+    [setSelectedId]
+  );
+
+  const exportSessionsWithDialog = useCallback(
+    async (
+      targetSessionIds: number[],
+      forcedFormat?: "har" | "saz" | "json" | "raw"
+    ) => {
+      try {
+        const stamp = new Date()
+          .toISOString()
+          .replace(/[:.]/g, "-")
+          .slice(0, 19);
+
+        let filters: FileDialogFilter[];
+        let defaultName: string;
+
+        if (forcedFormat === "har") {
+          filters = [
+            { name: "HTTP Archive 1.2 (*.har)", extensions: ["har"] },
+            { name: "All Files (*.*)", extensions: ["*"] },
+          ];
+          defaultName =
+            targetSessionIds.length === 1
+              ? `session_${targetSessionIds[0]}.har`
+              : targetSessionIds.length > 1
+                ? `fluxproxy_selected_${targetSessionIds.length}.har`
+                : `fluxproxy_capture_${stamp}.har`;
+        } else if (forcedFormat === "saz") {
+          filters = [
+            { name: "Fiddler Session Archive (*.saz)", extensions: ["saz"] },
+            { name: "All Files (*.*)", extensions: ["*"] },
+          ];
+          defaultName =
+            targetSessionIds.length === 1
+              ? `session_${targetSessionIds[0]}.saz`
+              : targetSessionIds.length > 1
+                ? `fluxproxy_selected_${targetSessionIds.length}.saz`
+                : `fluxproxy_capture_${stamp}.saz`;
+        } else if (forcedFormat === "raw") {
+          filters = [
+            { name: "Raw HTTP Message (*.txt)", extensions: ["txt"] },
+            { name: "All Files (*.*)", extensions: ["*"] },
+          ];
+          defaultName =
+            targetSessionIds.length === 1
+              ? `session_${targetSessionIds[0]}_raw.txt`
+              : `sessions_raw_${targetSessionIds.length}.txt`;
+        } else if (forcedFormat === "json") {
+          filters = [
+            { name: "JSON Sessions Archive (*.json)", extensions: ["json"] },
+            { name: "All Files (*.*)", extensions: ["*"] },
+          ];
+          defaultName = `fluxproxy_capture_${stamp}.json`;
+        } else {
+          filters = [
+            { name: "HTTP Archive 1.2 (*.har)", extensions: ["har"] },
+            { name: "Fiddler Session Archive (*.saz)", extensions: ["saz"] },
+            { name: "JSON Sessions Archive (*.json)", extensions: ["json"] },
+            { name: "All Files (*.*)", extensions: ["*"] },
+          ];
+          defaultName =
+            targetSessionIds.length > 0
+              ? `fluxproxy_selected_${targetSessionIds.length}.har`
+              : `fluxproxy_capture_${stamp}.har`;
+        }
+
+        const chosenPath = await proxyBridge.pickSaveFileDialog({
+          title:
+            targetSessionIds.length > 0
+              ? `Save Selected Sessions (${targetSessionIds.length})`
+              : "Save All Sessions As",
+          defaultName,
+          filters,
+        });
+        if (!chosenPath) return;
+
+        const lowerPath = chosenPath.toLowerCase();
+        const resolvedFormat =
+          forcedFormat ??
+          (lowerPath.endsWith(".saz")
+            ? "saz"
+            : lowerPath.endsWith(".json")
+              ? "json"
+              : lowerPath.endsWith(".txt")
+                ? "raw"
+                : "har");
+
+        const savedCount = await proxyBridge.exportSessionsFile(
+          targetSessionIds,
+          resolvedFormat,
+          chosenPath
+        );
+        const baseName = chosenPath.split(/[\\/]/).pop() ?? chosenPath;
+        showToast(
+          `💾 Сохранено сессий: ${savedCount.toLocaleString()} → ${baseName}`
+        );
+      } catch (err) {
+        showToast(
+          `⚠️ Ошибка экспорта: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    },
+    [showToast]
+  );
+
+  const exportAllSessionsAs = useCallback(
+    async (forcedFormat?: "har" | "saz" | "json") => {
+      if (sessions.length === 0) {
+        showToast("⚠️ Нет захваченных сессий для сохранения");
+        return;
+      }
+      await exportSessionsWithDialog([], forcedFormat);
+    },
+    [exportSessionsWithDialog, sessions.length, showToast]
+  );
+
+  const exportSelectedSessionsAs = useCallback(
+    async (
+      explicitIds?: number[],
+      forcedFormat?: "har" | "saz" | "json" | "raw"
+    ) => {
+      const ids =
+        explicitIds && explicitIds.length > 0
+          ? explicitIds
+          : selectedIds.length > 0
+            ? selectedIds
+            : selectedId !== null
+              ? [selectedId]
+              : [];
+      if (ids.length === 0) {
+        showToast("⚠️ Выделите хотя бы одну сессию для экспорта");
+        return;
+      }
+      await exportSessionsWithDialog(ids, forcedFormat);
+    },
+    [exportSessionsWithDialog, selectedId, selectedIds, showToast]
+  );
+
+  const importArchiveFromPath = useCallback(
+    async (filePath: string) => {
+      try {
+        const imported = await proxyBridge.importSessionsFile(filePath);
+        mergeImportedSummaries(imported);
+        await refreshStorageStats();
+        const baseName = filePath.split(/[\\/]/).pop() ?? filePath;
+        showToast(
+          imported.length > 0
+            ? `📂 Импортировано сессий: ${imported.length.toLocaleString()} из ${baseName}`
+            : `ℹ️ В архиве ${baseName} не найдено сессий`
+        );
+      } catch (err) {
+        showToast(
+          `⚠️ Ошибка импорта архива: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    },
+    [mergeImportedSummaries, refreshStorageStats, showToast]
+  );
+
+  const importArchiveFromDroppedFile = useCallback(
+    async (file: File) => {
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const imported = await proxyBridge.importSessionsBytes(file.name, bytes);
+        mergeImportedSummaries(imported);
+        await refreshStorageStats();
+        showToast(
+          imported.length > 0
+            ? `📂 Импортировано сессий: ${imported.length.toLocaleString()} из ${file.name}`
+            : `ℹ️ В файле ${file.name} не найдено сессий`
+        );
+      } catch (err) {
+        showToast(
+          `⚠️ Ошибка импорта ${file.name}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    },
+    [mergeImportedSummaries, refreshStorageStats, showToast]
+  );
+
+  const importArchiveDialog = useCallback(async () => {
+    try {
+      const chosenPath = await proxyBridge.pickOpenFileDialog({
+        title: "Open / Import Traffic Archive (.har, .saz, .json)",
+        filters: [
+          {
+            name: "Traffic Archives (*.har, *.saz, *.json)",
+            extensions: ["har", "saz", "json"],
+          },
+          { name: "HTTP Archive 1.2 (*.har)", extensions: ["har"] },
+          { name: "Fiddler Session Archive (*.saz)", extensions: ["saz"] },
+          { name: "JSON Sessions (*.json)", extensions: ["json"] },
+          { name: "All Files (*.*)", extensions: ["*"] },
+        ],
+      });
+      if (!chosenPath) return;
+      await importArchiveFromPath(chosenPath);
+    } catch (err) {
+      showToast(
+        `⚠️ Ошибка открытия диалога: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }, [importArchiveFromPath, showToast]);
+
+  const saveSessionBodyAs = useCallback(
+    async (sessionId: number, isResponse: boolean) => {
+      try {
+        let detail =
+          selectedDetail && selectedDetail.summary.id === sessionId
+            ? selectedDetail
+            : null;
+        if (!detail) {
+          detail = await proxyBridge.getSessionDetail(sessionId);
+        }
+
+        let mimeType: string | null = null;
+        if (detail) {
+          if (isResponse) {
+            mimeType =
+              detail.summary.contentType ||
+              detail.responseHeaders.find(
+                (h) => h.name.toLowerCase() === "content-type"
+              )?.value ||
+              null;
+          } else {
+            mimeType =
+              detail.requestHeaders.find(
+                (h) => h.name.toLowerCase() === "content-type"
+              )?.value ?? null;
+          }
+        } else if (isResponse) {
+          const summary = sessions.find((s) => s.id === sessionId);
+          mimeType = summary?.contentType ?? null;
+        }
+
+        const { fileName, ext } = suggestSessionBodyFileName(
+          sessionId,
+          isResponse,
+          mimeType
+        );
+        const chosenPath = await proxyBridge.pickSaveFileDialog({
+          title: isResponse
+            ? `Save Response Body (#${sessionId})`
+            : `Save Request Body (#${sessionId})`,
+          defaultName: fileName,
+          filters: [
+            {
+              name: `${ext.toUpperCase()} Payload (*.${ext})`,
+              extensions: [ext],
+            },
+            { name: "All Files (*.*)", extensions: ["*"] },
+          ],
+        });
+        if (!chosenPath) return;
+
+        const writtenBytes = await proxyBridge.saveSessionBodyFile(
+          sessionId,
+          isResponse,
+          chosenPath
+        );
+        const baseName = chosenPath.split(/[\\/]/).pop() ?? chosenPath;
+        showToast(
+          `💾 Сохранено тело ${isResponse ? "ответа" : "запроса"} #${sessionId}: ${baseName} (${formatBytes(writtenBytes)})`
+        );
+      } catch (err) {
+        showToast(
+          `⚠️ Не удалось сохранить тело сессии: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    },
+    [selectedDetail, sessions, showToast]
+  );
+
   const generateStress10k = useCallback(() => {
     proxyBridge.generateStressTestSessions(10_000);
     void refreshStorageStats();
@@ -2117,6 +2425,12 @@ export function useProxySessions() {
     clearAllSessions,
     saveToSqlite,
     loadFromSqlite,
+    exportAllSessionsAs,
+    exportSelectedSessionsAs,
+    importArchiveDialog,
+    importArchiveFromPath,
+    importArchiveFromDroppedFile,
+    saveSessionBodyAs,
     generateStress10k,
   };
 }
