@@ -39,10 +39,48 @@ use crate::proxy::network::{is_host_own_ip, normalize_client_ip};
 use crate::proxy::process::{resolve_client_process, ClientProcessInfo};
 use crate::proxy::rules::RuleEngine;
 use crate::proxy::sysproxy::SystemProxyManager;
-use crate::storage::TrafficStore;
+use crate::storage::{TrafficStore, BODY_OFFLOAD_THRESHOLD_BYTES};
 
-const MAX_CAPTURED_BODY_BYTES: usize = 8 * 1024 * 1024; // 8 MiB safety cap per body
+const MAX_CAPTURED_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB safety cap per body (> 2 MiB offloaded to SQLite)
 type ProxyBoxBody = BoxBody<Bytes, Infallible>;
+
+#[inline]
+fn evaluate_should_store_session(ctx: &SharedProxyContext, summary: &SessionSummary) -> bool {
+    ctx.filters.evaluate_should_store_session(summary)
+}
+
+fn encode_inline_or_offload(raw: &[u8]) -> (String, Option<String>, bool) {
+    if raw.len() > BODY_OFFLOAD_THRESHOLD_BYTES {
+        (String::new(), None, true)
+    } else {
+        (
+            base64::engine::general_purpose::STANDARD.encode(raw),
+            std::str::from_utf8(raw).ok().map(str::to_owned),
+            false,
+        )
+    }
+}
+
+fn record_completed_session(
+    ctx: &SharedProxyContext,
+    detail: SessionDetail,
+    raw_req_body: Option<&[u8]>,
+    raw_resp_body: Option<&[u8]>,
+) -> bool {
+    if !evaluate_should_store_session(ctx, &detail.summary) {
+        if ctx.store.get(detail.summary.id).is_some() {
+            ctx.store.remove_many(&[detail.summary.id]);
+        }
+        ctx.store.increment_dropped_sessions();
+        return false;
+    }
+
+    let summary = detail.summary.clone();
+    ctx.store
+        .insert_with_bodies(detail, raw_req_body, raw_resp_body);
+    let _ = ctx.event_tx.send(summary);
+    true
+}
 
 pub struct SharedProxyContext {
     pub ca: Arc<CertificateAuthority>,
@@ -541,6 +579,8 @@ impl ProxyEngineController {
                 client_addr: "Composer (Local)".into(),
                 websocket_frames: Vec::new(),
                 sse_events: Vec::new(),
+                body_offloaded: false,
+                request_body_offloaded: false,
             });
             let _ = self.context.event_tx.send(paused_summary);
 
@@ -665,23 +705,33 @@ impl ProxyEngineController {
                     client_ip: Some("127.0.0.1".into()),
                 };
 
+                let capped_req = &req_bytes[..req_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
+                let capped_resp = &resp_bytes[..resp_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
+                let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
+                let (resp_b64, resp_txt, resp_offloaded) = encode_inline_or_offload(capped_resp);
+
                 let detail = SessionDetail {
                     summary: summary.clone(),
                     request_headers: req_headers,
                     response_headers: mock_resp_headers,
-                    request_body_base64: base64::engine::general_purpose::STANDARD.encode(&req_bytes),
-                    response_body_base64: base64::engine::general_purpose::STANDARD.encode(resp_bytes),
-                    request_body_text: std::str::from_utf8(&req_bytes).ok().map(str::to_owned),
-                    response_body_text: Some(rule.response_body),
+                    request_body_base64: req_b64,
+                    response_body_base64: resp_b64,
+                    request_body_text: req_txt,
+                    response_body_text: resp_txt,
                     tls_version: Some("AutoResponder Mock".into()),
                     client_addr: "Composer (Local)".into(),
                     websocket_frames: Vec::new(),
                     sse_events,
+                    body_offloaded: resp_offloaded,
+                    request_body_offloaded: req_offloaded,
                 };
 
-                self.context.store.insert(detail.clone());
+                self.context
+                    .store
+                    .insert_with_bodies(detail.clone(), Some(capped_req), Some(capped_resp));
+                let stored = self.context.store.get(session_id).unwrap_or(detail);
                 let _ = self.context.event_tx.send(summary);
-                return Ok(detail);
+                return Ok(stored);
             }
         }
 
@@ -823,15 +873,18 @@ impl ProxyEngineController {
             client_ip: Some("127.0.0.1".into()),
         };
 
+        let capped_req = &req_bytes[..req_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
         let capped_resp = &resp_bytes[..resp_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
+        let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
+        let (resp_b64, resp_txt, resp_offloaded) = encode_inline_or_offload(capped_resp);
         let detail = SessionDetail {
             summary: summary.clone(),
             request_headers: req_headers,
             response_headers: resp_headers,
-            request_body_base64: base64::engine::general_purpose::STANDARD.encode(&req_bytes),
-            response_body_base64: base64::engine::general_purpose::STANDARD.encode(capped_resp),
-            request_body_text: std::str::from_utf8(&req_bytes).ok().map(str::to_owned),
-            response_body_text: std::str::from_utf8(capped_resp).ok().map(str::to_owned),
+            request_body_base64: req_b64,
+            response_body_base64: resp_b64,
+            request_body_text: req_txt,
+            response_body_text: resp_txt,
             tls_version: if scheme == "https" {
                 Some("TLS 1.3".into())
             } else {
@@ -840,11 +893,16 @@ impl ProxyEngineController {
             client_addr: "Composer (Local)".into(),
             websocket_frames: Vec::new(),
             sse_events,
+            body_offloaded: resp_offloaded,
+            request_body_offloaded: req_offloaded,
         };
 
-        self.context.store.insert(detail.clone());
+        self.context
+            .store
+            .insert_with_bodies(detail.clone(), Some(capped_req), Some(capped_resp));
+        let stored = self.context.store.get(session_id).unwrap_or(detail);
         let _ = self.context.event_tx.send(summary);
-        Ok(detail)
+        Ok(stored)
     }
 }
 
@@ -990,10 +1048,11 @@ async fn handle_outer_proxy_request(
                 client_addr: client_addr.to_string(),
                 websocket_frames: Vec::new(),
                 sse_events: Vec::new(),
+                body_offloaded: false,
+                request_body_offloaded: false,
             };
 
-            ctx.store.insert(detail);
-            let _ = ctx.event_tx.send(summary);
+            record_completed_session(&ctx, detail, None, None);
 
             tokio::spawn(async move {
                 match hyper::upgrade::on(req).await {
@@ -1278,6 +1337,8 @@ async fn handle_intercepted_request(
             client_addr: client_addr.to_string(),
             websocket_frames: Vec::new(),
             sse_events: Vec::new(),
+            body_offloaded: false,
+            request_body_offloaded: false,
         });
         let _ = ctx.event_tx.send(paused_summary);
 
@@ -1421,14 +1482,17 @@ async fn handle_intercepted_request(
             };
 
             let capped_req = &body_bytes[..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
+            let capped_mock = &mock_bytes[..mock_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
+            let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
+            let (resp_b64, resp_txt, resp_offloaded) = encode_inline_or_offload(capped_mock);
             let detail = SessionDetail {
                 summary: summary.clone(),
                 request_headers: req_headers,
                 response_headers: mock_resp_headers.clone(),
-                request_body_base64: base64::engine::general_purpose::STANDARD.encode(capped_req),
-                response_body_base64: base64::engine::general_purpose::STANDARD.encode(&mock_bytes),
-                request_body_text: std::str::from_utf8(capped_req).ok().map(str::to_owned),
-                response_body_text: Some(rule.response_body.clone()),
+                request_body_base64: req_b64,
+                response_body_base64: resp_b64,
+                request_body_text: req_txt,
+                response_body_text: resp_txt,
                 tls_version: if scheme_str == "https" {
                     Some("TLS 1.3 (MITM Mock)".into())
                 } else {
@@ -1437,10 +1501,11 @@ async fn handle_intercepted_request(
                 client_addr: client_addr.to_string(),
                 websocket_frames: Vec::new(),
                 sse_events,
+                body_offloaded: resp_offloaded,
+                request_body_offloaded: req_offloaded,
             };
 
-            ctx.store.insert(detail);
-            let _ = ctx.event_tx.send(summary);
+            record_completed_session(&ctx, detail, Some(capped_req), Some(capped_mock));
 
             let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
             let mut resp_builder = Response::builder().status(
@@ -1572,13 +1637,14 @@ async fn handle_intercepted_request(
             client_ip: Some(normalize_client_ip(client_addr)),
         };
 
+        let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
         let initial_detail = SessionDetail {
             summary: initial_summary.clone(),
             request_headers: req_headers,
             response_headers: resp_headers.clone(),
-            request_body_base64: base64::engine::general_purpose::STANDARD.encode(capped_req),
+            request_body_base64: req_b64,
             response_body_base64: String::new(),
-            request_body_text: std::str::from_utf8(capped_req).ok().map(str::to_owned),
+            request_body_text: req_txt,
             response_body_text: Some(String::new()),
             tls_version: if scheme_str == "https" {
                 Some("TLS 1.3 (MITM SSE)".into())
@@ -1588,10 +1654,11 @@ async fn handle_intercepted_request(
             client_addr: client_addr.to_string(),
             websocket_frames: Vec::new(),
             sse_events: Vec::new(),
+            body_offloaded: false,
+            request_body_offloaded: req_offloaded,
         };
 
-        ctx.store.insert(initial_detail);
-        let _ = ctx.event_tx.send(initial_summary);
+        record_completed_session(&ctx, initial_detail, Some(capped_req), None);
 
         let (chunk_tx, chunk_rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(64);
         let sse_ctx = ctx.clone();
@@ -1754,6 +1821,8 @@ async fn handle_intercepted_request(
             client_addr: client_addr.to_string(),
             websocket_frames: Vec::new(),
             sse_events: Vec::new(),
+            body_offloaded: false,
+            request_body_offloaded: false,
         });
         let _ = ctx.event_tx.send(paused_summary);
 
@@ -1883,15 +1952,17 @@ async fn handle_intercepted_request(
 
     let capped_req = &body_bytes[..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
     let capped_resp = &resp_bytes[..resp_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
+    let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
+    let (resp_b64, resp_txt, resp_offloaded) = encode_inline_or_offload(capped_resp);
 
     let detail = SessionDetail {
         summary: summary.clone(),
         request_headers: req_headers,
         response_headers: resp_headers.clone(),
-        request_body_base64: base64::engine::general_purpose::STANDARD.encode(capped_req),
-        response_body_base64: base64::engine::general_purpose::STANDARD.encode(capped_resp),
-        request_body_text: std::str::from_utf8(capped_req).ok().map(str::to_owned),
-        response_body_text: std::str::from_utf8(capped_resp).ok().map(str::to_owned),
+        request_body_base64: req_b64,
+        response_body_base64: resp_b64,
+        request_body_text: req_txt,
+        response_body_text: resp_txt,
         tls_version: if scheme_str == "https" {
             Some("TLS 1.3 (MITM)".into())
         } else {
@@ -1900,10 +1971,11 @@ async fn handle_intercepted_request(
         client_addr: client_addr.to_string(),
         websocket_frames: Vec::new(),
         sse_events,
+        body_offloaded: resp_offloaded,
+        request_body_offloaded: req_offloaded,
     };
 
-    ctx.store.insert(detail);
-    let _ = ctx.event_tx.send(summary);
+    record_completed_session(&ctx, detail, Some(capped_req), Some(capped_resp));
 
     let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
     let mut builder =
@@ -2048,10 +2120,11 @@ async fn handle_websocket_intercept(
                 client_addr: client_addr.to_string(),
                 websocket_frames: Vec::new(),
                 sse_events: Vec::new(),
+                body_offloaded: false,
+                request_body_offloaded: false,
             };
 
-            ctx.store.insert(detail);
-            let _ = ctx.event_tx.send(summary);
+            record_completed_session(&ctx, detail, None, None);
 
             let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
             let mut rej_resp = Response::builder()
@@ -2145,10 +2218,11 @@ async fn handle_websocket_intercept(
         client_addr: client_addr.to_string(),
         websocket_frames: Vec::new(),
         sse_events: Vec::new(),
+        body_offloaded: false,
+        request_body_offloaded: false,
     };
 
-    ctx.store.insert(initial_detail.clone());
-    let _ = ctx.event_tx.send(summary);
+    record_completed_session(&ctx, initial_detail, None, None);
     let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
 
     tokio::spawn(async move {
@@ -2641,6 +2715,8 @@ fn record_and_return_error(
         client_ip: Some(normalize_client_ip(client_addr)),
     };
 
+    let capped_req = &req_body[..req_body.len().min(MAX_CAPTURED_BODY_BYTES)];
+    let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
     let detail = SessionDetail {
         summary: summary.clone(),
         request_headers: req_headers,
@@ -2648,18 +2724,19 @@ fn record_and_return_error(
             name: "Content-Type".into(),
             value: "text/plain; charset=utf-8".into(),
         }],
-        request_body_base64: base64::engine::general_purpose::STANDARD.encode(&req_body),
+        request_body_base64: req_b64,
         response_body_base64: base64::engine::general_purpose::STANDARD.encode(err_msg.as_bytes()),
-        request_body_text: std::str::from_utf8(&req_body).ok().map(str::to_owned),
+        request_body_text: req_txt,
         response_body_text: Some(err_msg.clone()),
         tls_version: None,
         client_addr: client_addr.to_string(),
         websocket_frames: Vec::new(),
         sse_events: Vec::new(),
+        body_offloaded: false,
+        request_body_offloaded: req_offloaded,
     };
 
-    ctx.store.insert(detail);
-    let _ = ctx.event_tx.send(summary);
+    record_completed_session(ctx, detail, Some(capped_req), None);
     plain_response(StatusCode::BAD_GATEWAY, &err_msg)
 }
 
@@ -2975,6 +3052,8 @@ fn handle_builtin_portal_request(
         client_addr: client_addr.to_string(),
         websocket_frames: Vec::new(),
         sse_events: Vec::new(),
+        body_offloaded: false,
+        request_body_offloaded: false,
     };
 
     ctx.store.insert(detail);
@@ -3217,6 +3296,7 @@ mod tests {
             header_mutations: Vec::new(),
             strip_alt_svc: true,
             host_list_sync: Default::default(),
+            ..crate::proxy::filters::default_backend_config()
         });
         let store = Arc::new(TrafficStore::new(tmp_dir.join("test.sqlite")).unwrap());
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
@@ -3701,6 +3781,7 @@ mod tests {
             header_mutations: Vec::new(),
             strip_alt_svc: true,
             host_list_sync: Default::default(),
+            ..crate::proxy::filters::default_backend_config()
         });
 
         let store = Arc::new(TrafficStore::new(tmp_dir.join("targeted.sqlite")).unwrap());
@@ -4127,6 +4208,185 @@ mod tests {
             h2_preserved.headers().get("alternate-protocol").unwrap(),
             "443:quic"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn streaming_capture_drop_skips_store_and_ipc_and_increments_dropped_counter() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp_stream, _)) = upstream_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let svc = service_fn(|req: Request<Incoming>| async move {
+                        let status = if req.uri().path() == "/cached" {
+                            StatusCode::NOT_MODIFIED
+                        } else {
+                            StatusCode::OK
+                        };
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Full::new(Bytes::from_static(b"{\"ok\":true}")))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("fluxproxy-test-capdrop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("capdrop.sqlite")).unwrap());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        // Enable `drop_non_matching_on_capture` + hide 304 Not Modified + path filter `/api/*`
+        let mut cfg = filters.get_config();
+        cfg.drop_non_matching_on_capture = true;
+        cfg.noise_thresholds.hide_304_not_modified = true;
+        cfg.capture_host_list = crate::models::HostListBackendSyncConfig {
+            enabled: true,
+            mode: crate::models::HostListFilterMode::Whitelist,
+            raw_text: "/api/*".into(),
+        };
+        filters.update_config(cfg);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            store: store.clone(),
+            upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            event_tx,
+            active_port: AtomicU16::new(proxy_addr.port()),
+        });
+
+        // Also register an AutoResponder mock for telemetry.microsoft.com to test svchost/telemetry drop
+        ctx.rules.upsert_rule(crate::models::AutoResponderRule {
+            id: "mock-telemetry".into(),
+            enabled: true,
+            name: "Telemetry Mock".into(),
+            match_target: crate::models::RuleMatchTarget::UrlContains,
+            pattern: "telemetry.microsoft.com".into(),
+            method_filter: None,
+            header_name: None,
+            action: RuleActionType::MockResponse,
+            status_code: 200,
+            latency_ms: 0,
+            response_headers: vec![HeaderPair {
+                name: "Content-Type".into(),
+                value: "application/json".into(),
+            }],
+            response_body: "{\"acc\":1}".into(),
+        });
+
+        let proxy_ctx = ctx.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await else {
+                    break;
+                };
+                let c = proxy_ctx.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let inner_c = c.clone();
+                        // Simulate svchost.exe when hitting telemetry.microsoft.com
+                        let proc_info = if req
+                            .uri()
+                            .host()
+                            .unwrap_or("")
+                            .contains("telemetry.microsoft.com")
+                        {
+                            Some(ClientProcessInfo {
+                                pid: 1120,
+                                name: "svchost.exe".into(),
+                            })
+                        } else {
+                            Some(ClientProcessInfo {
+                                pid: 4200,
+                                name: "node.exe".into(),
+                            })
+                        };
+                        async move {
+                            Ok::<_, Infallible>(
+                                handle_outer_proxy_request(req, client_addr, proc_info, inner_c)
+                                    .await,
+                            )
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, service)
+                        .await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap();
+
+        // 1. Non-matching path `/noise` -> client gets 200 OK, but NOT stored in RAM or emitted on IPC
+        let r1 = client
+            .get(format!("http://127.0.0.1:{}/noise", upstream_addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        // 2. 304 Not Modified on `/cached` -> dropped
+        let r2 = client
+            .get(format!("http://127.0.0.1:{}/cached", upstream_addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::NOT_MODIFIED);
+
+        // 3. Background svchost telemetry -> dropped
+        let r3 = client
+            .post("http://telemetry.microsoft.com/OneCollector/1.0/")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r3.status(), StatusCode::OK);
+
+        // 4. Matching `/api/orders` -> stored in RAM AND emitted once over IPC
+        let r4 = client
+            .get(format!(
+                "http://127.0.0.1:{}/api/orders",
+                upstream_addr.port()
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r4.status(), StatusCode::OK);
+
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.dropped_sessions_count(), 3);
+
+        let emitted = event_rx.try_recv().expect("matching session emitted");
+        assert_eq!(emitted.path, "/api/orders");
+        assert!(event_rx.try_recv().is_err(), "no dropped session may be emitted");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

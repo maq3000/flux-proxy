@@ -10,16 +10,20 @@ import type {
   CodecOperation,
   CodecTransformResult,
   ComposedRequest,
+  LoadedSessionBody,
   NetworkInterfaceInfo,
   PausedBreakpointItem,
   ProxyFilterBackendConfig,
   ProxyStatus,
   SessionDetail,
   SessionSummary,
+  StorageStats,
 } from "../types/proxy";
+import { DEFAULT_SESSION_RETENTION_LIMIT } from "../types/proxy";
 import {
   applyHeaderMutationsInPreview,
   DEFAULT_BACKEND_FILTER_CONFIG,
+  evaluateShouldStoreSessionInPreview,
   evaluateTlsConnectInPreview,
 } from "./filterEngine";
 import { encodeTextToBase64 } from "./formatters";
@@ -83,6 +87,14 @@ class BrowserPreviewEngine {
   private nextId = 1;
   private nextBpSeq = 1;
   private store = new Map<number, SessionDetail>();
+  private sessionRetentionLimit: number | null =
+    DEFAULT_SESSION_RETENTION_LIMIT;
+  private droppedSessionsCount = 0;
+  private evictedSqliteBytes = 0;
+  private offloadedBodies = new Map<
+    string,
+    { bodyBase64: string; bodyText: string | null; bodySize: number }
+  >();
   private rules: AutoResponderRule[] = [...DEFAULT_AUTORESPONDER_RULES];
   private filterConfig: ProxyFilterBackendConfig = structuredClone(
     DEFAULT_BACKEND_FILTER_CONFIG
@@ -112,6 +124,28 @@ class BrowserPreviewEngine {
           this.allowRemote = Boolean(JSON.parse(rawRemote));
           this.bindAddr = this.allowRemote ? "0.0.0.0" : "127.0.0.1";
         }
+        const rawLimit = window.localStorage.getItem(
+          "fluxproxy.sessionRetentionLimit.v1"
+        );
+        if (rawLimit !== null) {
+          const parsedLimit = JSON.parse(rawLimit) as number | null;
+          if (
+            parsedLimit === null ||
+            (typeof parsedLimit === "number" &&
+              Number.isInteger(parsedLimit) &&
+              parsedLimit > 0)
+          ) {
+            this.sessionRetentionLimit = parsedLimit;
+          }
+        }
+        const rawDrop = window.localStorage.getItem(
+          "fluxproxy.dropNonMatching.v1"
+        );
+        if (rawDrop !== null) {
+          this.filterConfig.dropNonMatchingOnCapture = Boolean(
+            JSON.parse(rawDrop)
+          );
+        }
       } catch {
         // ignore storage errors in preview
       }
@@ -122,9 +156,65 @@ class BrowserPreviewEngine {
       const detail = this.applyPipelineToDetail(
         buildSimulatedSession(this.nextId++)
       );
-      this.store.set(detail.summary.id, detail);
+      if (evaluateShouldStoreSessionInPreview(detail.summary, this.filterConfig)) {
+        this.insertIntoStoreWithRingBuffer(detail);
+      } else {
+        this.droppedSessionsCount += 1;
+      }
     }
     this.startTicker();
+  }
+
+  private insertIntoStoreWithRingBuffer(rawDetail: SessionDetail): SessionDetail {
+    const threshold = 2 * 1024 * 1024;
+    let detail = rawDetail;
+
+    if (detail.summary.bodySize > threshold && detail.responseBodyBase64) {
+      this.offloadedBodies.set(`${detail.summary.id}:resp`, {
+        bodyBase64: detail.responseBodyBase64,
+        bodyText: detail.responseBodyText ?? null,
+        bodySize: detail.summary.bodySize,
+      });
+      detail = {
+        ...detail,
+        responseBodyBase64: "",
+        responseBodyText: null,
+        bodyOffloaded: true,
+      };
+    }
+
+    this.store.set(detail.summary.id, detail);
+    this.enforceRetentionLimit();
+    return detail;
+  }
+
+  private enforceRetentionLimit() {
+    if (
+      this.sessionRetentionLimit === null ||
+      this.store.size <= this.sessionRetentionLimit
+    ) {
+      return;
+    }
+    const sortedIds = Array.from(this.store.keys()).sort((a, b) => a - b);
+    const excess = sortedIds.length - this.sessionRetentionLimit;
+    for (let i = 0; i < excess; i++) {
+      const evicted = this.store.get(sortedIds[i]);
+      if (evicted) {
+        this.evictedSqliteBytes += Math.max(512, evicted.summary.bodySize);
+        this.store.delete(sortedIds[i]);
+      }
+    }
+  }
+
+  private commitCompletedSession(detail: SessionDetail): SessionDetail {
+    if (!evaluateShouldStoreSessionInPreview(detail.summary, this.filterConfig)) {
+      this.store.delete(detail.summary.id);
+      this.droppedSessionsCount += 1;
+      return detail;
+    }
+    const stored = this.insertIntoStoreWithRingBuffer(detail);
+    this.emitBatch([stored.summary]);
+    return stored;
   }
 
   private shouldBreak(
@@ -443,9 +533,7 @@ class BrowserPreviewEngine {
           responseBodyText: abortedBody,
           responseBodyBase64: encodeTextToBase64(abortedBody),
         };
-        this.store.set(id, abortedDetail);
-        this.emitBatch([abortedDetail.summary]);
-        return abortedDetail;
+        return this.commitCompletedSession(abortedDetail);
       }
 
       if (verdict.method && verdict.method.trim()) {
@@ -531,9 +619,7 @@ class BrowserPreviewEngine {
           responseBodyText: abortedBody,
           responseBodyBase64: encodeTextToBase64(abortedBody),
         };
-        this.store.set(id, abortedDetail);
-        this.emitBatch([abortedDetail.summary]);
-        return abortedDetail;
+        return this.commitCompletedSession(abortedDetail);
       }
 
       if (typeof verdict.statusCode === "number" && verdict.statusCode >= 100) {
@@ -567,9 +653,7 @@ class BrowserPreviewEngine {
 
     detail.summary.breakpointPaused = null;
     detail.summary.breakpointModified = bpModified;
-    this.store.set(id, detail);
-    this.emitBatch([detail.summary]);
-    return detail;
+    return this.commitCompletedSession(detail);
   }
 
   private findMatchingRule(
@@ -849,7 +933,7 @@ class BrowserPreviewEngine {
           const parsed = JSON.parse(raw) as SessionDetail[];
           if (Array.isArray(parsed) && parsed.length > 0) {
             for (const detail of parsed) {
-              this.store.set(detail.summary.id, detail);
+              this.insertIntoStoreWithRingBuffer(detail);
               if (detail.summary.id >= this.nextId) {
                 this.nextId = detail.summary.id + 1;
               }
@@ -865,16 +949,92 @@ class BrowserPreviewEngine {
 
   clear() {
     this.store.clear();
+    this.offloadedBodies.clear();
+    this.droppedSessionsCount = 0;
   }
 
   deleteMany(ids: number[]): number {
     let removed = 0;
     for (const id of ids) {
       if (this.store.delete(id)) {
+        this.offloadedBodies.delete(`${id}:req`);
+        this.offloadedBodies.delete(`${id}:resp`);
         removed += 1;
       }
     }
     return removed;
+  }
+
+  setSessionRetentionLimit(limit: number | null) {
+    if (limit !== null && (!Number.isInteger(limit) || limit <= 0)) {
+      throw new Error("Session retention limit must be greater than 0");
+    }
+    this.sessionRetentionLimit = limit;
+    this.enforceRetentionLimit();
+  }
+
+  setDropNonMatching(enabled: boolean) {
+    this.filterConfig = {
+      ...this.filterConfig,
+      dropNonMatchingOnCapture: enabled,
+    };
+  }
+
+  getMemoryStorageStats(): StorageStats {
+    let persistedBytes = this.evictedSqliteBytes;
+    if (typeof window !== "undefined") {
+      try {
+        const raw = window.localStorage.getItem(
+          "fluxproxy.sqliteArchivePreview.v1"
+        );
+        if (raw) persistedBytes += raw.length;
+      } catch {
+        // ignore
+      }
+    }
+    for (const item of this.offloadedBodies.values()) {
+      persistedBytes += item.bodySize;
+    }
+    return {
+      ramSessions: this.store.size,
+      sqliteSizeBytes: persistedBytes,
+      droppedSessionsCount: this.droppedSessionsCount,
+      sessionRetentionLimit: this.sessionRetentionLimit,
+      dropNonMatching: Boolean(this.filterConfig.dropNonMatchingOnCapture),
+    };
+  }
+
+  loadSessionBody(id: number, isResponse: boolean): LoadedSessionBody {
+    const key = `${id}:${isResponse ? "resp" : "req"}`;
+    const offloaded = this.offloadedBodies.get(key);
+    if (offloaded) {
+      return {
+        id,
+        isResponse,
+        bodyBase64: offloaded.bodyBase64,
+        bodyText: offloaded.bodyText,
+        bodySize: offloaded.bodySize,
+      };
+    }
+    const existing = this.store.get(id);
+    if (!existing) {
+      throw new Error(`Session #${id} body not found`);
+    }
+    const bodyBase64 = isResponse
+      ? existing.responseBodyBase64
+      : existing.requestBodyBase64;
+    const bodyText = isResponse
+      ? existing.responseBodyText ?? null
+      : existing.requestBodyText ?? null;
+    return {
+      id,
+      isResponse,
+      bodyBase64,
+      bodyText,
+      bodySize: isResponse
+        ? existing.summary.bodySize
+        : existing.requestBodyText?.length ?? 0,
+    };
   }
 
   generateBulkStressSessions(count: number): SessionSummary[] {
@@ -883,11 +1043,23 @@ class BrowserPreviewEngine {
       const detail = this.applyPipelineToDetail(
         buildSimulatedSession(this.nextId++)
       );
-      this.store.set(detail.summary.id, detail);
-      batch.push(detail.summary);
+      if (
+        !evaluateShouldStoreSessionInPreview(detail.summary, this.filterConfig)
+      ) {
+        this.droppedSessionsCount += 1;
+        continue;
+      }
+      const stored = this.insertIntoStoreWithRingBuffer(detail);
+      batch.push(stored.summary);
     }
-    this.emitBatch(batch);
-    return batch;
+    const cappedBatch =
+      this.sessionRetentionLimit && batch.length > this.sessionRetentionLimit
+        ? batch.slice(batch.length - this.sessionRetentionLimit)
+        : batch;
+    if (cappedBatch.length > 0) {
+      this.emitBatch(cappedBatch);
+    }
+    return cappedBatch;
   }
 
   listRules(): AutoResponderRule[] {
@@ -1265,9 +1437,9 @@ class BrowserPreviewEngine {
       }
     }
 
-    this.store.set(id, finalDetail);
-    this.emitBatch([finalDetail.summary]);
-    return finalDetail;
+    const storedFinal = this.insertIntoStoreWithRingBuffer(finalDetail);
+    this.emitBatch([storedFinal.summary]);
+    return storedFinal;
   }
 }
 
@@ -1355,6 +1527,42 @@ export const proxyBridge = {
       return invoke<SessionDetail | null>("get_session_detail", { id });
     }
     return previewEngine.getDetail(id);
+  },
+
+  async setSessionRetentionLimit(limit: number | null): Promise<void> {
+    if (isTauriRuntime()) {
+      await invoke("set_session_retention_limit", { limit });
+      return;
+    }
+    previewEngine.setSessionRetentionLimit(limit);
+  },
+
+  async setDropNonMatching(enabled: boolean): Promise<void> {
+    if (isTauriRuntime()) {
+      await invoke("set_drop_non_matching", { enabled });
+      return;
+    }
+    previewEngine.setDropNonMatching(enabled);
+  },
+
+  async getMemoryStorageStats(): Promise<StorageStats> {
+    if (isTauriRuntime()) {
+      return invoke<StorageStats>("get_memory_storage_stats");
+    }
+    return previewEngine.getMemoryStorageStats();
+  },
+
+  async loadSessionBody(
+    id: number,
+    isResponse: boolean
+  ): Promise<LoadedSessionBody> {
+    if (isTauriRuntime()) {
+      return invoke<LoadedSessionBody>("load_session_body", {
+        id,
+        isResponse,
+      });
+    }
+    return previewEngine.loadSessionBody(id, isResponse);
   },
 
   async clearSessions(): Promise<void> {

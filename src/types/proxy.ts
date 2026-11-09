@@ -62,7 +62,31 @@ export interface SessionDetail {
   clientAddr: string;
   websocketFrames: WebSocketFrameRecord[];
   sseEvents?: SseEventRecord[];
+  bodyOffloaded?: boolean;
+  requestBodyOffloaded?: boolean;
 }
+
+export interface StorageStats {
+  ramSessions: number;
+  sqliteSizeBytes: number;
+  droppedSessionsCount: number;
+  sessionRetentionLimit: number | null;
+  dropNonMatching: boolean;
+}
+
+export interface LoadedSessionBody {
+  id: number;
+  isResponse: boolean;
+  bodyBase64: string;
+  bodyText?: string | null;
+  bodySize: number;
+}
+
+export const SESSION_RETENTION_PRESETS = [
+  100, 250, 500, 1000, 2500, 5000, 10000,
+] as const;
+
+export const DEFAULT_SESSION_RETENTION_LIMIT = 10_000;
 
 export type RuleMatchTarget = "urlContains" | "urlRegex" | "headerMatch";
 export type RuleActionType = "mockResponse" | "overrideStatus" | "delayOnly";
@@ -178,6 +202,17 @@ export interface HostListBackendSyncConfig {
   rawText: string;
 }
 
+export interface NoiseThresholdsBackendSyncConfig {
+  hide304NotModified: boolean;
+  hideOptionsPreflight: boolean;
+  hideConnectTunnels: boolean;
+  hideStaticAssets: boolean;
+  minBodySizeBytes: number | null;
+  maxBodySizeBytes: number | null;
+  timeHeatWarningMs: number;
+  onlySlowRequests: boolean;
+}
+
 export interface ProxyFilterBackendConfig {
   tlsInterceptMode: TlsInterceptMode;
   tlsBypassEnabled: boolean;
@@ -187,6 +222,14 @@ export interface ProxyFilterBackendConfig {
   headerMutations: HeaderMutationRule[];
   stripAltSvc: boolean;
   hostListSync?: HostListBackendSyncConfig;
+  dropNonMatchingOnCapture?: boolean;
+  captureHostList?: HostListBackendSyncConfig;
+  noiseThresholds?: NoiseThresholdsBackendSyncConfig;
+  captureMatrixEnabled?: boolean;
+  captureFilterRules?: FilterConditionRule[];
+  quickCategory?: string | null;
+  filterQuery?: string | null;
+  useRegexQuery?: boolean | null;
 }
 
 export interface FilterPreset {

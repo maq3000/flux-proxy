@@ -87,6 +87,10 @@ pub struct SessionDetail {
     pub websocket_frames: Vec<WebSocketFrameRecord>,
     #[serde(default)]
     pub sse_events: Vec<SseEventRecord>,
+    #[serde(default)]
+    pub body_offloaded: bool,
+    #[serde(default)]
+    pub request_body_offloaded: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +198,41 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NoiseThresholdsBackendConfig {
+    #[serde(default, rename = "hide304NotModified")]
+    pub hide_304_not_modified: bool,
+    #[serde(default)]
+    pub hide_options_preflight: bool,
+    #[serde(default)]
+    pub hide_connect_tunnels: bool,
+    #[serde(default)]
+    pub hide_static_assets: bool,
+    #[serde(default)]
+    pub min_body_size_bytes: Option<usize>,
+    #[serde(default)]
+    pub max_body_size_bytes: Option<usize>,
+    #[serde(default)]
+    pub time_heat_warning_ms: u64,
+    #[serde(default)]
+    pub only_slow_requests: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureFilterRule {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub action: String, // "include" | "exclude"
+    #[serde(default)]
+    pub logical_op: String, // "AND" | "OR"
+    pub field: String,
+    pub operator: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyFilterBackendConfig {
@@ -209,6 +248,42 @@ pub struct ProxyFilterBackendConfig {
     pub strip_alt_svc: bool,
     #[serde(default)]
     pub host_list_sync: HostListBackendSyncConfig,
+    #[serde(default)]
+    pub drop_non_matching_on_capture: bool,
+    #[serde(default)]
+    pub capture_host_list: HostListBackendSyncConfig,
+    #[serde(default)]
+    pub noise_thresholds: NoiseThresholdsBackendConfig,
+    #[serde(default)]
+    pub capture_matrix_enabled: bool,
+    #[serde(default)]
+    pub capture_filter_rules: Vec<CaptureFilterRule>,
+    #[serde(default)]
+    pub quick_category: Option<String>,
+    #[serde(default)]
+    pub filter_query: Option<String>,
+    #[serde(default)]
+    pub use_regex_query: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageStats {
+    pub ram_sessions: usize,
+    pub sqlite_size_bytes: u64,
+    pub dropped_sessions_count: u64,
+    pub session_retention_limit: Option<usize>,
+    pub drop_non_matching: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadedSessionBody {
+    pub id: u64,
+    pub is_response: bool,
+    pub body_base64: String,
+    pub body_text: Option<String>,
+    pub body_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

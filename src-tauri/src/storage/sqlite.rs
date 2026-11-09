@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::{ProxyError, SessionDetail};
 
@@ -13,7 +13,9 @@ pub struct SqliteArchive {
 impl SqliteArchive {
     pub fn open(path: &Path) -> Result<Self, ProxyError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(
@@ -31,7 +33,13 @@ impl SqliteArchive {
                  payload_json TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_sessions_url ON captured_sessions(url);
-             CREATE INDEX IF NOT EXISTS idx_sessions_status ON captured_sessions(status);",
+             CREATE INDEX IF NOT EXISTS idx_sessions_status ON captured_sessions(status);
+             CREATE TABLE IF NOT EXISTS offloaded_bodies (
+                 session_id INTEGER NOT NULL,
+                 is_response INTEGER NOT NULL,
+                 body_bytes BLOB NOT NULL,
+                 PRIMARY KEY (session_id, is_response)
+             );",
         )?;
 
         Self::ensure_annotation_columns(&conn)?;
@@ -130,9 +138,13 @@ impl SqliteArchive {
 
         let mut stmt = guard.prepare(
             "SELECT payload_json, comment, marked_color
-             FROM captured_sessions
-             ORDER BY id ASC
-             LIMIT ?1",
+             FROM (
+                 SELECT id, payload_json, comment, marked_color
+                 FROM captured_sessions
+                 ORDER BY id DESC
+                 LIMIT ?1
+             )
+             ORDER BY id ASC",
         )?;
 
         let rows = stmt.query_map(params![limit as i64], |row| {
@@ -171,6 +183,121 @@ impl SqliteArchive {
         Ok(out)
     }
 
+    pub fn load_session_by_id(&self, id: u64) -> Result<Option<SessionDetail>, ProxyError> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| ProxyError::Custom("SQLite mutex poisoned".into()))?;
+
+        let row: Option<(String, Option<String>, Option<String>)> = guard
+            .query_row(
+                "SELECT payload_json, comment, marked_color
+                 FROM captured_sessions
+                 WHERE id = ?1",
+                params![id as i64],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+
+        let Some((raw, col_comment, col_color)) = row else {
+            return Ok(None);
+        };
+
+        let mut detail = serde_json::from_str::<SessionDetail>(&raw)
+            .map_err(|e| ProxyError::Custom(format!("JSON deserialize failed: {e}")))?;
+        if col_comment.is_some() {
+            detail.summary.comment = col_comment;
+        }
+        if col_color.is_some() {
+            detail.summary.marked_color = col_color;
+        }
+        Ok(Some(detail))
+    }
+
+    pub fn save_offloaded_body(
+        &self,
+        session_id: u64,
+        is_response: bool,
+        bytes: &[u8],
+    ) -> Result<(), ProxyError> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| ProxyError::Custom("SQLite mutex poisoned".into()))?;
+
+        guard.execute(
+            "INSERT OR REPLACE INTO offloaded_bodies (session_id, is_response, body_bytes)
+             VALUES (?1, ?2, ?3)",
+            params![session_id as i64, if is_response { 1i64 } else { 0i64 }, bytes],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_offloaded_body(
+        &self,
+        session_id: u64,
+        is_response: bool,
+    ) -> Result<Option<Vec<u8>>, ProxyError> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| ProxyError::Custom("SQLite mutex poisoned".into()))?;
+
+        let bytes = guard
+            .query_row(
+                "SELECT body_bytes
+                 FROM offloaded_bodies
+                 WHERE session_id = ?1 AND is_response = ?2",
+                params![session_id as i64, if is_response { 1i64 } else { 0i64 }],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+
+        Ok(bytes)
+    }
+
+    pub fn delete_unarchived_offloaded_bodies(&self) -> Result<usize, ProxyError> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| ProxyError::Custom("SQLite mutex poisoned".into()))?;
+
+        let removed = guard.execute(
+            "DELETE FROM offloaded_bodies
+             WHERE session_id NOT IN (SELECT id FROM captured_sessions)",
+            [],
+        )?;
+        Ok(removed)
+    }
+
+    pub fn database_size_bytes(&self, db_path: &Path) -> u64 {
+        let mut total = 0u64;
+        if let Ok(meta) = std::fs::metadata(db_path) {
+            total = total.saturating_add(meta.len());
+        }
+        let base = db_path.as_os_str();
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = base.to_os_string();
+            sidecar.push(suffix);
+            if let Ok(meta) = std::fs::metadata(&sidecar) {
+                total = total.saturating_add(meta.len());
+            }
+        }
+        if total > 0 {
+            return total;
+        }
+        if let Ok(guard) = self.conn.lock() {
+            let page_count: i64 = guard
+                .query_row("PRAGMA page_count", [], |r| r.get(0))
+                .unwrap_or(0);
+            let page_size: i64 = guard
+                .query_row("PRAGMA page_size", [], |r| r.get(0))
+                .unwrap_or(4096);
+            return (page_count.max(0) as u64).saturating_mul(page_size.max(0) as u64);
+        }
+        0
+    }
+
     pub fn delete_many(&self, ids: &[u64]) -> Result<usize, ProxyError> {
         if ids.is_empty() {
             return Ok(0);
@@ -184,8 +311,11 @@ impl SqliteArchive {
         {
             let mut stmt =
                 tx.prepare_cached("DELETE FROM captured_sessions WHERE id = ?1")?;
+            let mut body_stmt =
+                tx.prepare_cached("DELETE FROM offloaded_bodies WHERE session_id = ?1")?;
             for &id in ids {
                 removed += stmt.execute(params![id as i64])?;
+                let _ = body_stmt.execute(params![id as i64])?;
             }
         }
         tx.commit()?;
@@ -242,6 +372,8 @@ mod tests {
             client_addr: "127.0.0.1:54000".into(),
             websocket_frames: Vec::new(),
             sse_events: Vec::new(),
+            body_offloaded: false,
+            request_body_offloaded: false,
         }
     }
 

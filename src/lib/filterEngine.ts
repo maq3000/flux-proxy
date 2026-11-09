@@ -312,6 +312,27 @@ export const DEFAULT_BACKEND_FILTER_CONFIG: ProxyFilterBackendConfig = {
     mode: "whitelist",
     rawText: "",
   },
+  dropNonMatchingOnCapture: false,
+  captureHostList: {
+    enabled: false,
+    mode: "whitelist",
+    rawText: "",
+  },
+  noiseThresholds: {
+    hide304NotModified: false,
+    hideOptionsPreflight: false,
+    hideConnectTunnels: false,
+    hideStaticAssets: false,
+    minBodySizeBytes: null,
+    maxBodySizeBytes: null,
+    timeHeatWarningMs: 500,
+    onlySlowRequests: false,
+  },
+  captureMatrixEnabled: true,
+  captureFilterRules: [],
+  quickCategory: "all",
+  filterQuery: "",
+  useRegexQuery: false,
 };
 
 export const TLS_BYPASS_QUICK_PACKS: {
@@ -1836,4 +1857,211 @@ export function applyHeaderMutationsInPreview(
   }
 
   return { headers: next, mutated };
+}
+
+const OS_BACKGROUND_NOISE_PROCS = new Set([
+  "svchost",
+  "searchhost",
+  "compattelrunner",
+  "widgets",
+  "wuauclt",
+  "usoclient",
+  "trustedinstaller",
+  "mdnsresponder",
+  "apsd",
+]);
+
+const OS_BACKGROUND_NOISE_DOMAINS = [
+  "telemetry.microsoft.com",
+  "vortex.data.microsoft.com",
+  "watson.telemetry.microsoft.com",
+  "settings-win.data.microsoft.com",
+  "oca.microsoft.com",
+  "sqm.microsoft.com",
+  "msftconnecttest.com",
+  "msftncsi.com",
+  "windowsupdate.com",
+  "delivery.mp.microsoft.com",
+];
+
+export function isBackgroundOsNoiseSession(summary: SessionSummary): boolean {
+  if (summary.processName) {
+    const base = summary.processName
+      .trim()
+      .replace(/\.exe$/i, "")
+      .toLowerCase();
+    if (OS_BACKGROUND_NOISE_PROCS.has(base)) {
+      return true;
+    }
+  }
+
+  const hostClean = summary.host
+    .split(":")[0]
+    .trim()
+    .replace(/^\[|\]$/g, "")
+    .toLowerCase();
+
+  for (const dom of OS_BACKGROUND_NOISE_DOMAINS) {
+    if (hostClean === dom || hostClean.endsWith(`.${dom}`)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+export function evaluateShouldStoreSessionInPreview(
+  summary: SessionSummary,
+  config: ProxyFilterBackendConfig
+): boolean {
+  if (!config.dropNonMatchingOnCapture) {
+    return true;
+  }
+
+  const hostClean = summary.host
+    .split(":")[0]
+    .trim()
+    .replace(/^\[|\]$/g, "")
+    .toLowerCase();
+
+  if (
+    hostClean === "flux.proxy" ||
+    hostClean === "cert.flux.proxy" ||
+    hostClean === "fluxproxy.local"
+  ) {
+    return true;
+  }
+
+  const th: NoiseThresholdsConfig = {
+    ...DEFAULT_NOISE_THRESHOLDS,
+    ...(config.noiseThresholds ?? {}),
+  };
+
+  if (th.hide304NotModified && summary.status === 304) return false;
+  if (th.hideOptionsPreflight && summary.method.toUpperCase() === "OPTIONS") {
+    return false;
+  }
+  if (
+    th.hideConnectTunnels &&
+    (summary.method.toUpperCase() === "CONNECT" || summary.tlsBypassed)
+  ) {
+    return false;
+  }
+  if (th.minBodySizeBytes !== null && summary.bodySize < th.minBodySizeBytes) {
+    return false;
+  }
+  if (th.maxBodySizeBytes !== null && summary.bodySize > th.maxBodySizeBytes) {
+    return false;
+  }
+  if (th.onlySlowRequests && summary.durationMs < th.timeHeatWarningMs) {
+    return false;
+  }
+  if (th.hideStaticAssets) {
+    const ct = summary.contentType.toLowerCase();
+    if (
+      ct.startsWith("image/") ||
+      ct.startsWith("font/") ||
+      ct.includes("text/css") ||
+      STATIC_ASSET_EXT_RE.test(summary.path)
+    ) {
+      return false;
+    }
+  }
+
+  let explicitlyWhitelisted = false;
+  const activeHlCfg = config.captureHostList?.enabled
+    ? config.captureHostList
+    : config.hostListSync;
+  if (activeHlCfg?.enabled) {
+    const compiledHl = compileHostListFilter(activeHlCfg);
+    if (compiledHl.activeCount > 0) {
+      const matched = matchesCompiledHostList(summary, compiledHl);
+      if (compiledHl.mode === "whitelist") {
+        if (!matched) return false;
+        explicitlyWhitelisted = true;
+      } else if (matched) {
+        return false;
+      }
+    }
+  }
+
+  const cat = (config.quickCategory ?? "all").trim().toLowerCase();
+  if (cat && cat !== "all") {
+    const ct = summary.contentType.toLowerCase();
+    const isWs =
+      summary.status === 101 ||
+      summary.scheme === "ws" ||
+      summary.scheme === "wss" ||
+      summary.protocol.includes("WS") ||
+      ct.includes("websocket");
+    const isErr = summary.status >= 400 || Boolean(summary.error);
+    let catOk = true;
+    if (cat === "json") {
+      catOk =
+        !isErr &&
+        !isWs &&
+        !ct.includes("text/event-stream") &&
+        !ct.startsWith("image/") &&
+        (ct.includes("json") ||
+          ct.includes("graphql") ||
+          ct.includes("grpc") ||
+          ct.includes("protobuf") ||
+          summary.path.startsWith("/api/") ||
+          summary.path.startsWith("/v1/"));
+    } else if (cat === "images") {
+      catOk = !isErr && !isWs && ct.startsWith("image/");
+    } else if (cat === "sse") {
+      catOk = !isErr && !isWs && ct.includes("text/event-stream");
+    } else if (cat === "ws") {
+      catOk = !isErr && isWs;
+    } else if (cat === "errors") {
+      catOk = isErr;
+    } else if (cat === "mocked") {
+      catOk = Boolean(summary.isMocked || summary.breakpointModified);
+    } else if (cat === "marked") {
+      catOk = Boolean(summary.comment || summary.markedColor);
+    }
+    if (!catOk) return false;
+  }
+
+  const q = (config.filterQuery ?? "").trim();
+  if (q) {
+    const haystack = `${summary.url} ${summary.method} ${summary.status} ${summary.contentType} ${summary.processName ?? ""} ${summary.clientIp ?? ""} ${summary.comment ?? ""}`;
+    if (config.useRegexQuery) {
+      try {
+        if (!new RegExp(q, "i").test(haystack)) return false;
+      } catch {
+        // invalid regex falls back to non-drop just like Rust
+      }
+    } else if (!haystack.toLowerCase().includes(q.toLowerCase())) {
+      return false;
+    }
+  }
+
+  let explicitlyIncluded = false;
+  if (config.captureMatrixEnabled !== false && config.captureFilterRules?.length) {
+    const compiledMat = compileFilterMatrix(config.captureFilterRules);
+    if (
+      compiledMat.excludeGroups.length > 0 &&
+      evalDnfGroups(summary, compiledMat.excludeGroups)
+    ) {
+      return false;
+    }
+    if (compiledMat.includeGroups.length > 0) {
+      if (!evalDnfGroups(summary, compiledMat.includeGroups)) {
+        return false;
+      }
+      explicitlyIncluded = true;
+    }
+  }
+
+  if (
+    !explicitlyWhitelisted &&
+    !explicitlyIncluded &&
+    isBackgroundOsNoiseSession(summary)
+  ) {
+    return false;
+  }
+
+  return true;
 }

@@ -639,3 +639,14 @@ dialog.drawer-dialog::backdrop {
   min-block-size: 11lh;
   max-block-size: 24lh;
 }
+
+/* Post-interaction validation state for inline custom session retention input */
+.retention-custom-input:user-invalid,
+.retention-custom-input.user-invalid-fallback {
+  border-color: var(--status-5xx-fg);
+  background-color: var(--status-5xx-bg);
+}
+
+.retention-custom-input:user-valid {
+  border-color: var(--status-2xx-fg);
+}

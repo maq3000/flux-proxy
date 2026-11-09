@@ -108,6 +108,10 @@ pub fn run() {
             commands::resolve_breakpoint,
             commands::resume_all_breakpoints,
             commands::codec_transform,
+            commands::set_session_retention_limit,
+            commands::set_drop_non_matching,
+            commands::get_memory_storage_stats,
+            commands::load_session_body,
         ])
         .build(tauri::generate_context!())
         .expect("error while building FluxProxy Tauri application");
