@@ -2,6 +2,8 @@
 
 <div align="center">
 
+[![Latest Release](https://img.shields.io/github/v/release/maq3000/flux-proxy?color=blue&logo=github)](https://github.com/maq3000/flux-proxy/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/maq3000/flux-proxy/total?color=success&logo=github)](https://github.com/maq3000/flux-proxy/releases)
 [![Tauri v2](https://img.shields.io/badge/Tauri-v2.2-blue?logo=tauri&logoColor=white)](https://tauri.app/)
 [![Rust](https://img.shields.io/badge/Rust-2021_%281.80%2B%29-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![React 18](https://img.shields.io/badge/React-18.3-61dafb?logo=react&logoColor=black)](https://react.dev/)
@@ -13,6 +15,8 @@
 
 Мгновенный запуск, умный контроль памяти, аппаратное ускорение интерфейса и стабильные 60 FPS при работе с десятками тысяч перехваченных запросов.
 
+> 📥 **Скачать готовую сборку для Windows:** [**FluxProxy Setup v0.1.0 (.exe)**](https://github.com/maq3000/flux-proxy/releases/download/v0.1.0/FluxProxy_0.1.0_x64-setup.exe) или [**MSI-пакет (.msi)**](https://github.com/maq3000/flux-proxy/releases/download/v0.1.0/FluxProxy_0.1.0_x64_en-US.msi). Подробнее см. раздел [Скачать готовые сборки](#-скачать-готовые-сборки-releases).
+>
 > 📖 **Ищете понятную инструкцию по работе с программой?** Откройте [**Руководство пользователя (USER_GUIDE.md)**](USER_GUIDE.md) — пошаговое описание всех возможностей простым языком: от первого запуска и настройки телефона до подмены ответов и сравнения запросов.
 >
 > 🗺️ **План развития проекта и спецификации задач:** См. [**Дорожную карту проекта (ROADMAP.md)**](ROADMAP.md).
@@ -23,6 +27,7 @@
 
 ## 📋 Оглавление
 
+- [📥 Скачать готовые сборки (Releases)](#-скачать-готовые-сборки-releases)
 - [📖 Руководство пользователя (USER_GUIDE.md)](USER_GUIDE.md)
 - [🗺️ Дорожная карта проекта (ROADMAP.md)](ROADMAP.md)
 - [Особенности и возможности](#-особенности-и-возможности)
@@ -38,6 +43,20 @@
 - [Интеграция с CLI инструментами](#-интеграция-с-cli-инструментами)
 - [Дорожная карта (Roadmap)](#-дорожная-карта-roadmap)
 - [Разработка и Contributing](#-разработка-и-contributing)
+
+---
+
+## 📥 Скачать готовые сборки (Releases)
+
+Для запуска FluxProxy на **Windows** вам не требуется компилировать проект из исходных кодов — вы можете скачать готовые официальные установщики из [**GitHub Releases v0.1.0**](https://github.com/maq3000/flux-proxy/releases/tag/v0.1.0):
+
+| Дистрибутив | Версия | Архитектура | Описание | Ссылка на загрузку | Контрольная сумма (SHA-256) |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Windows Setup (`.exe`)** | `v0.1.0` | x64 | **Рекомендуемый** автономный инсталлятор (NSIS). Автоматическое создание ярлыков на рабочем столе и в меню «Пуск», встроенный деинсталлятор. | [📥 **FluxProxy_0.1.0_x64-setup.exe** (8.7 МБ)](https://github.com/maq3000/flux-proxy/releases/download/v0.1.0/FluxProxy_0.1.0_x64-setup.exe) | `30a5007463dc907c12bb922d367134196a3b3e51312fba434fae8d9888d740ad` |
+| **Windows Package (`.msi`)** | `v0.1.0` | x64 | Пакет Windows Installer (MSI). Оптимизирован для тихой установки (`msiexec /i ... /qn`) и автоматизированного развертывания через Active Directory (GPO). | [📥 **FluxProxy_0.1.0_x64_en-US.msi** (11.1 МБ)](https://github.com/maq3000/flux-proxy/releases/download/v0.1.0/FluxProxy_0.1.0_x64_en-US.msi) | `6b9ebc389da5f60737756aefad9762aaeca0bdc51e9f3f59811a366cb3ea8a5e` |
+
+> 📦 **Все релизы проекта:** [github.com/maq3000/flux-proxy/releases](https://github.com/maq3000/flux-proxy/releases)  
+> 🐧 🍏 **macOS и Linux:** На текущем этапе сборка выполняется из исходного кода с помощью команды `npx @tauri-apps/cli build` (см. раздел [Быстрый старт](#-быстрый-старт)). Готовые дистрибутивы `.dmg` и `.AppImage` будут доступны в следующих релизах.
 
 ---
 
