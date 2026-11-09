@@ -891,6 +891,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   height="100%"
                   language="http"
                   theme={monacoTheme}
+                  loading={<EditorLoadingIndicator />}
                   value={buildRawHttpRequest(effectiveDetail)}
                   options={{
                     readOnly: true,
@@ -914,6 +915,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   height="100%"
                   language="json"
                   theme={monacoTheme}
+                  loading={<EditorLoadingIndicator />}
                   value={
                     tryFormatJson(effectiveDetail.requestBodyText).formatted ||
                     "// Empty or non-JSON request body"
@@ -940,6 +942,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   height="100%"
                   language="xml"
                   theme={monacoTheme}
+                  loading={<EditorLoadingIndicator />}
                   value={
                     effectiveDetail.requestBodyText ||
                     "<!-- Empty request body -->"
@@ -1125,6 +1128,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   height="100%"
                   language="http"
                   theme={monacoTheme}
+                  loading={<EditorLoadingIndicator />}
                   value={buildRawHttpResponse(effectiveDetail)}
                   options={{
                     readOnly: true,
@@ -1149,6 +1153,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   height="100%"
                   language="json"
                   theme={monacoTheme}
+                  loading={<EditorLoadingIndicator />}
                   value={
                     tryFormatJson(effectiveDetail.responseBodyText).formatted ||
                     "// Empty response payload"
@@ -1176,6 +1181,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   height="100%"
                   language="xml"
                   theme={monacoTheme}
+                  loading={<EditorLoadingIndicator />}
                   value={
                     effectiveDetail.responseBodyText ||
                     "<!-- Empty response payload -->"
@@ -1236,6 +1242,13 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
     </div>
   );
 };
+
+const EditorLoadingIndicator: React.FC = () => (
+  <div className="flex h-full w-full items-center justify-center gap-2 text-xs text-muted">
+    <Loader2 className="h-4 w-4 animate-spin text-accent" />
+    <span>Загрузка редактора...</span>
+  </div>
+);
 
 const OffloadedBodyNotice: React.FC<{
   kind: "request" | "response";

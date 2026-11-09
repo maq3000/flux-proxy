@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@monaco-editor/react": "^4.6.0",
+    "monaco-editor": "^0.57.0",
     "@tanstack/react-virtual": "^3.11.2",
     "@tauri-apps/api": "^2.2.0",
     "clsx": "^2.1.1",

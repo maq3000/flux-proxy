@@ -127,25 +127,60 @@ export function parseCookies(
   return result;
 }
 
+function resolveRawBodyString(
+  text: string | null | undefined,
+  base64: string | null | undefined,
+  kind: "request" | "response"
+): string {
+  if (text !== null && text !== undefined && text.length > 0) {
+    return text;
+  }
+  if (!base64) {
+    return "";
+  }
+  const bytes = decodeBase64ToBytes(base64);
+  if (bytes.length === 0) {
+    return "";
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    const hint = kind === "response" ? "Hex / Image" : "Hex";
+    return `[Binary payload (${formatBytes(bytes.length)}) — view in ${hint} tab]`;
+  }
+}
+
 export function buildRawHttpRequest(detail: SessionDetail): string {
-  const { summary, requestHeaders, requestBodyText } = detail;
+  const { summary, requestHeaders, requestBodyText, requestBodyBase64 } = detail;
   const httpVer = summary.protocol.includes("2") ? "HTTP/2" : "HTTP/1.1";
+  const hasHostHeader = requestHeaders.some(
+    (h) => h.name.toLowerCase() === "host"
+  );
+  const hostLine =
+    hasHostHeader || !summary.host ? "" : `Host: ${summary.host}\r\n`;
   const headerLines = requestHeaders
     .map((h) => `${h.name}: ${h.value}`)
     .join("\r\n");
-  const body = requestBodyText ?? "";
-  return `${summary.method} ${summary.path || "/"} ${httpVer}\r\nHost: ${summary.host}\r\n${headerLines}\r\n\r\n${body}`;
+  const headersBlock = headerLines ? `${headerLines}\r\n` : "";
+  const body = resolveRawBodyString(requestBodyText, requestBodyBase64, "request");
+  return `${summary.method} ${summary.path || "/"} ${httpVer}\r\n${hostLine}${headersBlock}\r\n${body}`;
 }
 
 export function buildRawHttpResponse(detail: SessionDetail): string {
-  const { summary, responseHeaders, responseBodyText } = detail;
+  const { summary, responseHeaders, responseBodyText, responseBodyBase64 } =
+    detail;
   const httpVer = summary.protocol.includes("2") ? "HTTP/2" : "HTTP/1.1";
   const statusText = statusReasonPhrase(summary.status);
   const headerLines = responseHeaders
     .map((h) => `${h.name}: ${h.value}`)
     .join("\r\n");
-  const body = responseBodyText ?? "";
-  return `${httpVer} ${summary.status} ${statusText}\r\n${headerLines}\r\n\r\n${body}`;
+  const headersBlock = headerLines ? `${headerLines}\r\n` : "";
+  const body = resolveRawBodyString(
+    responseBodyText,
+    responseBodyBase64,
+    "response"
+  );
+  return `${httpVer} ${summary.status} ${statusText}\r\n${headersBlock}\r\n${body}`;
 }
 
 export function buildHeadersBlock(
