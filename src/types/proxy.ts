@@ -185,6 +185,7 @@ export interface ProxyFilterBackendConfig {
   tlsTargetRules: TlsBypassRule[];
   headerMutationsEnabled: boolean;
   headerMutations: HeaderMutationRule[];
+  stripAltSvc: boolean;
   hostListSync?: HostListBackendSyncConfig;
 }
 
@@ -227,6 +228,7 @@ export interface CaCertificateInfo {
   sha256Fingerprint: string;
   subject: string;
   validUntil: string;
+  isTrusted?: boolean;
 }
 
 export interface NetworkInterfaceInfo {

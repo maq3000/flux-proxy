@@ -169,6 +169,7 @@ export function useProxySessions() {
         tlsTargetRules: Array.isArray(saved.tlsTargetRules)
           ? saved.tlsTargetRules
           : [],
+        stripAltSvc: saved.stripAltSvc ?? true,
         hostListSync: buildHostListSyncPayload(
           bootHostList,
           bootCompiled.activeCount

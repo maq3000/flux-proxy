@@ -1272,6 +1272,7 @@ class BrowserPreviewEngine {
 }
 
 const previewEngine = new BrowserPreviewEngine();
+let previewCaTrusted = false;
 
 // ============================================================================
 // Unified Tauri IPC API Bridge
@@ -1417,6 +1418,7 @@ export const proxyBridge = {
       subject:
         "CN=FluxProxy Local Debugging Root CA, O=FluxProxy Web Debugger",
       validUntil: "2036-10-30 (ECDSA P-256 Root CA)",
+      isTrusted: previewCaTrusted,
     };
   },
 
@@ -1424,7 +1426,16 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<string>("install_root_ca");
     }
+    previewCaTrusted = true;
     return "Preview Mode: Run inside Tauri (`cargo tauri dev`) to invoke native OS certificate trust (`certutil -user -addstore Root` / Keychain).";
+  },
+
+  async uninstallRootCa(): Promise<string> {
+    if (isTauriRuntime()) {
+      return invoke<string>("uninstall_root_ca");
+    }
+    previewCaTrusted = false;
+    return "Preview Mode: Run inside Tauri (`cargo tauri dev`) to remove the Root CA from the OS trust store (`certutil -user -delstore Root` / Keychain).";
   },
 
   async listRules(): Promise<AutoResponderRule[]> {

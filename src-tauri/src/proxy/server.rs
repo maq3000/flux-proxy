@@ -32,7 +32,9 @@ use crate::models::{
 };
 use crate::proxy::breakpoints::BreakpointEngine;
 use crate::proxy::ca::CertificateAuthority;
-use crate::proxy::filters::{ConnectTunnelDecision, PassthroughReason, ProxyFilterEngine};
+use crate::proxy::filters::{
+    is_alt_svc_header, ConnectTunnelDecision, PassthroughReason, ProxyFilterEngine,
+};
 use crate::proxy::network::{is_host_own_ip, normalize_client_ip};
 use crate::proxy::process::{resolve_client_process, ClientProcessInfo};
 use crate::proxy::rules::RuleEngine;
@@ -703,7 +705,7 @@ impl ProxyEngineController {
         let mut status = upstream_resp.status().as_u16();
         let version_str = format_http_version(&scheme, upstream_resp.version());
         let mut resp_headers = extract_reqwest_headers(upstream_resp.headers());
-        let resp_mutated = self.context.filters.apply_header_mutations(
+        let mut resp_mutated = self.context.filters.apply_header_mutations(
             HeaderMutationDirection::Response,
             &full_url,
             &mut resp_headers,
@@ -761,6 +763,9 @@ impl ProxyEngineController {
                     }
                     if let Some(hdrs) = verdict.response_headers {
                         resp_headers = hdrs;
+                        if self.context.filters.strip_alt_svc_headers(&mut resp_headers) {
+                            resp_mutated = true;
+                        }
                         bp_modified = true;
                     }
                     if let Some(txt) = verdict.response_body_text {
@@ -1437,11 +1442,12 @@ async fn handle_intercepted_request(
             ctx.store.insert(detail);
             let _ = ctx.event_tx.send(summary);
 
+            let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
             let mut resp_builder = Response::builder().status(
                 StatusCode::from_u16(rule.status_code).unwrap_or(StatusCode::OK),
             );
             for h in &mock_resp_headers {
-                if !h.name.trim().is_empty() {
+                if !h.name.trim().is_empty() && !(strip_alt_svc && is_alt_svc_header(&h.name)) {
                     resp_builder = resp_builder.header(&h.name, &h.value);
                 }
             }
@@ -1511,7 +1517,7 @@ async fn handle_intercepted_request(
     }
 
     let mut resp_headers = extract_reqwest_headers(upstream_resp.headers());
-    let resp_mutated = ctx.filters.apply_header_mutations(
+    let mut resp_mutated = ctx.filters.apply_header_mutations(
         HeaderMutationDirection::Response,
         &full_url,
         &mut resp_headers,
@@ -1652,12 +1658,14 @@ async fn handle_intercepted_request(
         let stream = futures_util::stream::unfold(chunk_rx, |mut rx| async move {
             rx.recv().await.map(|frame| (frame, rx))
         });
+        let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
         let mut builder =
             Response::builder().status(StatusCode::from_u16(final_status).unwrap_or(StatusCode::OK));
         for h in &resp_headers {
             if !is_hop_by_hop_header(&h.name)
                 && !h.name.eq_ignore_ascii_case("content-encoding")
                 && !h.name.eq_ignore_ascii_case("content-length")
+                && !(strip_alt_svc && is_alt_svc_header(&h.name))
             {
                 builder = builder.header(&h.name, &h.value);
             }
@@ -1802,6 +1810,9 @@ async fn handle_intercepted_request(
                 }
                 if let Some(hdrs) = verdict.response_headers {
                     resp_headers = hdrs;
+                    if ctx.filters.strip_alt_svc_headers(&mut resp_headers) {
+                        resp_mutated = true;
+                    }
                     if let Some(ct_hdr) = resp_headers
                         .iter()
                         .find(|h| h.name.eq_ignore_ascii_case("content-type"))
@@ -1894,14 +1905,17 @@ async fn handle_intercepted_request(
     ctx.store.insert(detail);
     let _ = ctx.event_tx.send(summary);
 
+    let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
     let mut builder =
         Response::builder().status(StatusCode::from_u16(final_status).unwrap_or(StatusCode::OK));
     for h in &resp_headers {
         // Reqwest transparently decompresses bodies when gzip/brotli features are enabled,
         // so strip content-encoding & content-length before re-framing via Hyper Full<Bytes>.
+        // Also strip HTTP/3 QUIC discovery headers (`alt-svc`, `alternate-protocol`) when enabled.
         if !is_hop_by_hop_header(&h.name)
             && !h.name.eq_ignore_ascii_case("content-encoding")
             && !h.name.eq_ignore_ascii_case("content-length")
+            && !(strip_alt_svc && is_alt_svc_header(&h.name))
         {
             builder = builder.header(&h.name, &h.value);
         }
@@ -2039,12 +2053,16 @@ async fn handle_websocket_intercept(
             ctx.store.insert(detail);
             let _ = ctx.event_tx.send(summary);
 
+            let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
             let mut rej_resp = Response::builder()
                 .status(status)
                 .body(boxed_full(resp_bytes))
                 .unwrap_or_else(|_| plain_response(status, "WebSocket handshake rejected"));
             for h in &resp_headers {
-                if !is_hop_by_hop_header(&h.name) && !h.name.eq_ignore_ascii_case("content-length") {
+                if !is_hop_by_hop_header(&h.name)
+                    && !h.name.eq_ignore_ascii_case("content-length")
+                    && !(strip_alt_svc && is_alt_svc_header(&h.name))
+                {
                     if let (Ok(hn), Ok(hv)) = (
                         http::header::HeaderName::from_bytes(h.name.trim().as_bytes()),
                         http::header::HeaderValue::from_str(&h.value),
@@ -2131,6 +2149,7 @@ async fn handle_websocket_intercept(
 
     ctx.store.insert(initial_detail.clone());
     let _ = ctx.event_tx.send(summary);
+    let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
 
     tokio::spawn(async move {
         if let Ok(upgraded) = hyper::upgrade::on(req).await {
@@ -2189,10 +2208,12 @@ async fn handle_websocket_intercept(
         .unwrap();
 
     // Forward upstream handshake headers (`Sec-WebSocket-Protocol`, multiple `Set-Cookie`, `X-*`, etc.)
-    // while excluding hop-by-hop headers and upstream's `Sec-WebSocket-Accept`.
+    // while excluding hop-by-hop headers, `Alt-Svc`/`Alternate-Protocol` (when enabled), and upstream's `Sec-WebSocket-Accept`.
     for h in &resp_headers {
         let lower = h.name.trim().to_ascii_lowercase();
-        if is_ws_excluded_response_header(&lower) {
+        if is_ws_excluded_response_header(&lower)
+            || (strip_alt_svc && is_alt_svc_header(&lower))
+        {
             continue;
         }
         if let (Ok(hn), Ok(hv)) = (
@@ -3194,6 +3215,7 @@ mod tests {
             tls_target_rules: Vec::new(),
             header_mutations_enabled: true,
             header_mutations: Vec::new(),
+            strip_alt_svc: true,
             host_list_sync: Default::default(),
         });
         let store = Arc::new(TrafficStore::new(tmp_dir.join("test.sqlite")).unwrap());
@@ -3677,6 +3699,7 @@ mod tests {
             }],
             header_mutations_enabled: false,
             header_mutations: Vec::new(),
+            strip_alt_svc: true,
             host_list_sync: Default::default(),
         });
 
@@ -3929,6 +3952,181 @@ mod tests {
         let summaries = store.list_summaries();
         assert!(!summaries.is_empty());
         assert_eq!(summaries[0].client_ip.as_deref(), Some("127.0.0.1"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn strips_alt_svc_and_alternate_protocol_across_http1_and_http2_responses() {
+        // 1. Upstream HTTP server returning Alt-Svc and Alternate-Protocol headers
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp_stream, _)) = upstream_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let svc = service_fn(|_req: Request<Incoming>| async move {
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, "application/json")
+                                .header("Alt-Svc", "h3=\":443\"; ma=86400")
+                                .header("Alternate-Protocol", "443:quic")
+                                .header("X-Upstream", "ok")
+                                .body(Full::new(Bytes::from_static(b"{\"quic\":false}")))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        // 2. Start FluxProxy MITM listener with default `strip_alt_svc == true`
+        let tmp_dir =
+            std::env::temp_dir().join(format!("fluxproxy-test-altsvc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("altsvc.sqlite")).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+
+        // Mock rule for HTTPS/2 `https://localhost:9443/...` carrying Alt-Svc & Alternate-Protocol
+        rules.upsert_rule(crate::models::AutoResponderRule {
+            id: "mock-h2-altsvc".into(),
+            enabled: true,
+            name: "HTTPS/2 Alt-Svc Mock".into(),
+            match_target: crate::models::RuleMatchTarget::UrlContains,
+            pattern: "https://localhost:9443/".into(),
+            method_filter: None,
+            header_name: None,
+            action: RuleActionType::MockResponse,
+            status_code: 200,
+            latency_ms: 0,
+            response_headers: vec![
+                HeaderPair {
+                    name: "Content-Type".into(),
+                    value: "application/json".into(),
+                },
+                HeaderPair {
+                    name: "alt-svc".into(),
+                    value: "h3=\":443\"; ma=2592000".into(),
+                },
+                HeaderPair {
+                    name: "alternate-protocol".into(),
+                    value: "443:quic".into(),
+                },
+            ],
+            response_body: "{\"protocol\":\"h2\"}".into(),
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let ctx = Arc::new(SharedProxyContext {
+            ca: ca.clone(),
+            rules,
+            filters: filters.clone(),
+            breakpoints,
+            store: store.clone(),
+            upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            event_tx,
+            active_port: AtomicU16::new(proxy_addr.port()),
+        });
+
+        let proxy_ctx = ctx.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await else {
+                    break;
+                };
+                let c = proxy_ctx.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let inner_c = c.clone();
+                        async move {
+                            Ok::<_, Infallible>(
+                                handle_outer_proxy_request(req, client_addr, None, inner_c).await,
+                            )
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, service)
+                        .await;
+                });
+            }
+        });
+
+        let root_pem = std::fs::read(ca.info().cert_pem_path).unwrap();
+        let reqwest_ca = reqwest::Certificate::from_pem(&root_pem).unwrap();
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap())
+            .add_root_certificate(reqwest_ca)
+            .build()
+            .unwrap();
+
+        // 3A. HTTP/1.1 upstream response -> Alt-Svc & Alternate-Protocol stripped by default
+        let h1_resp = client
+            .get(format!("http://127.0.0.1:{}/h1-test", upstream_addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(h1_resp.version(), reqwest::Version::HTTP_11);
+        assert!(h1_resp.headers().get("alt-svc").is_none());
+        assert!(h1_resp.headers().get("alternate-protocol").is_none());
+        assert_eq!(h1_resp.headers().get("x-upstream").unwrap(), "ok");
+
+        // 3B. HTTPS/2 (`h2` via MITM ALPN) response -> Alt-Svc & Alternate-Protocol stripped by default
+        let h2_resp = client
+            .get("https://localhost:9443/h2-test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(h2_resp.version(), reqwest::Version::HTTP_2);
+        assert!(h2_resp.headers().get("alt-svc").is_none());
+        assert!(h2_resp.headers().get("alternate-protocol").is_none());
+
+        // 3C. Disable `strip_alt_svc` -> headers are preserved for both HTTP/1.1 and HTTPS/2
+        let mut cfg = filters.get_config();
+        cfg.strip_alt_svc = false;
+        filters.update_config(cfg);
+
+        let h1_preserved = client
+            .get(format!("http://127.0.0.1:{}/h1-keep", upstream_addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            h1_preserved.headers().get("alt-svc").unwrap(),
+            "h3=\":443\"; ma=86400"
+        );
+        assert_eq!(
+            h1_preserved.headers().get("alternate-protocol").unwrap(),
+            "443:quic"
+        );
+
+        let h2_preserved = client
+            .get("https://localhost:9443/h2-keep")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(h2_preserved.version(), reqwest::Version::HTTP_2);
+        assert_eq!(
+            h2_preserved.headers().get("alt-svc").unwrap(),
+            "h3=\":443\"; ma=2592000"
+        );
+        assert_eq!(
+            h2_preserved.headers().get("alternate-protocol").unwrap(),
+            "443:quic"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
