@@ -338,16 +338,17 @@ mod win_imp {
             return Vec::new();
         }
 
+        let valid_bytes = (actual_size as usize).min(buf.len());
         let num_entries =
             u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         let row_size = std::mem::size_of::<MibIpAddrRow>();
-        let max_rows = buf.len().saturating_sub(4) / row_size;
+        let max_rows = valid_bytes.saturating_sub(4) / row_size;
         let count = num_entries.min(max_rows);
         let rows_ptr = unsafe { buf.as_ptr().add(4) as *const MibIpAddrRow };
 
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
-            let row = unsafe { *rows_ptr.add(i) };
+            let row = unsafe { std::ptr::read_unaligned(rows_ptr.add(i)) };
             let ip = Ipv4Addr::from(u32::from_be(row.dw_addr));
             out.push((ip, row.dw_index));
         }

@@ -26,12 +26,22 @@ import {
 import {
   buildRawHttpRequest,
   buildRawHttpResponse,
+  decodeBase64ToBytes,
   formatBytes,
   formatDuration,
   parseCookies,
   parseQueryParams,
   tryFormatJson,
 } from "../lib/formatters";
+
+const SAFE_RASTER_IMAGE_MIMES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "image/bmp",
+  "image/x-icon",
+]);
 import { hexToRgba } from "../lib/sessionDiff";
 import {
   analyzeAuth,
@@ -441,7 +451,10 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
   }
 
   const { summary } = effectiveDetail;
-  const isImage = summary.contentType.toLowerCase().startsWith("image/");
+  const responseMime = summary.contentType.split(";")[0].trim().toLowerCase();
+  const isSafeRasterImage = SAFE_RASTER_IMAGE_MIMES.has(responseMime);
+  const isSvgImage = responseMime === "image/svg+xml";
+  const isImage = isSafeRasterImage || isSvgImage;
   const isReqOffloaded = Boolean(effectiveDetail.requestBodyOffloaded);
   const isRespOffloaded = Boolean(effectiveDetail.bodyOffloaded);
   const respStatusColor =
@@ -1204,24 +1217,43 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   error={respBodyError}
                   onLoad={() => void handleLoadResponseBody()}
                 />
+              ) : isSafeRasterImage && effectiveDetail.responseBodyBase64 ? (
+                <div className="flex h-full flex-col items-center justify-center gap-3 overflow-auto p-4 checkerboard-bg">
+                  <img
+                    src={`data:${responseMime};base64,${effectiveDetail.responseBodyBase64}`}
+                    alt={summary.path}
+                    className="max-h-[75%] max-w-[90%] rounded border border-strong shadow-popover"
+                  />
+                  <span className="rounded bg-surface/90 px-2.5 py-1 font-mono text-[11px] text-muted ring-1 ring-hairline">
+                    {summary.contentType} • {formatBytes(summary.bodySize)}
+                  </span>
+                </div>
+              ) : isSvgImage ? (
+                <div className="flex h-full flex-col overflow-hidden bg-surface">
+                  <div className="flex shrink-0 items-center justify-between border-b border-hairline bg-status4xx-bg/40 px-3 py-1.5 text-[11px] text-status4xx-fg">
+                    <span>
+                      SVG-изображение (<code>image/svg+xml</code>) отображается как безопасный текстовый исходник во избежание активного содержимого / XSS.
+                    </span>
+                    <span className="font-mono text-muted">
+                      {formatBytes(summary.bodySize)}
+                    </span>
+                  </div>
+                  <pre className="flex-1 overflow-auto p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap break-words text-fg select-text">
+                    {effectiveDetail.responseBodyText ??
+                      (effectiveDetail.responseBodyBase64
+                        ? new TextDecoder().decode(
+                            decodeBase64ToBytes(effectiveDetail.responseBodyBase64)
+                          )
+                        : "<!-- Empty SVG payload -->")}
+                  </pre>
+                </div>
               ) : (
                 <div className="flex h-full flex-col items-center justify-center gap-3 overflow-auto p-4 checkerboard-bg">
-                  {isImage && effectiveDetail.responseBodyBase64 ? (
-                    <>
-                      <img
-                        src={`data:${summary.contentType.split(";")[0]};base64,${effectiveDetail.responseBodyBase64}`}
-                        alt={summary.path}
-                        className="max-h-[75%] max-w-[90%] rounded border border-strong shadow-popover"
-                      />
-                      <span className="rounded bg-surface/90 px-2.5 py-1 font-mono text-[11px] text-muted ring-1 ring-hairline">
-                        {summary.contentType} • {formatBytes(summary.bodySize)}
-                      </span>
-                    </>
-                  ) : (
-                    <span className="rounded bg-surface/90 px-3 py-1.5 text-xs text-muted ring-1 ring-hairline">
-                      Response Content-Type ({summary.contentType}) is not an image.
-                    </span>
-                  )}
+                  <span className="rounded bg-surface/90 px-3 py-1.5 text-xs text-muted ring-1 ring-hairline">
+                    {isImage
+                      ? `Нет бинарных данных изображения для ${summary.contentType}.`
+                      : `Response Content-Type (${summary.contentType}) is not an image.`}
+                  </span>
                 </div>
               ))}
             {respTab === "hex" &&

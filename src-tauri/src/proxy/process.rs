@@ -71,7 +71,7 @@ mod imp {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
-    struct MibTcpRowOwnerPid {
+    pub(super) struct MibTcpRowOwnerPid {
         dw_state: u32,
         dw_local_addr: u32,
         dw_local_port: u32,
@@ -82,13 +82,14 @@ mod imp {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
-    struct MibTcp6RowOwnerPid {
+    pub(super) struct MibTcp6RowOwnerPid {
         uc_local_addr: [u8; 16],
         dw_local_scope_id: u32,
         dw_local_port: u32,
         uc_remote_addr: [u8; 16],
         dw_remote_scope_id: u32,
         dw_remote_port: u32,
+        dw_state: u32,
         dw_owning_pid: u32,
     }
 
@@ -483,5 +484,12 @@ mod tests {
 
         assert_eq!(resolved.pid, std::process::id());
         assert!(!resolved.name.is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_mib_tcp_owner_pid_structs_match_win32_abi_sizes() {
+        assert_eq!(std::mem::size_of::<imp::MibTcpRowOwnerPid>(), 24);
+        assert_eq!(std::mem::size_of::<imp::MibTcp6RowOwnerPid>(), 56);
     }
 }

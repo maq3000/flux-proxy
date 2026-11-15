@@ -398,6 +398,73 @@ pub async fn pick_open_file_dialog(
     .map_err(|e| ProxyError::Custom(format!("Native open dialog join error: {e}")))?
 }
 
+pub(crate) fn validate_user_file_path(
+    raw_path: &str,
+    allowed_extensions: Option<&[&str]>,
+    must_exist: bool,
+) -> Result<PathBuf, ProxyError> {
+    if raw_path.contains('\0') {
+        return Err(ProxyError::Custom(
+            "Путь к файлу содержит недопустимый NUL-байт.".into(),
+        ));
+    }
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Err(ProxyError::Custom(
+            "Путь к файлу не может быть пустым.".into(),
+        ));
+    }
+    if trimmed.ends_with('/') || trimmed.ends_with('\\') {
+        return Err(ProxyError::Custom(
+            "Указан путь к каталогу вместо имени файла.".into(),
+        ));
+    }
+
+    let path = PathBuf::from(trimmed);
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .ok_or_else(|| ProxyError::Custom("Некорректное имя файла в пути.".into()))?;
+    if file_name.trim().is_empty() {
+        return Err(ProxyError::Custom("Некорректное имя файла в пути.".into()));
+    }
+    if path.is_dir() {
+        return Err(ProxyError::Custom(format!(
+            "Указанный путь является каталогом: {}",
+            path.display()
+        )));
+    }
+
+    if let Some(exts) = allowed_extensions {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .ok_or_else(|| {
+                ProxyError::Custom(format!(
+                    "Отсутствует расширение файла. Ожидается одно из: {}",
+                    exts.join(", ")
+                ))
+            })?;
+        if !exts.iter().any(|allowed| allowed.eq_ignore_ascii_case(&ext)) {
+            return Err(ProxyError::Custom(format!(
+                "Недопустимое расширение файла '.{ext}'. Разрешены: {}",
+                exts.join(", ")
+            )));
+        }
+    }
+
+    if must_exist && !path.is_file() {
+        return Err(ProxyError::Custom(format!(
+            "Файл не найден или недоступен: {}",
+            path.display()
+        )));
+    }
+
+    Ok(path)
+}
+
 #[tauri::command]
 pub async fn export_sessions_file(
     session_ids: Vec<u64>,
@@ -405,10 +472,35 @@ pub async fn export_sessions_file(
     file_path: String,
     state: State<'_, AppState>,
 ) -> Result<usize, ProxyError> {
+    let validated_path =
+        validate_user_file_path(&file_path, Some(&["har", "saz", "json", "txt", "raw"]), false)?;
+    let fmt_clean = format.trim().trim_start_matches('.').to_ascii_lowercase();
+    if !fmt_clean.is_empty() {
+        let ext = validated_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let compatible = match fmt_clean.as_str() {
+            "raw" | "txt" => ext == "txt" || ext == "raw",
+            "har" | "saz" | "json" => ext == fmt_clean,
+            _ => {
+                return Err(ProxyError::Custom(format!(
+                    "Неподдерживаемый формат экспорта: '{format}'"
+                )));
+            }
+        };
+        if !compatible {
+            return Err(ProxyError::Custom(format!(
+                "Расширение файла '.{ext}' не соответствует выбранному формату экспорта '{fmt_clean}'."
+            )));
+        }
+    }
+
     let store = state.controller.context.store.clone();
     tokio::task::spawn_blocking(move || {
         let sessions = store.collect_sessions_for_export(&session_ids)?;
-        export_sessions_to_path(&sessions, &format, &PathBuf::from(file_path))
+        export_sessions_to_path(&sessions, &format, &validated_path)
     })
     .await
     .map_err(|e| ProxyError::Custom(format!("Export task join error: {e}")))?
@@ -419,10 +511,12 @@ pub async fn import_sessions_file(
     file_path: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<SessionSummary>, ProxyError> {
+    let validated_path =
+        validate_user_file_path(&file_path, Some(&["har", "saz", "json", "zip"]), true)?;
     let store = state.controller.context.store.clone();
     let event_tx = state.controller.context.event_tx.clone();
     tokio::task::spawn_blocking(move || {
-        let details = import_sessions_from_path(&PathBuf::from(file_path))?;
+        let details = import_sessions_from_path(&validated_path)?;
         let summaries = store.import_sessions(details);
         for summary in &summaries {
             let _ = event_tx.send(summary.clone());
@@ -464,10 +558,11 @@ pub async fn save_session_body_file(
     file_path: String,
     state: State<'_, AppState>,
 ) -> Result<usize, ProxyError> {
+    let validated_path = validate_user_file_path(&file_path, None, false)?;
     let store = state.controller.context.store.clone();
     tokio::task::spawn_blocking(move || {
         let bytes = store.extract_raw_body_bytes(session_id, is_response)?;
-        write_raw_bytes_to_file(&PathBuf::from(file_path), &bytes)
+        write_raw_bytes_to_file(&validated_path, &bytes)
     })
     .await
     .map_err(|e| ProxyError::Custom(format!("Save body task join error: {e}")))?
@@ -478,8 +573,9 @@ pub async fn export_settings_file(
     file_path: String,
     contents: String,
 ) -> Result<usize, ProxyError> {
+    let validated_path = validate_user_file_path(&file_path, Some(&["json"]), false)?;
     tokio::task::spawn_blocking(move || {
-        write_raw_bytes_to_file(&PathBuf::from(file_path), contents.as_bytes())
+        write_raw_bytes_to_file(&validated_path, contents.as_bytes())
     })
     .await
     .map_err(|e| ProxyError::Custom(format!("Export settings task join error: {e}")))?
@@ -487,11 +583,36 @@ pub async fn export_settings_file(
 
 #[tauri::command]
 pub async fn import_settings_file(file_path: String) -> Result<String, ProxyError> {
+    let validated_path = validate_user_file_path(&file_path, Some(&["json"]), true)?;
     tokio::task::spawn_blocking(move || {
-        let raw = std::fs::read_to_string(&PathBuf::from(&file_path))
-            .map_err(|e| ProxyError::Custom(format!("Не удалось прочитать файл {file_path}: {e}")))?;
+        let raw = std::fs::read_to_string(&validated_path)
+            .map_err(|e| ProxyError::Custom(format!("Не удалось прочитать файл {}: {e}", validated_path.display())))?;
         Ok(raw.trim_start_matches('\u{feff}').to_owned())
     })
     .await
     .map_err(|e| ProxyError::Custom(format!("Import settings task join error: {e}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_user_file_path;
+
+    #[test]
+    fn validates_user_file_paths_and_extensions() {
+        assert!(validate_user_file_path("", Some(&["har"]), false).is_err());
+        assert!(validate_user_file_path("   ", None, false).is_err());
+        assert!(validate_user_file_path("capture.har\0.exe", Some(&["har"]), false).is_err());
+        assert!(validate_user_file_path("some/dir/", None, false).is_err());
+        assert!(validate_user_file_path("some/dir/..", None, false).is_err());
+        assert!(validate_user_file_path("capture.exe", Some(&["har", "saz"]), false).is_err());
+        assert!(validate_user_file_path("capture", Some(&["har", "saz"]), false).is_err());
+
+        let valid_har = validate_user_file_path("exports/trace.HAR", Some(&["har", "saz"]), false)
+            .expect("valid extension case-insensitive");
+        assert!(valid_har.ends_with("trace.HAR"));
+
+        let valid_body = validate_user_file_path("payload.bin", None, false)
+            .expect("unrestricted save body path");
+        assert!(valid_body.ends_with("payload.bin"));
+    }
 }

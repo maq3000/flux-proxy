@@ -117,13 +117,13 @@ impl TrafficStore {
 
         // Offload heavy response body (> 2 MiB) to SQLite to prevent heap bloat / OOM
         if let Some(resp_bytes) = raw_resp_body {
-            if resp_bytes.len() > BODY_OFFLOAD_THRESHOLD_BYTES {
-                if self.sqlite.save_offloaded_body(id, true, resp_bytes).is_ok() {
-                    detail.body_offloaded = true;
-                    detail.summary.body_size = detail.summary.body_size.max(resp_bytes.len());
-                    detail.response_body_base64 = String::new();
-                    detail.response_body_text = None;
-                }
+            if resp_bytes.len() > BODY_OFFLOAD_THRESHOLD_BYTES
+                && self.sqlite.save_offloaded_body(id, true, resp_bytes).is_ok()
+            {
+                detail.body_offloaded = true;
+                detail.summary.body_size = detail.summary.body_size.max(resp_bytes.len());
+                detail.response_body_base64 = String::new();
+                detail.response_body_text = None;
             }
         } else if !detail.body_offloaded {
             if let Some(decoded_resp) = extract_heavy_payload_bytes(
@@ -145,12 +145,12 @@ impl TrafficStore {
 
         // Offload heavy request body (> 2 MiB) to SQLite as well
         if let Some(req_bytes) = raw_req_body {
-            if req_bytes.len() > BODY_OFFLOAD_THRESHOLD_BYTES {
-                if self.sqlite.save_offloaded_body(id, false, req_bytes).is_ok() {
-                    detail.request_body_offloaded = true;
-                    detail.request_body_base64 = String::new();
-                    detail.request_body_text = None;
-                }
+            if req_bytes.len() > BODY_OFFLOAD_THRESHOLD_BYTES
+                && self.sqlite.save_offloaded_body(id, false, req_bytes).is_ok()
+            {
+                detail.request_body_offloaded = true;
+                detail.request_body_base64 = String::new();
+                detail.request_body_text = None;
             }
         } else if !detail.request_body_offloaded {
             if let Some(decoded_req) = extract_heavy_payload_bytes(

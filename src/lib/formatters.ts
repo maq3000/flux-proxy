@@ -204,11 +204,12 @@ function escapePosixSingleQuotes(value: string): string {
 
 export function buildCurlCommand(detail: SessionDetail): string {
   const { summary, requestHeaders, requestBodyText } = detail;
+  const methodUpper = summary.method.toUpperCase();
   const parts: string[] = [
     "curl",
     "-i",
     "-X",
-    summary.method.toUpperCase(),
+    escapePosixSingleQuotes(methodUpper),
     escapePosixSingleQuotes(summary.url),
   ];
 
@@ -254,7 +255,7 @@ export function decodeBase64ToBytes(b64: string): Uint8Array {
     }
     return bytes;
   } catch {
-    return new TextEncoder().encode(b64);
+    return new Uint8Array(0);
   }
 }
 

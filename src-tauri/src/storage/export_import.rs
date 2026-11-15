@@ -1398,15 +1398,22 @@ fn build_saz_index_html(sessions: &[SessionDetail], pad_width: usize) -> String 
     )
 }
 
+fn sanitize_http_line_token(raw: &str) -> String {
+    raw.chars()
+        .filter(|&c| c != '\r' && c != '\n' && c != '\0')
+        .collect()
+}
+
 fn build_raw_http_request_bytes(detail: &SessionDetail) -> Vec<u8> {
     let s = &detail.summary;
     let body = decode_detail_body_bytes(detail, false);
     let http_version = wire_http_version(&s.protocol);
-    let target = if s.method.eq_ignore_ascii_case("CONNECT") {
-        if s.host.contains(':') {
-            s.host.clone()
+    let clean_host = sanitize_http_line_token(&s.host);
+    let raw_target = if s.method.eq_ignore_ascii_case("CONNECT") {
+        if clean_host.contains(':') {
+            clean_host.clone()
         } else {
-            format!("{}:443", s.host)
+            format!("{clean_host}:443")
         }
     } else if !s.url.is_empty() && s.url.contains("://") {
         s.url.clone()
@@ -1415,14 +1422,25 @@ fn build_raw_http_request_bytes(detail: &SessionDetail) -> Vec<u8> {
     } else {
         "/".to_string()
     };
+    let target = sanitize_http_line_token(&raw_target);
 
-    let method = if s.method.is_empty() { "GET" } else { &s.method };
+    let clean_method = sanitize_http_line_token(&s.method);
+    let method = if clean_method.is_empty() {
+        "GET"
+    } else {
+        clean_method.as_str()
+    };
     let mut head = format!("{method} {target} {http_version}\r\n");
 
     let mut has_host = false;
     let mut has_content_len = false;
     for h in &detail.request_headers {
-        let lower = h.name.to_ascii_lowercase();
+        let clean_name = sanitize_http_line_token(&h.name);
+        if clean_name.is_empty() {
+            continue;
+        }
+        let clean_value = sanitize_http_line_token(&h.value);
+        let lower = clean_name.to_ascii_lowercase();
         if lower == "host" {
             has_host = true;
         }
@@ -1430,19 +1448,19 @@ fn build_raw_http_request_bytes(detail: &SessionDetail) -> Vec<u8> {
         if lower == "transfer-encoding" {
             continue;
         }
-        if lower == "content-encoding" && !is_matching_compressed_magic(&h.value, &body) {
+        if lower == "content-encoding" && !is_matching_compressed_magic(&clean_value, &body) {
             continue;
         }
         if lower == "content-length" {
             has_content_len = true;
-            head.push_str(&format!("{}: {}\r\n", h.name, body.len()));
+            head.push_str(&format!("{clean_name}: {}\r\n", body.len()));
             continue;
         }
-        head.push_str(&format!("{}: {}\r\n", h.name, h.value));
+        head.push_str(&format!("{clean_name}: {clean_value}\r\n"));
     }
 
-    if !has_host && !s.host.is_empty() {
-        head.push_str(&format!("Host: {}\r\n", s.host));
+    if !has_host && !clean_host.is_empty() {
+        head.push_str(&format!("Host: {clean_host}\r\n"));
     }
     if !has_content_len && !body.is_empty() {
         head.push_str(&format!("Content-Length: {}\r\n", body.len()));
@@ -1470,26 +1488,32 @@ fn build_raw_http_response_bytes(detail: &SessionDetail) -> Vec<u8> {
     let mut has_content_type = false;
 
     for h in &detail.response_headers {
-        let lower = h.name.to_ascii_lowercase();
+        let clean_name = sanitize_http_line_token(&h.name);
+        if clean_name.is_empty() {
+            continue;
+        }
+        let clean_value = sanitize_http_line_token(&h.value);
+        let lower = clean_name.to_ascii_lowercase();
         if lower == "transfer-encoding" {
             continue;
         }
-        if lower == "content-encoding" && !is_matching_compressed_magic(&h.value, &body) {
+        if lower == "content-encoding" && !is_matching_compressed_magic(&clean_value, &body) {
             continue;
         }
         if lower == "content-length" {
             has_content_len = true;
-            head.push_str(&format!("{}: {}\r\n", h.name, body.len()));
+            head.push_str(&format!("{clean_name}: {}\r\n", body.len()));
             continue;
         }
         if lower == "content-type" {
             has_content_type = true;
         }
-        head.push_str(&format!("{}: {}\r\n", h.name, h.value));
+        head.push_str(&format!("{clean_name}: {clean_value}\r\n"));
     }
 
-    if !has_content_type && !s.content_type.trim().is_empty() {
-        head.push_str(&format!("Content-Type: {}\r\n", s.content_type));
+    let clean_content_type = sanitize_http_line_token(&s.content_type);
+    if !has_content_type && !clean_content_type.trim().is_empty() {
+        head.push_str(&format!("Content-Type: {clean_content_type}\r\n"));
     }
     if !has_content_len {
         head.push_str(&format!("Content-Length: {}\r\n", body.len()));
@@ -3032,5 +3056,35 @@ mod tests {
         let _ = std::fs::remove_file(&saz_path);
         let _ = std::fs::remove_file(&raw_body_path);
         let _ = std::fs::remove_file(&full_raw_path);
+    }
+
+    #[test]
+    fn raw_http_builders_strip_crlf_and_nul_header_injections() {
+        let mut detail = sample_sessions().into_iter().next().unwrap();
+        detail.summary.method = "POST\r\nX-Injected: evil\0".into();
+        detail.summary.url = "https://example.com/test\r\nInjected-Req: 1\0".into();
+        detail.summary.host = "example.com\r\nX-Host-Injected: yes\0".into();
+        detail.summary.content_type = "application/json\r\nSet-Cookie: pwn=1\0".into();
+        detail.request_headers = vec![crate::models::HeaderPair {
+            name: "X-Custom\r\nEvil".into(),
+            value: "val\r\nX-Smuggled: 1\0".into(),
+        }];
+        detail.response_headers = vec![crate::models::HeaderPair {
+            name: "X-Resp\nName".into(),
+            value: "ok\r\nSet-Cookie: bad=2\0".into(),
+        }];
+
+        let req_raw = String::from_utf8(build_raw_http_request_bytes(&detail)).unwrap();
+        let req_head = req_raw.split("\r\n\r\n").next().unwrap();
+        assert!(!req_head.contains('\0'));
+        assert!(!req_head.contains("\r\nX-Injected:"));
+        assert!(!req_head.contains("\r\nInjected-Req:"));
+        assert!(!req_head.contains("\r\nX-Smuggled:"));
+        assert!(!req_head.contains("\r\nX-Host-Injected:"));
+
+        let resp_raw = String::from_utf8(build_raw_http_response_bytes(&detail)).unwrap();
+        let resp_head = resp_raw.split("\r\n\r\n").next().unwrap();
+        assert!(!resp_head.contains('\0'));
+        assert!(!resp_head.contains("\r\nSet-Cookie:"));
     }
 }

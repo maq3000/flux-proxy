@@ -187,20 +187,36 @@ pub fn default_breakpoint_config() -> BreakpointConfig {
     }
 }
 
+fn strip_regex_prefix(s: &str) -> Option<&str> {
+    if s.is_char_boundary(6) && s.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("regex:")) {
+        s.get(6..)
+    } else {
+        None
+    }
+}
+
 fn url_pattern_matches(url_lower: &str, raw_url: &str, pattern: &str) -> bool {
     let trimmed = pattern.trim();
     if trimmed.is_empty() || trimmed == "*" {
         return true;
     }
-    if let Some(re_pat) = trimmed.strip_prefix("regex:") {
+    if let Some(re_pat) = strip_regex_prefix(trimmed) {
         return Regex::new(re_pat.trim())
             .map(|re| re.is_match(raw_url))
             .unwrap_or(false);
     }
     let pat_lower = trimmed.to_ascii_lowercase();
-    if pat_lower.contains('*') {
-        let mut regex_str = String::from("^(?i)");
-        for ch in pat_lower.chars() {
+    if pat_lower.contains('*') || pat_lower.contains('?') {
+        let anchor_start = pat_lower.starts_with('^');
+        let anchor_end = pat_lower.ends_with('$');
+        let inner = pat_lower.strip_prefix('^').unwrap_or(&pat_lower);
+        let inner = inner.strip_suffix('$').unwrap_or(inner);
+
+        let mut regex_str = String::from("(?i)");
+        if anchor_start {
+            regex_str.push('^');
+        }
+        for ch in inner.chars() {
             if ch == '*' {
                 regex_str.push_str(".*");
             } else if ch == '?' {
@@ -209,7 +225,9 @@ fn url_pattern_matches(url_lower: &str, raw_url: &str, pattern: &str) -> bool {
                 regex_str.push_str(&regex::escape(&ch.to_string()));
             }
         }
-        regex_str.push('$');
+        if anchor_end {
+            regex_str.push('$');
+        }
         return Regex::new(&regex_str)
             .map(|re| re.is_match(raw_url))
             .unwrap_or(false);
@@ -299,5 +317,27 @@ mod tests {
             verdict.request_body_text.as_deref(),
             Some("{\"amount\":9999}")
         );
+    }
+
+    #[test]
+    fn wildcard_patterns_match_substrings_consistently_with_plain_patterns_and_explicit_anchors() {
+        let url = "https://api.stripe.com/v1/checkout/sessions?mode=payment";
+        let lower = url.to_ascii_lowercase();
+
+        // Plain substring vs wildcard substring
+        assert!(url_pattern_matches(&lower, url, "/v1/checkout"));
+        assert!(url_pattern_matches(&lower, url, "/v1/*/sessions"));
+        assert!(url_pattern_matches(&lower, url, "api.*.com/*/sessions"));
+        assert!(url_pattern_matches(&lower, url, "v?/checkout"));
+        assert!(url_pattern_matches(&lower, url, "*checkout*"));
+        assert!(url_pattern_matches(&lower, url, "https://*.stripe.com/*"));
+
+        // Explicit anchors still restrict boundaries
+        assert!(url_pattern_matches(&lower, url, "^https://api.stripe.com/*mode=payment$"));
+        assert!(!url_pattern_matches(&lower, url, "^/v1/*/sessions$"));
+
+        // Case-insensitive `regex:` prefix and UTF-8 safety
+        assert!(url_pattern_matches(&lower, url, "ReGeX:/v1/[a-z]+/sessions"));
+        assert!(!url_pattern_matches(&lower, url, "ab😀cd"));
     }
 }

@@ -222,25 +222,25 @@ impl CertificateAuthority {
     pub fn is_installed_in_os_trust_store(&self) -> bool {
         #[cfg(target_os = "windows")]
         {
-            return new_os_command("certutil")
+            new_os_command("certutil")
                 .args(["-user", "-store", "Root", ROOT_CA_COMMON_NAME])
                 .output()
                 .map(|o| o.status.success())
-                .unwrap_or(false);
+                .unwrap_or(false)
         }
 
         #[cfg(target_os = "macos")]
         {
-            return new_os_command("security")
+            new_os_command("security")
                 .args(["find-certificate", "-c", ROOT_CA_COMMON_NAME])
                 .output()
                 .map(|o| o.status.success())
-                .unwrap_or(false);
+                .unwrap_or(false)
         }
 
         #[cfg(target_os = "linux")]
         {
-            return Path::new(LINUX_SYSTEM_CA_CERT_PATH).exists();
+            Path::new(LINUX_SYSTEM_CA_CERT_PATH).exists()
         }
 
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
@@ -399,25 +399,25 @@ impl CertificateAuthority {
 
     /// Triggers explicit, OS-prompted installation of the local Root CA into the current user's trust store.
     pub fn install_into_os_trust_store(&self) -> Result<String, ProxyError> {
-        let cert_path = self.cert_cer_path.display().to_string();
-
         #[cfg(target_os = "windows")]
         {
+            let cert_path = self.cert_cer_path.display().to_string();
             // Installs into CurrentUser Root store, triggering Windows' native Security Warning confirmation prompt.
             let output = new_os_command("certutil")
                 .args(["-user", "-addstore", "Root", &cert_path])
                 .output()?;
 
             if output.status.success() {
-                return Ok("Root CA installed into Windows CurrentUser Trusted Root Store.".into());
+                Ok("Root CA installed into Windows CurrentUser Trusted Root Store.".into())
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                Err(ProxyError::Custom(format_command_error(
+                    &stderr,
+                    &stdout,
+                    "Failed to install Root CA into Windows CurrentUser Root store.",
+                )))
             }
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(ProxyError::Custom(format_command_error(
-                &stderr,
-                &stdout,
-                "Failed to install Root CA into Windows CurrentUser Root store.",
-            )));
         }
 
         #[cfg(target_os = "macos")]
@@ -437,15 +437,16 @@ impl CertificateAuthority {
                 .output()?;
 
             if output.status.success() {
-                return Ok("Root CA installed into macOS login keychain.".into());
+                Ok("Root CA installed into macOS login keychain.".into())
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                Err(ProxyError::Custom(format_command_error(
+                    &stderr,
+                    &stdout,
+                    "Failed to install Root CA into macOS login keychain.",
+                )))
             }
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(ProxyError::Custom(format_command_error(
-                &stderr,
-                &stdout,
-                "Failed to install Root CA into macOS login keychain.",
-            )));
         }
 
         #[cfg(target_os = "linux")]
@@ -455,28 +456,28 @@ impl CertificateAuthority {
                 .args([
                     "sh",
                     "-c",
-                    &format!(
-                        "cp '{}' {LINUX_SYSTEM_CA_CERT_PATH} && update-ca-certificates",
-                        pem_path
-                    ),
+                    "cp \"$1\" \"$2\" && update-ca-certificates",
+                    "_",
+                    &pem_path,
+                    LINUX_SYSTEM_CA_CERT_PATH,
                 ])
                 .output()?;
 
             if output.status.success() {
-                return Ok("Root CA installed via update-ca-certificates.".into());
+                Ok("Root CA installed via update-ca-certificates.".into())
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                Err(ProxyError::Custom(format!(
+                    "Automatic install failed ({}). Import '{}' manually into your browser/OS trust store.",
+                    format_command_error(&stderr, &stdout, "pkexec error"),
+                    pem_path
+                )))
             }
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(ProxyError::Custom(format!(
-                "Automatic install failed ({}). Import '{}' manually into your browser/OS trust store.",
-                format_command_error(&stderr, &stdout, "pkexec error"),
-                pem_path
-            )));
         }
 
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         {
-            let _ = cert_path;
             Err(ProxyError::Custom(
                 "Automatic OS trust store installation is not supported on this platform.".into(),
             ))
@@ -511,8 +512,10 @@ impl CertificateAuthority {
                     "sh".into(),
                     "-c".into(),
                     format!(
-                        "rm -f {LINUX_SYSTEM_CA_CERT_PATH} && update-ca-certificates --fresh"
+                        "rm -f \"$1\" && update-ca-certificates --fresh # {LINUX_SYSTEM_CA_CERT_PATH}"
                     ),
+                    "_".into(),
+                    LINUX_SYSTEM_CA_CERT_PATH.into(),
                 ],
                 success_message:
                     "Root CA removed from /usr/local/share/ca-certificates/ via update-ca-certificates --fresh.".into(),

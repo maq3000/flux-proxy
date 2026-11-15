@@ -5,13 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <!-- Declare support for both schemes; default to dark on first launch while honoring user/system choice -->
     <meta name="color-scheme" content="light dark" />
-    <script>
-      try {
-        const saved = localStorage.getItem("fluxproxy-color-scheme");
-        document.querySelector('meta[name="color-scheme"]').content =
-          saved === "system" ? "light dark" : (saved ?? "dark");
-      } catch {}
-    </script>
+    <script src="/theme-init.js"></script>
     <title>FluxProxy — Web Debugging Proxy</title>
   </head>
   <body>

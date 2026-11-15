@@ -3068,6 +3068,21 @@ fn handle_builtin_portal_request(
         .unwrap_or_else(|_| plain_response(StatusCode::INTERNAL_SERVER_ERROR, "Portal build error"))
 }
 
+pub(crate) fn escape_html(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 fn render_mobile_portal_html(
     client_ip: &str,
     host_header: &str,
@@ -3080,6 +3095,11 @@ fn render_mobile_portal_html(
         || ua.contains("ipod")
         || (ua.contains("macintosh") && ua.contains("mobile"));
     let is_android = ua.contains("android");
+
+    let client_ip = escape_html(client_ip);
+    let host_header = escape_html(host_header);
+    let fingerprint = escape_html(fingerprint);
+    let _user_agent_escaped = escape_html(user_agent);
 
     let detected_badge = if is_ios {
         "Определено устройство: iOS / iPadOS"
@@ -3523,6 +3543,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::result_large_err)]
     async fn websocket_signalr_forwards_auth_cookies_subprotocol_and_response_headers() {
         use tokio_tungstenite::tungstenite::handshake::server::{Request as WsReq, Response as WsResp};
         use tokio_tungstenite::tungstenite::Message;
@@ -4389,5 +4410,24 @@ mod tests {
         assert!(event_rx.try_recv().is_err(), "no dropped session may be emitted");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn mobile_portal_html_escapes_dynamic_fields_against_xss() {
+        let html = render_mobile_portal_html(
+            "10.0.0.1<script>alert(1)</script>",
+            "evil.com\" onmouseover=\"alert(2)",
+            "AB:CD'<img src=x onerror=alert(3)>",
+            "Mozilla/5.0 iPhone <svg onload=alert(4)>",
+        );
+
+        assert!(!html.contains("<script>alert(1)</script>"));
+        assert!(!html.contains("<img src=x onerror=alert(3)>"));
+        assert!(!html.contains("<svg onload=alert(4)>"));
+        assert!(!html.contains("\" onmouseover=\"alert(2)"));
+        assert!(html.contains("10.0.0.1&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(html.contains("evil.com&quot; onmouseover=&quot;alert(2)"));
+        assert!(html.contains("AB:CD&#39;&lt;img src=x onerror=alert(3)&gt;"));
+        assert!(html.contains("Определено устройство: iOS / iPadOS"));
     }
 }

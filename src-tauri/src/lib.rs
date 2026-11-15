@@ -28,7 +28,10 @@ pub fn run() {
             let app_data_dir = app
                 .path()
                 .app_data_dir()
-                .unwrap_or_else(|_| std::env::temp_dir().join("fluxproxy"));
+                .or_else(|_| app.path().app_local_data_dir())
+                .map_err(|e| {
+                    format!("Failed to resolve secure application data directory for Root CA: {e}")
+                })?;
 
             let sysproxy = Arc::new(SystemProxyManager::new(&app_data_dir));
             install_panic_hook_rollback(sysproxy.clone());

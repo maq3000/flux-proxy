@@ -291,6 +291,10 @@ impl SystemProxyManager {
     /// Restores the OS system proxy to the pre-FluxProxy snapshot and deletes `system-proxy-backup.json`.
     pub fn disable(&self) -> Result<(), ProxyError> {
         let mut guard = self.lock_inner();
+        self.disable_with_guard(&mut guard)
+    }
+
+    fn disable_with_guard(&self, guard: &mut ManagerInner) -> Result<(), ProxyError> {
         let (target_host, target_port) = guard.active_target.clone();
 
         let backup_to_restore = guard
@@ -337,8 +341,47 @@ impl SystemProxyManager {
 
     /// Synchronous best-effort rollback invoked from `RunEvent::Exit`, window close, and `std::panic::set_hook`.
     pub fn rollback_sync(&self) {
-        if let Err(err) = self.disable() {
-            tracing::error!("Failed synchronous system proxy rollback: {err}");
+        match self.inner.try_lock() {
+            Ok(mut guard) => {
+                if let Err(err) = self.disable_with_guard(&mut guard) {
+                    tracing::error!("Failed synchronous system proxy rollback: {err}");
+                }
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let mut guard = poisoned.into_inner();
+                if let Err(err) = self.disable_with_guard(&mut guard) {
+                    tracing::error!(
+                        "Failed synchronous system proxy rollback after mutex poison: {err}"
+                    );
+                }
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // Avoid re-entrant deadlock when panic occurs while `self.inner` is already locked on this thread.
+                if let Some(backup) = Self::read_backup_file_opt(&self.backup_path) {
+                    match self.backend.restore_snapshot(&backup.snapshot) {
+                        Ok(()) => {
+                            if self.backup_path.exists() {
+                                let _ = fs::remove_file(&self.backup_path);
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                "Failed lock-free synchronous system proxy rollback from backup file: {err}"
+                            );
+                        }
+                    }
+                } else if let Ok(current_os) = self.backend.capture_snapshot() {
+                    if snapshot_points_to_self(&current_os, "127.0.0.1", 8888) {
+                        let sanitized =
+                            sanitize_self_referential_snapshot(current_os, "127.0.0.1", 8888);
+                        if let Err(err) = self.backend.restore_snapshot(&sanitized) {
+                            tracing::error!(
+                                "Failed lock-free synchronous system proxy sanitization: {err}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1879,6 +1922,34 @@ mod tests {
             8888
         ));
         assert!(!proxy_server_matches_endpoint("127.0.0.1:7890", "127.0.0.1", 8888));
+    }
+
+    #[test]
+    fn rollback_sync_uses_lock_free_fallback_when_mutex_is_held_on_same_thread() {
+        let dir = make_temp_test_dir("reentrant-rollback");
+        let initial = WindowsProxySnapshot {
+            proxy_enable: Some(0),
+            proxy_server: None,
+            proxy_override: None,
+            auto_config_url: None,
+        };
+        let backend = MockWindowsOsBackend::new(initial.clone());
+        let mgr = SystemProxyManager::with_backend(&dir, backend.clone());
+
+        mgr.enable("127.0.0.1", 8888).expect("enable");
+        assert_eq!(backend.current().proxy_enable, Some(1));
+        assert!(mgr.backup_file_path().exists());
+
+        // Simulate panic occurring inside a method that already holds `self.inner`
+        let held = mgr.lock_inner();
+        mgr.rollback_sync();
+        drop(held);
+
+        assert_eq!(backend.current().proxy_enable, Some(0));
+        assert_eq!(backend.current().proxy_server, None);
+        assert!(!mgr.backup_file_path().exists());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(target_os = "windows")]

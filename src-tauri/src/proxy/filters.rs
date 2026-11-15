@@ -427,10 +427,11 @@ impl ProxyFilterEngine {
         };
 
         let mut mutated = false;
-        if direction == HeaderMutationDirection::Response && guard.config.strip_alt_svc {
-            if strip_alt_svc_vec(headers) {
-                mutated = true;
-            }
+        if direction == HeaderMutationDirection::Response
+            && guard.config.strip_alt_svc
+            && strip_alt_svc_vec(headers)
+        {
+            mutated = true;
         }
 
         if !guard.config.header_mutations_enabled {
@@ -493,10 +494,11 @@ impl ProxyFilterEngine {
             }
         }
 
-        if direction == HeaderMutationDirection::Response && guard.config.strip_alt_svc {
-            if strip_alt_svc_vec(headers) {
-                mutated = true;
-            }
+        if direction == HeaderMutationDirection::Response
+            && guard.config.strip_alt_svc
+            && strip_alt_svc_vec(headers)
+        {
+            mutated = true;
         }
 
         mutated
@@ -565,6 +567,14 @@ pub fn match_host_rule_list(rules: &[TlsBypassRule], host: &str, port: u16) -> O
     None
 }
 
+pub(crate) fn strip_regex_prefix(s: &str) -> Option<&str> {
+    if s.is_char_boundary(6) && s.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("regex:")) {
+        s.get(6..)
+    } else {
+        None
+    }
+}
+
 fn normalize_host_token(raw: &str) -> Option<(bool, String)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -578,8 +588,8 @@ fn normalize_host_token(raw: &str) -> Option<(bool, String)> {
     if rest.is_empty() {
         return None;
     }
-    if rest.len() >= 6 && rest[..6].eq_ignore_ascii_case("regex:") {
-        let expr = rest[6..].trim();
+    if let Some(regex_body) = strip_regex_prefix(rest) {
+        let expr = regex_body.trim();
         if expr.is_empty() {
             return None;
         }
@@ -609,7 +619,7 @@ fn url_scope_matches(url_lower: &str, raw_url: &str, pattern: &str) -> bool {
     if trimmed.is_empty() || trimmed == "*" {
         return true;
     }
-    if let Some(re_pat) = trimmed.strip_prefix("regex:") {
+    if let Some(re_pat) = strip_regex_prefix(trimmed) {
         return Regex::new(re_pat.trim())
             .map(|re| re.is_match(raw_url))
             .unwrap_or(false);
@@ -625,7 +635,7 @@ fn wildcard_or_regex_matches(subject: &str, token: &str) -> bool {
     if token == "*" {
         return true;
     }
-    if let Some(re_str) = token.strip_prefix("regex:") {
+    if let Some(re_str) = strip_regex_prefix(token) {
         return Regex::new(&format!("(?i){}", re_str.trim()))
             .map(|re| re.is_match(subject))
             .unwrap_or(false);
@@ -689,7 +699,7 @@ pub fn tokenize_host_list_input(raw_text: &str) -> Vec<String> {
             continue;
         }
 
-        if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("regex:") {
+        if strip_regex_prefix(trimmed).is_some() {
             tokens.push(trimmed.to_string());
             continue;
         }
@@ -716,10 +726,7 @@ pub fn tokenize_host_list_input(raw_text: &str) -> Vec<String> {
                 continue;
             }
             let curr_trimmed = current.trim_start();
-            if !in_regex_segment
-                && curr_trimmed.len() >= 6
-                && curr_trimmed[..6].eq_ignore_ascii_case("regex:")
-            {
+            if !in_regex_segment && strip_regex_prefix(curr_trimmed).is_some() {
                 in_regex_segment = true;
             }
             match ch {
@@ -826,8 +833,8 @@ fn compile_backend_host_list(sync: &HostListBackendSyncConfig) -> CompiledBacken
 
     for token in tokens {
         // 1. Explicit `regex:...`
-        if token.len() >= 6 && token[..6].eq_ignore_ascii_case("regex:") {
-            let expr = token[6..].trim();
+        if let Some(regex_body) = strip_regex_prefix(&token) {
+            let expr = regex_body.trim();
             if expr.is_empty() {
                 continue;
             }
@@ -894,7 +901,7 @@ fn compile_backend_host_list(sync: &HostListBackendSyncConfig) -> CompiledBacken
         let is_whole_host_path = matches!(path_raw, None | Some("/") | Some("/*"));
         let host_has_wildcard = host_pat.contains('*') || host_pat.contains('?');
         let port_has_wildcard =
-            port_pat.map_or(false, |p| p.contains('*') || p.contains('?'));
+            port_pat.is_some_and(|p| p.contains('*') || p.contains('?'));
 
         let simple_subdomain_suffix = if let Some(rest) = host_pat.strip_prefix("*.") {
             (!rest.is_empty() && !rest.contains('*') && !rest.contains('?')).then_some(rest)
@@ -1002,7 +1009,7 @@ fn evaluate_compiled_host_list_connect(
             let matched = compiled.whitelist_hosts.contains(host_lower)
                 || compiled.whitelist_host_ports.contains(&host_port)
                 || matches_wildcard_domain_set(host_lower, &compiled.whitelist_wildcards)
-                || compiled.whitelist_glob_regex.as_ref().map_or(false, |re| {
+                || compiled.whitelist_glob_regex.as_ref().is_some_and(|re| {
                     re.is_match(host_lower) || re.is_match(&host_port)
                 })
                 || matches_any_user_regex(
@@ -1026,7 +1033,7 @@ fn evaluate_compiled_host_list_connect(
                 || compiled.blacklist_hosts.contains(host_lower)
                 || compiled.blacklist_host_ports.contains(&host_port)
                 || matches_wildcard_domain_set(host_lower, &compiled.blacklist_wildcards)
-                || compiled.blacklist_glob_regex.as_ref().map_or(false, |re| {
+                || compiled.blacklist_glob_regex.as_ref().is_some_and(|re| {
                     re.is_match(host_lower) || re.is_match(&host_port)
                 })
                 || matches_any_user_regex(
@@ -1273,8 +1280,8 @@ fn compile_capture_host_list(sync: &HostListBackendSyncConfig) -> CompiledCaptur
     let mut path_only_sources = Vec::new();
 
     for token in tokens {
-        if token.len() >= 6 && token[..6].eq_ignore_ascii_case("regex:") {
-            let expr = token[6..].trim();
+        if let Some(regex_body) = strip_regex_prefix(&token) {
+            let expr = regex_body.trim();
             if !expr.is_empty() {
                 if let Ok(re) = Regex::new(&format!("(?i){expr}")) {
                     out.user_regexes.push(re);
@@ -1334,7 +1341,7 @@ fn compile_capture_host_list(sync: &HostListBackendSyncConfig) -> CompiledCaptur
 
         let is_whole_host_path = matches!(path_raw, None | Some("/") | Some("/*"));
         let host_has_wildcard = host_pat.contains('*') || host_pat.contains('?');
-        let port_has_wildcard = port_pat.map_or(false, |p| p.contains('*') || p.contains('?'));
+        let port_has_wildcard = port_pat.is_some_and(|p| p.contains('*') || p.contains('?'));
 
         if is_whole_host_path {
             if let Some(sc) = scheme {
@@ -1421,7 +1428,7 @@ fn matches_compiled_capture_host_list(
         || compiled
             .host_glob_regex
             .as_ref()
-            .map_or(false, |re| re.is_match(host_clean))
+            .is_some_and(|re| re.is_match(host_clean))
     {
         return true;
     }
@@ -1449,7 +1456,7 @@ fn matches_compiled_capture_host_list(
     if compiled
         .host_port_glob_regex
         .as_ref()
-        .map_or(false, |re| re.is_match(&host_port))
+        .is_some_and(|re| re.is_match(&host_port))
     {
         return true;
     }
@@ -1457,7 +1464,7 @@ fn matches_compiled_capture_host_list(
     if compiled
         .path_only_regex
         .as_ref()
-        .map_or(false, |re| re.is_match(url_path))
+        .is_some_and(|re| re.is_match(url_path))
     {
         return true;
     }
@@ -1644,7 +1651,7 @@ fn eval_capture_condition(s: &SessionSummary, cond: &CompiledCaptureCondition) -
         return cond
             .regex
             .as_ref()
-            .map_or(false, |re| re.is_match(&raw_text));
+            .is_some_and(|re| re.is_match(&raw_text));
     }
 
     let text_lower = raw_text.to_lowercase();
@@ -2118,5 +2125,34 @@ mod tests {
         assert!(!engine.evaluate_should_store_session(&not_modified_304));
         assert!(!engine.evaluate_should_store_session(&other_host));
         assert!(!engine.evaluate_should_store_session(&svchost_telemetry));
+    }
+
+    #[test]
+    fn strip_regex_prefix_handles_multibyte_utf8_at_byte_six_and_case_insensitivity() {
+        // Multi-byte UTF-8 straddling byte index 6 (Cyrillic 2-byte chars & 4-byte emoji)
+        let cyrillic_6_boundary = "приветик.рф"; // 'п'(2) 'р'(2) 'и'(2) -> byte 6, try 5+ byte straddle:
+        let cyrillic_straddle = "abвгд.рф"; // 'a'(1) 'b'(1) 'в'(2) 'г'(2..4->4) 'д'(4..6->6), wait: "abcдe" => a(0..1), b(1..2), c(2..3), 'д'(3..5), 'е'(5..7)! Byte 6 is mid-'е'!
+        let emoji_straddle = "ab😀cd"; // a(0..1), b(1..2), '😀'(2..6), Wait: "abc😀def" => a(0),b(1),c(2), '😀'(3..7)! Byte 6 is inside '😀'!
+
+        for sample in [cyrillic_6_boundary, "abcдеж", cyrillic_straddle, emoji_straddle, "abc😀def", "пr😀"] {
+            assert_eq!(strip_regex_prefix(sample), None);
+            assert!(normalize_host_token(sample).is_some());
+            assert!(!tokenize_host_list_input(sample).is_empty());
+            assert!(!wildcard_or_regex_matches("example.com", sample));
+            assert!(!url_scope_matches("https://example.com", "https://example.com", sample));
+        }
+
+        // Case-insensitive `regex:` matching across helpers
+        assert_eq!(strip_regex_prefix("REGEX:^https://api\\."), Some("^https://api\\."));
+        assert_eq!(strip_regex_prefix("ReGeX:.*тест😀"), Some(".*тест😀"));
+        assert!(url_scope_matches(
+            "https://api.example.com/v1",
+            "https://api.example.com/v1",
+            "REGEX:^https://api\\.example\\.com/v1$"
+        ));
+        assert!(wildcard_or_regex_matches(
+            "api.example.com",
+            "ReGeX:^api\\.example\\.com$"
+        ));
     }
 }

@@ -50,6 +50,55 @@ function escapeWifiQrField(raw: string): string {
   return raw.replace(/([\\;,"':])/g, "\\$1");
 }
 
+function isValidIpv4Address(value: string): boolean {
+  const parts = value.split(".");
+  if (parts.length !== 4) return false;
+  return parts.every((part) => {
+    if (!/^(0|[1-9]\d{0,2})$/.test(part)) return false;
+    const num = Number(part);
+    return num >= 0 && num <= 255;
+  });
+}
+
+function isValidIpv6Address(value: string): boolean {
+  if (!value.includes(":")) return false;
+  // Reject host:port or IPv4:port patterns (single colon); IPv6 always has >= 2 colons
+  if ((value.match(/:/g)?.length ?? 0) < 2) return false;
+  if (!/^[0-9a-fA-F:.]+$/.test(value)) return false;
+  try {
+    const parsed = new URL(`http://[${value}]/`);
+    return parsed.hostname === `[${value.toLowerCase()}]` || parsed.hostname.startsWith("[");
+  } catch {
+    return false;
+  }
+}
+
+function isValidRfcHostname(value: string): boolean {
+  if (value.length === 0 || value.length > 253) return false;
+  if (!/[a-zA-Z]/.test(value)) return false;
+  const labels = value.split(".");
+  return labels.every(
+    (label) =>
+      label.length >= 1 &&
+      label.length <= 63 &&
+      /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/.test(label)
+  );
+}
+
+function isValidCustomProxyHost(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  // Forbid whitespace, control chars, semicolons, quotes, and shell metacharacters
+  if (/[\s\u0000-\u001f\u007f;'"`$&|<>()\\/,?*#@!~^{}[\]=+%_]/.test(trimmed)) {
+    return false;
+  }
+  return (
+    isValidIpv4Address(trimmed) ||
+    isValidRfcHostname(trimmed) ||
+    isValidIpv6Address(trimmed)
+  );
+}
+
 export const MobileSetupModal: React.FC<MobileSetupModalProps> = ({
   open,
   status,
@@ -145,37 +194,42 @@ export const MobileSetupModal: React.FC<MobileSetupModalProps> = ({
     status.allowRemote || status.bindAddr === "0.0.0.0" || status.bindAddr === "::"
   );
 
-  const activeIp = useMemo(() => {
-    const trimmedCustom = customIp.trim();
-    if (trimmedCustom) return trimmedCustom;
-    if (selectedIp) return selectedIp;
-    return "192.168.1.45";
-  }, [customIp, selectedIp]);
+  const trimmedCustomIp = customIp.trim();
+  const isCustomIpInvalid =
+    trimmedCustomIp.length > 0 && !isValidCustomProxyHost(trimmedCustomIp);
 
-  const proxyEndpoint = `${activeIp}:${status.port}`;
+  const activeIp = useMemo(() => {
+    if (trimmedCustomIp && !isCustomIpInvalid) return trimmedCustomIp;
+    if (selectedIp && isValidCustomProxyHost(selectedIp)) return selectedIp;
+    return "192.168.1.45";
+  }, [trimmedCustomIp, isCustomIpInvalid, selectedIp]);
+
+  const urlHostSegment = activeIp.includes(":") ? `[${activeIp}]` : activeIp;
+  const proxyEndpoint = `${urlHostSegment}:${status.port}`;
 
   const certDownloadUrl = useMemo(() => {
     if (certFormat === "mobileconfig") {
-      return `http://${activeIp}:${status.port}/ca.mobileconfig`;
+      return `http://${urlHostSegment}:${status.port}/ca.mobileconfig`;
     }
     if (certFormat === "auto") {
-      return `http://${activeIp}:${status.port}/cert`;
+      return `http://${urlHostSegment}:${status.port}/cert`;
     }
-    return `http://${activeIp}:${status.port}/ca.crt`;
-  }, [activeIp, status.port, certFormat]);
+    return `http://${urlHostSegment}:${status.port}/ca.crt`;
+  }, [urlHostSegment, status.port, certFormat]);
 
-  const portalUrl = `http://${activeIp}:${status.port}`;
+  const portalUrl = `http://${urlHostSegment}:${status.port}`;
   const magicCertUrl = "http://flux.proxy/cert";
 
   const androidWifiQrPayload = useMemo(() => {
     const ssid = escapeWifiQrField(wifiSsid.trim() || "MyWiFiNetwork");
     const pass = escapeWifiQrField(wifiPassword);
+    const safeProxyHost = escapeWifiQrField(activeIp);
     // Include standard ZXing Wi-Fi schema fields + explicit proxy host/port parameters
     const authSegment =
       wifiSecurity === "nopass"
         ? "T:nopass;"
         : `T:${wifiSecurity};P:${pass};`;
-    return `WIFI:${authSegment}S:${ssid};H:false;PROXY_HOST:${activeIp};PROXY_PORT:${status.port};;`;
+    return `WIFI:${authSegment}S:${ssid};H:false;PROXY_HOST:${safeProxyHost};PROXY_PORT:${status.port};;`;
   }, [wifiSsid, wifiPassword, wifiSecurity, activeIp, status.port]);
 
   const qrValue = qrMode === "cert" ? certDownloadUrl : androidWifiQrPayload;
@@ -429,35 +483,47 @@ export const MobileSetupModal: React.FC<MobileSetupModalProps> = ({
               </div>
 
               {/* Optional manual IP override for custom bridge / hotspot subnets */}
-              <div className="flex items-center gap-2">
-                <label
-                  htmlFor="mobile-custom-ip-input"
-                  className="shrink-0 text-[11px] text-subtle"
-                >
-                  Ручной IP (опц.):
-                </label>
-                <input
-                  id="mobile-custom-ip-input"
-                  type="text"
-                  value={customIp}
-                  onChange={(e) => setCustomIp(e.target.value)}
-                  placeholder={selectedIp || "например, 192.168.1.45"}
-                  className="min-w-0 flex-1 rounded border border-hairline bg-surface px-2 py-1 font-mono text-[11px] text-fg placeholder:text-subtle focus:border-accent focus:outline-none"
-                />
-                <button
-                  type="button"
-                  onClick={() =>
-                    void copyText("endpoint", proxyEndpoint, proxyEndpoint)
-                  }
-                  className="inline-flex shrink-0 items-center gap-1 rounded border border-hairline bg-surface px-2 py-1 font-mono text-[11px] text-muted hover:border-strong hover:text-fg"
-                >
-                  {copiedKey === "endpoint" ? (
-                    <Check className="h-3 w-3 text-status2xx-fg" aria-hidden="true" />
-                  ) : (
-                    <Copy className="h-3 w-3" aria-hidden="true" />
-                  )}
-                  <span>{proxyEndpoint}</span>
-                </button>
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <label
+                    htmlFor="mobile-custom-ip-input"
+                    className="shrink-0 text-[11px] text-subtle"
+                  >
+                    Ручной IP (опц.):
+                  </label>
+                  <input
+                    id="mobile-custom-ip-input"
+                    type="text"
+                    value={customIp}
+                    aria-invalid={isCustomIpInvalid}
+                    onChange={(e) => setCustomIp(e.target.value)}
+                    placeholder={selectedIp || "например, 192.168.1.45"}
+                    className={`min-w-0 flex-1 rounded border bg-surface px-2 py-1 font-mono text-[11px] text-fg placeholder:text-subtle focus:outline-none ${
+                      isCustomIpInvalid
+                        ? "border-status5xx-fg focus:border-status5xx-fg"
+                        : "border-hairline focus:border-accent"
+                    }`}
+                  />
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void copyText("endpoint", proxyEndpoint, proxyEndpoint)
+                    }
+                    className="inline-flex shrink-0 items-center gap-1 rounded border border-hairline bg-surface px-2 py-1 font-mono text-[11px] text-muted hover:border-strong hover:text-fg"
+                  >
+                    {copiedKey === "endpoint" ? (
+                      <Check className="h-3 w-3 text-status2xx-fg" aria-hidden="true" />
+                    ) : (
+                      <Copy className="h-3 w-3" aria-hidden="true" />
+                    )}
+                    <span>{proxyEndpoint}</span>
+                  </button>
+                </div>
+                {isCustomIpInvalid && (
+                  <p className="text-[10.5px] text-status5xx-fg">
+                    Укажите корректный IPv4, IPv6 или RFC-hostname (без пробелов, `;`, `:` в качестве порта и спецсимволов shell). Используется резервный адрес <code>{activeIp}</code>.
+                  </p>
+                )}
               </div>
             </div>
 
@@ -488,15 +554,15 @@ export const MobileSetupModal: React.FC<MobileSetupModalProps> = ({
                   onClick={() =>
                     void copyText(
                       "direct-crt",
-                      `http://${activeIp}:${status.port}/ca.crt`,
-                      `http://${activeIp}:${status.port}/ca.crt`
+                      `http://${urlHostSegment}:${status.port}/ca.crt`,
+                      `http://${urlHostSegment}:${status.port}/ca.crt`
                     )
                   }
                   title="Прямая ссылка скачивания сертификата по IP (работает даже до настройки прокси)"
                   className="flex items-center justify-between gap-1.5 rounded border border-hairline bg-canvas px-2 py-1 font-mono text-fg hover:border-accent"
                 >
                   <span className="truncate">
-                    http://{activeIp}:{status.port}/ca.crt
+                    http://{urlHostSegment}:{status.port}/ca.crt
                   </span>
                   <Copy className="h-3 w-3 shrink-0 text-muted" aria-hidden="true" />
                 </button>
@@ -847,8 +913,8 @@ export const MobileSetupModal: React.FC<MobileSetupModalProps> = ({
                         onClick={() =>
                           void copyText(
                             "adb-proxy",
-                            `adb shell settings put global http_proxy ${activeIp}:${status.port}`,
-                            `adb shell settings put global http_proxy ${activeIp}:${status.port}`
+                            `adb shell settings put global http_proxy ${proxyEndpoint}`,
+                            `adb shell settings put global http_proxy ${proxyEndpoint}`
                           )
                         }
                         title="Скопировать ADB-команду включения прокси по USB"
@@ -889,7 +955,7 @@ export const MobileSetupModal: React.FC<MobileSetupModalProps> = ({
                     <p className="mt-0.5 leading-relaxed text-muted">
                       Отсканируйте QR-код{" "}
                       <code className="rounded border border-hairline bg-canvas px-1.5 py-0.5 font-mono text-fg">
-                        http://{activeIp}:{status.port}/ca.crt
+                        http://{urlHostSegment}:{status.port}/ca.crt
                       </code>{" "}
                       или откройте{" "}
                       <code className="rounded border border-hairline bg-canvas px-1.5 py-0.5 font-mono text-fg">
