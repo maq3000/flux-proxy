@@ -86,6 +86,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
 
     const matchedStatic = commands.filter(
       (c) =>
+        c.id.toLowerCase().includes(q) ||
         c.label.toLowerCase().includes(q) ||
         c.category.toLowerCase().includes(q)
     );

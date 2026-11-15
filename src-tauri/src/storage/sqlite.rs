@@ -376,6 +376,45 @@ impl SqliteArchive {
         tx.commit()?;
         Ok(removed)
     }
+
+    pub fn purge_and_vacuum(&self) -> Result<(), ProxyError> {
+        let mut guard = self
+            .conn
+            .lock()
+            .map_err(|_| ProxyError::Custom("SQLite mutex poisoned".into()))?;
+
+        let tx = guard.transaction()?;
+        tx.execute("DELETE FROM offloaded_bodies;", [])?;
+        tx.execute("DELETE FROM captured_sessions;", [])?;
+        tx.commit()?;
+
+        guard.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE);
+             VACUUM;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )?;
+        Ok(())
+    }
+
+    pub fn count_sessions(&self) -> Result<usize, ProxyError> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| ProxyError::Custom("SQLite mutex poisoned".into()))?;
+        let count: i64 =
+            guard.query_row("SELECT COUNT(*) FROM captured_sessions", [], |r| r.get(0))?;
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn count_offloaded_bodies(&self) -> Result<usize, ProxyError> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| ProxyError::Custom("SQLite mutex poisoned".into()))?;
+        let count: i64 =
+            guard.query_row("SELECT COUNT(*) FROM offloaded_bodies", [], |r| r.get(0))?;
+        Ok(count.max(0) as usize)
+    }
 }
 
 #[cfg(test)]
@@ -537,5 +576,88 @@ mod tests {
 
         drop(archive);
         let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    #[test]
+    fn purge_and_vacuum_reclaims_disk_space() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_path = std::env::temp_dir().join(format!(
+            "fluxproxy_vacuum_test_{}_{nanos}.sqlite",
+            std::process::id()
+        ));
+        let cleanup = |path: &std::path::Path| {
+            let _ = std::fs::remove_file(path);
+            let base = path.as_os_str();
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = base.to_os_string();
+                sidecar.push(suffix);
+                let _ = std::fs::remove_file(sidecar);
+            }
+        };
+        cleanup(&tmp_path);
+
+        let archive = SqliteArchive::open(&tmp_path).expect("open sqlite archive");
+
+        // Insert 40 large sessions (~64 KiB each) + 20 offloaded bodies (~128 KiB each)
+        let large_text = "A".repeat(64 * 1024);
+        let sessions: Vec<SessionDetail> = (1u64..=40)
+            .map(|id| {
+                let mut detail = sample_detail(id, Some("heavy session"), None);
+                detail.response_body_text = Some(large_text.clone());
+                detail.summary.body_size = large_text.len();
+                detail
+            })
+            .collect();
+        archive.persist_batch(&sessions).expect("persist heavy batch");
+
+        let large_blob = vec![0x5Au8; 128 * 1024];
+        for id in 1000u64..1020 {
+            archive
+                .save_offloaded_body(id, true, &large_blob)
+                .expect("save heavy offloaded body");
+        }
+
+        let size_before = archive.database_size_bytes(&tmp_path);
+        assert!(
+            size_before > 2 * 1024 * 1024,
+            "expected size_before > 2 MiB, got {size_before} bytes"
+        );
+        assert_eq!(archive.count_sessions().expect("count sessions"), 40);
+        assert_eq!(
+            archive
+                .count_offloaded_bodies()
+                .expect("count offloaded bodies"),
+            20
+        );
+
+        archive
+            .purge_and_vacuum()
+            .expect("purge_and_vacuum should succeed");
+
+        let size_after = archive.database_size_bytes(&tmp_path);
+        assert_eq!(archive.count_sessions().expect("count after purge"), 0);
+        assert_eq!(
+            archive
+                .count_offloaded_bodies()
+                .expect("count offloaded after purge"),
+            0
+        );
+        assert_eq!(
+            archive
+                .load_offloaded_body(1000, true)
+                .expect("load offloaded after purge"),
+            None
+        );
+        assert!(
+            size_after < size_before / 4 && size_after < 256 * 1024,
+            "expected compacted DB < min({} / 4, 256 KiB), got size_after={size_after}, size_before={size_before}",
+            size_before
+        );
+
+        drop(archive);
+        cleanup(&tmp_path);
     }
 }

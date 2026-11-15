@@ -773,3 +773,12 @@ export const DEFAULT_AUTORESPONDER_RULES: AutoResponderRule[] = [
     responseBody: "",
   },
 ];
+
+export const DEFAULT_CLEAR_DB_ON_EXIT = false;
+
+export const PREVIEW_SQLITE_ARCHIVE_STORAGE_KEY =
+  "fluxproxy.sqliteArchivePreview.v1";
+export const PREVIEW_SQLITE_COUNT_STORAGE_KEY =
+  "fluxproxy-sqlite-preview-count";
+export const PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY =
+  "fluxproxy.clearDbOnExit.v1";

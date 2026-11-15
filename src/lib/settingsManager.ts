@@ -15,7 +15,11 @@ import {
   DEFAULT_HOST_LIST_FILTER_CONFIG,
   DEFAULT_NOISE_THRESHOLDS,
 } from "./filterEngine";
-import { DEFAULT_AUTORESPONDER_RULES } from "./mockTraffic";
+import {
+  DEFAULT_AUTORESPONDER_RULES,
+  DEFAULT_CLEAR_DB_ON_EXIT,
+  PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
+} from "./mockTraffic";
 import { proxyBridge } from "./tauriBridge";
 import { DEFAULT_SESSION_RETENTION_LIMIT } from "../types/proxy";
 import type {
@@ -71,6 +75,7 @@ export const SETTINGS_STORAGE_KEYS = {
   autoResponder: "fluxproxy.autoResponder.v1",
   sessionRetentionLimit: "fluxproxy.sessionRetentionLimit.v1",
   dropNonMatching: "fluxproxy.dropNonMatching.v1",
+  clearDbOnExit: PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
 } as const;
 
 const VALID_THEMES = new Set<ThemePreference>(["dark", "light", "system"]);
@@ -148,6 +153,7 @@ const RECOGNIZED_PROFILE_TOP_KEYS = new Set<string>([
   "backendFilterConfig",
   "tlsInterceptMode",
   "autoResponderRules",
+  "clearDbOnExit",
 ]);
 
 type LiveSettingsSnapshotGetter = () => Partial<FluxUserSettingsProfile>;
@@ -227,6 +233,7 @@ export function createDefaultSettingsProfile(): FluxUserSettingsProfile {
       stripAltSvc: DEFAULT_BACKEND_FILTER_CONFIG.stripAltSvc,
       sessionRetentionLimit: DEFAULT_SESSION_RETENTION_LIMIT,
       dropNonMatching: false,
+      clearDbOnExit: DEFAULT_CLEAR_DB_ON_EXIT,
     },
     autoResponder: {
       enabled: true,
@@ -315,6 +322,13 @@ const SCHEMA_MIGRATIONS: Record<number, SchemaMigrationFn> = {
     }
     if (proxy.allowRemote === undefined && draft.allowRemote !== undefined) {
       proxy.allowRemote = draft.allowRemote;
+    }
+    if (proxy.clearDbOnExit === undefined) {
+      if (draft.clearDbOnExit !== undefined) {
+        proxy.clearDbOnExit = draft.clearDbOnExit;
+      } else if (ui.clearDbOnExit !== undefined) {
+        proxy.clearDbOnExit = ui.clearDbOnExit;
+      }
     }
 
     const autoResponder: Record<string, unknown> = { ...existingAutoResp };
@@ -1304,6 +1318,14 @@ export function validateAndMigrateSettingsProfileWithReport(
         "proxy.dropNonMatching",
         warnings
       ),
+      clearDbOnExit: sanitizeBoolean(
+        rawProxy.clearDbOnExit !== undefined
+          ? rawProxy.clearDbOnExit
+          : rawUi.clearDbOnExit,
+        Boolean(defaults.proxy.clearDbOnExit ?? DEFAULT_CLEAR_DB_ON_EXIT),
+        "proxy.clearDbOnExit",
+        warnings
+      ),
     },
     autoResponder: {
       enabled: sanitizeBoolean(
@@ -1405,6 +1427,10 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
   const storedDropNonMatching = readLocalStorageJson<boolean>(
     SETTINGS_STORAGE_KEYS.dropNonMatching,
     false
+  );
+  const storedClearDbOnExit = readLocalStorageJson<boolean>(
+    SETTINGS_STORAGE_KEYS.clearDbOnExit,
+    Boolean(defaults.proxy.clearDbOnExit ?? DEFAULT_CLEAR_DB_ON_EXIT)
   );
   const storedAutoResponder = readLocalStorageJson<{
     enabled?: boolean;
@@ -1515,6 +1541,10 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
           ? live.proxy.sessionRetentionLimit
           : storedRetention,
       dropNonMatching: live.proxy?.dropNonMatching ?? storedDropNonMatching,
+      clearDbOnExit:
+        live.proxy?.clearDbOnExit ??
+        live.ui?.clearDbOnExit ??
+        storedClearDbOnExit,
     },
     autoResponder: {
       enabled:
@@ -1768,6 +1798,10 @@ function atomicWriteProfileToLocalStorage(
       SETTINGS_STORAGE_KEYS.dropNonMatching,
       JSON.stringify(Boolean(profile.proxy.dropNonMatching ?? false)),
     ],
+    [
+      SETTINGS_STORAGE_KEYS.clearDbOnExit,
+      JSON.stringify(Boolean(profile.proxy.clearDbOnExit ?? false)),
+    ],
   ];
 
   // Capture rollback snapshot for atomic recovery if quota is exceeded mid-batch
@@ -1829,6 +1863,7 @@ export async function applySettingsProfile(
       ? normalized.proxy.sessionRetentionLimit
       : DEFAULT_SESSION_RETENTION_LIMIT;
   const dropNonMatching = Boolean(normalized.proxy.dropNonMatching ?? false);
+  const clearDbOnExit = Boolean(normalized.proxy.clearDbOnExit ?? false);
 
   await Promise.all([
     proxyBridge.updateProxyFilterConfig(backendConfig),
@@ -1838,6 +1873,7 @@ export async function applySettingsProfile(
     ),
     proxyBridge.setSessionRetentionLimit(retentionLimit),
     proxyBridge.setDropNonMatching(dropNonMatching),
+    proxyBridge.setClearDbOnExit(clearDbOnExit),
   ]);
 
   let latestStatus: ProxyStatus = await proxyBridge.getStatus();

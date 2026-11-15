@@ -39,6 +39,7 @@ interface MenuBarProps {
   onImportArchive: () => void;
   onSaveSqlite: () => void;
   onLoadSqlite: () => void;
+  onPurgeSqliteArchive: () => void;
   onClearSessions: () => void;
   onExportSettingsProfile: () => void;
   onImportSettingsProfile: () => void;
@@ -274,6 +275,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onImportArchive,
   onSaveSqlite,
   onLoadSqlite,
+  onPurgeSqliteArchive,
   onClearSessions,
   onExportSettingsProfile,
   onImportSettingsProfile,
@@ -1010,6 +1012,12 @@ export const MenuBar: React.FC<MenuBarProps> = ({
               >
                 <span>Restore Archive from SQLite</span>
               </button>
+              <button
+                type="button"
+                onClick={(e) => activateCommand(e, onPurgeSqliteArchive)}
+              >
+                <span>Purge SQLite Archive (Free Disk)...</span>
+              </button>
               <hr />
               <button
                 type="button"
@@ -1650,6 +1658,12 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 onClick={(e) => activateCommand(e, onLoadSqlite)}
               >
                 <span>Load Sessions from SQLite</span>
+              </button>
+              <button
+                type="button"
+                onClick={(e) => activateCommand(e, onPurgeSqliteArchive)}
+              >
+                <span>Purge SQLite Archive (Free Disk)...</span>
               </button>
 
               {/* Submenu: Session Retention Limit... */}

@@ -28,6 +28,8 @@ export interface FluxUserUiSettings {
   columnWidths: Record<ColumnId, number>;
   visibleColumns: Record<ColumnId, boolean>;
   toolbarGroups: Record<ToolbarGroupId, boolean>;
+  /** Optional alias accepted during profile import/migration; canonically stored in `proxy.clearDbOnExit` */
+  clearDbOnExit?: boolean;
 }
 
 export interface FluxUserFilterSettings {
@@ -55,6 +57,8 @@ export interface FluxUserProxySettings {
   stripAltSvc?: boolean;
   sessionRetentionLimit?: number | null;
   dropNonMatching?: boolean;
+  /** Автоматически очищать и сжимать (VACUUM) SQLite-архив при выходе из приложения */
+  clearDbOnExit?: boolean;
 }
 
 export interface FluxUserAutoResponderSettings {

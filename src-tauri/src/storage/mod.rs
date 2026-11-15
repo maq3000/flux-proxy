@@ -2,8 +2,8 @@ pub mod export_import;
 pub mod sqlite;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use base64::Engine as _;
@@ -27,6 +27,10 @@ pub struct TrafficStore {
     sessions: DashMap<u64, Arc<SessionDetail>>,
     sqlite: SqliteArchive,
     db_path: PathBuf,
+    clear_db_on_exit_pref_path: PathBuf,
+    clear_db_on_exit: AtomicBool,
+    exit_purge_executed: AtomicBool,
+    clear_pref_lock: Mutex<()>,
     session_retention_limit: RwLock<Option<usize>>,
     dropped_sessions_count: AtomicU64,
     eviction_lock: Mutex<()>,
@@ -35,14 +39,45 @@ pub struct TrafficStore {
 impl TrafficStore {
     pub fn new(db_path: PathBuf) -> Result<Self, ProxyError> {
         let sqlite = SqliteArchive::open(&db_path)?;
+        let clear_db_on_exit_pref_path = Self::clear_db_on_exit_pref_path(&db_path);
+        let initial_clear_on_exit =
+            Self::load_clear_db_on_exit_pref(&clear_db_on_exit_pref_path);
         Ok(Self {
             next_id: AtomicU64::new(1),
             sessions: DashMap::with_capacity(16_384),
             sqlite,
             db_path,
+            clear_db_on_exit_pref_path,
+            clear_db_on_exit: AtomicBool::new(initial_clear_on_exit),
+            exit_purge_executed: AtomicBool::new(false),
+            clear_pref_lock: Mutex::new(()),
             session_retention_limit: RwLock::new(Some(DEFAULT_SESSION_RETENTION_LIMIT)),
             dropped_sessions_count: AtomicU64::new(0),
             eviction_lock: Mutex::new(()),
+        })
+    }
+
+    fn clear_db_on_exit_pref_path(db_path: &Path) -> PathBuf {
+        db_path.with_file_name("clear_db_on_exit.pref")
+    }
+
+    fn load_clear_db_on_exit_pref(pref_path: &Path) -> bool {
+        std::fs::read_to_string(pref_path)
+            .ok()
+            .map(|raw| matches!(raw.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    }
+
+    fn persist_clear_db_on_exit_pref(pref_path: &Path, enabled: bool) -> Result<(), ProxyError> {
+        if let Some(parent) = pref_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        std::fs::write(pref_path, if enabled { "true\n" } else { "false\n" }).map_err(|e| {
+            ProxyError::Custom(format!(
+                "Failed to persist clear_db_on_exit preference: {e}"
+            ))
         })
     }
 
@@ -90,6 +125,52 @@ impl TrafficStore {
             session_retention_limit: self.retention_limit(),
             drop_non_matching,
         }
+    }
+
+    pub fn clear_sqlite_archive(&self, drop_non_matching: bool) -> Result<StorageStats, ProxyError> {
+        let _evict_guard = match self.eviction_lock.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.sqlite.purge_and_vacuum()?;
+        Ok(self.storage_stats(drop_non_matching))
+    }
+
+    pub fn clear_db_on_exit(&self) -> bool {
+        self.clear_db_on_exit.load(Ordering::SeqCst)
+    }
+
+    pub fn set_clear_db_on_exit(&self, enabled: bool) -> Result<bool, ProxyError> {
+        let _guard = match self.clear_pref_lock.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Self::persist_clear_db_on_exit_pref(&self.clear_db_on_exit_pref_path, enabled)?;
+        self.clear_db_on_exit.store(enabled, Ordering::SeqCst);
+        Ok(enabled)
+    }
+
+    /// Runs `clear_sqlite_archive` at most once per `TrafficStore` lifecycle when `clear_db_on_exit` is enabled.
+    pub fn purge_on_exit_once(&self, drop_non_matching: bool) -> bool {
+        if !self.clear_db_on_exit() {
+            return false;
+        }
+        if self
+            .exit_purge_executed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            match self.clear_sqlite_archive(drop_non_matching) {
+                Ok(_) => {
+                    tracing::info!("Cleared and vacuumed SQLite archive on application exit");
+                }
+                Err(err) => {
+                    tracing::warn!("Failed to clear SQLite archive on application exit: {err}");
+                }
+            }
+            return true;
+        }
+        false
     }
 
     pub fn insert(&self, detail: SessionDetail) {
@@ -882,5 +963,56 @@ mod tests {
         drop(store);
         drop(store2);
         cleanup_temp_db(&db_path);
+    }
+
+    #[test]
+    fn clear_sqlite_archive_and_clear_on_exit_pref_run_once() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy_store_exit_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("sessions.sqlite");
+
+        let store = TrafficStore::new(db_path.clone()).expect("init isolated TrafficStore");
+        assert!(!store.clear_db_on_exit());
+
+        // Set retention limit small and spill several heavy sessions into SQLite
+        store.set_retention_limit(Some(2)).unwrap();
+        let heavy_payload = "B".repeat(BODY_OFFLOAD_THRESHOLD_BYTES + 128 * 1024);
+        for _ in 0..5 {
+            let id = store.allocate_id();
+            store.insert(make_session(id, heavy_payload.as_bytes()));
+        }
+        assert_eq!(store.len(), 2);
+
+        let before = store.storage_stats(false);
+        assert!(before.sqlite_size_bytes > 2 * 1024 * 1024);
+
+        // Explicit archive purge shrinks SQLite while keeping RAM sessions intact
+        let after = store
+            .clear_sqlite_archive(false)
+            .expect("clear_sqlite_archive");
+        assert_eq!(after.ram_sessions, 2);
+        assert!(after.sqlite_size_bytes < before.sqlite_size_bytes / 4);
+
+        // Persist clear_db_on_exit preference and verify reload from disk
+        assert!(store.set_clear_db_on_exit(true).unwrap());
+        drop(store);
+
+        let reloaded_store =
+            TrafficStore::new(db_path.clone()).expect("reopen isolated TrafficStore");
+        assert!(reloaded_store.clear_db_on_exit());
+
+        // purge_on_exit_once executes strictly once
+        assert!(reloaded_store.purge_on_exit_once(false));
+        assert!(!reloaded_store.purge_on_exit_once(false));
+
+        drop(reloaded_store);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

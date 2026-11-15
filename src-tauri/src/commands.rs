@@ -317,6 +317,34 @@ pub async fn get_memory_storage_stats(
 }
 
 #[tauri::command]
+pub async fn clear_sqlite_database(
+    state: State<'_, AppState>,
+) -> Result<StorageStats, ProxyError> {
+    let store = state.controller.context.store.clone();
+    let drop_enabled = state
+        .controller
+        .context
+        .filters
+        .is_drop_non_matching_enabled();
+    tokio::task::spawn_blocking(move || store.clear_sqlite_archive(drop_enabled))
+        .await
+        .map_err(|e| ProxyError::Custom(format!("Clear SQLite task join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn get_clear_db_on_exit(state: State<'_, AppState>) -> Result<bool, ProxyError> {
+    Ok(state.controller.context.store.clear_db_on_exit())
+}
+
+#[tauri::command]
+pub async fn set_clear_db_on_exit(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<bool, ProxyError> {
+    state.controller.context.store.set_clear_db_on_exit(enabled)
+}
+
+#[tauri::command]
 pub async fn load_session_body(
     id: u64,
     is_response: bool,

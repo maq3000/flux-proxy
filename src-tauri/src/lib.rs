@@ -118,6 +118,9 @@ pub fn run() {
             commands::set_session_retention_limit,
             commands::set_drop_non_matching,
             commands::get_memory_storage_stats,
+            commands::clear_sqlite_database,
+            commands::get_clear_db_on_exit,
+            commands::set_clear_db_on_exit,
             commands::load_session_body,
             commands::export_sessions_file,
             commands::import_sessions_file,
@@ -138,6 +141,20 @@ pub fn run() {
         ) {
             if let Some(state) = app_handle.try_state::<AppState>() {
                 state.controller.shutdown_sync();
+                if matches!(event, tauri::RunEvent::Exit)
+                    && state.controller.context.store.clear_db_on_exit()
+                {
+                    let drop_enabled = state
+                        .controller
+                        .context
+                        .filters
+                        .is_drop_non_matching_enabled();
+                    state
+                        .controller
+                        .context
+                        .store
+                        .purge_on_exit_once(drop_enabled);
+                }
             }
         }
     });

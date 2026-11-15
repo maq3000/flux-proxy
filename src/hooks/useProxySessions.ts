@@ -16,6 +16,10 @@ import {
   suggestSessionBodyFileName,
 } from "../lib/formatters";
 import {
+  DEFAULT_CLEAR_DB_ON_EXIT,
+  PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
+} from "../lib/mockTraffic";
+import {
   DEFAULT_BREAKPOINT_CONFIG,
   type FileDialogFilter,
   proxyBridge,
@@ -58,6 +62,7 @@ const LS_FOLLOW_TAIL_KEY = "fluxproxy.followTail.v1";
 const LS_BREAKPOINT_CFG_KEY = "fluxproxy.breakpointConfig.v1";
 const LS_RETENTION_LIMIT_KEY = "fluxproxy.sessionRetentionLimit.v1";
 const LS_DROP_NON_MATCHING_KEY = "fluxproxy.dropNonMatching.v1";
+const LS_CLEAR_DB_ON_EXIT_KEY = PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY;
 
 function loadPersistedProxyPort(): number {
   if (typeof window === "undefined") return 8888;
@@ -255,6 +260,27 @@ export function useProxySessions() {
   const dropNonMatchingRef = useRef<boolean>(dropNonMatching);
   dropNonMatchingRef.current = dropNonMatching;
 
+  const hasPersistedClearDbOnExitRef = useRef<boolean>(
+    typeof window !== "undefined" &&
+      (() => {
+        try {
+          return window.localStorage.getItem(LS_CLEAR_DB_ON_EXIT_KEY) !== null;
+        } catch {
+          return false;
+        }
+      })()
+  );
+  const [clearDbOnExit, setClearDbOnExitState] = useState<boolean>(() =>
+    Boolean(
+      loadPersistedState<boolean>(
+        LS_CLEAR_DB_ON_EXIT_KEY,
+        DEFAULT_CLEAR_DB_ON_EXIT
+      )
+    )
+  );
+  const clearDbOnExitRef = useRef<boolean>(clearDbOnExit);
+  clearDbOnExitRef.current = clearDbOnExit;
+
   const [storageStats, setStorageStats] = useState<StorageStats>(() => ({
     ramSessions: 0,
     sqliteSizeBytes: 0,
@@ -414,6 +440,12 @@ export function useProxySessions() {
       dropNonMatchingRef.current = nextDropNonMatching;
       setDropNonMatchingState(nextDropNonMatching);
 
+      const nextClearDbOnExit = Boolean(
+        detail.proxy.clearDbOnExit ?? DEFAULT_CLEAR_DB_ON_EXIT
+      );
+      clearDbOnExitRef.current = nextClearDbOnExit;
+      setClearDbOnExitState(nextClearDbOnExit);
+
       const compiledHl = compileHostListFilter(nextHostList);
       const nextBackendCfg: ProxyFilterBackendConfig = {
         tlsInterceptMode: detail.proxy.tlsInterceptMode,
@@ -564,6 +596,24 @@ export function useProxySessions() {
         proxyBridge.listPausedBreakpoints(),
       ]);
       await proxyBridge.setDropNonMatching(dropNonMatchingRef.current);
+      if (hasPersistedClearDbOnExitRef.current) {
+        await proxyBridge.setClearDbOnExit(clearDbOnExitRef.current);
+      } else {
+        const backendClearOnExit = await proxyBridge.getClearDbOnExit();
+        const resolvedClearOnExit = await proxyBridge.setClearDbOnExit(
+          backendClearOnExit
+        );
+        clearDbOnExitRef.current = resolvedClearOnExit;
+        setClearDbOnExitState(resolvedClearOnExit);
+        try {
+          window.localStorage.setItem(
+            LS_CLEAR_DB_ON_EXIT_KEY,
+            JSON.stringify(resolvedClearOnExit)
+          );
+        } catch {
+          // ignore storage quota errors
+        }
+      }
       const [initialStatus, initialSessions, initialStats] = await Promise.all([
         proxyBridge.getStatus(),
         proxyBridge.getSessions(),
@@ -1048,6 +1098,53 @@ export function useProxySessions() {
   const toggleDropNonMatching = useCallback(async () => {
     await setDropNonMatching(!dropNonMatchingRef.current);
   }, [setDropNonMatching]);
+
+  const setClearDbOnExit = useCallback(
+    async (enabled: boolean) => {
+      const next = Boolean(enabled);
+      clearDbOnExitRef.current = next;
+      setClearDbOnExitState(next);
+      try {
+        window.localStorage.setItem(
+          LS_CLEAR_DB_ON_EXIT_KEY,
+          JSON.stringify(next)
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+      const confirmed = await proxyBridge.setClearDbOnExit(next);
+      clearDbOnExitRef.current = confirmed;
+      setClearDbOnExitState(confirmed);
+      showToast(
+        confirmed
+          ? "🧹 Автоочистка SQLite при выходе (Clear DB on App Exit) включена"
+          : "Автоочистка SQLite при выходе отключена"
+      );
+      return confirmed;
+    },
+    [showToast]
+  );
+
+  const clearSqliteDatabase = useCallback(async (): Promise<StorageStats> => {
+    try {
+      const stats = await proxyBridge.clearSqliteDatabase();
+      setStorageStats(stats);
+      showToast(
+        `🗜️ Архив SQLite очищен и сжат (VACUUM) • Размер на диске: ${(
+          stats.sqliteSizeBytes /
+          (1024 * 1024)
+        ).toFixed(2)} MB`
+      );
+      return stats;
+    } catch (err) {
+      showToast(
+        `⚠️ Ошибка очистки SQLite: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+      throw err;
+    }
+  }, [showToast]);
 
   const detectedProcesses = useMemo<DetectedProcessItem[]>(() => {
     const map = new Map<string, DetectedProcessItem>();
@@ -2665,6 +2762,9 @@ export function useProxySessions() {
     dropNonMatching,
     setDropNonMatching,
     toggleDropNonMatching,
+    clearDbOnExit,
+    setClearDbOnExit,
+    clearSqliteDatabase,
     storageStats,
     refreshStorageStats,
     // Core Proxy Actions

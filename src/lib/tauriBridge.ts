@@ -35,6 +35,10 @@ import {
 import {
   buildSimulatedSession,
   DEFAULT_AUTORESPONDER_RULES,
+  DEFAULT_CLEAR_DB_ON_EXIT,
+  PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
+  PREVIEW_SQLITE_ARCHIVE_STORAGE_KEY,
+  PREVIEW_SQLITE_COUNT_STORAGE_KEY,
 } from "./mockTraffic";
 import { browserPreviewCodecTransform } from "./textWizard";
 
@@ -140,6 +144,7 @@ class BrowserPreviewEngine {
     DEFAULT_SESSION_RETENTION_LIMIT;
   private droppedSessionsCount = 0;
   private evictedSqliteBytes = 0;
+  private clearDbOnExit = DEFAULT_CLEAR_DB_ON_EXIT;
   private offloadedBodies = new Map<
     string,
     { bodyBase64: string; bodyText: string | null; bodySize: number }
@@ -195,6 +200,12 @@ class BrowserPreviewEngine {
           this.filterConfig.dropNonMatchingOnCapture = Boolean(
             JSON.parse(rawDrop)
           );
+        }
+        const rawClearDbOnExit = window.localStorage.getItem(
+          PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY
+        );
+        if (rawClearDbOnExit !== null) {
+          this.clearDbOnExit = Boolean(JSON.parse(rawClearDbOnExit));
         }
         const rawPort = window.localStorage.getItem("fluxproxy.proxyPort.v1");
         if (rawPort !== null) {
@@ -1071,7 +1082,7 @@ class BrowserPreviewEngine {
     if (typeof window !== "undefined") {
       try {
         const raw = window.localStorage.getItem(
-          "fluxproxy.sqliteArchivePreview.v1"
+          PREVIEW_SQLITE_ARCHIVE_STORAGE_KEY
         );
         if (raw) persistedBytes += raw.length;
       } catch {
@@ -1088,6 +1099,39 @@ class BrowserPreviewEngine {
       sessionRetentionLimit: this.sessionRetentionLimit,
       dropNonMatching: Boolean(this.filterConfig.dropNonMatchingOnCapture),
     };
+  }
+
+  clearSqliteDatabase(): StorageStats {
+    this.evictedSqliteBytes = 0;
+    this.offloadedBodies.clear();
+    if (typeof window !== "undefined") {
+      try {
+        window.localStorage.removeItem(PREVIEW_SQLITE_ARCHIVE_STORAGE_KEY);
+        window.localStorage.removeItem(PREVIEW_SQLITE_COUNT_STORAGE_KEY);
+      } catch {
+        // ignore storage errors
+      }
+    }
+    return this.getMemoryStorageStats();
+  }
+
+  getClearDbOnExit(): boolean {
+    return this.clearDbOnExit;
+  }
+
+  setClearDbOnExit(enabled: boolean): boolean {
+    this.clearDbOnExit = Boolean(enabled);
+    if (typeof window !== "undefined") {
+      try {
+        window.localStorage.setItem(
+          PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
+          JSON.stringify(this.clearDbOnExit)
+        );
+      } catch {
+        // ignore storage errors
+      }
+    }
+    return this.clearDbOnExit;
   }
 
   loadSessionBody(id: number, isResponse: boolean): LoadedSessionBody {
@@ -1950,6 +1994,27 @@ export const proxyBridge = {
       return invoke<StorageStats>("get_memory_storage_stats");
     }
     return previewEngine.getMemoryStorageStats();
+  },
+
+  async clearSqliteDatabase(): Promise<StorageStats> {
+    if (isTauriRuntime()) {
+      return invoke<StorageStats>("clear_sqlite_database");
+    }
+    return previewEngine.clearSqliteDatabase();
+  },
+
+  async getClearDbOnExit(): Promise<boolean> {
+    if (isTauriRuntime()) {
+      return invoke<boolean>("get_clear_db_on_exit");
+    }
+    return previewEngine.getClearDbOnExit();
+  },
+
+  async setClearDbOnExit(enabled: boolean): Promise<boolean> {
+    if (isTauriRuntime()) {
+      return invoke<boolean>("set_clear_db_on_exit", { enabled });
+    }
+    return previewEngine.setClearDbOnExit(enabled);
   },
 
   async loadSessionBody(

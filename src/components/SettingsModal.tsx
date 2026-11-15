@@ -4,6 +4,7 @@ import {
   Check,
   Columns,
   Copy,
+  Database,
   Download,
   ExternalLink,
   FileJson,
@@ -41,6 +42,7 @@ import type {
   NoiseThresholdsConfig,
   ProxyFilterBackendConfig,
   ProxyStatus,
+  StorageStats,
   TlsBypassRule,
   TlsInterceptMode,
   ToolbarGroupId,
@@ -137,6 +139,10 @@ export interface SettingsModalProps {
   onSetSessionRetentionLimit: (limit: number | null) => Promise<void> | void;
   dropNonMatching: boolean;
   onSetDropNonMatching: (drop: boolean) => Promise<void> | void;
+  storageStats: StorageStats;
+  clearDbOnExit: boolean;
+  onSetClearDbOnExit: (enabled: boolean) => Promise<boolean | void> | void;
+  onClearSqliteDatabase: () => Promise<StorageStats | void> | void;
   backendFilterConfig: ProxyFilterBackendConfig;
   onUpdateBackendFilterConfig: (next: ProxyFilterBackendConfig) => Promise<void>;
   onSetTlsInterceptMode: (mode: TlsInterceptMode) => Promise<void> | void;
@@ -241,6 +247,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onSetSessionRetentionLimit,
   dropNonMatching,
   onSetDropNonMatching,
+  storageStats,
+  clearDbOnExit,
+  onSetClearDbOnExit,
+  onClearSqliteDatabase,
   backendFilterConfig,
   onUpdateBackendFilterConfig,
   onSetTlsInterceptMode,
@@ -260,6 +270,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 }) => {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const resetConfirmDialogRef = useRef<HTMLDialogElement>(null);
+  const purgeConfirmDialogRef = useRef<HTMLDialogElement>(null);
   const tabButtonRefs = useRef<Record<SettingsModalTab, HTMLButtonElement | null>>(
     {
       general: null,
@@ -273,9 +284,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const baseId = useId();
   const titleId = `${baseId}-title`;
   const resetTitleId = `${baseId}-reset-title`;
+  const purgeTitleId = `${baseId}-purge-title`;
 
   const [activeTab, setActiveTab] = useState<SettingsModalTab>(initialTab);
   const [confirmResetOpen, setConfirmResetOpen] = useState(false);
+  const [confirmPurgeSqliteOpen, setConfirmPurgeSqliteOpen] = useState(false);
+  const [isPurgingSqlite, setIsPurgingSqlite] = useState(false);
 
   // Port input local draft & post-blur validation
   const [portDraft, setPortDraft] = useState<string>(() => String(status.port));
@@ -342,11 +356,36 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   }, [confirmResetOpen]);
 
+  useEffect(() => {
+    const dialog = purgeConfirmDialogRef.current;
+    if (!dialog) return;
+    if (confirmPurgeSqliteOpen) {
+      if (!dialog.open) dialog.showModal();
+    } else if (dialog.open) {
+      dialog.close();
+    }
+  }, [confirmPurgeSqliteOpen]);
+
   useEffect(() => attachDialogLightDismissFallback(dialogRef.current), []);
   useEffect(
     () => attachDialogLightDismissFallback(resetConfirmDialogRef.current),
     []
   );
+  useEffect(
+    () => attachDialogLightDismissFallback(purgeConfirmDialogRef.current),
+    []
+  );
+
+  const handleConfirmPurgeSqlite = async () => {
+    if (isPurgingSqlite) return;
+    setIsPurgingSqlite(true);
+    try {
+      await onClearSqliteDatabase();
+      setConfirmPurgeSqliteOpen(false);
+    } finally {
+      setIsPurgingSqlite(false);
+    }
+  };
 
   const compiledHosts = useMemo(
     () => compileHostListFilter(hostFilters),
@@ -849,6 +888,57 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       </div>
                     </div>
                   </label>
+
+                  <div className="mt-3 rounded-lg border border-hairline bg-surface p-3 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 text-xs font-medium text-fg">
+                        <Database className="h-3.5 w-3.5 text-accent" />
+                        <span>Архив SQLite (sessions.sqlite + WAL)</span>
+                      </div>
+                      <div className="text-xs font-mono tabular-nums text-fg">
+                        {(storageStats.sqliteSizeBytes / (1024 * 1024)).toFixed(2)} MB
+                        <span className="ml-1.5 text-[11px] text-muted">
+                          ({Math.round(storageStats.sqliteSizeBytes / 1024).toLocaleString("en-US")} KB)
+                        </span>
+                      </div>
+                    </div>
+
+                    <label className="flex cursor-pointer items-start gap-2.5 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={clearDbOnExit}
+                        onChange={(e) => void onSetClearDbOnExit(e.target.checked)}
+                        className="checkbox-native mt-0.5"
+                      />
+                      <div>
+                        <div className="font-medium text-fg">
+                          Очищать базу SQLite при выходе (Clear DB on App Exit)
+                        </div>
+                        <div className="text-[11px] text-muted">
+                          При закрытии приложения автоматически удаляет все архивные сессии и сжимает файл базы через VACUUM.
+                        </div>
+                      </div>
+                    </label>
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-hairline">
+                      <div className="text-[11px] text-muted">
+                        Полная очистка удаляет все сохранённые сессии с диска (сессии в ОЗУ сохраняются).
+                      </div>
+                      <button
+                        type="button"
+                        disabled={isPurgingSqlite}
+                        onClick={() => setConfirmPurgeSqliteOpen(true)}
+                        className="inline-flex items-center gap-1.5 rounded border border-status5xx-fg/40 bg-status5xx-bg/40 px-2.5 py-1.5 text-xs font-medium text-status5xx-fg transition-colors hover:bg-status5xx-bg disabled:opacity-50"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                        <span>
+                          {isPurgingSqlite
+                            ? "Сжатие SQLite..."
+                            : "Очистить архив SQLite сейчас (VACUUM)"}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
                 </div>
               </>
             )}
@@ -2259,6 +2349,79 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               Готово
             </button>
           </div>
+        </div>
+      </dialog>
+
+      {/* SQLite Purge & VACUUM Confirmation Native <dialog> (autofocus on safe Cancel action) */}
+      <dialog
+        ref={purgeConfirmDialogRef}
+        aria-labelledby={purgeTitleId}
+        onClose={() => {
+          if (!isPurgingSqlite) setConfirmPurgeSqliteOpen(false);
+        }}
+        {...({ closedby: "any" } as Record<string, string>)}
+        className="m-auto w-full max-w-md rounded-xl border border-strong bg-surface p-0 text-fg shadow-popover open:flex open:flex-col"
+      >
+        <div className="flex items-center justify-between border-b border-hairline px-4 py-3">
+          <div className="flex items-center gap-2">
+            <Database className="h-4 w-4 text-status5xx-fg" />
+            <h2 id={purgeTitleId} className="text-sm font-semibold text-fg">
+              Очистить и сжать архив SQLite?
+            </h2>
+          </div>
+          <button
+            type="button"
+            disabled={isPurgingSqlite}
+            onClick={() => setConfirmPurgeSqliteOpen(false)}
+            className="rounded p-1 text-muted hover:bg-hover hover:text-fg disabled:opacity-45"
+            aria-label="Закрыть подтверждение очистки SQLite"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="space-y-2 px-4 py-3 text-xs text-fg">
+          <p>
+            Все сохранённые на диске сессии и выгруженные тела запросов/ответов в{" "}
+            <code className="rounded bg-canvas px-1 py-0.5 font-mono text-[11px]">
+              sessions.sqlite
+            </code>{" "}
+            будут безвозвратно удалены, после чего выполнится{" "}
+            <code className="rounded bg-canvas px-1 py-0.5 font-mono text-[11px]">
+              VACUUM
+            </code>{" "}
+            и усечение WAL-журнала.
+          </p>
+          <p className="text-[11px] text-muted">
+            Текущий размер на диске:{" "}
+            <strong className="font-semibold text-fg">
+              {(storageStats.sqliteSizeBytes / (1024 * 1024)).toFixed(2)} MB
+            </strong>{" "}
+            ({storageStats.sqliteSizeBytes.toLocaleString("en-US")} байт). Сессии в
+            текущей таблице ОЗУ ({storageStats.ramSessions.toLocaleString("en-US")}{" "}
+            шт.) затронуты не будут.
+          </p>
+        </div>
+        <div className="flex items-center justify-end gap-2 border-t border-hairline bg-canvas/50 px-4 py-2.5">
+          <button
+            type="button"
+            autoFocus
+            disabled={isPurgingSqlite}
+            onClick={() => setConfirmPurgeSqliteOpen(false)}
+            className="rounded border border-strong bg-surface px-3 py-1.5 text-xs font-medium text-fg hover:bg-hover disabled:opacity-45"
+          >
+            Отмена
+          </button>
+          <button
+            type="button"
+            disabled={isPurgingSqlite}
+            onClick={() => void handleConfirmPurgeSqlite()}
+            className="inline-flex items-center gap-1.5 rounded bg-rose-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-rose-700 disabled:opacity-50"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            <span>
+              {isPurgingSqlite ? "Очистка и VACUUM..." : "Очистить и сжать (VACUUM)"}
+            </span>
+          </button>
         </div>
       </dialog>
 

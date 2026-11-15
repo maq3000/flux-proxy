@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Upload } from "lucide-react";
+import { Database, Trash2, Upload, X } from "lucide-react";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { AutoResponderPanel } from "./components/AutoResponderPanel";
 import {
@@ -165,6 +165,9 @@ export const App: React.FC = () => {
     setDropNonMatching,
     toggleDropNonMatching,
     storageStats,
+    clearDbOnExit,
+    setClearDbOnExit,
+    clearSqliteDatabase,
     toggleProxy,
     setProxyPort,
     setAllowRemote,
@@ -669,6 +672,7 @@ export const App: React.FC = () => {
       stripAltSvc: backendFilterConfig.stripAltSvc,
       sessionRetentionLimit,
       dropNonMatching,
+      clearDbOnExit,
     },
     autoResponder: {
       enabled: autoResponderEnabled,
@@ -792,6 +796,31 @@ export const App: React.FC = () => {
     setActiveSection("traffic");
     setCustomRetentionTriggerSeq((n) => n + 1);
   }, []);
+
+  const sqlitePurgeDialogRef = useRef<HTMLDialogElement>(null);
+  const [confirmSqlitePurgeOpen, setConfirmSqlitePurgeOpen] = useState(false);
+  const [isPurgingSqlite, setIsPurgingSqlite] = useState(false);
+
+  useEffect(() => {
+    const dialog = sqlitePurgeDialogRef.current;
+    if (!dialog) return;
+    if (confirmSqlitePurgeOpen) {
+      if (!dialog.open) dialog.showModal();
+    } else if (dialog.open) {
+      dialog.close();
+    }
+  }, [confirmSqlitePurgeOpen]);
+
+  const handleConfirmSqlitePurge = useCallback(async () => {
+    if (isPurgingSqlite) return;
+    setIsPurgingSqlite(true);
+    try {
+      await clearSqliteDatabase();
+      setConfirmSqlitePurgeOpen(false);
+    } finally {
+      setIsPurgingSqlite(false);
+    }
+  }, [clearSqliteDatabase, isPurgingSqlite]);
 
   const copyUrlsForIds = useCallback(
     (ids: number[]) => {
@@ -1657,6 +1686,12 @@ export const App: React.FC = () => {
         perform: () => void loadFromSqlite(),
       },
       {
+        id: "clear-sqlite-db",
+        category: "Storage",
+        label: "Purge & Compact SQLite Archive (VACUUM / Free Disk)...",
+        perform: () => setConfirmSqlitePurgeOpen(true),
+      },
+      {
         id: "toggle-drop-non-matching",
         category: "Storage",
         label: dropNonMatching
@@ -1958,6 +1993,7 @@ export const App: React.FC = () => {
         onImportArchive={() => void importArchiveDialog()}
         onSaveSqlite={() => void saveToSqlite()}
         onLoadSqlite={() => void loadFromSqlite()}
+        onPurgeSqliteArchive={() => setConfirmSqlitePurgeOpen(true)}
         onClearSessions={() => void clearAllSessions()}
         onExportSettingsProfile={() => void handleExportSettingsProfile()}
         onImportSettingsProfile={() => void handleImportSettingsProfileDialog()}
@@ -2440,37 +2476,63 @@ export const App: React.FC = () => {
               {toastMessage}
             </span>
           )}
-          <button
-            type="button"
-            onClick={handleOpenCustomRetentionLimit}
-            title={`Кольцевой буфер (Ring Buffer): ${
-              sessionRetentionLimit === null
-                ? "All Sessions (без ограничений)"
-                : `Keep ${sessionRetentionLimit.toLocaleString("en-US")} сессий`
-            } • Drop Non-Matching: ${
-              dropNonMatching ? "ON" : "OFF"
-            } — нажмите для настройки лимита`}
-            className="shrink-0 tabular-nums text-muted transition-colors hover:text-fg"
-          >
-            RAM:{" "}
-            <strong className="font-semibold text-fg">
-              {storageStats.ramSessions.toLocaleString("en-US")}
-            </strong>{" "}
-            ses | SQLite:{" "}
-            <strong className="font-semibold text-fg">
-              {(storageStats.sqliteSizeBytes / (1024 * 1024)).toFixed(1)} MB
-            </strong>{" "}
-            | Dropped:{" "}
-            <strong
-              className={`font-semibold ${
-                storageStats.droppedSessionsCount > 0
-                  ? "text-status4xx-fg"
-                  : "text-fg"
-              }`}
+          <div className="flex shrink-0 items-center gap-1.5 tabular-nums text-muted">
+            <button
+              type="button"
+              onClick={handleOpenCustomRetentionLimit}
+              title={`Кольцевой буфер (Ring Buffer): ${
+                sessionRetentionLimit === null
+                  ? "All Sessions (без ограничений)"
+                  : `Keep ${sessionRetentionLimit.toLocaleString("en-US")} сессий`
+              } • Drop Non-Matching: ${
+                dropNonMatching ? "ON" : "OFF"
+              } — нажмите для настройки лимита`}
+              className="transition-colors hover:text-fg"
             >
-              {storageStats.droppedSessionsCount.toLocaleString("en-US")}
-            </strong>
-          </button>
+              RAM:{" "}
+              <strong className="font-semibold text-fg">
+                {storageStats.ramSessions.toLocaleString("en-US")}
+              </strong>{" "}
+              ses
+            </button>
+            <span aria-hidden="true">|</span>
+            <button
+              type="button"
+              onClick={() => setConfirmSqlitePurgeOpen(true)}
+              title={`Размер архива SQLite (sessions.sqlite + WAL): ${(
+                storageStats.sqliteSizeBytes /
+                (1024 * 1024)
+              ).toFixed(2)} MB • Очистка при выходе: ${
+                clearDbOnExit ? "ON" : "OFF"
+              } — нажмите для очистки и VACUUM`}
+              className="transition-colors hover:text-fg"
+            >
+              SQLite:{" "}
+              <strong className="font-semibold text-fg">
+                {(storageStats.sqliteSizeBytes / (1024 * 1024)).toFixed(1)} MB
+              </strong>
+            </button>
+            <span aria-hidden="true">|</span>
+            <button
+              type="button"
+              onClick={handleOpenCustomRetentionLimit}
+              title={`Отброшено сессий фильтром (Drop Non-Matching): ${storageStats.droppedSessionsCount.toLocaleString(
+                "en-US"
+              )} — нажмите для настройки буфера`}
+              className="transition-colors hover:text-fg"
+            >
+              Dropped:{" "}
+              <strong
+                className={`font-semibold ${
+                  storageStats.droppedSessionsCount > 0
+                    ? "text-status4xx-fg"
+                    : "text-fg"
+                }`}
+              >
+                {storageStats.droppedSessionsCount.toLocaleString("en-US")}
+              </strong>
+            </button>
+          </div>
           <span className="hidden text-subtle 2xl:inline">•</span>
           <button
             type="button"
@@ -2540,6 +2602,10 @@ export const App: React.FC = () => {
         onSetSessionRetentionLimit={setSessionRetentionLimit}
         dropNonMatching={dropNonMatching}
         onSetDropNonMatching={setDropNonMatching}
+        storageStats={storageStats}
+        clearDbOnExit={clearDbOnExit}
+        onSetClearDbOnExit={setClearDbOnExit}
+        onClearSqliteDatabase={clearSqliteDatabase}
         backendFilterConfig={backendFilterConfig}
         onUpdateBackendFilterConfig={updateBackendFilterConfig}
         onSetTlsInterceptMode={setTlsInterceptMode}
@@ -2674,6 +2740,111 @@ export const App: React.FC = () => {
         }
         onQuickOpenJwt={(token) => openTextWizardAt("jwt", token)}
       />
+
+      <dialog
+        ref={sqlitePurgeDialogRef}
+        aria-labelledby="sqlite-purge-confirm-title"
+        onCancel={(e) => {
+          if (isPurgingSqlite) e.preventDefault();
+        }}
+        onClose={() => {
+          if (!isPurgingSqlite) setConfirmSqlitePurgeOpen(false);
+        }}
+        onClick={(e) => {
+          if (e.target === e.currentTarget && !isPurgingSqlite) {
+            setConfirmSqlitePurgeOpen(false);
+          }
+        }}
+        {...({ closedby: "any" } as Record<string, string>)}
+        className="m-auto w-full max-w-md rounded-xl border border-strong bg-surface p-0 text-fg shadow-popover open:flex open:flex-col"
+      >
+        <div className="flex items-center justify-between border-b border-hairline px-4 py-3">
+          <div className="flex items-center gap-2">
+            <Database className="h-4 w-4 text-status5xx-fg" />
+            <h2
+              id="sqlite-purge-confirm-title"
+              className="text-sm font-semibold text-fg"
+            >
+              Очистка и сжатие архива SQLite (VACUUM)
+            </h2>
+          </div>
+          <button
+            type="button"
+            disabled={isPurgingSqlite}
+            onClick={() => setConfirmSqlitePurgeOpen(false)}
+            className="rounded p-1 text-muted hover:bg-hover hover:text-fg disabled:opacity-45"
+            aria-label="Закрыть диалог очистки SQLite"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="space-y-3 px-4 py-3 text-xs text-fg">
+          <p>
+            Полностью удаляет сохранённые сессии и выгруженные тела из{" "}
+            <code className="rounded bg-canvas px-1 py-0.5 font-mono text-[11px]">
+              sessions.sqlite
+            </code>
+            , усекает WAL-журнал и выполняет{" "}
+            <code className="rounded bg-canvas px-1 py-0.5 font-mono text-[11px]">
+              VACUUM
+            </code>{" "}
+            для освобождения места на диске.
+          </p>
+          <div className="rounded border border-hairline bg-canvas/60 px-3 py-2 text-[11px] text-muted">
+            Текущий размер SQLite:{" "}
+            <strong className="font-semibold text-fg">
+              {(storageStats.sqliteSizeBytes / (1024 * 1024)).toFixed(2)} MB
+            </strong>{" "}
+            ({storageStats.sqliteSizeBytes.toLocaleString("en-US")} байт) • В ОЗУ:{" "}
+            <strong className="font-semibold text-fg">
+              {storageStats.ramSessions.toLocaleString("en-US")}
+            </strong>{" "}
+            сессий (остаются в таблице).
+          </div>
+          <label className="flex cursor-pointer items-start gap-2 rounded border border-hairline bg-canvas/40 px-2.5 py-2 text-xs">
+            <input
+              type="checkbox"
+              checked={clearDbOnExit}
+              onChange={(e) => void setClearDbOnExit(e.target.checked)}
+              className="checkbox-native mt-0.5"
+            />
+            <div>
+              <div className="font-medium text-fg">
+                Очищать базу SQLite при выходе (Clear DB on App Exit)
+              </div>
+              <div className="text-[11px] text-muted">
+                Автоматически очищать и сжимать архив при каждом закрытии FluxProxy.
+              </div>
+            </div>
+          </label>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t border-hairline bg-canvas/50 px-4 py-2.5">
+          <button
+            type="button"
+            autoFocus
+            disabled={isPurgingSqlite}
+            onClick={() => setConfirmSqlitePurgeOpen(false)}
+            className="rounded border border-strong bg-surface px-3 py-1.5 text-xs font-medium text-fg hover:bg-hover disabled:opacity-45"
+          >
+            Отмена
+          </button>
+          <button
+            type="button"
+            disabled={isPurgingSqlite}
+            onClick={() => void handleConfirmSqlitePurge()}
+            className="inline-flex items-center gap-1.5 rounded bg-rose-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-rose-700 disabled:opacity-50"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            <span>
+              {isPurgingSqlite
+                ? "Очистка и VACUUM..."
+                : "Очистить архив и выполнить VACUUM"}
+            </span>
+          </button>
+        </div>
+      </dialog>
     </div>
   );
 };
