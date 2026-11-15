@@ -517,6 +517,45 @@ export const HostFiltersTab: React.FC<HostFiltersTabProps> = ({
             </div>
           </label>
         </div>
+
+        {config.enabled &&
+          compiled.activeCount > 0 &&
+          !config.applyToTlsPassthrough && (
+            <div
+              role="alert"
+              className="mt-3 flex flex-wrap items-center justify-between gap-2.5 rounded-md border border-amber-500/45 bg-amber-500/10 px-3 py-2 text-xs text-amber-200"
+            >
+              <div className="flex min-w-0 flex-1 items-start gap-2">
+                <AlertTriangle
+                  className="mt-0.5 h-4 w-4 shrink-0 text-amber-400"
+                  aria-hidden="true"
+                />
+                <div className="min-w-0 leading-relaxed">
+                  <span className="font-semibold text-amber-100">
+                    TLS Passthrough отключён (UI Only):
+                  </span>{" "}
+                  фильтр скрывает домены только на уровне интерфейса, но{" "}
+                  <strong className="font-semibold text-amber-100">
+                    HTTPS-соединения всё ещё расшифровываются через MITM
+                  </strong>
+                  . Для видеопотоков, CDN и приложений с TLS pinning включите
+                  прямой обход (CONNECT passthrough).
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() =>
+                  onChange((prev) => ({
+                    ...prev,
+                    applyToTlsPassthrough: true,
+                  }))
+                }
+                className="shrink-0 rounded border border-amber-400/50 bg-amber-500/20 px-2.5 py-1 text-[11px] font-semibold text-amber-100 transition-colors hover:bg-amber-500/30"
+              >
+                Включить TLS Passthrough
+              </button>
+            </div>
+          )}
       </section>
 
       {/* Quick 1-click Host Picker from Captured Sessions */}

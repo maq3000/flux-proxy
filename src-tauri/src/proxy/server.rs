@@ -43,7 +43,119 @@ use crate::storage::{TrafficStore, BODY_OFFLOAD_THRESHOLD_BYTES};
 
 const MAX_CAPTURED_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB safety cap per body (> 2 MiB offloaded to SQLite)
 const ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES: usize = 256 * 1024; // 256 KiB
+const STREAM_TEXT_PREVIEW_MAX_BYTES: usize = 64 * 1024; // 64 KiB cap for text/* or application/* large-stream previews
 type ProxyBoxBody = BoxBody<Bytes, Infallible>;
+
+/// Builds the shared upstream HTTP/HTTPS `reqwest::Client` with keep-alive, pool timeouts,
+/// native root CAs (`rustls-tls-native-roots`), and `.no_proxy()` to prevent loopback recursion.
+pub(crate) fn build_upstream_client(
+    follow_redirects: bool,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let redirect_policy = if follow_redirects {
+        reqwest::redirect::Policy::default()
+    } else {
+        reqwest::redirect::Policy::none()
+    };
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(redirect_policy)
+        .connect_timeout(Duration::from_secs(15))
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .http2_keep_alive_interval(Some(Duration::from_secs(20)))
+        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_while_idle(true)
+        .pool_idle_timeout(Some(Duration::from_secs(35)))
+        .build()
+}
+
+/// Traverses the full `std::error::Error::source()` chain and formats all causes joined with `" -> "`.
+pub(crate) fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut current = err.source();
+    while let Some(source) = current {
+        let text = source.to_string();
+        if !text.is_empty() && parts.last().map(|last| last != &text).unwrap_or(true) {
+            parts.push(text);
+        }
+        current = source.source();
+    }
+    parts.join(" -> ")
+}
+
+#[inline]
+fn is_idempotent_retry_method(method: &reqwest::Method) -> bool {
+    matches!(
+        *method,
+        reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
+    )
+}
+
+fn is_stale_pool_connection_error(err: &reqwest::Error) -> bool {
+    if !(err.is_request() || err.is_connect()) {
+        return false;
+    }
+
+    let mut current: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
+    while let Some(source) = current {
+        if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            ) {
+                return true;
+            }
+        }
+        if let Some(hyper_err) = source.downcast_ref::<hyper::Error>() {
+            if hyper_err.is_incomplete_message()
+                || hyper_err.is_canceled()
+                || hyper_err.is_closed()
+            {
+                return true;
+            }
+        }
+        let msg = source.to_string().to_ascii_lowercase();
+        if msg.contains("incompletemessage")
+            || msg.contains("incomplete message")
+            || msg.contains("connection closed before message completed")
+            || msg.contains("connection reset")
+            || msg.contains("broken pipe")
+            || msg.contains("unexpected eof")
+            || msg.contains("unexpectedeof")
+            || msg.contains("canceled")
+        {
+            return true;
+        }
+        current = source.source();
+    }
+
+    false
+}
+
+async fn send_upstream_with_retry<F>(
+    client: &reqwest::Client,
+    method: &reqwest::Method,
+    build_req: F,
+) -> Result<reqwest::Response, reqwest::Error>
+where
+    F: Fn(&reqwest::Client) -> reqwest::RequestBuilder,
+{
+    match build_req(client).send().await {
+        Ok(resp) => Ok(resp),
+        Err(err) if is_idempotent_retry_method(method) && is_stale_pool_connection_error(&err) => {
+            tracing::debug!(
+                "Retrying idempotent {} request once after stale pooled connection drop: {}",
+                method,
+                format_error_chain(&err)
+            );
+            build_req(client).send().await
+        }
+        Err(err) => Err(err),
+    }
+}
 
 pub(crate) fn has_zstd_content_encoding(headers: &[HeaderPair]) -> bool {
     headers.iter().any(|h| {
@@ -634,12 +746,7 @@ impl ProxyEngineController {
         bp_tx: mpsc::UnboundedSender<Vec<PausedBreakpointItem>>,
     ) -> Result<Self, ProxyError> {
         // CRITICAL: `.no_proxy()` prevents infinite recursion when OS system proxy points to us!
-        let upstream_client = reqwest::Client::builder()
-            .no_proxy()
-            .pool_idle_timeout(Duration::from_secs(90))
-            .connect_timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        let upstream_client = build_upstream_client(false)?;
 
         let breakpoints = Arc::new(BreakpointEngine::new(Some(bp_tx)));
 
@@ -1407,20 +1514,10 @@ impl ProxyEngineController {
         }
 
         let client = if composed.follow_redirects {
-            reqwest::Client::builder().no_proxy().build()?
+            build_upstream_client(true)?
         } else {
             self.context.upstream_client.clone()
         };
-
-        let mut builder = client.request(method, parsed_url);
-        for h in &req_headers {
-            if !h.name.trim().is_empty() && !h.name.eq_ignore_ascii_case("content-length") {
-                builder = builder.header(&h.name, &h.value);
-            }
-        }
-        if !req_bytes.is_empty() {
-            builder = builder.body(req_bytes.clone());
-        }
 
         let in_flight_proto = if scheme == "https" {
             "HTTPS/2".to_string()
@@ -1453,9 +1550,23 @@ impl ProxyEngineController {
             &req_bytes,
         );
 
-        let upstream_resp = match builder.send().await {
+        let upstream_resp = match send_upstream_with_retry(&client, &method, |c| {
+            let mut builder = c.request(method.clone(), parsed_url.clone());
+            for h in &req_headers {
+                if !h.name.trim().is_empty() && !h.name.eq_ignore_ascii_case("content-length") {
+                    builder = builder.header(&h.name, &h.value);
+                }
+            }
+            if !req_bytes.is_empty() {
+                builder = builder.body(req_bytes.clone());
+            }
+            builder
+        })
+        .await
+        {
             Ok(resp) => resp,
             Err(err) => {
+                let chain = format_error_chain(&err);
                 record_error_session(
                     &self.context,
                     session_id,
@@ -1476,7 +1587,7 @@ impl ProxyEngineController {
                     bp_modified,
                     Some("127.0.0.1".into()),
                     "Composer (Local)".into(),
-                    &format!("Upstream connection error: {err}"),
+                    &format!("Upstream connection error: {chain}"),
                 );
                 return Err(err.into());
             }
@@ -1493,6 +1604,7 @@ impl ProxyEngineController {
         let raw_resp_bytes = match upstream_resp.bytes().await {
             Ok(b) => b,
             Err(err) => {
+                let chain = format_error_chain(&err);
                 record_error_session(
                     &self.context,
                     session_id,
@@ -1513,7 +1625,7 @@ impl ProxyEngineController {
                     bp_modified,
                     Some("127.0.0.1".into()),
                     "Composer (Local)".into(),
-                    &format!("Failed reading upstream response body: {err}"),
+                    &format!("Failed reading upstream response body: {chain}"),
                 );
                 return Err(err.into());
             }
@@ -1872,6 +1984,8 @@ async fn handle_outer_proxy_request(
                 .unwrap();
         }
 
+        let mut filter_updates_rx = ctx.filters.subscribe_config_updates();
+
         tokio::spawn(async move {
             match hyper::upgrade::on(req).await {
                 Ok(upgraded) => {
@@ -1892,6 +2006,18 @@ async fn handle_outer_proxy_request(
                         }
                     };
 
+                    if let ConnectTunnelDecision::Passthrough(reason) =
+                        ctx.filters.evaluate_connect_tunnel(&host, port)
+                    {
+                        tracing::info!(
+                            "Closing newly negotiated MITM tunnel for {}:{} after filter switch to Passthrough ({:?})",
+                            host,
+                            port,
+                            reason
+                        );
+                        return;
+                    }
+
                     let negotiated_alpn = tls_stream
                         .get_ref()
                         .1
@@ -1905,6 +2031,8 @@ async fn handle_outer_proxy_request(
                     } else {
                         format!("{host}:{port}")
                     };
+                    let conn_ctx = ctx.clone();
+                    let mitm_host = host.clone();
 
                     let service = service_fn(move |inner_req: Request<Incoming>| {
                         let req_ctx = ctx.clone();
@@ -1927,9 +2055,41 @@ async fn handle_outer_proxy_request(
                         }
                     });
 
-                    let _ = AutoConnBuilder::new(TokioExecutor::new())
-                        .serve_connection_with_upgrades(inner_io, service)
-                        .await;
+                    let auto_builder = AutoConnBuilder::new(TokioExecutor::new());
+                    let conn = auto_builder.serve_connection_with_upgrades(inner_io, service);
+                    tokio::pin!(conn);
+
+                    loop {
+                        tokio::select! {
+                            res = conn.as_mut() => {
+                                let _ = res;
+                                break;
+                            }
+                            changed = filter_updates_rx.changed() => {
+                                if changed.is_err() {
+                                    let _ = conn.as_mut().await;
+                                    break;
+                                }
+                                if let ConnectTunnelDecision::Passthrough(reason) =
+                                    conn_ctx.filters.evaluate_connect_tunnel(&mitm_host, port)
+                                {
+                                    tracing::info!(
+                                        "Gracefully shutting down active MITM tunnel for {}:{} after filter switch to Passthrough ({:?})",
+                                        mitm_host,
+                                        port,
+                                        reason
+                                    );
+                                    conn.as_mut().graceful_shutdown();
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(2),
+                                        conn.as_mut(),
+                                    )
+                                    .await;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(err) => {
                     tracing::debug!("HTTP CONNECT upgrade error: {err}");
@@ -2316,19 +2476,6 @@ async fn handle_intercepted_request(
         }
     };
 
-    let mut upstream_req = ctx.upstream_client.request(reqwest_method, &full_url);
-    for h in &req_headers {
-        if !is_hop_by_hop_header(&h.name)
-            && !h.name.eq_ignore_ascii_case("host")
-            && !h.name.eq_ignore_ascii_case("content-length")
-        {
-            upstream_req = upstream_req.header(&h.name, &h.value);
-        }
-    }
-    if !body_bytes.is_empty() {
-        upstream_req = upstream_req.body(body_bytes.to_vec());
-    }
-
     record_in_flight_session(
         &ctx,
         session_id,
@@ -2354,9 +2501,32 @@ async fn handle_intercepted_request(
         &body_bytes,
     );
 
-    let mut upstream_resp = match upstream_req.send().await {
+    let mut upstream_resp = match send_upstream_with_retry(&ctx.upstream_client, &reqwest_method, |client| {
+        let mut upstream_req = client.request(reqwest_method.clone(), &full_url);
+        for h in &req_headers {
+            if !is_hop_by_hop_header(&h.name)
+                && !h.name.eq_ignore_ascii_case("host")
+                && !h.name.eq_ignore_ascii_case("content-length")
+            {
+                upstream_req = upstream_req.header(&h.name, &h.value);
+            }
+        }
+        if !body_bytes.is_empty() {
+            upstream_req = upstream_req.body(body_bytes.clone());
+        }
+        upstream_req
+    })
+    .await
+    {
         Ok(r) => r,
         Err(err) => {
+            let chain = format_error_chain(&err);
+            tracing::warn!(
+                "Upstream connection error for {} {}: {}",
+                method_str,
+                full_url,
+                chain
+            );
             return record_and_return_error(
                 &ctx,
                 session_id,
@@ -2373,7 +2543,7 @@ async fn handle_intercepted_request(
                 client_proc.as_ref(),
                 false,
                 bp_modified,
-                format!("Upstream connection error: {err}"),
+                format!("Upstream connection error: {chain}"),
             );
         }
     };
@@ -2613,10 +2783,202 @@ async fn handle_intercepted_request(
             });
     }
 
-    // 4b. Standard Buffered Upstream Response (+ Optional Live Breakpoint After Response)
+    // 4b. Zero-buffering Streaming for Media (`video/*`, `audio/*`), `206 Partial Content`,
+    // and large responses (> 2 MiB) when neither Breakpoint After Response nor Zstd buffering is required
+    let resp_has_zstd = has_zstd_content_encoding(&resp_headers);
+    let ct_lower = content_type.to_ascii_lowercase();
+    let is_media_or_partial =
+        final_status == 206 || ct_lower.starts_with("video/") || ct_lower.starts_with("audio/");
+    let resp_content_length = resp_headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+        .and_then(|h| h.value.trim().parse::<usize>().ok());
+    let is_large_stream_body = resp_content_length
+        .map(|len| len > BODY_OFFLOAD_THRESHOLD_BYTES)
+        .unwrap_or(false);
+
+    if !should_break_resp
+        && !is_sse_stream
+        && !resp_has_zstd
+        && (is_media_or_partial || is_large_stream_body)
+    {
+        let has_reqwest_decoded_encoding = resp_headers.iter().any(|h| {
+            h.name.trim().eq_ignore_ascii_case("content-encoding")
+                && h.value.split(',').any(|token| {
+                    let t = token.trim();
+                    t.eq_ignore_ascii_case("gzip")
+                        || t.eq_ignore_ascii_case("x-gzip")
+                        || t.eq_ignore_ascii_case("br")
+                        || t.eq_ignore_ascii_case("deflate")
+                })
+        });
+        let capture_text_preview = !is_media_or_partial
+            && (ct_lower.starts_with("text/") || ct_lower.starts_with("application/"));
+
+        let capped_req = &body_bytes[..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
+        let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
+        let initial_summary = SessionSummary {
+            id: session_id,
+            status: final_status,
+            protocol: protocol_label,
+            scheme: scheme_str.clone(),
+            method: method_str,
+            host: host_header,
+            path: path_and_query,
+            url: full_url,
+            content_type,
+            body_size: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
+            timestamp,
+            is_mocked,
+            matched_rule_id,
+            error: None,
+            process_name: client_proc.as_ref().map(|p| p.name.clone()),
+            process_pid: client_proc.as_ref().map(|p| p.pid),
+            tls_bypassed: false,
+            headers_mutated: req_mutated || resp_mutated,
+            breakpoint_paused: None,
+            breakpoint_modified: bp_modified,
+            comment: None,
+            marked_color: None,
+            client_ip: Some(normalize_client_ip(client_addr)),
+        };
+
+        let initial_detail = SessionDetail {
+            summary: initial_summary,
+            request_headers: req_headers,
+            response_headers: resp_headers.clone(),
+            request_body_base64: req_b64,
+            response_body_base64: String::new(),
+            request_body_text: req_txt,
+            response_body_text: None,
+            tls_version: if scheme_str == "https" {
+                Some("TLS 1.3 (MITM Stream)".into())
+            } else {
+                None
+            },
+            client_addr: client_addr.to_string(),
+            websocket_frames: Vec::new(),
+            sse_events: Vec::new(),
+            body_offloaded: false,
+            request_body_offloaded: req_offloaded,
+        };
+
+        // Stage 21 Phase 1: publish final response headers & status immediately before streaming chunks
+        let initial_recorded =
+            record_completed_session(&ctx, initial_detail.clone(), Some(capped_req), None);
+        let req_body_for_deferred_end = if initial_recorded {
+            None
+        } else {
+            Some(body_bytes.slice(..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)))
+        };
+
+        let (chunk_tx, chunk_rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(32);
+        let stream_ctx = ctx.clone();
+
+        tokio::spawn(async move {
+            let mut total_bytes: usize = 0;
+            let mut preview_accum: Vec<u8> = Vec::new();
+            let mut stream_error: Option<String> = None;
+            let mut last_emit = Instant::now() - Duration::from_secs(1);
+
+            loop {
+                match upstream_resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        total_bytes = total_bytes.saturating_add(chunk.len());
+
+                        if capture_text_preview
+                            && preview_accum.len() < STREAM_TEXT_PREVIEW_MAX_BYTES
+                        {
+                            let room = STREAM_TEXT_PREVIEW_MAX_BYTES - preview_accum.len();
+                            preview_accum.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                        }
+
+                        if chunk_tx.send(Ok(Frame::data(chunk))).await.is_err() {
+                            break;
+                        }
+
+                        if last_emit.elapsed() >= Duration::from_millis(150) {
+                            last_emit = Instant::now();
+                            let elapsed_ms = start.elapsed().as_millis() as u64;
+                            if let Some(mut detail) = stream_ctx.store.get(session_id) {
+                                detail.summary.body_size = total_bytes;
+                                detail.summary.duration_ms = elapsed_ms;
+                                let updated_summary = detail.summary.clone();
+                                stream_ctx.store.insert(detail);
+                                let _ = stream_ctx.event_tx.send(updated_summary);
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        let chain = format_error_chain(&err);
+                        tracing::warn!(
+                            "Upstream stream chunk error for session #{session_id} after {total_bytes} bytes: {chain}"
+                        );
+                        stream_error = Some(format!("Upstream response stream error: {chain}"));
+                        break;
+                    }
+                }
+            }
+
+            drop(chunk_tx);
+
+            let final_duration_ms = start.elapsed().as_millis() as u64;
+            let mut final_detail = stream_ctx.store.get(session_id).unwrap_or(initial_detail);
+            final_detail.summary.body_size = total_bytes;
+            final_detail.summary.duration_ms = final_duration_ms;
+            if let Some(ref err_msg) = stream_error {
+                final_detail.summary.error = Some(err_msg.clone());
+            }
+            if capture_text_preview && !preview_accum.is_empty() {
+                final_detail.response_body_base64 =
+                    base64::engine::general_purpose::STANDARD.encode(&preview_accum);
+                final_detail.response_body_text =
+                    std::str::from_utf8(&preview_accum).ok().map(str::to_owned);
+            } else {
+                final_detail.response_body_base64.clear();
+                final_detail.response_body_text = None;
+            }
+
+            if initial_recorded || stream_error.is_some() || total_bytes > 0 {
+                let _ = record_completed_session(
+                    &stream_ctx,
+                    final_detail,
+                    req_body_for_deferred_end.as_deref(),
+                    None,
+                );
+            }
+        });
+
+        let stream = futures_util::stream::unfold(chunk_rx, |mut rx| async move {
+            rx.recv().await.map(|frame| (frame, rx))
+        });
+        let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
+        let mut builder =
+            Response::builder().status(StatusCode::from_u16(final_status).unwrap_or(StatusCode::OK));
+        for h in &resp_headers {
+            if !is_hop_by_hop_header(&h.name)
+                && !(has_reqwest_decoded_encoding
+                    && (h.name.eq_ignore_ascii_case("content-encoding")
+                        || h.name.eq_ignore_ascii_case("content-length")))
+                && !(strip_alt_svc && is_alt_svc_header(&h.name))
+            {
+                builder = builder.header(&h.name, &h.value);
+            }
+        }
+        return builder
+            .body(http_body_util::BodyExt::boxed(StreamBody::new(stream)))
+            .unwrap_or_else(|_| {
+                plain_response(StatusCode::BAD_GATEWAY, "Failed building streamed response")
+            });
+    }
+
+    // 4c. Standard Buffered Upstream Response (+ Optional Live Breakpoint After Response)
     let raw_resp_bytes = match upstream_resp.bytes().await {
         Ok(b) => b,
         Err(err) => {
+            let chain = format_error_chain(&err);
             return record_and_return_error(
                 &ctx,
                 session_id,
@@ -2633,7 +2995,7 @@ async fn handle_intercepted_request(
                 client_proc.as_ref(),
                 false,
                 bp_modified,
-                format!("Failed reading upstream response body: {err}"),
+                format!("Failed reading upstream response body: {chain}"),
             );
         }
     };
@@ -3026,6 +3388,7 @@ async fn handle_websocket_intercept(
             return rej_resp;
         }
         Err(err) => {
+            let chain = format_error_chain(&err);
             return record_and_return_error(
                 &ctx,
                 session_id,
@@ -3042,7 +3405,7 @@ async fn handle_websocket_intercept(
                 client_proc.as_ref(),
                 false,
                 req_mutated,
-                format!("WebSocket upstream connect failed: {err}"),
+                format!("WebSocket upstream connect failed: {chain}"),
             );
         }
     };
@@ -5996,6 +6359,327 @@ mod tests {
             .expect("primary socket must be rolled back after second socket fails with AddrInUse");
         drop(verify_primary_closed);
         drop(occupied_loopback);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn formats_full_reqwest_error_source_chain() {
+        #[derive(Debug)]
+        struct LeafCause(&'static str);
+        impl std::fmt::Display for LeafCause {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for LeafCause {}
+
+        #[derive(Debug)]
+        struct MiddleCause {
+            msg: &'static str,
+            src: Box<dyn std::error::Error + Send + Sync>,
+        }
+        impl std::fmt::Display for MiddleCause {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.msg)
+            }
+        }
+        impl std::error::Error for MiddleCause {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&*self.src)
+            }
+        }
+
+        let nested = MiddleCause {
+            msg: "error sending request for url",
+            src: Box::new(MiddleCause {
+                msg: "client error (Connect)",
+                src: Box::new(MiddleCause {
+                    msg: "client error (Connect)",
+                    src: Box::new(LeafCause("ConnectionReset")),
+                }),
+            }),
+        };
+        assert_eq!(
+            format_error_chain(&nested),
+            "error sending request for url -> client error (Connect) -> ConnectionReset"
+        );
+
+        // Verify real reqwest error source traversal + safe 1-time idempotent retry on stale pool drop
+        let dead_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead_probe.local_addr().unwrap().port();
+        drop(dead_probe);
+
+        let client = build_upstream_client(false).expect("build_upstream_client should succeed");
+        let req_err = client
+            .get(format!("http://127.0.0.1:{dead_port}/unreachable"))
+            .send()
+            .await
+            .expect_err("connecting to closed port must fail");
+        let formatted_real = format_error_chain(&req_err);
+        assert!(
+            formatted_real.contains(" -> "),
+            "expected reqwest error chain with ` -> `, got: {formatted_real}"
+        );
+        assert!(is_idempotent_retry_method(&reqwest::Method::GET));
+        assert!(is_idempotent_retry_method(&reqwest::Method::HEAD));
+        assert!(is_idempotent_retry_method(&reqwest::Method::OPTIONS));
+        assert!(!is_idempotent_retry_method(&reqwest::Method::POST));
+
+        // Simulate stale pooled keep-alive connection:
+        // Connection 1 responds OK to prime the pool, then closes right as request #2 arrives;
+        // Connection 2 succeeds with `200 OK recovered` on the automatic 1-time retry.
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Connection 1: serve request 1, read request 2 and drop abruptly mid-keepalive
+            let (mut sock1, _) = upstream_listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock1.read(&mut buf).await;
+            let _ = sock1
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nprimed")
+                .await;
+            let _ = sock1.flush().await;
+            let _ = sock1.read(&mut buf).await;
+            drop(sock1);
+
+            // Connection 2 (retry): succeed
+            let (mut sock2, _) = upstream_listener.accept().await.unwrap();
+            let _ = sock2.read(&mut buf).await;
+            let _ = sock2
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nrecovered")
+                .await;
+            let _ = sock2.shutdown().await;
+        });
+
+        let pool_client = build_upstream_client(false).unwrap();
+        let prime_url = format!("http://{upstream_addr}/prime");
+        let r1 = send_upstream_with_retry(&pool_client, &reqwest::Method::GET, |c| c.get(&prime_url))
+            .await
+            .unwrap();
+        assert_eq!(r1.text().await.unwrap(), "primed");
+
+        let retry_url = format!("http://{upstream_addr}/second");
+        let r2 = send_upstream_with_retry(&pool_client, &reqwest::Method::GET, |c| c.get(&retry_url))
+            .await
+            .expect("idempotent GET should recover via 1-time retry after stale pool drop");
+        assert_eq!(r2.status().as_u16(), 200);
+        assert_eq!(r2.text().await.unwrap(), "recovered");
+    }
+
+    #[tokio::test]
+    async fn streams_video_partial_content_without_full_buffering() {
+        let release_second_chunk = Arc::new(tokio::sync::Notify::new());
+        let release_clone = release_second_chunk.clone();
+
+        // 1. Mock upstream video server (request 1: 206 Partial Content chunked across a barrier;
+        // request 2: truncated 206 video stream to verify mid-stream error recording).
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            // Request 1: zero-buffering 206 Partial Content
+            if let Ok((mut sock, _)) = upstream_listener.accept().await {
+                let mut req_buf = [0u8; 2048];
+                let _ = sock.read(&mut req_buf).await;
+                let headers = b"HTTP/1.1 206 Partial Content\r\n\
+                                Content-Type: video/mp4\r\n\
+                                Content-Range: bytes 0-32767/1048576\r\n\
+                                Content-Length: 32768\r\n\
+                                Connection: close\r\n\r\n";
+                sock.write_all(headers).await.unwrap();
+                sock.write_all(&vec![b'A'; 16_384]).await.unwrap();
+                sock.flush().await.unwrap();
+
+                release_clone.notified().await;
+
+                sock.write_all(&vec![b'B'; 16_384]).await.unwrap();
+                sock.flush().await.unwrap();
+                let _ = sock.shutdown().await;
+            }
+
+            // Request 2: mid-stream abrupt EOF before declared Content-Length (65536)
+            if let Ok((mut sock, _)) = upstream_listener.accept().await {
+                let mut req_buf = [0u8; 2048];
+                let _ = sock.read(&mut req_buf).await;
+                let headers = b"HTTP/1.1 206 Partial Content\r\n\
+                                Content-Type: video/mp4\r\n\
+                                Content-Range: bytes 0-65535/1048576\r\n\
+                                Content-Length: 65536\r\n\
+                                Connection: close\r\n\r\n";
+                sock.write_all(headers).await.unwrap();
+                sock.write_all(&vec![b'C'; 4_096]).await.unwrap();
+                sock.flush().await.unwrap();
+                drop(sock);
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-video-stream-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("video-stream.sqlite")).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            store: store.clone(),
+            upstream_client: build_upstream_client(false).unwrap(),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(0),
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_ctx = ctx.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await else {
+                    break;
+                };
+                let c = proxy_ctx.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let inner_c = c.clone();
+                        async move {
+                            Ok::<_, Infallible>(
+                                handle_outer_proxy_request(req, client_addr, None, inner_c).await,
+                            )
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, service)
+                        .await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap();
+
+        // Start request #1: client MUST receive 206 + first chunk BEFORE chunk #2 is released!
+        let mut resp = tokio::time::timeout(
+            Duration::from_secs(3),
+            client
+                .get(format!("http://{upstream_addr}/video.mp4"))
+                .header("Range", "bytes=0-32767")
+                .send(),
+        )
+        .await
+        .expect("proxied 206 headers must arrive without buffering full video")
+        .unwrap();
+
+        assert_eq!(resp.status().as_u16(), 206);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("video/mp4")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes 0-32767/1048576")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok()),
+            Some("32768")
+        );
+
+        let mut received = Vec::new();
+        while received.len() < 16_384 {
+            let chunk = tokio::time::timeout(Duration::from_secs(3), resp.chunk())
+                .await
+                .expect("first chunk must arrive while upstream still holds second chunk")
+                .unwrap()
+                .expect("expected first chunk bytes");
+            received.extend_from_slice(&chunk);
+        }
+        assert!(received[..16_384].iter().all(|&b| b == b'A'));
+
+        // Two-phase check mid-stream: TrafficStore already has status 206 while stream is open
+        let mid_detail = store.get(1).expect("session 1 should be committed in phase 1");
+        assert_eq!(mid_detail.summary.status, 206);
+        assert!(mid_detail.response_body_base64.is_empty());
+
+        // Release second chunk and read to EOF
+        release_second_chunk.notify_one();
+        while let Some(chunk) = resp.chunk().await.unwrap() {
+            received.extend_from_slice(&chunk);
+        }
+        assert_eq!(received.len(), 32_768);
+        assert!(received[16_384..].iter().all(|&b| b == b'B'));
+
+        // Poll until stream task finishes updating final byte count & check binary video was NOT buffered
+        let mut final_detail = None;
+        for _ in 0..40 {
+            if let Some(d) = store.get(1) {
+                if d.summary.body_size == 32_768 {
+                    final_detail = Some(d);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let final_detail = final_detail.expect("TrafficStore should record 32768 streamed bytes");
+        assert_eq!(final_detail.summary.status, 206);
+        assert!(final_detail.summary.error.is_none());
+        assert!(
+            final_detail.response_body_base64.is_empty(),
+            "binary video/206 response must not be accumulated into response_body_base64"
+        );
+        assert!(final_detail.response_body_text.is_none());
+        assert!(!final_detail.body_offloaded);
+
+        // Request #2: verify mid-stream truncation error is recorded on session #2
+        let mut err_resp = client
+            .get(format!("http://{upstream_addr}/broken-video.mp4"))
+            .header("Range", "bytes=0-65535")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(err_resp.status().as_u16(), 206);
+        while let Ok(Some(_)) = err_resp.chunk().await {}
+
+        let mut broken_detail = None;
+        for _ in 0..40 {
+            if let Some(d) = store.get(2) {
+                if d.summary.error.is_some() {
+                    broken_detail = Some(d);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let broken_detail = broken_detail.expect("session 2 should record mid-stream error");
+        assert!(
+            broken_detail
+                .summary
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Upstream response stream error"),
+            "unexpected stream error text: {:?}",
+            broken_detail.summary.error
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

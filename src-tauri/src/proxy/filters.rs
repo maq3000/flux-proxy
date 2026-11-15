@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::RwLock;
 
 use regex::Regex;
+use tokio::sync::watch;
 
 use crate::models::{
     CaptureFilterRule, HeaderMutationDirection, HeaderMutationOp, HeaderMutationRule, HeaderPair,
@@ -92,6 +93,7 @@ struct FilterEngineState {
 /// 3. Capture-stage streaming session filter (`drop_non_matching_on_capture`) preventing unwanted/noisy sessions from entering RAM or IPC
 pub struct ProxyFilterEngine {
     state: RwLock<FilterEngineState>,
+    config_version_tx: watch::Sender<u64>,
 }
 
 impl Default for ProxyFilterEngine {
@@ -103,9 +105,15 @@ impl Default for ProxyFilterEngine {
 impl ProxyFilterEngine {
     pub fn new() -> Self {
         let initial_cfg = default_backend_config();
+        let (config_version_tx, _) = watch::channel(0u64);
         Self {
             state: RwLock::new(build_filter_engine_state(initial_cfg)),
+            config_version_tx,
         }
+    }
+
+    pub fn subscribe_config_updates(&self) -> watch::Receiver<u64> {
+        self.config_version_tx.subscribe()
     }
 
     pub fn get_config(&self) -> ProxyFilterBackendConfig {
@@ -120,6 +128,7 @@ impl ProxyFilterEngine {
         if let Ok(mut guard) = self.state.write() {
             *guard = next_state;
         }
+        self.config_version_tx.send_modify(|v| *v = v.wrapping_add(1));
         next
     }
 
@@ -382,6 +391,21 @@ impl ProxyFilterEngine {
                                 PassthroughReason::BypassRule(rule),
                             );
                         }
+                    }
+                    if guard.config.tls_intercept_mode == TlsInterceptMode::TargetedOnly
+                        && guard
+                            .config
+                            .tls_target_rules
+                            .iter()
+                            .any(|r| r.enabled && !r.pattern.trim().is_empty())
+                    {
+                        if match_host_rule_list(&guard.config.tls_target_rules, host, port).is_some()
+                        {
+                            return ConnectTunnelDecision::InterceptMitm;
+                        }
+                        return ConnectTunnelDecision::Passthrough(
+                            PassthroughReason::NotInTargetAllowlist,
+                        );
                     }
                     ConnectTunnelDecision::InterceptMitm
                 }
@@ -2277,5 +2301,102 @@ mod tests {
         let mut slow_204 = slow_200;
         slow_204.status = 204;
         assert!(!engine.evaluate_should_store_session(&slow_204));
+    }
+
+    #[test]
+    fn video_cdn_bypass_pack_bypasses_googlevideo_and_notifies_config_watch() {
+        let engine = ProxyFilterEngine::new();
+        let mut rx = engine.subscribe_config_updates();
+        assert_eq!(*rx.borrow(), 0);
+
+        let mut cfg = engine.get_config();
+        cfg.tls_bypass_enabled = true;
+        cfg.tls_bypass_rules.push(TlsBypassRule {
+            id: "pack-video-cdn".into(),
+            enabled: true,
+            pattern: "*.googlevideo.com, *.youtube.com, *.ytimg.com, *.ggpht.com, *.ttvnw.net, *.vimeocdn.com".into(),
+            category: "Video & CDN".into(),
+            description: "Video streaming & CDN passthrough".into(),
+        });
+        engine.update_config(cfg);
+
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow_and_update(), 1);
+
+        for host in [
+            "rr1---sn-n8v7zn7d.googlevideo.com",
+            "www.youtube.com",
+            "i.ytimg.com",
+            "yt3.ggpht.com",
+            "video-weaver.ams01.hls.ttvnw.net",
+            "skyfire.vimeocdn.com",
+        ] {
+            assert!(
+                matches!(
+                    engine.evaluate_connect_tunnel(host, 443),
+                    ConnectTunnelDecision::Passthrough(PassthroughReason::BypassRule(_))
+                ),
+                "expected video/CDN host {host} to enter TLS Passthrough"
+            );
+        }
+        assert_eq!(
+            engine.evaluate_connect_tunnel("api.myservice.dev", 443),
+            ConnectTunnelDecision::InterceptMitm
+        );
+    }
+
+    #[test]
+    fn host_list_whitelist_and_targeted_only_priority_match_preview_contract() {
+        let engine = ProxyFilterEngine::new();
+        let mut cfg = engine.get_config();
+        cfg.tls_intercept_mode = TlsInterceptMode::TargetedOnly;
+        cfg.host_list_sync = HostListBackendSyncConfig {
+            enabled: true,
+            mode: HostListFilterMode::Whitelist,
+            raw_text: "*.mycompany.com\n*.othercorp.com".into(),
+        };
+        cfg.tls_target_rules = vec![
+            TlsBypassRule {
+                id: "target-api".into(),
+                enabled: true,
+                pattern: "api.mycompany.com, *.mycompany.com, !mtls.mycompany.com".into(),
+                category: "Target".into(),
+                description: "Restrict TargetedOnly allowlist within Whitelist".into(),
+            },
+        ];
+        engine.update_config(cfg.clone());
+
+        // Matched by BOTH Whitelist and TargetedOnly -> InterceptMitm
+        assert_eq!(
+            engine.evaluate_connect_tunnel("api.mycompany.com", 443),
+            ConnectTunnelDecision::InterceptMitm
+        );
+        // Matched by Whitelist, carved out via `!mtls.mycompany.com` in TargetedOnly -> NotInTargetAllowlist
+        assert_eq!(
+            engine.evaluate_connect_tunnel("mtls.mycompany.com", 443),
+            ConnectTunnelDecision::Passthrough(PassthroughReason::NotInTargetAllowlist)
+        );
+        // Matched by Whitelist (`*.othercorp.com`), but outside active TargetedOnly allowlist -> NotInTargetAllowlist
+        assert_eq!(
+            engine.evaluate_connect_tunnel("cdn.othercorp.com", 443),
+            ConnectTunnelDecision::Passthrough(PassthroughReason::NotInTargetAllowlist)
+        );
+        // Outside Whitelist -> NotInHostsWhitelist
+        assert_eq!(
+            engine.evaluate_connect_tunnel("external.example.org", 443),
+            ConnectTunnelDecision::Passthrough(PassthroughReason::NotInHostsWhitelist)
+        );
+
+        // When TargetedOnly has no enabled rules, active Hosts Whitelist supplies the allowlist
+        cfg.tls_target_rules.clear();
+        engine.update_config(cfg);
+        assert_eq!(
+            engine.evaluate_connect_tunnel("cdn.othercorp.com", 443),
+            ConnectTunnelDecision::InterceptMitm
+        );
+        assert_eq!(
+            engine.evaluate_connect_tunnel("external.example.org", 443),
+            ConnectTunnelDecision::Passthrough(PassthroughReason::NotInHostsWhitelist)
+        );
     }
 }

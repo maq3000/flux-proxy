@@ -366,6 +366,17 @@ export const TLS_BYPASS_QUICK_PACKS: {
       description: "Десктопные клиенты с пиннингом WebSocket/TLS",
     },
   },
+  {
+    label: "+ Видеохостинги / CDN (YouTube, Googlevideo, Twitch, Vimeo)",
+    rule: {
+      enabled: true,
+      pattern:
+        "*.googlevideo.com, *.youtube.com, *.ytimg.com, *.ggpht.com, *.ttvnw.net, *.vimeocdn.com",
+      category: "Video & CDN",
+      description:
+        "Видеопотоки и медиа-CDN (снижает нагрузку MITM и устраняет буферизацию)",
+    },
+  },
 ];
 
 export const USER_AGENT_PRESETS: { label: string; value: string }[] = [
@@ -1721,7 +1732,7 @@ export function evaluateTlsConnectInPreview(
       if (syncDecision.mode === "passthrough") {
         return syncDecision;
       }
-      // In Whitelist mode, matched hosts are intercepted unless explicitly in TLS Bypass list below
+      // In Whitelist mode, matched hosts still respect TLS Bypass rules and Targeted Only allowlist
       if (config.tlsBypassEnabled) {
         const matchedBypass = matchHostRuleList(
           config.tlsBypassRules,
@@ -1735,6 +1746,22 @@ export function evaluateTlsConnectInPreview(
             rule: matchedBypass,
           };
         }
+      }
+      if (
+        config.tlsInterceptMode === "targetedOnly" &&
+        (config.tlsTargetRules ?? []).some(
+          (r) => r.enabled && r.pattern.trim().length > 0
+        )
+      ) {
+        const matchedTarget = matchHostRuleList(
+          config.tlsTargetRules ?? [],
+          host,
+          port
+        );
+        if (matchedTarget) {
+          return { mode: "intercept" };
+        }
+        return { mode: "passthrough", reason: "notInTargetAllowlist" };
       }
       return { mode: "intercept" };
     }
