@@ -1644,7 +1644,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenCompressionCodec)}
               >
-                <span>Gzip / Brotli / Deflate Codec…</span>
+                <span>Gzip / Brotli / Deflate / Zstd Codec…</span>
               </button>
               <hr />
               <button

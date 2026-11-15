@@ -31,48 +31,56 @@
    - Модуль `src-tauri/src/storage/export_import.rs`, нативные диалоги (`rfd`), горячие клавиши `Ctrl+S` / `Ctrl+O`, Drag-and-Drop архивов и команда `save_session_body_file`.
 8. **[Этап 4 — Выполнено] Версионированные профили настроек и централизованный Preferences:**
    - Схема `FluxUserSettingsProfile` (`schemaVersion: 1`, `src/types/settings.ts`), валидатор/мигратор `src/lib/settingsManager.ts` и модальное окно `src/components/SettingsModal.tsx` (`Ctrl+,`) с 5 вкладками (*General*, *UI & Columns*, *Filters*, *Rules & Proxy*, *Backup & Export*).
+9. **[Этап 26 — Выполнено] Безопасность: защита от XSS и инъекций, CSP и устранение UB в Rust:**
+   - Санитизация `host_header`, отказ от небезопасного рендеринга SVG `data:`, устранение shell/CLI-инъекций (`pkexec`, `adb`/cURL, CRLF), валидация IPC-путей, усиление CSP и исправление UB/паник в Rust (`process.rs`, `network.rs`, `sysproxy.rs`, `filters.rs`).
+10. **[Этап 27 — Выполнено] Целостность `TrafficStore` и SQLite, безопасность парсеров SAZ и консистентность CA:**
+    - Настройка SQLite `busy_timeout`, корректная дочитка вытесненных сессий с диска, защита парсеров `.saz`/HAR от ZIP-бомб и переполнения (включая UTF-16BE), а также консистентная загрузка Root CA.
+11. **[Этап 20 — Выполнено] Управление хранилищем SQLite (ручная очистка `VACUUM` и автоочистка при выходе):**
+    - Очистка `sessions.sqlite` через `VACUUM` + `wal_checkpoint(TRUNCATE)`, интерактивный индикатор размера БД в статус-баре, кнопка очистки в настройках и опция *Clear DB on App Exit*.
+12. **[Этап 21 — Выполнено] Двухфазный захват сессий (In-Flight / Pending в стиле Fiddler):**
+    - Мгновенное появление запроса в таблице при получении заголовков (`status: 0` / `Pending`) еще до ответа сервера и real-time обновление метрик/тела после завершения ответа.
+13. **[Этап 14 — Выполнено] Поддержка сжатия Zstandard (RFC 8878 / `zstd`):**
+    - Прозрачная потоковая распаковка `Content-Encoding: zstd` на лету в прокси-ядре и Composer, а также кодирование/декодирование `Zstd` в TextWizard и Compression Codec.
+14. **[Этап 15 — Выполнено] Привязка к конкретному IP / сетевому интерфейсу и мульти-бинд:**
+    - Выбор конкретного сетевого адаптера (Wi-Fi/Ethernet/WSL/VPN) и режим Dual Listener (loopback + выбранный интерфейс) без обязательного открытия порта на `0.0.0.0`.
+15. **[Этап 25 — Выполнено] Надежность upstream-соединений, стриминг видео, диагностика ошибок и консистентный TCP-проброс:**
+    - Zero-buffering стриминг для видео/CDN и ответов `206`, диагностика причин обрывов по цепочке `err.source()`, Video & CDN Quick-Pack и мгновенный сброс активных MITM-туннелей в Passthrough.
+16. **[Этап 28 — Выполнено] Неблокирующий Tokio-рантайм, предкомпиляция Regex и потоковый SSE/WebSocket:**
+    - Вынос `resolve_client_process` и операций SQLite в `spawn_blocking`, предкомпиляция `Regex`, устранение квадратичной сложности ($O(N^2)$) в SSE/WebSocket и переиспользование пула `reqwest::Client` в Composer.
 
 ---
 
 ## 📋 Матрица приоритетов и порядок выполнения
 
-> *Номера этапов (`5–30`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз.*
+> *Номера этапов (`5–30`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз. Завершенные этапы Спринта 1 (Этапы 14, 15, 20, 21, 25–28) выполнены в релизе `v0.2.0` и перенесены в раздел реализованных этапов выше.*
 
 | # | Этап | Приоритет | Спринт | Зависимости | Ключевая ценность |
 | :-: | :--- | :--- | :--- | :--- | :--- |
-| 1 | **[Этап 26](#этап-26-безопасность-защита-от-xss-и-инъекций-csp-и-устранение-ub-в-rust)** | **P0 (Critical)** | Спринт 1 | — | Устранение XSS/инъекций (`host_header`, SVG `data:`, `pkexec`, `adb`/cURL, CRLF), валидация IPC-путей, CSP и починка UB/паник в Rust (`process.rs`, `network.rs`, `sysproxy.rs`, `filters.rs`) |
-| 2 | **[Этап 27](#этап-27-целостность-trafficstore-и-sqlite-безопасность-парсеров-saz-и-консистентность-ca)** | **P0 (Critical)** | Спринт 1 | — | SQLite `busy_timeout` и дочитка вытесненных сессий, защита `.saz`/HAR от ZIP-бомб и переполнения, консистентная загрузка Root CA |
-| 3 | **[Этап 20](#этап-20-управление-хранилищем-sqlite-ручная-очистка-vacuum-и-автоочистка-при-выходе)** | **P0 (Critical)** | Спринт 1 | Этап 27 | Защита диска от раздувания `sessions.sqlite` (`VACUUM` + `wal_checkpoint(TRUNCATE)` и автоочистка при выходе) |
-| 4 | **[Этап 21](#этап-21-двухфазный-захват-сессий-in-flight--pending-в-стиле-fiddler)** | **P0 (Critical)** | Спринт 1 | — | Мгновенное появление запроса в таблице до ответа сервера (`status: 0`) и инспекция исходящих данных |
-| 5 | **[Этап 14](#этап-14-поддержка-сжатия-zstandard-rfc-8878-zstd)** | **P0 (Critical)** | Спринт 1 | — | Прозрачная распаковка `content-encoding: zstd` на лету (в прокси и Composer) и поддержка в TextWizard |
-| 6 | **[Этап 15](#этап-15-привязка-к-конкретному-ip--сетевому-интерфейсу-и-мульти-бинд)** | **P0 (Critical)** | Спринт 1 | — | Безопасный выбор конкретного сетевого адаптера (Wi-Fi/Ethernet/WSL/VPN) и Dual Listener без открытия порта на `0.0.0.0` |
-| 7 | **[Этап 25](#этап-25-надежность-upstream-соединений-стриминг-видео-диагностика-ошибок-и-консистентный-tcp-проброс)** | **P0 (Critical)** | Спринт 1 | Этап 21, Этап 14 | Устранение `Upstream connection error` на видео/CDN, zero-buffering стриминг, цепочка `err.source()` и сброс устаревших MITM-туннелей |
-| 8 | **[Этап 28](#этап-28-неблокирующий-tokio-рантайм-предкомпиляция-regex-и-потоковый-sse-и-websocket)** | **P0 (High)** | Спринт 1 | Этап 21, Этап 25 | Вынос `resolve_client_process` и SQLite в `spawn_blocking`, предкомпиляция `Regex`, устранение $O(N^2)$ в SSE/WS и пул `reqwest::Client` в Composer |
-| 9 | **[Этап 24](#этап-24-интерактивная-сортировка-колонок-таблицы-ascdesc-и-массовое-выделение-ctrla)** | **P0 (High)** | Спринт 2 | — | Быстрый поиск аномалий по `Status` / `Time` / `Size` / `ID` и массовое выделение `Ctrl+A` |
-| 10 | **[Этап 23](#этап-23-персистентность-геометрии-сплитов-и-адаптивной-сетки-панелей)** | **P0 (High)** | Спринт 2 | — | Сохранение пропорций всех `<PanelGroup>` и ориентации сплита инспектора между перезапусками |
-| 11 | **[Этап 5](#этап-5-ультра-компактный-тулбар-автоподбор-колонок-и-шорткаты-инспектора)** | **P0 (High)** | Спринт 2 | — | Однострочный Slim-тулбар (`Ctrl+Shift+T`), автоподбор колонок из меню шапки и быстрые вкладки `Ctrl+1..6` |
-| 12 | **[Этап 16](#этап-16-очистка-и-маскирование-pii--секретов-при-экспорте-sanitized-export)** | **P0 (High)** | Спринт 2 | — | Безопасная передача `.har`/`.saz`/`.json`/`.txt` без утечки токенов, cookie, паролей и платежных данных |
-| 13 | **[Этап 17](#этап-17-диагностический-мастер-самопроверки-proxy-doctor)** | **P0 (High)** | Спринт 2 | Этап 15 | 1-клик диагностика и автоисправление конфликтов порта, файрвола, системного прокси, Root CA и VPN |
-| 14 | **[Этап 29](#этап-29-единый-источник-конфигурации-запуска-гонки-useproxysessions-и-честные-ошибки-bridge)** | **P0 (High)** | Спринт 2 | Этап 15, Этап 27 | Устранение двойного старта `:8888`, атомарная смена порта и профилей настроек, слияние гонок фильтров и отказ от маскировки ошибок IPC |
-| 15 | **[Этап 30](#этап-30-исправление-багов-ui-компонентов-виртуализация-hexviewer-и-настройка-manualchunks)** | **P1 (High)** | Спринт 2 | Этап 26 | Исправление багов `BreakpointModal`/`ComposerPanel`/`AutoResponderPanel`/`SessionInspector`/`TrafficGrid`/`TextWizard`, виртуализация `HexViewer` и дробление JS-бандла |
-| 16 | **[Этап 22](#этап-22-продвинутая-кастомизация-темы-пресеты-и-детальная-палитра-цветов)** | **P1 (High)** | Спринт 3 | — | 8 тем-пресетов (Dracula, Tokyo Night, Nord, Fiddler Classic и др.) и live-редактор CSS-токенов + Monaco |
-| 17 | **[Этап 6](#этап-6-selective-mitm--bypass-20-bulk-editor-10-quick-packs-и-hit-counter)** | **P1 (High)** | Спринт 3 | Этап 25 | Пакетный редактор TLS-правил, расширение `TLS_BYPASS_QUICK_PACKS` до 10+ наборов, счетчик срабатываний и бейдж `TUNNEL` |
-| 18 | **[Этап 18](#этап-18-клиентские-сертификаты-mtls--client-certificates-store)** | **P1 (High)** | Спринт 3 | Этап 25 | Хранилище PKCS#12/PEM-сертификатов с привязкой к маскам доменов и кэшируемыми mTLS-клиентами |
-| 19 | **[Этап 7](#этап-7-кастомные-скрипты-на-python-python-scripting-engine)** | **P1 (Medium)** | Спринт 3 | Этап 14 | Автоматизация перехвата `on_request` / `on_response` через долгоживущий IPC-процесс Python + Monaco Editor |
-| 20 | **[Этап 8](#этап-8-composer-20-умный-paste-curl-и-генератор-клиентского-кода-на-5-языках)** | **P1 (Medium)** | Спринт 3 | — | Парсер команд `cURL` из буфера обмена и генерация сниппетов (JS, Python, Go, Rust, cURL) |
-| 21 | **[Этап 19](#этап-19-автоматическая-генерация-спецификаций-openapi-30--swagger)** | **P1 (Medium)** | Спринт 3 | Этап 16 | Генерация YAML/JSON OpenAPI 3.0 спецификации по выделенным сессиям с выводом JSON Schema |
-| 22 | **[Этап 9](#этап-9-тестирование-фронтенда-vitest-и-cicd-github-actions)** | **P1 (Medium)** | Спринт 3 | Этап 8, 19, 22, 29, 30 | Покрытие движков `src/lib/*.ts` и хуков тестами Vitest и кроссплатформенный CI (включая `clippy -D warnings`) |
-| 23 | **[Этап 10](#этап-10-сетевая-инфраструктура-hosts-remapping-и-bandwidth-throttling)** | **P2 (Feature)** | Спринт 4 | Этап 15, 25 | Виртуальный DNS (`resolve` / `CONNECT`) без правки системного `hosts` и эмуляция медленных сетей |
-| 24 | **[Этап 11](#этап-11-архитектурная-декомпозиция-монолитов-и-внедрение-zustand)** | **P2 (Feature)** | Спринт 4 | — | Разделение крупных Rust/React-модулей, внедрение `zustand` и `React.lazy()` Code Splitting |
-| 25 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 4 | — | Виртуализированная каскадная диаграмма таймингов и сводный Markdown-отчет (P95, статусы, MIME) |
-| 26 | **[Этап 13](#этап-13-расширенные-протоколы-upstream-proxy-chaining-и-ws-инъекция)** | **P2 (Feature)** | Спринт 4 | Этап 18, 25 | Каскадирование трафика через внешний HTTP/HTTPS/SOCKS5-прокси и отправка фреймов в открытые WS |
+| 1 | **[Этап 24](#этап-24-интерактивная-сортировка-колонок-таблицы-ascdesc-и-массовое-выделение-ctrla)** | **P0 (High)** | Спринт 2 | — | Быстрый поиск аномалий по `Status` / `Time` / `Size` / `ID` и массовое выделение `Ctrl+A` |
+| 2 | **[Этап 23](#этап-23-персистентность-геометрии-сплитов-и-адаптивной-сетки-панелей)** | **P0 (High)** | Спринт 2 | — | Сохранение пропорций всех `<PanelGroup>` и ориентации сплита инспектора между перезапусками |
+| 3 | **[Этап 5](#этап-5-ультра-компактный-тулбар-автоподбор-колонок-и-шорткаты-инспектора)** | **P0 (High)** | Спринт 2 | — | Однострочный Slim-тулбар (`Ctrl+Shift+T`), автоподбор колонок из меню шапки и быстрые вкладки `Ctrl+1..6` |
+| 4 | **[Этап 16](#этап-16-очистка-и-маскирование-pii--секретов-при-экспорте-sanitized-export)** | **P0 (High)** | Спринт 2 | — | Безопасная передача `.har`/`.saz`/`.json`/`.txt` без утечки токенов, cookie, паролей и платежных данных |
+| 5 | **[Этап 17](#этап-17-диагностический-мастер-самопроверки-proxy-doctor)** | **P0 (High)** | Спринт 2 | Этап 15 ✅ | 1-клик диагностика и автоисправление конфликтов порта, файрвола, системного прокси, Root CA и VPN |
+| 6 | **[Этап 29](#этап-29-единый-источник-конфигурации-запуска-гонки-useproxysessions-и-честные-ошибки-bridge)** | **P0 (High)** | Спринт 2 | Этап 15 ✅, Этап 27 ✅ | Устранение двойного старта `:8888`, атомарная смена порта и профилей настроек, слияние гонок фильтров и отказ от маскировки ошибок IPC |
+| 7 | **[Этап 30](#этап-30-исправление-багов-ui-компонентов-виртуализация-hexviewer-и-настройка-manualchunks)** | **P1 (High)** | Спринт 2 | Этап 26 ✅ | Исправление багов `BreakpointModal`/`ComposerPanel`/`AutoResponderPanel`/`SessionInspector`/`TrafficGrid`/`TextWizard`, виртуализация `HexViewer` и дробление JS-бандла |
+| 8 | **[Этап 22](#этап-22-продвинутая-кастомизация-темы-пресеты-и-детальная-палитра-цветов)** | **P1 (High)** | Спринт 3 | — | 8 тем-пресетов (Dracula, Tokyo Night, Nord, Fiddler Classic и др.) и live-редактор CSS-токенов + Monaco |
+| 9 | **[Этап 6](#этап-6-selective-mitm--bypass-20-bulk-editor-10-quick-packs-и-hit-counter)** | **P1 (High)** | Спринт 3 | Этап 25 ✅ | Пакетный редактор TLS-правил, расширение `TLS_BYPASS_QUICK_PACKS` до 10+ наборов, счетчик срабатываний и бейдж `TUNNEL` |
+| 10 | **[Этап 18](#этап-18-клиентские-сертификаты-mtls--client-certificates-store)** | **P1 (High)** | Спринт 3 | Этап 25 ✅ | Хранилище PKCS#12/PEM-сертификатов с привязкой к маскам доменов и кэшируемыми mTLS-клиентами |
+| 11 | **[Этап 7](#этап-7-кастомные-скрипты-на-python-python-scripting-engine)** | **P1 (Medium)** | Спринт 3 | Этап 14 ✅ | Автоматизация перехвата `on_request` / `on_response` через долгоживущий IPC-процесс Python + Monaco Editor |
+| 12 | **[Этап 8](#этап-8-composer-20-умный-paste-curl-и-генератор-клиентского-кода-на-5-языках)** | **P1 (Medium)** | Спринт 3 | — | Парсер команд `cURL` из буфера обмена и генерация сниппетов (JS, Python, Go, Rust, cURL) |
+| 13 | **[Этап 19](#этап-19-автоматическая-генерация-спецификаций-openapi-30--swagger)** | **P1 (Medium)** | Спринт 3 | Этап 16 | Генерация YAML/JSON OpenAPI 3.0 спецификации по выделенным сессиям с выводом JSON Schema |
+| 14 | **[Этап 9](#этап-9-тестирование-фронтенда-vitest-и-cicd-github-actions)** | **P1 (Medium)** | Спринт 3 | Этап 8, 19, 22, 29, 30 | Покрытие движков `src/lib/*.ts` и хуков тестами Vitest и кроссплатформенный CI (включая `clippy -D warnings`) |
+| 15 | **[Этап 10](#этап-10-сетевая-инфраструктура-hosts-remapping-и-bandwidth-throttling)** | **P2 (Feature)** | Спринт 4 | Этап 15 ✅, 25 ✅ | Виртуальный DNS (`resolve` / `CONNECT`) без правки системного `hosts` и эмуляция медленных сетей |
+| 16 | **[Этап 11](#этап-11-архитектурная-декомпозиция-монолитов-и-внедрение-zustand)** | **P2 (Feature)** | Спринт 4 | — | Разделение крупных Rust/React-модулей, внедрение `zustand` и `React.lazy()` Code Splitting |
+| 17 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 4 | — | Виртуализированная каскадная диаграмма таймингов и сводный Markdown-отчет (P95, статусы, MIME) |
+| 18 | **[Этап 13](#этап-13-расширенные-протоколы-upstream-proxy-chaining-и-ws-инъекция)** | **P2 (Feature)** | Спринт 4 | Этап 18, 25 ✅ | Каскадирование трафика через внешний HTTP/HTTPS/SOCKS5-прокси и отправка фреймов в открытые WS |
 
 ---
 
 ## ⚙️ Общие инженерные правила
 
 1. **Изоляция новых подсистем (Modular-First Guardrail):**
-   Ключевые файлы уже достигли крупных размеров (`src-tauri/src/proxy/server.rs` ~4.4k строк, `export_import.rs` ~3k, `useProxySessions.ts` ~2.7k, `App.tsx` ~2.7k, `SettingsModal.tsx` ~2.5k, `FilterDrawer.tsx` ~2.2k, `filters.rs` ~2.1k). При реализации этапов Спринтов 1–3 **выносите новую логику в отдельные Rust-модули, TS-утилиты и React-компоненты**, минимизируя разрастание существующих монолитов до рефакторинга в Этапе 11.
+   Ключевые файлы уже достигли крупных размеров (`src-tauri/src/proxy/server.rs` ~6.9k строк, `export_import.rs` ~3.5k, `useProxySessions.ts` ~3.1k, `SettingsModal.tsx` ~3.0k, `App.tsx` ~2.9k, `filters.rs` ~2.4k, `FilterDrawer.tsx` ~2.2k). При реализации этапов Спринтов 2–3 **выносите новую логику в отдельные Rust-модули, TS-утилиты и React-компоненты**, минимизируя разрастание существующих монолитов до рефакторинга в Этапе 11.
 2. **Обязательная верификация после каждого этапа:**
    - Проверка типов: `npm run typecheck`
    - Сборка фронтенда: `npm run build`
@@ -90,434 +98,6 @@
    git add .
    git commit -m "feat(phase-N): <краткое описание выполненного этапа>"
    ```
-
----
-
-## 🔴 Спринт 1 — P0 (Critical): Надежность хранилища, real-time захват и сетевой стек
-
----
-
-## Этап 26: Безопасность, защита от XSS и инъекций, CSP и устранение UB в Rust
-**Приоритет: P0 (Critical) | Спринт 1 | Зависимости: нет**
-
-### Цель и контекст
-Аудит безопасности и системного кода выявил критические уязвимости инъекций, конфликт CSP и три класса потенциальных UB/паник/дедлоков в Rust:
-1. В веб-портале мобильной настройки (`src-tauri/src/proxy/server.rs`) заголовок `Host` (`host_header`, извлекаемый для `is_direct_origin_http`) напрямую интерполируется в HTML (`Proxy: <strong>{host_header}</strong>`) без HTML-экранирования (Reflected XSS).
-2. `SessionInspector.tsx` подставляет заголовок `Content-Type` ответа напрямую в `data:` URL для `<img>` (при `image/svg+xml` рендерится произвольный SVG), а `decodeBase64ToBytes` в `src/lib/formatters.ts` при ошибке `atob` молча подменяет данные UTF-8 текстом.
-3. Генераторы команд допускают инъекции: `ca.rs` вызывает `pkexec sh -c "cp '{}' ..."` с неэкранированным `pem_path`, `formatters.ts` (`buildCurlCommand`) подставляет `summary.method` без шелл-экранирования, `MobileSetupModal.tsx` подставляет непроверенный `customIp` в `adb shell settings put global http_proxy` и QR-схему `WIFI:`, а `export_import.rs` (`build_raw_http_request_bytes` / `build_raw_http_response_bytes`) записывает заголовки и целевой путь без удаления `\r`/`\n` (CRLF-инъекция).
-4. IPC-команды `export_sessions_file`, `import_sessions_file`, `save_session_body_file`, `export_settings_file`, `import_settings_file` (`src-tauri/src/commands.rs`) принимают произвольный `file_path` из WebView без проверки, а `src-tauri/src/lib.rs` при отказе `app_data_dir()` уводит хранение приватного ключа Root CA и SQLite в общий каталог `std::env::temp_dir().join("fluxproxy")`.
-5. `src-tauri/tauri.conf.json` задаёт `script-src 'self' 'wasm-unsafe-eval'` без `'unsafe-inline'`, блокируя pre-paint inline-скрипт `index.html` для `color-scheme`.
-6. **UB, дедлоки и паники в Rust:**
-   - `MibTcp6RowOwnerPid` в `src-tauri/src/proxy/process.rs` не содержит поля `dw_state: u32` перед `dw_owning_pid`, искажая раскладку Win32 `MIB_TCP6ROW_OWNER_PID` для IPv6;
-   - `src-tauri/src/proxy/network.rs` разыменовывает `buf.as_ptr().add(4) as *const MibIpAddrRow` без учёта выравнивания;
-   - `panic::set_hook` в `src-tauri/src/proxy/sysproxy.rs` вызывает `rollback_sync()` → `disable()` → `lock_inner()` на не-реентрантном `Mutex` (дедлок при панике под захваченным мьютексом);
-   - `src-tauri/src/proxy/filters.rs` в пяти местах режет строку `&token[..6]` до проверки UTF-8 границ (паника на многобайтных UTF-8 символах на 6-м байте) и несогласованно использует чувствительный к регистру `strip_prefix("regex:")`;
-   - `src-tauri/src/proxy/breakpoints.rs` для правил с `*` ставит жёсткие якоря `^(?i)...$`, тогда как без `*` ищет подстроку.
-
-### Критерии приемки (DoD)
-- HTML-портал в `server.rs` экранирует `host_header`, `client_ip` и любые внешние значения; `SessionInspector.tsx` использует allowlist безопасных растровых MIME для `<img src="data:...">` (исключая небезопасный рендеринг SVG через `data:`), а `decodeBase64ToBytes` явно сигнализирует об ошибке или возвращает пустой буфер без молчаливой подмены.
-- `ca.rs` передаёт путь в `pkexec` аргументами без интерполяции в shell (`cp`, `--`, `pem_path`, ...); `buildCurlCommand` экранирует HTTP-метод; `MobileSetupModal.tsx` валидирует `customIp` как IP/hostname; `export_import.rs` удаляет `\r`/`\n` из всех полей заголовков и стартовой строки при экспорте Raw HTTP.
-- IPC-команды в `commands.rs` валидируют/канонизируют пути (проверка расширений/запрет системных/неожиданных директорий и проверка существования/согласованности путей от диалогов), а `lib.rs` при отказе `app_data_dir()` завершает запуск с понятной ошибкой вместо записи приватного ключа CA в общедоступный `temp_dir`.
-- Pre-paint скрипт темы вынесен из inline `<script>` в статический локальный JS-файл (`script-src 'self'`), либо авторизован SHA-256 хэшем в CSP.
-- Исправлены раскладка `MibTcp6RowOwnerPid` (`dw_state: u32`) в `process.rs`, чтение через `std::ptr::read_unaligned` в `network.rs`, защита от дедлока `try_lock`/безблокировочный откат в panic-hook `sysproxy.rs`, безопасный UTF-8 разбор префикса `regex:` в `filters.rs`, согласованное сопоставление wildcard `*` в `breakpoints.rs`, а также устранены все 15 предупреждений `cargo clippy`.
-- Unit-тесты в Rust на XSS-экранирование портала, CRLF-санитизацию, UTF-8 многобайтный ввод в `filters.rs` и `MibTcp6RowOwnerPid`.
-
-### 📝 Промпт для Antigravity (Этап 26)
-
-```markdown
-Роль: Principal Security & Systems Engineer (Rust / Win32 FFI / WebView CSP).
-Проект: FluxProxy (Tauri v2 + Rust + React 18).
-
-Задача: Закрыть уязвимости XSS/инъекций, исправить конфликт CSP, валидировать пути в IPC и устранить UB, паники и дедлоки в Rust-бэкенде.
-
-1. Безопасность HTML/Команд/CSP (`server.rs`, `ca.rs`, `export_import.rs`, `commands.rs`, `lib.rs`, `index.html`, `tauri.conf.json`, `SessionInspector.tsx`, `formatters.ts`, `MobileSetupModal.tsx`):
-   - В `src-tauri/src/proxy/server.rs` реализовать `escape_html(...)` и экранировать все динамические поля в `render_mobile_portal_html` (`client_ip`, `host_header`, `user_agent`).
-   - В `src-tauri/src/proxy/ca.rs` заменить вызов `pkexec sh -c "cp '{}' ..."` на безопасное экранирование / передачу путей через позиционные параметры `sh -c 'cp "$1" "$2" && update-ca-certificates' _ "$pem_path" "$dst"`.
-   - В `src-tauri/src/storage/export_import.rs` в `build_raw_http_request_bytes` и `build_raw_http_response_bytes` очищать `\r` и `\n` (и NUL) из `method`, `target`, `h.name`, `h.value`, `s.host`, `s.content_type`.
-   - В `src-tauri/src/commands.rs` добавить общую проверку `validate_user_file_path` (запрет пустых/NUL/некорректных путей и несоответствующих расширений при сохранении/экспорте), а в `src-tauri/src/lib.rs` убрать небезопасный fallback приватного ключа Root CA в `std::env::temp_dir()`.
-   - В `index.html` и `src-tauri/tauri.conf.json`: вынести pre-paint скрипт `color-scheme` во внешний скрипт из `public/` (совместимо с `script-src 'self'`) либо добавить точный `sha256-...` хэш в `csp` без использования `'unsafe-inline'`.
-   - На фронтенде:
-     * В `src/components/SessionInspector.tsx` разрешать `<img src="data:...">` только для безопасных растровых MIME (`image/png`, `image/jpeg`, `image/gif`, `image/webp`, `image/bmp`, `image/x-icon`), а `image/svg+xml` показывать только как текст/безопасное превью.
-     * В `src/lib/formatters.ts`: экранировать `summary.method.toUpperCase()` в `buildCurlCommand` через `escapePosixSingleQuotes`; в `decodeBase64ToBytes` не подменять битый base64 на UTF-8 байты исходной строки.
-     * В `src/components/MobileSetupModal.tsx`: валидировать `customIp` (IPv4/IPv6/RFC-hostname без разделителей `;`, `:`, пробелов и спецсимволов shell) перед подстановкой в `adb shell` и QR-код `WIFI:`.
-
-2. Устранение UB, дедлоков, паник и warnings (`process.rs`, `network.rs`, `sysproxy.rs`, `filters.rs`, `breakpoints.rs`):
-   - В `src-tauri/src/proxy/process.rs`: добавить `dw_state: u32` в `MibTcp6RowOwnerPid` согласно Win32 ABI (`MIB_TCP6ROW_OWNER_PID`).
-   - В `src-tauri/src/proxy/network.rs`: читать `MibIpAddrRow` из `buf` через `std::ptr::read_unaligned` (с проверкой длины буфера относительно `dw_num_entries`).
-   - В `src-tauri/src/proxy/sysproxy.rs`: в `rollback_sync()` (вызываемом из `std::panic::set_hook`) использовать `try_lock` (или lock-free состояние резервного прокси) и не вызывать блокирующий `lock_inner()` поверх уже захваченного в текущем потоке мьютекса.
-   - В `src-tauri/src/proxy/filters.rs`: заменить все срезы `&s[..6]` на helper `strip_regex_prefix(s: &str) -> Option<&str>` через `s.get(..6)` с проверкой `is_char_boundary(6)` (и case-insensitive `eq_ignore_ascii_case("regex:")`), убрать чувствительность к регистру в `strip_prefix("regex:")`. Добавить тест с многобайтным UTF-8 символом на 5–7 байтах (кириллица/эмодзи).
-   - В `src-tauri/src/proxy/breakpoints.rs`: унифицировать сопоставление wildcard `*` с поведением без `*` (поиск подстроки / явные якоря только при `^`/`$` или корректная семантика URL-маски) и покрыть unit-тестом.
-   - Исправить все предупреждения `cargo clippy --manifest-path src-tauri/Cargo.toml`.
-
-Проверка: `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings`, `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run typecheck`, `npm run build`.
-```
-
----
-
-## Этап 27: Целостность TrafficStore и SQLite, безопасность парсеров SAZ и консистентность CA
-**Приоритет: P0 (Critical) | Спринт 1 | Зависимости: нет**
-
-### Цель и контекст
-Аудит подсистемы хранения и импорта/экспорта выявил риски потери данных, гонок, исчерпания памяти и рассинхронизации сертификатов:
-1. **`TrafficStore` и SQLite (`src-tauri/src/storage/mod.rs`, `sqlite.rs`, `commands.rs`):**
-   - `get_session_detail` читает только in-memory `DashMap` (`store.get(id)`), возвращая `None` для сессий, уже вытесненных в SQLite при FIFO eviction.
-   - В `SqliteArchive::open` не задан `PRAGMA busy_timeout`, что приводит к немедленному `SQLITE_BUSY` при параллельных операциях.
-   - Обновление аннотаций (`comment`/`marked_color`) выполняет неатомарный read-modify-write и не обновляет сессии в SQLite; при импорте/загрузке `next_id` обновляется неатомарным `Relaxed` `load`/`store`; SSE-стриминг после первого превышения порога 2 MiB (`body_offloaded == true`) перестаёт повторно выгружать дописываемые чанки; ошибки `persist_batch` и `save_offloaded_body` молча игнорируются.
-2. **Парсеры `.saz` / HAR / JSON / HTTP (`src-tauri/src/storage/export_import.rs`):**
-   - При распаковке `.saz` `Vec::with_capacity(entry.size() as usize)` + `read_to_end` и `std::fs::read(path)` не имеют лимита размера (уязвимость к ZIP-бомбам и OOM); в `decode_chunked` сложение `pos + chunk_size` без `checked_add` грозит паникой переполнения.
-   - `decode_xml_bytes` пропускает UTF-16BE (`0xFE 0xFF`); `extract_xml_tag_fragment` ищет `<{tag_name}` подстрокой (конфликт префиксов тегов и `>` в атрибутах); парсер URL `rest.find('/')` ломается на `https://example.com?a=1`.
-   - Распаковка `Content-Encoding` идёт через `if / else if` (ломаются цепочки вроде `gzip, br`), `is_matching_compressed_magic` знает только gzip-магик `1f 8b` (ложноположительно вырезая `content-encoding` для `br`/`deflate`), при импорте `.saz` теряются `sse_events`, а при экспорте `status == 0` подменяется на `200`.
-3. **Root CA (`src-tauri/src/proxy/ca.rs`):**
-   - При перезапуске с существующим ключом `params.self_signed(&ca_key)` перегенерирует новый CA-объект с новыми датами/серийником, но `der` читается с диска из старого `.cer`; `valid_until` захардкожен строкой `"10 years (Local Root CA)"`; проверка установки на Linux проверяет лишь `.exists()` без сверки отпечатка.
-
-### Критерии приемки (DoD)
-- `get_session_detail` подгружает вытесненную сессию из SQLite при промахе RAM-кэша; `SqliteArchive` задаёт `PRAGMA busy_timeout = 5000`; аннотации атомарно обновляются в RAM и SQLite; `next_id` обновляется через `fetch_max`; SSE-тела > 2 MiB корректно обновляются в `offloaded_bodies` при дозаписи чанков; ошибки записи SQLite логируются и не глотаются бесследно.
-- Импорт файлов и `.saz`-архивов защищён явными лимитами на размер файла и распакованной записи (`take(limit)` + проверка заявленного и фактического размера); в `decode_chunked` используется `checked_add`.
-- Починены `decode_xml_bytes` (UTF-16BE BOM), `extract_xml_tag_fragment` (границы имени тега и кавычки), единый URL-парсер с `?`/`@`, цепочка декодирования `Content-Encoding` (`gzip`/`br`/`deflate`/`zstd`), точное определение/сохранение `Content-Encoding` в Raw HTTP и отказ от подмены `status == 0` на `200` при экспорте.
-- При загрузке существующего Root CA в `ca.rs` гарантируется идентичность подписанного сертификата в памяти и `.cer`/`.pem` на диске, вычисляется реальная дата окончания `valid_until`, а проверка доверия на Linux сверяет отпечаток/содержимое сертификата.
-- Добавлены Rust-тесты на чтение вытесненных сессий, защиту от ZIP-бомб/`decode_chunked` overflow и reload CA без смены отпечатка.
-
-### 📝 Промпт для Antigravity (Этап 27)
-
-```markdown
-Роль: Senior Rust Systems & Storage Engineer (SQLite / X.509 / Parsers).
-Проект: FluxProxy (Tauri v2 + Rust).
-
-Задача: Устранить потерю и рассинхронизацию данных в `TrafficStore`/SQLite, защитить импорт `.saz`/HAR от ZIP-бомб и ошибок парсинга, и исправить перезагрузку Root CA.
-
-1. Хранилище (`src-tauri/src/storage/sqlite.rs`, `src-tauri/src/storage/mod.rs`, `src-tauri/src/commands.rs`):
-   - В `sqlite.rs`: добавить `PRAGMA busy_timeout = 5000;` при инициализации соединения; добавить чтение полной вытесненной `SessionDetail` по `id` и обновление `comment` / `marked_color` для записей в `captured_sessions`.
-   - В `storage/mod.rs`:
-     * В `TrafficStore::get(id)` при отсутствии сессии в `self.sessions` подгружать её из `self.sqlite`.
-     * Для `annotate_session` исключить потерю обновлений при параллельном `update_response` (обновлять атомарно / под узкой синхронизацией) и обновлять запись также в SQLite; не вызывать лишний двойной emit при обновлении.
-     * Заменить цикл обновления `next_id` через `Relaxed` `load`/`store` на атомарный `self.next_id.fetch_max(max_id, Ordering::SeqCst)`.
-     * В ветке SSE > 2 MiB разрешить повторную запись/обновление оффлоада даже когда `detail.body_offloaded` уже установлен в `true`.
-     * Ошибки `persist_batch` и `save_offloaded_body` логировать через `eprintln!`/tracing (или возвращать вызывающему коду там, где возможно) вместо тихого `let _ = ...`.
-
-2. Импорт/Экспорт (`src-tauri/src/storage/export_import.rs`):
-   - Ввести константы лимитов (например, `MAX_IMPORT_FILE_BYTES`, `MAX_SAZ_ENTRY_BYTES`, `MAX_SAZ_TOTAL_UNCOMPRESSED_BYTES`) и при чтении `.saz`-записей использовать ограниченную аллокацию + `Read::take`, отвергая подозрительные архивы с понятной ошибкой `ProxyError`. Проверять размер файла до `std::fs::read`.
-   - В `decode_chunked` заменить `pos + chunk_size` на `pos.checked_add(chunk_size)`.
-   - Поддержать UTF-16BE BOM (`[0xFE, 0xFF]`) в `decode_xml_bytes`, исправить поиск открывающего/закрывающего тега в `extract_xml_tag_fragment` (сверять разделитель после имени тега и учитывать кавычки атрибутов) и унифицировать разбор URL (`find(['/', '?'])` + `rsplit_once('@')`).
-   - Исправить `decode_http_body`: обрабатывать список кодировок в `Content-Encoding` справа налево (стек кодировок), не обнулять `is_matching_compressed_magic` для `br` и `deflate`, сохранять `status: 0` без подмены на `200` при экспорте.
-
-3. Root CA (`src-tauri/src/proxy/ca.rs`):
-   - При наличии сохранённых CA PEM/DER и ключа использовать сохранённый PEM/DER напрямую (через `rcgen::Issuer::from_ca_cert_pem` / разбор X.509) вместо повторного `self_signed` с новым серийным номером и датой; если `.cer` отсутствует или повреждён, пересоздавать `.cer` строго из загруженного CA.
-   - Парсить `not_after` сертификата (через `x509-parser` или ASN.1) для реального `valid_until`.
-   - На Linux сверять содержимое/SHA-256 установленного `LINUX_SYSTEM_CA_CERT_PATH` с активным Root CA, а не просто `.exists()`.
-
-Проверка: `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings`, `cargo test --manifest-path src-tauri/Cargo.toml`.
-```
-
----
-
-## Этап 20: Управление хранилищем SQLite: ручная очистка, VACUUM и автоочистка при выходе
-**Приоритет: P0 (Critical) | Спринт 1 | Зависимости: Этап 27**
-
-### Цель и контекст
-При длительной работе сессии сверх лимита `TrafficStore` вытесняются в `sessions.sqlite` (`captured_sessions`), а тела > 2 MiB — в `offloaded_bodies` (`src-tauri/src/storage/mod.rs`). Текущая команда `clear_sessions` (`TrafficStore::clear()`) очищает RAM и удаляет только неархивированные оффлоад-тела (`delete_unarchived_offloaded_bodies`), оставляя вытесненные сессии в `captured_sessions` и не сжимая WAL/freelist-страницы. В результате база разрастается до гигабайтов.
-
-> **Важный архитектурный нюанс:** UI-настройки хранятся в `localStorage`, а не в файле внутри `app_data_dir` (в `app_data_dir` Rust-бэкенд хранит только свои `.pref`-файлы, см. `SystemProxyManager` в `src-tauri/src/proxy/sysproxy.rs`). Поэтому флаг автоочистки при выходе должен синхронизироваться в Rust через отдельную команду и локальный `.pref`-файл. Также в `src-tauri/src/lib.rs` и `WindowEvent::CloseRequested`, и `RunEvent::Exit` вызывают завершение работы — очистку при выходе нужно защитить `AtomicBool` от повторного запуска.
-
-### Критерии приемки (DoD)
-- В `SqliteArchive` (`src-tauri/src/storage/sqlite.rs`) и `TrafficStore` (`src-tauri/src/storage/mod.rs`) реализован метод `purge_and_vacuum()` / `clear_sqlite_archive()`, очищающий `captured_sessions` и `offloaded_bodies` с выполнением `PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);` и возвращающий обновленный `StorageStats`.
-- Экспортированы Tauri-команды `clear_sqlite_database` и `set_clear_db_on_exit(enabled: bool)` / `get_clear_db_on_exit()`.
-- Флаг `clearDbOnExit: boolean` (по умолчанию `false`) добавлен в `FluxUserSettingsProfile`, синхронизируется с Rust при старте/изменении и срабатывает ровно один раз при выходе в `src-tauri/src/lib.rs` (после `shutdown_sync()`).
-- Управление доступно в `SettingsModal.tsx` (*General* → блок *Хранилище*), в `MenuBar.tsx` (меню `File` и `Tools` — отдельного меню `Sessions` в приложении нет), по клику на индикатор `SQLite: X.X MB` в строке состояния `App.tsx` и через `CommandPalette.tsx` (`Ctrl+K`).
-- Unit-тест `purge_and_vacuum_reclaims_disk_space` в `sqlite.rs` проверяет сжатие файла на диске после удаления записей.
-
-### 📝 Промпт для Antigravity (Этап 20)
-
-```markdown
-Роль: Senior Systems Engineer (Rust / SQLite / WAL) & Fullstack UI Developer.
-Проект: FluxProxy (Tauri v2 + Rust + React 18).
-
-Задача: Реализовать полную очистку архива SQLite со сжатием файла через VACUUM, настройку автоочистки при выходе из приложения и UI-элементы управления хранилищем.
-
-1. Бэкенд (`src-tauri/src/storage/sqlite.rs`, `src-tauri/src/storage/mod.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/lib.rs`):
-   - В `SqliteArchive` (`sqlite.rs`):
-     * Добавить `pub fn purge_and_vacuum(&self) -> Result<(), ProxyError>`: в транзакции выполнить `DELETE FROM offloaded_bodies;` и `DELETE FROM captured_sessions;`, зафиксировать транзакцию, затем выполнить `PRAGMA wal_checkpoint(TRUNCATE);`, `VACUUM;`, `PRAGMA wal_checkpoint(TRUNCATE);`.
-     * Добавить unit-тест `purge_and_vacuum_reclaims_disk_space`, вставляющий крупные записи, вызывающий `purge_and_vacuum()` и проверяющий уменьшение `database_size_bytes()` и пустоту таблиц.
-   - В `TrafficStore` (`mod.rs`):
-     * Добавить `pub fn clear_sqlite_archive(&self, drop_non_matching: bool) -> Result<StorageStats, ProxyError>`, вызывающий `self.sqlite.purge_and_vacuum()` и возвращающий `self.storage_stats(drop_non_matching)`.
-     * Добавить потокобезопасное чтение/сохранение преференса `clear_db_on_exit` (например, `clear_db_on_exit.pref` в `app_data_dir`, аналогично `sysproxy.rs`) и `AtomicBool`-защиту, чтобы автоочистка при завершении выполнялась строго один раз.
-   - В `commands.rs` и `lib.rs`:
-     * Зарегистрировать команды `clear_sqlite_database`, `get_clear_db_on_exit`, `set_clear_db_on_exit`.
-     * В `lib.rs` (в ветке финального завершения `RunEvent::Exit` после `state.controller.shutdown_sync()`) при включенном `clear_db_on_exit` вызывать `clear_sqlite_archive(...)`.
-
-2. Настройки и Dual-Mode (`src/types/settings.ts`, `src/lib/settingsManager.ts`, `src/lib/tauriBridge.ts`, `src/lib/mockTraffic.ts`, `src/hooks/useProxySessions.ts`):
-   - Добавить `clearDbOnExit?: boolean` (дефолт `false`) в `FluxUserUiSettings` или `FluxUserProxySettings` (использовать единое место, например `ui` или `proxy`, с нормализацией в `settingsManager.ts`).
-   - В `useProxySessions.ts` при старте и изменении синхронизировать флаг в Rust через `proxyBridge.setClearDbOnExit(...)`, а при вызове `clearSqliteDatabase()` обновлять `storageStats`.
-   - Поддержать методы в Browser Preview (`tauriBridge.ts`, `mockTraffic.ts`).
-
-3. Пользовательский интерфейс:
-   - В `src/components/SettingsModal.tsx` (вкладка `General`):
-     * Отобразить размер БД (`storageStats.sqliteSizeBytes`), чекбокс «Очищать базу SQLite при выходе (Clear DB on App Exit)» и кнопку «Очистить архив SQLite сейчас (VACUUM)» с подтверждением.
-   - В `src/components/MenuBar.tsx`:
-     * Добавить пункт `Purge SQLite Archive (Free Disk)...` в меню `File` и/или `Tools` (актуальные верхние меню: `File`, `Edit`, `Rules`, `View`, `Tools`, `Help`).
-   - В `src/App.tsx` и `src/components/CommandPalette.tsx`:
-     * Сделать бейдж `SQLite: X.X MB` в статус-баре (или отдельную кнопку рядом с `RAM`) интерактивным для быстрого вызова диалога очистки/сжатия, не ломая клик по `RAM` (открывающий лимит удержания).
-     * Добавить действие `clear-sqlite-db` в `CommandPalette.tsx`.
-
-Проверка: `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run typecheck`, `npm run build`.
-```
-
----
-
-## Этап 21: Двухфазный захват сессий (In-Flight / Pending в стиле Fiddler)
-**Приоритет: P0 (Critical) | Спринт 1 | Зависимости: нет**
-
-### Цель и контекст
-Сейчас прокси (`handle_intercepted_request` и `execute_composed` в `src-tauri/src/proxy/server.rs`) регистрирует сессию и отправляет событие в UI только **после получения ответа** от upstream. На медленных запросах (LLM API, долгие SQL/HTTP-запросы, таймауты) пользователь не видит запрос в таблице до завершения или обрыва. В Fiddler сессия появляется мгновенно при отправке запроса (`status: 0` / `Pending`), позволяет инспектировать исходящие заголовки/тело и обновляется на месте при приходе ответа.
-
-> **Важные технические нюансы:**
-> - `TrafficGrid.tsx` сейчас красит любой `status < 300` (включая `0`) зеленым стилем `2xx` — статус `0` (при `!breakpointPaused && !tlsBypassed && !error`) нужно отделить в нейтральный/пульсирующий стиль `Pending`.
-> - При активном `Drop Non-Matching on Capture` (`evaluate_should_store_session` в `filters.rs`): в Фазе 1 (`status: 0`, `duration_ms: 0`, `body_size: 0`, пустой `content_type`) фильтры по статусу, `contentType`, `bodySize` и `onlySlowRequests` еще не применимы. Нужно либо пропускать эти проверки на этапе `in-flight`, а при отбраковке в Фазе 2 удалять сессию из `TrafficStore` и уведомлять UI (например, событием `proxy://sessions-removed`), чтобы в таблице не оставались «зависшие» строки `Pending`.
-> - `useProxySessions.ts` уже умеет обновлять строки по `id` в `flushPendingSessions` и перечитывать `selectedDetail` при изменении `status`/`bodySize`/`durationMs`.
-
-### Критерии приемки (DoD)
-- **Фаза 1 (In-Flight):** в `handle_intercepted_request` (и `execute_composed`) перед отправкой upstream-запроса (`upstream_req.send().await`) вызывается `record_in_flight_session`, записывающая `SessionDetail` со `status: 0`, `duration_ms: 0`, `body_size: 0`, полными данными запроса и пустыми данными ответа в `TrafficStore`, и отправляющая `summary` в `event_tx`.
-- **Фаза 2 (Completion / Error):** при получении ответа (или сетевой ошибке `record_and_return_error`) сессия с тем же `session_id` обновляется на месте (`status`, `duration_ms`, `body_size`, заголовки и тело ответа, `error`), сохраняя пользовательские аннотации (`comment`/`marked_color`). При активном `Drop Non-Matching` отсеянная по факту ответа сессия корректно удаляется из UI и `TrafficStore`.
-- **`TrafficGrid.tsx`:** строки со `status === 0` (и `!breakpointPaused`) отображают нейтральный пульсирующий бейдж `...` / `Pending`, время `...` и размер `--`.
-- **`SessionInspector.tsx`:** для `status === 0` вкладки Request полностью доступны, а панель Response показывает индикатор ожидания «Запрос отправлен, ожидание ответа от сервера...», автоматически сменяющийся на ответ без потери выбранной вкладки.
-- Покрыто интеграционным тестом в `server.rs` (медленный upstream-сервер возвращает ответ с задержкой, проверяется появление `status == 0` до завершения ответа и обновление до `200`).
-
-### 📝 Промпт для Antigravity (Этап 21)
-
-```markdown
-Роль: Principal Systems Network Engineer (Rust / Tokio / Hyper) & Senior Frontend Engineer (React 18).
-Проект: FluxProxy (Tauri v2 + Rust + React 18).
-
-Задача: Реализовать двухфазный захват трафика (Two-Phase Capture): немедленное отображение запроса в статусе In-Flight (`status: 0`) в момент отправки в upstream и обновление строки/инспектора на месте при получении ответа или ошибки.
-
-1. Бэкенд (`src-tauri/src/proxy/server.rs`, `src-tauri/src/proxy/filters.rs`, `src-tauri/src/models.rs`):
-   - В `server.rs`:
-     * Реализовать helper `record_in_flight_session(ctx, session_id, ...)` для `handle_intercepted_request` (непосредственно перед `upstream_req.send().await`) и `execute_composed` (перед `builder.send().await`). Note: `handle_outer_proxy_request` лишь делегирует в `handle_intercepted_request` или открывает `CONNECT`-туннель.
-     * Формировать `SessionSummary` с `status: 0`, `duration_ms: 0`, `body_size: 0`, `content_type: ""` и `SessionDetail` с заполненными `request_headers`, `request_body_base64`, `request_body_text`.
-     * Учитывать `Drop Non-Matching on Capture`:
-       - В `filters.rs` проверить, чтобы в Фазе 1 (`status == 0`) хост/метод/URL-фильтры могли отбрасывать шум сразу, а фильтры, зависящие от ответа (`status`, `contentType`, `bodySize`, `onlySlowRequests`), не отбрасывали `in-flight` запрос раньше времени.
-       - Если в Фазе 2 (после получения ответа) `evaluate_should_store_session` вернул `false` для уже эмиченной сессии, удалять её из `ctx.store` и отправлять в UI событие `proxy://sessions-removed` (`Vec<u64>`) для удаления строки из таблицы.
-     * При завершении ответа или ошибке (`record_and_return_error`) обновлять ту же `session_id` через `record_completed_session` (сохраняя `comment` и `marked_color`).
-   - Добавить интеграционный тест в `server.rs` с искусственной задержкой ответа upstream.
-
-2. Таблица и Инспектор (`src/components/TrafficGrid.tsx`, `src/components/SessionInspector.tsx`, `src/hooks/useProxySessions.ts`, `src/lib/tauriBridge.ts`, `src/lib/mockTraffic.ts`):
-   - В `TrafficGrid.tsx`:
-     * В логике `statusBadgeClasses` выделить `s.status === 0 && !s.breakpointPaused && !s.tlsBypassed && !s.error` до ветки `else (2xx)`, чтобы `Pending` не подсвечивался зеленым.
-     * Для `status === 0` показывать компактный пульсирующий бейдж `...` / `Pending`, длительность `...` и размер `--`.
-   - В `SessionInspector.tsx`:
-     * При `detail.summary.status === 0 && !detail.summary.breakpointPaused && !detail.summary.error` оставлять Request-вкладки полностью активными, а в Response-панели показывать плашку ожидания ответа со спиннером.
-   - В `useProxySessions.ts` и `tauriBridge.ts`:
-     * Подписаться на `proxy://sessions-removed` (если удаляется in-flight строка по `Drop Non-Matching`).
-     * В `mockTraffic.ts` добавить демонстрацию задержки ответа (Phase 1 -> Phase 2) для Browser Preview.
-
-Проверка: `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run typecheck`, `npm run build`.
-```
-
----
-
-## Этап 14: Поддержка сжатия Zstandard (RFC 8878 zstd)
-**Приоритет: P0 (Critical) | Спринт 1 | Зависимости: нет**
-
-### Цель и контекст
-Браузеры (Chrome 123+, Firefox 126+, Edge) отправляют `Accept-Encoding: gzip, deflate, br, zstd`. Крупные CDN (Cloudflare, Fastly, Google, Meta) возвращают `content-encoding: zstd`. Крейт `reqwest 0.12` (с текущими фичами в `src-tauri/Cargo.toml`) декодирует только `gzip`, `brotli` и `deflate`, а `server.rs` (`handle_intercepted_request` и `execute_composed`) удаляет `content-encoding` перед отправкой ответа браузеру. В результате браузер и инспектор получают сырой бинарный поток `zstd` (`0x28 0xB5 0x2F 0xFD`) вместо HTML/JSON. Кроме того, в TextWizard отсутствует поддержка Zstd.
-
-### Критерии приемки (DoD)
-- В `src-tauri/Cargo.toml` добавлен крейт `zstd = "0.13"`.
-- В `src-tauri/src/proxy/server.rs` (и в `handle_intercepted_request`, и в `execute_composed`) ответы с `content-encoding: zstd` (включая регистронезависимые и комбинированные заголовки) прозрачно декодируются до сохранения в `TrafficStore` и до отправки в клиентский Hyper `Response`.
-- При ошибке декодирования `zstd` исходные байты и заголовок `content-encoding` сохраняются без повреждения ответа клиенту (fail-safe); если декодирование отключено/неудачно, предусмотрена нормализация `Accept-Encoding` (fallback).
-- В `src-tauri/src/models.rs`, `src-tauri/src/proxy/codec.rs`, `src/types/proxy.ts`, `src/lib/textWizard.ts`, `src/lib/tauriBridge.ts` и `src/components/TextWizardModal.tsx` добавлены операции `ZstdCompress` / `ZstdDecompress` (с preview-реализацией или явным fallback).
-- Unit-тест `roundtrips_zstd` в `codec.rs` и интеграционный тест прозрачного декодирования `zstd`-ответа в `server.rs`.
-
-### 📝 Промпт для Antigravity (Этап 14)
-
-```markdown
-Роль: Senior Systems Engineer (Rust / Tokio / Hyper / Codecs) & Fullstack Developer.
-Проект: FluxProxy (Tauri v2 + Rust + React 18).
-
-Задача: Реализовать прозрачную распаковку HTTP-ответов, сжатых алгоритмом Zstandard (`content-encoding: zstd`), и добавить сжатие/распаковку Zstd в TextWizard.
-
-1. Зависимости (`src-tauri/Cargo.toml`):
-   - Добавить `zstd = "0.13"`.
-
-2. Прозрачная распаковка в прокси и Composer (`src-tauri/src/proxy/server.rs`):
-   - Написать общий helper `maybe_decompress_zstd(headers: &[HeaderPair], body: Bytes) -> (Bytes, bool)`:
-     * Проверять `content-encoding` на наличие токена `zstd` (case-insensitive, учитывая списки через запятую).
-     * Декодировать через `zstd::decode_all(body.as_ref())` (внутри `spawn_blocking` для крупных тел > 256 KB или напрямую для небольших).
-     * Если декодирование успешно, возвращать распакованные `Bytes` и `true` (разрешая удаление `content-encoding` / `content-length` при пересборке Hyper `Response`).
-     * Если декодирование вернуло ошибку — логировать предупреждение, возвращать исходный `body` и `false`, и **НЕ** удалять заголовок `content-encoding` у ответа клиенту.
-   - Применить helper в `handle_intercepted_request` и в `execute_composed` (`server.rs`).
-   - Для SSE-ветки (и будущих потоковых веток): если `content-encoding` содержит `zstd`, не отправлять сырой `zstd`-поток со снятым `content-encoding` (либо снимать `zstd` из `Accept-Encoding` на SSE/стриминг, либо использовать потоковый декодер).
-   - Добавить интеграционный тест в `server.rs`, проверяющий получение клиентом и сохранение в `TrafficStore` чистого HTML/JSON от upstream с `content-encoding: zstd`.
-
-3. TextWizard & Codec Engine (`src-tauri/src/models.rs`, `src-tauri/src/proxy/codec.rs`, `src/types/proxy.ts`, `src/lib/textWizard.ts`, `src/lib/tauriBridge.ts`, `src/components/TextWizardModal.tsx`):
-   - В `models.rs` расширить `CodecOperation` вариантами `ZstdCompress`, `ZstdDecompress`.
-   - В `codec.rs` реализовать обработку через `zstd::encode_all(..., 3)` и `zstd::decode_all(...)`, добавить тест `roundtrips_zstd`.
-   - Обновить `src/types/proxy.ts`, `src/lib/textWizard.ts`, `src/lib/tauriBridge.ts` и `src/components/TextWizardModal.tsx` (кнопки/опции Zstd Compress и Zstd Decompress + поддержка Base64/Hex).
-
-Проверка: `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run typecheck`, `npm run build`.
-```
-
----
-
-## Этап 15: Привязка к конкретному IP / сетевому интерфейсу и мульти-бинд
-**Приоритет: P0 (Critical) | Спринт 1 | Зависимости: нет**
-
-### Цель и контекст
-Сейчас `allow_remote` переключает прослушивание только между `127.0.0.1` и `0.0.0.0` (`src-tauri/src/proxy/server.rs`). Биндинг на `0.0.0.0` открывает порт на всех интерфейсах сразу (включая публичный Wi-Fi и корпоративные VPN), что противоречит требованиям безопасности, а также мешает при наличии нескольких адаптеров (Ethernet, Wi-Fi, WSL, Docker, VPN).
-
-> **Важные технические нюансы:**
-> - Функция `list_network_interfaces()` в `src-tauri/src/proxy/network.rs` сейчас намеренно **исключает** CGNAT/VPN (`100.64.0.0/10`) и виртуальные адаптеры (WSL, Hyper-V, Docker, VMware). Для окна `MobileSetupModal.tsx` это поведение нужно сохранить, а для выбора bind-интерфейса в `SettingsModal.tsx` добавить параметр `include_virtual: Option<bool>` в `get_network_interfaces`, чтобы отображались также WSL/Docker/VPN-адаптеры.
-> - При режиме `Specific(ip)` опциональный Dual Listener на `127.0.0.1:{port}` должен быть настраиваемым (`also_bind_loopback: bool`, по умолчанию `true`) и безопасно обрабатывать конфликт порта `AddrInUse` на `127.0.0.1` (предупреждение без срыва основного сокета или корректный откат), а `SystemProxyManager` (`sysproxy.rs`) должен корректно регистрировать в ОС `127.0.0.1` (если loopback поднят) или `{ip}`.
-
-### Критерии приемки (DoD)
-- В `models.rs` и `server.rs` поддержана конфигурация `BindHostMode`: `Loopback` (`127.0.0.1`), `AllInterfaces` (`0.0.0.0`), `Specific(String)` + флаг `also_bind_loopback: bool`.
-- `ProxyStatus` возвращает `bind_mode`, `bound_ips: Vec<String>` и сохраняет обратную совместимость полей `bind_addr` / `allow_remote`.
-- Добавлена команда `set_bind_configuration(mode, ip, port, also_bind_loopback)` (и параметр `include_virtual` у `get_network_interfaces`), а преференс режима привязки сохраняется в `app_data_dir` через `sysproxy.rs`.
-- В `SettingsModal.tsx` (*Rules & Proxy*), `MobileSetupModal.tsx` и строке состояния `App.tsx` добавлен выбор конкретного сетевого интерфейса с отображением актуальных привязанных IP.
-- `FluxUserProxySettings` (`settings.ts` / `settingsManager.ts`) поддерживает `bindMode`, `specificBindIp` и `alsoBindLoopback` с миграцией старого `allowRemote`.
-- Unit-тесты мульти-бинда (поднятие двух `TcpListener` и корректное завершение обоих при `stop()`/`shutdown_sync()`) в `server.rs`.
-
-### 📝 Промпт для Antigravity (Этап 15)
-
-```markdown
-Роль: Senior Network Systems Engineer (Rust / Tokio / Sockets) & Fullstack Developer.
-Проект: FluxProxy (Tauri v2 + Rust + React 18).
-
-Задача: Заменить жесткое переключение `127.0.0.1` / `0.0.0.0` на гибкую конфигурацию привязки к сетевым интерфейсам (Loopback, All Interfaces, Specific IP + опциональный Dual Listener для локального системного прокси).
-
-1. Бэкенд (`src-tauri/src/models.rs`, `src-tauri/src/proxy/network.rs`, `src-tauri/src/proxy/server.rs`, `src-tauri/src/proxy/sysproxy.rs`, `src-tauri/src/commands.rs`):
-   - В `models.rs`:
-     * Добавить `BindHostMode` (`Loopback`, `AllInterfaces`, `Specific`), поля `bind_mode`, `specific_bind_ip`, `also_bind_loopback`, `bound_ips: Vec<String>` в `ProxyStatus` (с `#[serde(default)]` для совместимости).
-   - В `network.rs`:
-     * Добавить `list_network_interfaces_with_options(include_virtual: bool) -> Vec<NetworkInterfaceInfo>` (старую `list_network_interfaces()` оставить для `MobileSetupModal` / совместимости). При `include_virtual = true` включать WSL / Docker / Hyper-V / VPN-интерфейсы с понятным `kind`/`name`.
-   - В `server.rs`:
-     * Обновить `ProxyEngineController` для запуска одного или двух `TcpListener` (в режиме `Specific(ip)`: основной на `{ip}:{port}` и при `also_bind_loopback && ip != "127.0.0.1"` дополнительный на `127.0.0.1:{port}` с общим `watch::Receiver<bool>` для синхронного закрытия).
-     * Корректно обрабатывать ошибку `AddrInUse` при старте (останавливать уже поднятый второй сокет и возвращать понятный `ProxyError`, либо сообщать причину).
-     * Сохранить совместимость метода `set_allow_remote` (как переключение между `Loopback` и `AllInterfaces`).
-   - В `sysproxy.rs`:
-     * Сохранять `bind_mode` / `specific_ip` / `also_bind_loopback` в преференсы `app_data_dir` (с чтением legacy `allow_remote.pref`) и указывать в системный прокси ОС `127.0.0.1` (если loopback слушается) или `{specific_ip}`.
-   - В `commands.rs` и `lib.rs`:
-     * Добавить `set_bind_configuration` и расширить `get_network_interfaces(include_virtual: Option<bool>)`.
-   - Добавить unit-тест в `server.rs` на мульти-бинд и остановку всех listener-задач.
-
-2. Настройки и Frontend (`src/types/proxy.ts`, `src/types/settings.ts`, `src/lib/settingsManager.ts`, `src/lib/tauriBridge.ts`, `src/lib/mockTraffic.ts`, `src/hooks/useProxySessions.ts`, `src/components/SettingsModal.tsx`, `src/components/MobileSetupModal.tsx`, `src/App.tsx`):
-   - Расширить `FluxUserProxySettings` полями `bindMode?: 'loopback' | 'all' | 'specific'`, `specificBindIp?: string | null`, `alsoBindLoopback?: boolean` с автомиграцией из `allowRemote`.
-   - В `SettingsModal.tsx` (*Rules & Proxy*) заменить чекбокс `allowRemote` на радиогруппу: `Loopback (127.0.0.1)`, `All Interfaces (0.0.0.0)`, `Specific Interface` (список из `getNetworkInterfaces(true)` + чекбокс «Также слушать 127.0.0.1 для системного прокси ОС»).
-   - Обновить `MobileSetupModal.tsx` и индикатор адреса/порта в `App.tsx` для отображения активных `boundIps`.
-
-Проверка: `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run typecheck`, `npm run build`.
-```
-
----
-
-## Этап 25: Надежность upstream-соединений, стриминг видео, диагностика ошибок и консистентный TCP-проброс
-**Приоритет: P0 (Critical) | Спринт 1 | Зависимости: Этап 21 (Two-Phase Capture), Этап 14 (Zstd)**
-
-### Цель и контекст
-При воспроизведении видео (YouTube / `*.googlevideo.com`) и тяжелых CDN-ответов возникает ошибка `Upstream connection error: error sending request for url (...)` — иногда даже после попытки включить Passthrough. Аудит `server.rs` и `filters.rs` выявил 4 причины:
-1. Ошибка `reqwest::Error` форматируется через `{err}`, скрывая всю цепочку `std::error::Error::source()` (DNS, TLS, reset, HTTP/2 `GOAWAY`, timeout).
-2. `upstream_client` (`src-tauri/src/proxy/server.rs:120`) настроен с `pool_idle_timeout(90s)` и без `tcp_keepalive`, `http2_keep_alive_*`, `rustls-tls-native-roots` и retry на оборванном keep-alive сокете из пула.
-3. Все не-SSE ответы вычитываются целиком через `upstream_resp.bytes().await` до отправки первого байта браузеру, ломая `206 Partial Content` и ABR-стриминг видео.
-4. Долгоживущие открытые HTTP/2 `CONNECT` MITM-туннели продолжают работать после изменения правил TLS Bypass / `TargetedOnly`; правило `*.youtube.com` не покрывает `*.googlevideo.com`; в `filters.rs` и `filterEngine.ts` `Hosts List (Whitelist)` с включенным `applyToTlsPassthrough` перекрывает `TargetedOnly`, а в `HostFiltersTab.tsx` слабо заметно, что без этого чекбокса трафик все еще расшифровывается через MITM.
-
-> **Критичные межэтапные ограничения:**
-> - **Взаимодействие с Этапом 14 (Zstd):** ответы с `content-encoding: zstd` (например, > 2 MiB HTML/JSON) НЕЛЬЗЯ пускать в сырую ветку `StreamBody` со снятым `content-encoding` — иначе браузер получит несжатый мусор. Сырой zero-buffering стриминг разрешен только если `!is_zstd_encoded` (или через потоковый декодер Zstd).
-> - **Защита от OOM на видео-стримах:** `MAX_CAPTURED_BODY_BYTES` в `server.rs` равен **64 MiB**! Буферизация 64 MiB на каждый видеосегмент `video/*` / `206` вызовет утечку/скачок RAM. Для медиа-потоков (`video/*`, `audio/*`, `206`) сохранять метаданные, заголовки и точный счетчик `body_size` (либо не более превью `<= 64 KB` / без хранения 64 MiB видео в `TrafficStore`).
-> - **Точное место `TLS_BYPASS_QUICK_PACKS`:** константа экспортируется из `src/lib/filterEngine.ts`, а не из `FilterDrawer.tsx`.
-
-### Критерии приемки (DoD)
-- Реализован `format_error_chain(err: &dyn std::error::Error) -> String` для всех ошибок upstream (`handle_intercepted_request`, `execute_composed`, `handle_websocket_intercept`).
-- `upstream_client` (через переиспользуемый `build_upstream_client`) включает `rustls-tls-native-roots`, `tcp_keepalive`, `http2_keep_alive_interval`, `http2_keep_alive_while_idle`, сниженный `pool_idle_timeout` (~35 сек) и безопасный 1-кратный retry для идемпотентных запросов (`GET`/`HEAD`/`OPTIONS`) с переиспользуемым `Bytes`-телом при отказе stale-соединения до получения заголовков.
-- Для ответов `206 Partial Content`, `video/*`, `audio/*` или `Content-Length > 2 MiB` (при `!should_break_resp` и `!is_zstd_encoded`) используется zero-buffering `StreamBody` поверх двухфазного захвата (Этап 21) без 64-MiB буферизации видеосегментов в памяти.
-- В `ProxyFilterEngine` добавлен `watch::Sender<u64>` генерации правил `CONNECT`: при переводе хоста из MITM в Passthrough открытые простаивающие MITM-туннели корректно завершаются через `graceful_shutdown` (`AutoConnBuilder`), чтобы браузер немедленно переоткрыл прямой TCP-туннель.
-- Уточнен и синхронизирован приоритет `host_list_sync` vs `TargetedOnly` между `src-tauri/src/proxy/filters.rs` (`evaluate_connect_tunnel`) и `src/lib/filterEngine.ts` (`evaluateTlsConnectInPreview`).
-- В `src/lib/filterEngine.ts` (`TLS_BYPASS_QUICK_PACKS`) добавлен пресет для видеохостингов и CDN (`*.googlevideo.com`, `*.youtube.com`, `*.ytimg.com`, `*.ggpht.com`, `*.ttvnw.net`, `*.vimeocdn.com`), а в `HostFiltersTab.tsx` усилен визуальный индикатор «UI Only — HTTPS все еще расшифровывается через MITM».
-- Unit/интеграционные тесты `formats_full_reqwest_error_source_chain`, `streams_video_partial_content_without_full_buffering` в `server.rs` и тесты в `filters.rs`.
-
-### 📝 Промпт для Antigravity (Этап 25)
-
-```markdown
-Роль: Principal Network Systems Engineer (Rust / Tokio / Hyper / Reqwest / Rustls) & Senior Frontend Engineer (React 18).
-Проект: FluxProxy (Tauri v2 + Rust + React 18).
-
-Контекст: Зависит от двухфазного захвата (Этап 21) и поддержки Zstd (Этап 14). Необходимо устранить скрытые ошибки upstream на видео/CDN, перевести медиа и крупные ответы на потоковую передачу, а также сделать переключение в TLS Passthrough мгновенным для активных соединений.
-
-1. Диагностика ошибок и настройка `upstream_client` (`src-tauri/Cargo.toml`, `src-tauri/src/proxy/server.rs`):
-   - В `Cargo.toml` для `reqwest` добавить фичу `"rustls-tls-native-roots"` (вместе с `"rustls-tls"`).
-   - Вынести сборку клиента в общий helper `build_upstream_client(...)`:
-     * `tcp_keepalive(Some(Duration::from_secs(30)))`,
-     * `http2_keep_alive_interval(Some(Duration::from_secs(20)))`, `http2_keep_alive_timeout(Duration::from_secs(10))`, `http2_keep_alive_while_idle(true)`,
-     * `pool_idle_timeout(Some(Duration::from_secs(35)))`.
-   - Реализовать `format_error_chain(err: &dyn std::error::Error) -> String` (обход `err.source()` через ` -> `) и использовать его в `handle_intercepted_request`, `execute_composed` и `handle_websocket_intercept`.
-   - Добавить безопасный 1-кратный retry при ошибке `send().await` до получения ответа для идемпотентных методов (`GET`, `HEAD`, `OPTIONS`) при признаках обрыва stale-соединения из пула (`is_request()` / `is_connect()` + IO `ConnectionReset` / `BrokenPipe` / `UnexpectedEof` или hyper `IncompleteMessage` / `Canceled`).
-
-2. Zero-buffering потоковая передача для медиа и `206` (`src-tauri/src/proxy/server.rs`):
-   - В `handle_intercepted_request` (рядом с веткой SSE) добавить потоковую передачу через `StreamBody`, если `!should_break_resp`, `!is_sse_stream`, И НЕ требуется буферизация для `content-encoding: zstd` (Этап 14), когда выполняется одно из условий:
-     * `final_status == 206` (Partial Content),
-     * `content_type` начинается с `video/` или `audio/`,
-     * `content-length` > `BODY_OFFLOAD_THRESHOLD_BYTES` (2 MiB).
-   - Использовать двухфазную модель Этапа 21: обновить запись заголовками ответа (`status = final_status`), транслировать чанки `upstream_resp.chunk().await` клиенту без ожидания конца файла, обновляя `body_size` и `duration_ms` в `TrafficStore` (для `video/*` / `audio/*` / `206` не накапливать 64 MiB видеобайтов в `raw_accum`, ограничиваясь заголовками/счетчиком байт или малым текстовым превью для `text/*`/`application/*`).
-   - При ошибке чтения чанка на лету корректно фиксировать `error` в сессии.
-
-3. Консистентный TLS Passthrough и инвалидация открытых MITM-туннелей (`src-tauri/src/proxy/filters.rs`, `server.rs`, `src/lib/filterEngine.ts`, `src/components/HostFiltersTab.tsx`):
-   - В `ProxyFilterEngine` (`filters.rs`) добавить `watch::Sender<u64>` (инкрементировать при `update_config`).
-   - В `handle_outer_proxy_request` (`server.rs`) при обслуживании MITM-соединения (`AutoConnBuilder::serve_connection_with_upgrades`) слушать канал обновления правил и вызывать `conn.graceful_shutdown()`, если `evaluate_connect_tunnel(&host, port)` сменился на `Passthrough`.
-   - Согласовать и протестировать приоритет `host_list_sync` (Whitelist) vs `TargetedOnly` одинаково в `filters.rs` и `src/lib/filterEngine.ts` (`evaluateTlsConnectInPreview`).
-   - В `src/lib/filterEngine.ts` (`TLS_BYPASS_QUICK_PACKS`) добавить пак `+ Видеохостинги / CDN (YouTube, Googlevideo, Twitch, Vimeo)` (`*.googlevideo.com, *.youtube.com, *.ytimg.com, *.ggpht.com, *.ttvnw.net, *.vimeocdn.com`).
-   - В `src/components/HostFiltersTab.tsx` сделать явный предупреждающий баннер, когда фильтр активен, но `applyToTlsPassthrough` выключен (пояснить, что HTTPS-соединения все еще расшифровываются через MITM).
-
-4. Тесты (`server.rs`, `filters.rs`):
-   - Добавить `formats_full_reqwest_error_source_chain`, `streams_video_partial_content_without_full_buffering` и тест пака `*.googlevideo.com` в `filters.rs`.
-
-Проверка: `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run typecheck`, `npm run build`.
-```
-
----
-
-## Этап 28: Неблокирующий Tokio-рантайм, предкомпиляция Regex и потоковый SSE и WebSocket
-**Приоритет: P0 (High) | Спринт 1 | Зависимости: Этап 21, Этап 25**
-
-### Цель и контекст
-Профилирование пути прохождения трафика выявило узкие места по CPU, памяти и блокировке асинхронных потоков Tokio:
-1. `resolve_client_process` вызывается синхронно в async-обработчике каждого соединения (`src-tauri/src/proxy/server.rs:272`), сканируя таблицы сокетов ОС прямо на воркер-потоке Tokio; тяжёлые синхронные вызовы `rusqlite` и файлового I/O в `commands.rs` также исполняются без `tokio::task::spawn_blocking`.
-2. `RuleEngine` (`src-tauri/src/proxy/rules.rs:93`) и `BreakpointEngine` (`src-tauri/src/proxy/breakpoints.rs:196`) вызывают `Regex::new(...)` заново на каждый проходящий HTTP-запрос под read-локом.
-3. Приём тела запроса в `server.rs` (`req.into_body().collect().await`) неограниченно буферизует payload в RAM; при `composed.follow_redirects` (`server.rs:738-742`) на каждый запрос создаётся новый `reqwest::Client`.
-4. На потоковых соединениях наблюдается квадратичная деградация ($O(N^2)$): SSE (`server.rs:1689`) на каждый чанк заново кодирует весь накопленный буфер целиком в Base64 и `String`, а WebSocket (`server.rs:2245-2247`) на каждый новый фрейм пересчитывает/перезаписывает весь массив `recorded_frames`.
-5. На фронтенде параллельно работают polling-интервалы `1500` мс и `3500` мс (`useProxySessions.ts`), постоянно нагружающие IPC и синхронные Rust-команды.
-
-### Критерии приемки (DoD)
-- Вызовы `resolve_client_process` и команды работы с SQLite / файловой системой в `commands.rs` выполняются через `tokio::task::spawn_blocking`, не блокируя планировщик Tokio.
-- Регулярные выражения в `RuleEngine` и `BreakpointEngine` предкомпилируются один раз при загрузке/обновлении правил (`CompiledRule` / `CompiledBreakpoint`).
-- Чтение тела запроса в `server.rs` защищено явным лимитом размера (`http_body_util::Limited` или потоковое ограничение) до полной буферизации в памяти.
-- SSE-накопление и запись WebSocket-фреймов в `TrafficStore` работают инкрементально ($O(1)$ амортизированно на фрейм/чанк с отложенным/финальным формированием `SessionDetail` или `append_sse_chunk`/`append_ws_frame`) без $O(N^2)$ перекодирования на каждый пакет.
-- В `SharedProxyContext` переиспользуется общий `reqwest::Client` с поддержкой редиректов для Composer (вместо `Client::builder()` на каждый запрос).
-- Polling-интервалы статуса и статистики в `useProxySessions.ts` заменены на event-push при изменении состояния (либо увеличены/объединены без лишней фоновой нагрузки при простое).
-
-### 📝 Промпт для Antigravity (Этап 28)
-
-```markdown
-Роль: Senior Rust Performance & Async Runtime Engineer (Tokio / Hyper).
-Проект: FluxProxy (Tauri v2 + Rust + React 18).
-
-Задача: Устранить блокировки Tokio worker-потоков, вынести компиляцию Regex из hot-path, убрать $O(N^2)$ на SSE/WebSocket и наладить пул клиентов Composer.
-
-1. Неблокирующий Tokio (`src-tauri/src/proxy/server.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/proxy/process.rs`):
-   - Вызывать `resolve_client_process` внутри `tokio::task::spawn_blocking` (или с коротким неблокирующим таймаутом/кэшем) при принятии подключения.
-   - Обернуть тяжёлые синхронные обращения к `TrafficStore`/SQLite/ФС в `src-tauri/src/commands.rs` (`get_session_detail`, `load_session_body`, экспорт/импорт и т.д.) в `tokio::task::spawn_blocking`.
-
-2. Предкомпиляция Regex (`src-tauri/src/proxy/rules.rs`, `src-tauri/src/proxy/breakpoints.rs`):
-   - Хранить предкомпилированный `Option<regex::Regex>` рядом с правилом в `RuleEngine` (`rules.rs`) и `BreakpointEngine` (`breakpoints.rs`), компилируя его только в `set_rules`/`update_rules`/`set_config`. В hot-path (`evaluate`/`matches`) использовать только готовый `&Regex`.
-   - Покрыть бенчмарком/unit-тестом сопоставление без аллокации компиляции в hot-path.
-
-3. Потоки, лимиты памяти и Composer (`src-tauri/src/proxy/server.rs`, `src-tauri/src/storage/mod.rs`):
-   - Заменить безлимитный `req.into_body().collect().await` на ограниченное чтение (`http_body_util::Limited::new(body, MAX_CAPTURED_REQUEST_BODY_BYTES)` с корректным `413 Payload Too Large` или потоковым пробросом для крупных запросов).
-   - Перевести обновление SSE и WebSocket в `TrafficStore` на инкрементальный append (хранить/дописывать дельту, а полное Base64/текстовое представление собирать лениво при запросе `get_session_detail` или финально при закрытии потока), убрав $O(N^2)$ цикл на каждом чанке/фрейме.
-   - Добавить в `SharedProxyContext` предсозданный `upstream_redirect_client` для Composer при `follow_redirects: true` вместо пересоздания `reqwest::Client` на каждый вызов `execute_composed`.
-
-4. Снижение polling-нагрузки (`src/hooks/useProxySessions.ts`, `src-tauri/src/proxy/server.rs`):
-   - Заменить или проредить интервалы `1500` мс и `3500` мс (перевести изменение статуса/статистики на события `tauri` при изменении и паузе на скрытой вкладке).
-
-Проверка: `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings`, `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run typecheck`, `npm run build`.
-```
 
 ---
 

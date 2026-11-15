@@ -872,7 +872,7 @@ function tryParseGrpcEnvelopeFrames(
             fieldNumber: 0,
             wireType: 2,
             wireTypeName: "Compressed gRPC Payload",
-            valueSummary: `${msgLen} B (compressed flag=1 — распакуйте через TextWizard Gzip/Brotli)`,
+            valueSummary: `${msgLen} B (compressed flag=1 — распакуйте через TextWizard Gzip/Brotli/Zstd)`,
             alternateInterpretations: bytesToHex(
               slice.subarray(0, Math.min(slice.length, 32)),
               " "

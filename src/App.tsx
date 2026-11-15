@@ -1473,7 +1473,7 @@ export const App: React.FC = () => {
         id: "open-text-wizard",
         category: "TextWizard",
         label:
-          "Открыть TextWizard & JWT Decoder (Base64, URL, Gzip/Brotli, Hex, Timestamp)",
+          "Открыть TextWizard & JWT Decoder (Base64, URL, Gzip/Brotli/Zstd, Hex, Timestamp)",
         shortcut: "Ctrl+E",
         perform: () => openTextWizardAt("jwt"),
       },
@@ -1486,7 +1486,7 @@ export const App: React.FC = () => {
       {
         id: "open-compression-codec",
         category: "TextWizard",
-        label: "TextWizard: Сжатие и распаковка Gzip / Brotli / Deflate",
+        label: "TextWizard: Сжатие и распаковка Gzip / Brotli / Deflate / Zstd",
         perform: () => openTextWizardAt("compression"),
       },
       {

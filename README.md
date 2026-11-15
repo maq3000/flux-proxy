@@ -15,7 +15,7 @@
 
 Мгновенный запуск, умный контроль памяти, аппаратное ускорение интерфейса и стабильные 60 FPS при работе с десятками тысяч перехваченных запросов.
 
-> 📥 **Скачать готовую сборку для Windows:** [**FluxProxy Setup v0.1.0 (.exe)**](https://github.com/maq3000/flux-proxy/releases/download/v0.1.0/FluxProxy_0.1.0_x64-setup.exe) или [**MSI-пакет (.msi)**](https://github.com/maq3000/flux-proxy/releases/download/v0.1.0/FluxProxy_0.1.0_x64_en-US.msi). Подробнее см. раздел [Скачать готовые сборки](#-скачать-готовые-сборки-releases).
+> 📥 **Скачать готовую сборку для Windows:** [**FluxProxy Setup v0.2.0 (.exe)**](https://github.com/maq3000/flux-proxy/releases/download/v0.2.0/FluxProxy_0.2.0_x64-setup.exe) или [**MSI-пакет (.msi)**](https://github.com/maq3000/flux-proxy/releases/download/v0.2.0/FluxProxy_0.2.0_x64_en-US.msi). Подробнее см. раздел [Скачать готовые сборки](#-скачать-готовые-сборки-releases).
 >
 > 📖 **Ищете понятную инструкцию по работе с программой?** Откройте [**Руководство пользователя (USER_GUIDE.md)**](USER_GUIDE.md) — пошаговое описание всех возможностей простым языком: от первого запуска и настройки телефона до подмены ответов и сравнения запросов.
 >
@@ -48,12 +48,12 @@
 
 ## 📥 Скачать готовые сборки (Releases)
 
-Для запуска FluxProxy на **Windows** вам не требуется компилировать проект из исходных кодов — вы можете скачать готовые официальные установщики из [**GitHub Releases v0.1.0**](https://github.com/maq3000/flux-proxy/releases/tag/v0.1.0):
+Для запуска FluxProxy на **Windows** вам не требуется компилировать проект из исходных кодов — вы можете скачать готовые официальные установщики из [**GitHub Releases v0.2.0**](https://github.com/maq3000/flux-proxy/releases/tag/v0.2.0):
 
 | Дистрибутив | Версия | Архитектура | Описание | Ссылка на загрузку | Контрольная сумма (SHA-256) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Windows Setup (`.exe`)** | `v0.1.0` | x64 | **Рекомендуемый** автономный инсталлятор (NSIS). Автоматическое создание ярлыков на рабочем столе и в меню «Пуск», встроенный деинсталлятор. | [📥 **FluxProxy_0.1.0_x64-setup.exe** (8.7 МБ)](https://github.com/maq3000/flux-proxy/releases/download/v0.1.0/FluxProxy_0.1.0_x64-setup.exe) | `30a5007463dc907c12bb922d367134196a3b3e51312fba434fae8d9888d740ad` |
-| **Windows Package (`.msi`)** | `v0.1.0` | x64 | Пакет Windows Installer (MSI). Оптимизирован для тихой установки (`msiexec /i ... /qn`) и автоматизированного развертывания через Active Directory (GPO). | [📥 **FluxProxy_0.1.0_x64_en-US.msi** (11.1 МБ)](https://github.com/maq3000/flux-proxy/releases/download/v0.1.0/FluxProxy_0.1.0_x64_en-US.msi) | `6b9ebc389da5f60737756aefad9762aaeca0bdc51e9f3f59811a366cb3ea8a5e` |
+| **Windows Setup (`.exe`)** | `v0.2.0` | x64 | **Рекомендуемый** автономный инсталлятор (NSIS). Автоматическое создание ярлыков на рабочем столе и в меню «Пуск», встроенный деинсталлятор. | [📥 **FluxProxy_0.2.0_x64-setup.exe** (9.1 МБ)](https://github.com/maq3000/flux-proxy/releases/download/v0.2.0/FluxProxy_0.2.0_x64-setup.exe) | `4b57c09e3ed0c9ad06e404f4c36ade9d93b3431e5ad977d29e34058e98758176` |
+| **Windows Package (`.msi`)** | `v0.2.0` | x64 | Пакет Windows Installer (MSI). Оптимизирован для тихой установки (`msiexec /i ... /qn`) и автоматизированного развертывания через Active Directory (GPO). | [📥 **FluxProxy_0.2.0_x64_en-US.msi** (11.7 МБ)](https://github.com/maq3000/flux-proxy/releases/download/v0.2.0/FluxProxy_0.2.0_x64_en-US.msi) | `5853d51f015a050a27ffa8fe8bd939f5643c4f10a3a02ca71ffc1cf8532f6fc1` |
 
 > 📦 **Все релизы проекта:** [github.com/maq3000/flux-proxy/releases](https://github.com/maq3000/flux-proxy/releases)  
 > 🐧 🍏 **macOS и Linux:** На текущем этапе сборка выполняется из исходного кода с помощью команды `npx @tauri-apps/cli build` (см. раздел [Быстрый старт](#-быстрый-старт)). Готовые дистрибутивы `.dmg` и `.AppImage` будут доступны в следующих релизах.
@@ -64,11 +64,13 @@
 
 ### 🚀 Сетевое ядро перехвата (Rust MITM Core)
 - **HTTP/1.1 и HTTP/2**: Прозрачный перехват и мультиплексирование потоков с автоматическим выбором протокола (`hyper-util auto`).
-- **Расшифровка HTTPS на лету**: Динамическая генерация X.509 сертификатов (ECDSA P-256) под целевые домены через `rcgen` с LRU-кэшированием в памяти (`moka`).
-- **Избирательный перехват (Selective MITM & TLS Bypass)**: Режимы *Intercept All* и *Targeted Allowlist* — расшифровывайте только нужные API-домены, пропуская трафик приложений с жестким Certificate Pinning (мессенджеры, банки, ОС) через прямой TCP-туннель.
+- **Двухфазный захват сессий (In-Flight / Pending)**: Мгновенное появление запроса в таблице еще до ответа сервера (`Pending`) с реальной инспекцией исходящих данных и последующим обновлением статуса, таймингов и ответа.
+- **Zero-Buffering видео/CDN-стриминг и надежность upstream**: Потоковая передача медиа, `206 Partial Content` и крупных ответов без буферизации, мгновенный сброс активных MITM-туннелей в Passthrough при изменении правил и диагностика сбоев с полной цепочкой причин (`err.source()`).
+- **Расшифровка HTTPS на лету и Zstandard (`zstd`)**: Динамическая генерация X.509 сертификатов (ECDSA P-256) под целевые домены через `rcgen` с LRU-кэшированием (`moka`), а также прозрачная распаковка `Content-Encoding: zstd` (RFC 8878) на лету в прокси и Composer.
+- **Избирательный перехват (Selective MITM & TLS Bypass)**: Режимы *Intercept All* и *Targeted Allowlist*, готовые пресеты (включая *Video & CDN*), пропускающие трафик приложений с жестким Certificate Pinning или крупные медиа-CDN через прямой TCP-туннель.
 - **Блокировка обхода через HTTP/3 (QUIC)**: Автоматическое удаление заголовков `Alt-Svc` и `Alternate-Protocol`, предотвращающее уход современных браузеров в UDP-туннель мимо системного прокси.
-- **Перехват WebSocket (WS/WSS)**: Декодирование и инспекция кадров в реальном времени (`tokio-tungstenite`) с полной передачей заголовков авторизации и субпротоколов (включая SignalR).
-- **Управление системным прокси и процессами ОС**: Автоматическое включение и гарантированный возврат настроек системного прокси в Windows, macOS и Linux, а также определение процесса-источника (`PID`, имя приложения) и IP мобильных клиентов в LAN.
+- **Перехват WebSocket (WS/WSS) и SSE**: Инкрементальное декодирование кадров в реальном времени ($O(1)$ append без лишних аллокаций, `tokio-tungstenite`) с полной передачей заголовков авторизации и субпротоколов (включая SignalR).
+- **Гибкая привязка к IP и адаптерам ОС (Dual Listener)**: Точный выбор сетевого интерфейса (*Loopback Only*, *All Interfaces `0.0.0.0`* или *Specific Interface* — Wi-Fi / Ethernet / WSL / VPN + опциональный одновременный loopback-листенер), неблокирующий Tokio-рантайм (`spawn_blocking` для OS/SQLite), предкомпиляция Regex, управление системным прокси и определение процессов/LAN-клиентов.
 
 ### 🛠 Инструменты анализа и модификации
 - **Протокольные анализаторы в Session Inspector**:
@@ -87,15 +89,16 @@
   - Конструктор запросов с поддержкой **Drag-and-Drop** строк из таблицы и параллельным режимом (*Split Composer*).
   - Визуальное сравнение двух сессий (**Session Diff**, `Ctrl+D`) с сортировкой ключей JSON и фильтрацией динамических заголовков.
 - **Text Wizard & Codec Suite (`Ctrl+E`)**:
-  - Декодер JWT с проверкой срока жизни токена, конвертеры Base64, URL, Hex, Unix Timestamp и сжатие Gzip / Brotli / Deflate.
+  - Декодер JWT с проверкой срока жизни токена, конвертеры Base64, URL, Hex, Unix Timestamp и сжатие/распаковка Gzip / Brotli / Deflate / Zstd.
 
-### 💾 Управление памятью, архивы и профили настроек
-- **Кольцевой буфер (Ring Buffer) и защита памяти**:
-  - Ограничение числа хранимых сессий в стиле Fiddler (`Keep: All / 100..10 000 / Custom...`) с автоматической архивацией в SQLite.
+### 💾 Управление памятью, SQLite и профили настроек
+- **Кольцевой буфер (Ring Buffer), SQLite и защита памяти**:
+  - Ограничение числа хранимых сессий в стиле Fiddler (`Keep: All / 100..10 000 / Custom...`) с архивацией в SQLite (`busy_timeout` + автоматическая дочитка вытесненных тел).
+  - Управление размером `sessions.sqlite`: индикатор `SQLite: X.X MB` в статус-баре, ручной `VACUUM` + `wal_checkpoint(TRUNCATE)` и опция *Clear DB on App Exit* в настройках.
   - Режим **Drop Non-Matching on Capture** — отбрасывание фонового шума на этапе захвата без расхода оперативной памяти.
   - Ленивая подгрузка тяжелых тел (> 2 МБ) с диска только при открытии в инспекторе.
 - **Полная совместимость форматов (`Ctrl+S` / `Ctrl+O`)**:
-  - Экспорт и импорт индустриального стандарта **HAR 1.2 (`.har`)**, архивов **Fiddler Classic (`.saz`)**, **JSON**, сырых HTTP-сообщений (`.txt`), а также выгрузка отдельных тел запросов и ответов в файлы.
+  - Экспорт и импорт индустриального стандарта **HAR 1.2 (`.har`)**, архивов **Fiddler Classic (`.saz`)**, **JSON**, сырых HTTP-сообщений (`.txt`) с защитой парсеров от ZIP-бомб и переполнения (включая UTF-16BE), а также выгрузка отдельных тел запросов и ответов в файлы.
   - Поддержка **Drag-and-Drop** файлов `.har`, `.saz` и `.json` прямо в окно программы.
 - **Централизованные настройки и профили (`Preferences`, `Ctrl+,`)**:
   - Единое окно управления интерфейсом, портом прокси, колонками, фильтрами и правилами.
@@ -119,11 +122,12 @@
 ┌──────────────────────────────▼──────────────────────────────┐
 │                  Asynchronous MITM Engine                   │
 │   ├── Hyper 1.x + Tokio (HTTP/1.1 & HTTP/2 Server/Client)   │
+│   ├── Two-Phase In-Flight Capture, Zstd & Zero-Buffering    │
 │   ├── Tokio-Rustls + rcgen + Moka (On-the-fly ECDSA CA)     │
 │   ├── Selective MITM, Alt-Svc Strip & Capture-Stage Drop    │
 │   ├── Tokio-Tungstenite (WebSocket / SignalR Interception)  │
 │   ├── Breakpoints, AutoResponder & Header Mutation Engine   │
-│   └── SysProxy Controller & OS Process / LAN Resolver       │
+│   └── Dual-Bind Listener, SysProxy, SQLite & OS Resolver    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -134,7 +138,7 @@
 | **TLS & Сертификаты** | MITM-расшифровка, управление доверием ОС | `rustls`, `tokio-rustls`, `rcgen`, `moka` |
 | **WebSockets** | Перехват и разбор фреймов WS/WSS | `tokio-tungstenite` |
 | **Хранилище и архивы** | Ring Buffer в RAM, база SQLite, экспорт HAR/SAZ | `DashMap` + `rusqlite` (WAL) + `zip` |
-| **Кодеки и сжатие** | Сжатие/распаковка и кодировки | `flate2` (Gzip/Deflate), `brotli`, `base64`, `hex`, `sha2` |
+| **Кодеки и сжатие** | Сжатие/распаковка и кодировки | `flate2` (Gzip/Deflate), `brotli`, `zstd`, `base64`, `hex`, `sha2` |
 | **Frontend UI** | Компонентный реактивный интерфейс | `React 18`, `TypeScript 5.6`, `Vite 6`, `Tailwind CSS` |
 | **Виртуализация и код** | Скроллинг 60 FPS, редакторы и diff-сравнение | `@tanstack/react-virtual 3`, `@monaco-editor/react` |
 
@@ -270,7 +274,7 @@ npx @tauri-apps/cli build
 FluxProxy умеет перехватывать трафик со смартфонов и планшетов в вашей локальной Wi-Fi сети:
 
 1. Откройте **Tools → Connect Mobile Device (iOS / Android)…** (или нажмите `Ctrl+Shift+M`).
-2. Включите переключатель внешних подключений (`0.0.0.0`), если он еще не активен — программа покажет ваш Wi-Fi IP-адрес, порт и **QR-код**.
+2. Выберите конкретный Wi-Fi/LAN-адаптер в режиме **Specific Interface** (с опцией **Dual Listener** в **Settings → Rules & Proxy**) либо включите режим внешних подключений (`0.0.0.0`) — программа покажет ваш IP-адрес, порт и **QR-код**.
 3. В настройках Wi-Fi на телефоне укажите ручной прокси с IP вашего компьютера и портом `8888`.
 4. Отсканируйте QR-код камерой телефона (или откройте `http://flux.proxy` в мобильном браузере), скачайте профиль сертификата и включите доверие к нему по пошаговой подсказке на экране.
 
@@ -337,14 +341,17 @@ curl -x http://127.0.0.1:8888 https://httpbin.org/get -k
 - ✅ Пакетные списки хостов (Whitelist / Blacklist), матрица фильтров и совместимость с WebSocket / SignalR.
 - ✅ Блокировка обхода HTTP/3 (`Alt-Svc`), управление доверием Root CA (установка/удаление) и строгая политика CSP.
 - ✅ Кольцевой буфер памяти (Ring Buffer `Keep`), фильтрация при захвате (*Drop Non-Matching*) и ленивая подгрузка тяжелых тел.
-- ✅ Полная поддержка архивов **HAR 1.2** и **Fiddler SAZ** (экспорт, импорт, Drag-and-Drop) и выгрузка сырых тел.
+- ✅ Полная поддержка архивов **HAR 1.2** и **Fiddler SAZ** (экспорт, импорт, Drag-and-Drop), защита парсеров от ZIP-бомб/переполнения и выгрузка сырых тел.
 - ✅ Централизованное окно настроек (`Preferences`) и версионированные JSON-профили конфигурации.
+- ✅ **Двухфазный захват сессий (In-Flight / `Pending`)**, zero-buffering стриминг видео/`206`, сброс активных MITM-туннелей в Passthrough и диагностика сетевых сбоев (`err.source()`).
+- ✅ Прозрачная распаковка сжатия **Zstandard (`zstd`, RFC 8878)** на лету (прокси-ядро, Composer, Text Wizard).
+- ✅ **Привязка к конкретному IP / сетевому интерфейсу** (Wi-Fi/Ethernet/WSL/VPN) и режим **Dual Listener** (loopback + выбранный адаптер).
+- ✅ Управление хранилищем SQLite (`VACUUM` + `wal_checkpoint(TRUNCATE)`, *Clear DB on App Exit*), неблокирующий Tokio-рантайм (`spawn_blocking`), предкомпиляция Regex и $O(1)$ SSE/WebSocket-стриминг.
 
 ### Ближайшие этапы разработки:
-- 🔜 **P0 (Critical)** — Прозрачная распаковка сжатия **Zstandard (`zstd`, RFC 8878)** и **привязка к конкретному IP / сетевому интерфейсу LAN** с мульти-биндом.
-- 🔜 **P0 (High)** — Компактный тулбар (`Ctrl+Shift+T`), **очистка PII / секретов при экспорте**, мастер самопроверки **«Proxy Doctor»** и шорткаты инспектора.
-- 🔜 **P1** — **Selective MITM 2.0**, клиентские сертификаты (**mTLS**), **Python Scripting Engine**, **Composer 2.0** («Paste cURL»), генератор **OpenAPI 3.0 / Swagger** и тесты **Vitest & CI/CD**.
-- 🔜 **P2** — **HOSTS Remapping** (виртуальный DNS), **Bandwidth Throttling** (эмуляция 3G/LTE), **Waterfall Timeline**, статистика трафика, **Upstream Proxy** и ручная отправка WebSocket-сообщений.
+- 🔜 **P0 (High)** — Сортировка колонок таблицы (`ASC`/`DESC`) и `Ctrl+A`, сохранение геометрии сплитов, компактный тулбар (`Ctrl+Shift+T`) и шорткаты вкладок `Ctrl+1..6`, очистка PII/секретов при экспорте (**Sanitized Export**), мастер самопроверки **«Proxy Doctor»**, унификация запуска и виртуализация `HexViewer`.
+- 🔜 **P1** — Продвинутые темы-пресеты и палитра, **Selective MITM 2.0**, клиентские сертификаты (**mTLS**), **Python Scripting Engine**, **Composer 2.0** («Paste cURL» и кодогенератор), генератор **OpenAPI 3.0 / Swagger** и тесты **Vitest & CI/CD**.
+- 🔜 **P2** — **HOSTS Remapping** (виртуальный DNS), **Bandwidth Throttling** (эмуляция 3G/LTE), архитектурная декомпозиция + **Zustand**, **Waterfall Timeline**, статистика трафика, **Upstream Proxy** и ручная отправка WebSocket-сообщений.
 
 ---
 
