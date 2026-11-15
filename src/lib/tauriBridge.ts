@@ -167,6 +167,8 @@ class BrowserPreviewEngine {
   private listeners = new Set<(batch: SessionSummary[]) => void>();
   private removedListeners = new Set<(ids: number[]) => void>();
   private bpListeners = new Set<(items: PausedBreakpointItem[]) => void>();
+  private statusListeners = new Set<(status: ProxyStatus) => void>();
+  private storageStatsListeners = new Set<(stats: StorageStats) => void>();
   private timer: number | null = null;
 
   constructor() {
@@ -878,12 +880,30 @@ class BrowserPreviewEngine {
     for (const cb of this.listeners) {
       cb(batch);
     }
+    this.emitStorageStatsChanged();
   }
 
   private emitRemoved(ids: number[]) {
     if (ids.length === 0) return;
     for (const cb of this.removedListeners) {
       cb(ids);
+    }
+    this.emitStorageStatsChanged();
+  }
+
+  private emitStatusChanged() {
+    if (this.statusListeners.size === 0) return;
+    const snapshot = this.getStatus();
+    for (const cb of this.statusListeners) {
+      cb(snapshot);
+    }
+  }
+
+  private emitStorageStatsChanged() {
+    if (this.storageStatsListeners.size === 0) return;
+    const stats = this.getMemoryStorageStats();
+    for (const cb of this.storageStatsListeners) {
+      cb(stats);
     }
   }
 
@@ -905,6 +925,20 @@ class BrowserPreviewEngine {
     this.bpListeners.add(cb);
     return () => {
       this.bpListeners.delete(cb);
+    };
+  }
+
+  subscribeStatus(cb: (status: ProxyStatus) => void): () => void {
+    this.statusListeners.add(cb);
+    return () => {
+      this.statusListeners.delete(cb);
+    };
+  }
+
+  subscribeStorageStats(cb: (stats: StorageStats) => void): () => void {
+    this.storageStatsListeners.add(cb);
+    return () => {
+      this.storageStatsListeners.delete(cb);
     };
   }
 
@@ -1038,6 +1072,7 @@ class BrowserPreviewEngine {
       this.systemProxyError = null;
       this.resumeAllBreakpoints("continue");
     }
+    this.emitStatusChanged();
     return this.getStatus();
   }
 
@@ -1060,6 +1095,7 @@ class BrowserPreviewEngine {
     this.alsoBindLoopback = Boolean(alsoBindLoopback);
     this.syncDerivedBindState();
     this.persistBindConfig();
+    this.emitStatusChanged();
     return this.getStatus();
   }
 
@@ -1074,6 +1110,7 @@ class BrowserPreviewEngine {
   setSystemProxy(enabled: boolean): ProxyStatus {
     this.systemProxyEnabled = enabled;
     this.systemProxyError = null;
+    this.emitStatusChanged();
     return this.getStatus();
   }
 
@@ -1083,12 +1120,14 @@ class BrowserPreviewEngine {
       this.systemProxyEnabled = true;
       this.systemProxyError = null;
     }
+    this.emitStatusChanged();
     return this.getStatus();
   }
 
   setPort(port: number): ProxyStatus {
     if (Number.isInteger(port) && port >= 1 && port <= 65535) {
       this.port = port;
+      this.emitStatusChanged();
     }
     return this.getStatus();
   }
@@ -1216,6 +1255,7 @@ class BrowserPreviewEngine {
         // ignore storage errors
       }
     }
+    this.emitStorageStatsChanged();
     return this.getSummaries();
   }
 
@@ -1223,6 +1263,7 @@ class BrowserPreviewEngine {
     this.store.clear();
     this.offloadedBodies.clear();
     this.droppedSessionsCount = 0;
+    this.emitStorageStatsChanged();
   }
 
   deleteMany(ids: number[]): number {
@@ -1234,6 +1275,9 @@ class BrowserPreviewEngine {
         removed += 1;
       }
     }
+    if (removed > 0) {
+      this.emitStorageStatsChanged();
+    }
     return removed;
   }
 
@@ -1243,6 +1287,7 @@ class BrowserPreviewEngine {
     }
     this.sessionRetentionLimit = limit;
     this.enforceRetentionLimit();
+    this.emitStorageStatsChanged();
   }
 
   setDropNonMatching(enabled: boolean) {
@@ -1250,6 +1295,7 @@ class BrowserPreviewEngine {
       ...this.filterConfig,
       dropNonMatchingOnCapture: enabled,
     };
+    this.emitStorageStatsChanged();
   }
 
   getMemoryStorageStats(): StorageStats {
@@ -1287,7 +1333,9 @@ class BrowserPreviewEngine {
         // ignore storage errors
       }
     }
-    return this.getMemoryStorageStats();
+    const stats = this.getMemoryStorageStats();
+    this.emitStorageStatsChanged();
+    return stats;
   }
 
   getClearDbOnExit(): boolean {
@@ -2601,6 +2649,32 @@ export const proxyBridge = {
       });
     }
     return previewEngine.subscribeRemoved(onRemoved);
+  },
+
+  async subscribeStatusChanged(
+    onChanged: (status: ProxyStatus) => void
+  ): Promise<UnlistenFn> {
+    if (isTauriRuntime()) {
+      return listen<ProxyStatus>("proxy://status-changed", (event) => {
+        if (event.payload) {
+          onChanged(event.payload);
+        }
+      });
+    }
+    return previewEngine.subscribeStatus(onChanged);
+  },
+
+  async subscribeStorageStatsChanged(
+    onChanged: (stats: StorageStats) => void
+  ): Promise<UnlistenFn> {
+    if (isTauriRuntime()) {
+      return listen<StorageStats>("proxy://storage-stats-changed", (event) => {
+        if (event.payload) {
+          onChanged(event.payload);
+        }
+      });
+    }
+    return previewEngine.subscribeStorageStats(onChanged);
   },
 
   async pickSaveFileDialog(options: {

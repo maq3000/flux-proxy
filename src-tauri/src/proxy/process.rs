@@ -25,7 +25,7 @@ pub fn resolve_client_process(
     proxy_port: Option<u16>,
 ) -> Option<ClientProcessInfo> {
     // Only local / loopback client sockets exist in the local OS TCP table
-    if !client_addr.ip().is_loopback() && !is_local_interface_ip(&client_addr) {
+    if client_addr.port() == 0 || (!client_addr.ip().is_loopback() && !is_local_interface_ip(&client_addr)) {
         return None;
     }
 
@@ -34,6 +34,28 @@ pub fn resolve_client_process(
         .unwrap_or_else(|| format!("pid-{pid}"));
 
     Some(ClientProcessInfo { pid, name })
+}
+
+/// Asynchronous non-blocking wrapper around [`resolve_client_process`].
+/// Executes OS process-table queries on Tokio's blocking thread pool with a short timeout
+/// so slow lookups (`GetExtendedTcpTable`, `/proc` scan, or `lsof`) never stall async worker threads.
+pub async fn resolve_client_process_async(
+    client_addr: SocketAddr,
+    proxy_port: Option<u16>,
+) -> Option<ClientProcessInfo> {
+    if client_addr.port() == 0 {
+        return None;
+    }
+
+    let handle = tokio::task::spawn_blocking(move || resolve_client_process(client_addr, proxy_port));
+    match tokio::time::timeout(Duration::from_millis(250), handle).await {
+        Ok(Ok(info)) => info,
+        Ok(Err(_join_err)) => None,
+        Err(_elapsed) => {
+            tracing::debug!(%client_addr, ?proxy_port, "Client process resolution timed out");
+            None
+        }
+    }
 }
 
 fn is_local_interface_ip(addr: &SocketAddr) -> bool {
@@ -484,6 +506,28 @@ mod tests {
 
         assert_eq!(resolved.pid, std::process::id());
         assert!(!resolved.name.is_empty());
+    }
+
+    #[tokio::test]
+    async fn async_resolve_client_process_runs_off_worker_thread() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let server_addr = listener.local_addr().expect("listener local_addr");
+
+        let client = TcpStream::connect(server_addr).expect("connect loopback client");
+        let (_accepted, peer_addr) = listener.accept().expect("accept loopback client");
+        assert_eq!(client.local_addr().unwrap(), peer_addr);
+
+        let resolved = resolve_client_process_async(peer_addr, Some(server_addr.port()))
+            .await
+            .expect("async lookup should resolve active loopback socket to owning PID");
+        assert_eq!(resolved.pid, std::process::id());
+        assert!(!resolved.name.is_empty());
+
+        let remote_addr: SocketAddr = "203.0.113.42:54321".parse().unwrap();
+        assert!(resolve_client_process_async(remote_addr, Some(server_addr.port())).await.is_none());
+
+        let zero_port_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        assert!(resolve_client_process_async(zero_port_addr, Some(server_addr.port())).await.is_none());
     }
 
     #[cfg(target_os = "windows")]

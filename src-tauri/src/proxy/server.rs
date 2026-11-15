@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use http::header::{CONTENT_TYPE, HOST, UPGRADE};
 use http::{Method, Request, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full, StreamBody};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -28,7 +28,7 @@ use tokio_tungstenite::WebSocketStream;
 use crate::models::{
     BindHostMode, BreakpointAction, BreakpointStage, ComposedRequest, HeaderMutationDirection,
     HeaderPair, PausedBreakpointItem, ProxyError, ProxyStatus, RuleActionType, SessionDetail,
-    SessionSummary, SseEventRecord, WebSocketFrameRecord,
+    SessionSummary, SseEventRecord, StorageStats, WebSocketFrameRecord,
 };
 use crate::proxy::breakpoints::BreakpointEngine;
 use crate::proxy::ca::CertificateAuthority;
@@ -36,15 +36,42 @@ use crate::proxy::filters::{
     is_alt_svc_header, ConnectTunnelDecision, PassthroughReason, ProxyFilterEngine,
 };
 use crate::proxy::network::{is_host_own_ip, normalize_client_ip};
-use crate::proxy::process::{resolve_client_process, ClientProcessInfo};
+use crate::proxy::process::{resolve_client_process_async, ClientProcessInfo};
 use crate::proxy::rules::RuleEngine;
 use crate::proxy::sysproxy::{resolve_sysproxy_host_for_bind, SystemProxyManager};
 use crate::storage::{TrafficStore, BODY_OFFLOAD_THRESHOLD_BYTES};
 
 const MAX_CAPTURED_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB safety cap per body (> 2 MiB offloaded to SQLite)
+pub const MAX_CAPTURED_REQUEST_BODY_BYTES: usize = MAX_CAPTURED_BODY_BYTES;
 const ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES: usize = 256 * 1024; // 256 KiB
 const STREAM_TEXT_PREVIEW_MAX_BYTES: usize = 64 * 1024; // 64 KiB cap for text/* or application/* large-stream previews
 type ProxyBoxBody = BoxBody<Bytes, Infallible>;
+
+#[derive(Debug)]
+enum RequestBodyReadError {
+    PayloadTooLarge(usize),
+    Transport(String),
+}
+
+async fn collect_request_body_limited<B>(
+    body: B,
+    max_bytes: usize,
+) -> Result<Bytes, RequestBodyReadError>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    match Limited::new(body, max_bytes).collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(err) => {
+            if err.is::<LengthLimitError>() {
+                Err(RequestBodyReadError::PayloadTooLarge(max_bytes))
+            } else {
+                Err(RequestBodyReadError::Transport(err.to_string()))
+            }
+        }
+    }
+}
 
 /// Builds the shared upstream HTTP/HTTPS `reqwest::Client` with keep-alive, pool timeouts,
 /// native root CAs (`rustls-tls-native-roots`), and `.no_proxy()` to prevent loopback recursion.
@@ -240,6 +267,7 @@ fn record_completed_session(
             let _ = ctx.removed_tx.send(vec![detail.summary.id]);
         }
         ctx.store.increment_dropped_sessions();
+        ctx.stats_dirty.store(true, Ordering::Relaxed);
         return false;
     }
 
@@ -416,9 +444,33 @@ pub struct SharedProxyContext {
     pub breakpoints: Arc<BreakpointEngine>,
     pub store: Arc<TrafficStore>,
     pub upstream_client: reqwest::Client,
+    pub upstream_redirect_client: reqwest::Client,
     pub event_tx: mpsc::UnboundedSender<SessionSummary>,
     pub removed_tx: mpsc::UnboundedSender<Vec<u64>>,
     pub active_port: AtomicU16,
+    pub app_handle: Option<AppHandle>,
+    pub stats_dirty: Arc<AtomicBool>,
+}
+
+impl SharedProxyContext {
+    pub fn current_storage_stats(&self) -> StorageStats {
+        let drop_enabled = self.filters.is_drop_non_matching_enabled();
+        self.store.storage_stats(drop_enabled)
+    }
+
+    pub fn emit_storage_stats_changed(&self) {
+        self.stats_dirty.store(false, Ordering::Relaxed);
+        let Some(ref app) = self.app_handle else {
+            return;
+        };
+        let app = app.clone();
+        let store = self.store.clone();
+        let filters = self.filters.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let stats = store.storage_stats(filters.is_drop_non_matching_enabled());
+            let _ = app.emit("proxy://storage-stats-changed", stats);
+        });
+    }
 }
 
 struct ControllerRuntimeState {
@@ -441,11 +493,13 @@ fn format_bind_sock_addr(ip: &str, port: u16) -> String {
     }
 }
 
+pub(crate) type ResolvedBindPlan = (BindHostMode, String, Option<String>, Vec<String>, bool);
+
 pub(crate) fn resolve_bind_plan(
     bind_mode: BindHostMode,
     specific_bind_ip: Option<&str>,
     also_bind_loopback: bool,
-) -> Result<(BindHostMode, String, Option<String>, Vec<String>, bool), ProxyError> {
+) -> Result<ResolvedBindPlan, ProxyError> {
     match bind_mode {
         BindHostMode::Loopback => Ok((
             BindHostMode::Loopback,
@@ -627,18 +681,26 @@ impl ProxyEngineController {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SessionSummary>();
         let (removed_tx, mut removed_rx) = mpsc::unbounded_channel::<Vec<u64>>();
         let (bp_tx, mut bp_rx) = mpsc::unbounded_channel::<Vec<PausedBreakpointItem>>();
+        let stats_dirty = Arc::new(AtomicBool::new(false));
+        let ipc_stats_dirty = stats_dirty.clone();
+        let ipc_app = app_handle.clone();
+        let ipc_store = store.clone();
+        let ipc_filters = filters.clone();
 
         // 60 FPS (16 ms) micro-batching IPC loop for sessions + zero-latency push for Live Breakpoints
+        // + coalesced storage-stats push notifications every 500ms when stats changed
         tauri::async_runtime::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(16));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut stats_ticker = tokio::time::interval(Duration::from_millis(500));
+            stats_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut buffer: Vec<SessionSummary> = Vec::with_capacity(256);
 
             loop {
                 tokio::select! {
                     maybe_bp = bp_rx.recv() => {
                         if let Some(snapshot) = maybe_bp {
-                            let _ = app_handle.emit("proxy://breakpoints-changed", snapshot);
+                            let _ = ipc_app.emit("proxy://breakpoints-changed", snapshot);
                         }
                     }
                     maybe_removed = removed_rx.recv() => {
@@ -650,7 +712,8 @@ impl ProxyEngineController {
                                     buffer.push(item);
                                 }
                                 buffer.retain(|s| !removed_ids.contains(&s.id));
-                                let _ = app_handle.emit("proxy://sessions-removed", removed_ids);
+                                let _ = ipc_app.emit("proxy://sessions-removed", removed_ids);
+                                ipc_stats_dirty.store(true, Ordering::Relaxed);
                             }
                         }
                     }
@@ -660,7 +723,8 @@ impl ProxyEngineController {
                                 buffer.push(item);
                                 if buffer.len() >= 250 {
                                     let batch = std::mem::take(&mut buffer);
-                                    let _ = app_handle.emit("proxy://sessions-batch", batch);
+                                    let _ = ipc_app.emit("proxy://sessions-batch", batch);
+                                    ipc_stats_dirty.store(true, Ordering::Relaxed);
                                 }
                             }
                             None => break,
@@ -669,7 +733,20 @@ impl ProxyEngineController {
                     _ = ticker.tick() => {
                         if !buffer.is_empty() {
                             let batch = std::mem::take(&mut buffer);
-                            let _ = app_handle.emit("proxy://sessions-batch", batch);
+                            let _ = ipc_app.emit("proxy://sessions-batch", batch);
+                            ipc_stats_dirty.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    _ = stats_ticker.tick() => {
+                        if ipc_stats_dirty.swap(false, Ordering::Relaxed) {
+                            let app = ipc_app.clone();
+                            let store = ipc_store.clone();
+                            let filters = ipc_filters.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let stats = store.storage_stats(filters.is_drop_non_matching_enabled());
+                                let _ = app.emit("proxy://storage-stats-changed", stats);
+                            })
+                            .await;
                         }
                     }
                 }
@@ -685,6 +762,8 @@ impl ProxyEngineController {
             event_tx,
             removed_tx,
             bp_tx,
+            Some(app_handle),
+            stats_dirty,
         )
     }
 
@@ -731,6 +810,8 @@ impl ProxyEngineController {
             event_tx,
             removed_tx,
             bp_tx,
+            None,
+            Arc::new(AtomicBool::new(false)),
         )
     }
 
@@ -744,9 +825,12 @@ impl ProxyEngineController {
         event_tx: mpsc::UnboundedSender<SessionSummary>,
         removed_tx: mpsc::UnboundedSender<Vec<u64>>,
         bp_tx: mpsc::UnboundedSender<Vec<PausedBreakpointItem>>,
+        app_handle: Option<AppHandle>,
+        stats_dirty: Arc<AtomicBool>,
     ) -> Result<Self, ProxyError> {
         // CRITICAL: `.no_proxy()` prevents infinite recursion when OS system proxy points to us!
         let upstream_client = build_upstream_client(false)?;
+        let upstream_redirect_client = build_upstream_client(true)?;
 
         let breakpoints = Arc::new(BreakpointEngine::new(Some(bp_tx)));
 
@@ -757,9 +841,12 @@ impl ProxyEngineController {
             breakpoints,
             store,
             upstream_client,
+            upstream_redirect_client,
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(8888),
+            app_handle,
+            stats_dirty,
         });
 
         let initial_auto = sysproxy.load_auto_system_proxy_pref();
@@ -862,6 +949,12 @@ impl ProxyEngineController {
         self.build_status()
     }
 
+    pub fn emit_status_changed(&self, status: &ProxyStatus) {
+        if let Some(ref app) = self.context.app_handle {
+            let _ = app.emit("proxy://status-changed", status.clone());
+        }
+    }
+
     fn spawn_accept_loop(
         &self,
         listener: TcpListener,
@@ -887,8 +980,8 @@ impl ProxyEngineController {
                                 let conn_ctx = ctx.clone();
                                 let local_proxy_port = tcp_stream.local_addr().ok().map(|a| a.port()).or(Some(actual_port));
                                 tokio::spawn(async move {
-                                    // Resolve owning local OS process (PID + executable name) once per TCP socket
-                                    let client_proc = resolve_client_process(client_addr, local_proxy_port);
+                                    // Resolve owning local OS process (PID + executable name) off Tokio worker threads
+                                    let client_proc = resolve_client_process_async(client_addr, local_proxy_port).await;
                                     let io = TokioIo::new(tcp_stream);
                                     let service = service_fn(move |req: Request<Incoming>| {
                                         let req_ctx = conn_ctx.clone();
@@ -1018,7 +1111,9 @@ impl ProxyEngineController {
             self.sysproxy.rollback_if_dirty();
         }
 
-        Ok(self.build_status())
+        let status = self.build_status();
+        self.emit_status_changed(&status);
+        Ok(status)
     }
 
     /// Configures network interface binding (`Loopback`, `AllInterfaces`, or `Specific` IP with optional
@@ -1205,7 +1300,9 @@ impl ProxyEngineController {
         if let Err(err) = self.sysproxy.disable() {
             tracing::warn!("Could not roll back OS system proxy on stop: {err}");
         }
-        self.build_status()
+        let status = self.build_status();
+        self.emit_status_changed(&status);
+        status
     }
 
     /// Manually enables or disables the OS system proxy independently of the local TCP listener
@@ -1232,7 +1329,9 @@ impl ProxyEngineController {
             tracing::warn!("Manual set_system_proxy(false) failed: {err}");
         }
 
-        Ok(self.build_status())
+        let status = self.build_status();
+        self.emit_status_changed(&status);
+        Ok(status)
     }
 
     /// Toggles Fiddler-style «Act as System Proxy» mode when capture starts/stops.
@@ -1262,7 +1361,9 @@ impl ProxyEngineController {
             }
         }
 
-        Ok(self.build_status())
+        let status = self.build_status();
+        self.emit_status_changed(&status);
+        Ok(status)
     }
 
     /// Synchronous, deadlock-free shutdown + OS proxy rollback invoked on window close and app exit.
@@ -1514,7 +1615,7 @@ impl ProxyEngineController {
         }
 
         let client = if composed.follow_redirects {
-            build_upstream_client(true)?
+            self.context.upstream_redirect_client.clone()
         } else {
             self.context.upstream_client.clone()
         };
@@ -2202,9 +2303,68 @@ async fn handle_intercepted_request(
         &mut req_headers,
     );
 
-    let mut body_bytes = match req.into_body().collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) => {
+    let mut body_bytes = match collect_request_body_limited(
+        req.into_body(),
+        MAX_CAPTURED_REQUEST_BODY_BYTES,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(RequestBodyReadError::PayloadTooLarge(limit)) => {
+            let msg = format!(
+                "Request body exceeds maximum captured payload limit ({limit} bytes)"
+            );
+            let protocol = resolve_protocol_label(&scheme_str, alpn, req_version);
+            let resp_headers = vec![HeaderPair {
+                name: "Content-Type".into(),
+                value: "text/plain; charset=utf-8".into(),
+            }];
+            let summary = SessionSummary {
+                id: session_id,
+                status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                protocol,
+                scheme: scheme_str.clone(),
+                method: method_str.clone(),
+                host: host_header.clone(),
+                path: path_and_query.clone(),
+                url: full_url.clone(),
+                content_type: "text/plain; charset=utf-8".into(),
+                body_size: msg.len(),
+                duration_ms: start.elapsed().as_millis() as u64,
+                timestamp,
+                is_mocked: false,
+                matched_rule_id: None,
+                error: Some(msg.clone()),
+                process_name: client_proc.as_ref().map(|p| p.name.clone()),
+                process_pid: client_proc.as_ref().map(|p| p.pid),
+                tls_bypassed: false,
+                headers_mutated: req_mutated,
+                breakpoint_paused: None,
+                breakpoint_modified: false,
+                comment: None,
+                marked_color: None,
+                client_ip: Some(normalize_client_ip(client_addr)),
+            };
+            let detail = SessionDetail {
+                summary,
+                request_headers: req_headers,
+                response_headers: resp_headers,
+                request_body_base64: String::new(),
+                response_body_base64: base64::engine::general_purpose::STANDARD
+                    .encode(msg.as_bytes()),
+                request_body_text: None,
+                response_body_text: Some(msg.clone()),
+                tls_version: None,
+                client_addr: client_addr.to_string(),
+                websocket_frames: Vec::new(),
+                sse_events: Vec::new(),
+                body_offloaded: false,
+                request_body_offloaded: false,
+            };
+            record_completed_session(&ctx, detail, None, Some(msg.as_bytes()));
+            return plain_response(StatusCode::PAYLOAD_TOO_LARGE, &msg);
+        }
+        Err(RequestBodyReadError::Transport(err)) => {
             return record_and_return_error(
                 &ctx,
                 session_id,
@@ -2646,9 +2806,9 @@ async fn handle_intercepted_request(
         tokio::spawn(async move {
             use std::io::Write;
 
-            let mut raw_accum: Vec<u8> = Vec::new();
-            let mut parse_cursor = 0usize;
-            let mut recorded_events: Vec<SseEventRecord> = Vec::new();
+            const MAX_SSE_EVENTS: usize = 1024;
+            let mut pending_parse_buf: Vec<u8> = Vec::new();
+            let mut total_parsed_events = 0usize;
             let mut total_bytes = 0usize;
             let mut zstd_decoder = if sse_has_zstd {
                 match zstd::stream::write::Decoder::new(Vec::<u8>::new()) {
@@ -2679,32 +2839,16 @@ async fn handle_intercepted_request(
 
                 let chunk_offset_ms = start.elapsed().as_millis() as u64;
                 total_bytes += effective_chunk.len();
-
-                if raw_accum.len() < MAX_CAPTURED_BODY_BYTES {
-                    let room = MAX_CAPTURED_BODY_BYTES - raw_accum.len();
-                    raw_accum.extend_from_slice(&effective_chunk[..effective_chunk.len().min(room)]);
-                }
-
-                // Extract complete SSE blocks (`\n\n` or `\r\n\r\n`) arrived so far
-                drain_complete_sse_events(
-                    &raw_accum,
-                    &mut parse_cursor,
+                record_sse_chunk(
+                    &sse_ctx,
+                    session_id,
+                    &effective_chunk,
+                    &mut pending_parse_buf,
+                    &mut total_parsed_events,
+                    total_bytes,
                     chunk_offset_ms,
-                    &mut recorded_events,
+                    MAX_SSE_EVENTS,
                 );
-
-                if let Some(mut detail) = sse_ctx.store.get(session_id) {
-                    detail.summary.body_size = total_bytes;
-                    detail.summary.duration_ms = chunk_offset_ms;
-                    detail.response_body_base64 =
-                        base64::engine::general_purpose::STANDARD.encode(&raw_accum);
-                    detail.response_body_text =
-                        Some(String::from_utf8_lossy(&raw_accum).into_owned());
-                    detail.sse_events = recorded_events.clone();
-                    let updated_summary = detail.summary.clone();
-                    sse_ctx.store.insert(detail);
-                    let _ = sse_ctx.event_tx.send(updated_summary);
-                }
 
                 if chunk_tx.send(Ok(Frame::data(effective_chunk))).await.is_err() {
                     break;
@@ -2717,47 +2861,33 @@ async fn handle_intercepted_request(
                 if !tail_decoded.is_empty() {
                     let chunk_offset_ms = start.elapsed().as_millis() as u64;
                     total_bytes += tail_decoded.len();
-                    if raw_accum.len() < MAX_CAPTURED_BODY_BYTES {
-                        let room = MAX_CAPTURED_BODY_BYTES - raw_accum.len();
-                        raw_accum.extend_from_slice(&tail_decoded[..tail_decoded.len().min(room)]);
-                    }
-                    drain_complete_sse_events(
-                        &raw_accum,
-                        &mut parse_cursor,
+                    record_sse_chunk(
+                        &sse_ctx,
+                        session_id,
+                        &tail_decoded,
+                        &mut pending_parse_buf,
+                        &mut total_parsed_events,
+                        total_bytes,
                         chunk_offset_ms,
-                        &mut recorded_events,
+                        MAX_SSE_EVENTS,
                     );
-                    if let Some(mut detail) = sse_ctx.store.get(session_id) {
-                        detail.summary.body_size = total_bytes;
-                        detail.summary.duration_ms = chunk_offset_ms;
-                        detail.response_body_base64 =
-                            base64::engine::general_purpose::STANDARD.encode(&raw_accum);
-                        detail.response_body_text =
-                            Some(String::from_utf8_lossy(&raw_accum).into_owned());
-                        detail.sse_events = recorded_events.clone();
-                        let updated_summary = detail.summary.clone();
-                        sse_ctx.store.insert(detail);
-                        let _ = sse_ctx.event_tx.send(updated_summary);
-                    }
                     let _ = chunk_tx.send(Ok(Frame::data(Bytes::from(tail_decoded)))).await;
                 }
             }
 
-            // Flush any trailing partial SSE block when the stream closes
-            if parse_cursor < raw_accum.len() {
-                let tail = &raw_accum[parse_cursor..];
-                if let Some(ev) =
-                    parse_single_sse_block(tail, recorded_events.len() + 1, start.elapsed().as_millis() as u64)
-                {
-                    recorded_events.push(ev);
-                    if let Some(mut detail) = sse_ctx.store.get(session_id) {
-                        detail.summary.duration_ms = start.elapsed().as_millis() as u64;
-                        detail.sse_events = recorded_events;
-                        let updated_summary = detail.summary.clone();
-                        sse_ctx.store.insert(detail);
-                        let _ = sse_ctx.event_tx.send(updated_summary);
-                    }
-                }
+            // Flush any trailing partial SSE block and finalize Base64/text/SQLite offload once
+            let end_ms = start.elapsed().as_millis() as u64;
+            let trailing_event = if !pending_parse_buf.is_empty() && total_parsed_events < MAX_SSE_EVENTS {
+                parse_single_sse_block(&pending_parse_buf, total_parsed_events + 1, end_ms)
+            } else {
+                None
+            };
+            if let Some(updated_summary) =
+                sse_ctx
+                    .store
+                    .finalize_sse_stream(session_id, end_ms, trailing_event, MAX_SSE_EVENTS)
+            {
+                let _ = sse_ctx.event_tx.send(updated_summary);
             }
         });
 
@@ -3475,7 +3605,8 @@ async fn handle_websocket_intercept(
             let (mut client_sink, mut client_stream) = client_ws.split();
             let (mut upstream_sink, mut upstream_stream) = upstream_ws.split();
 
-            let mut recorded_frames: Vec<WebSocketFrameRecord> = Vec::new();
+            const MAX_WS_FRAMES: usize = 256;
+            let mut recorded_count = 0usize;
             let mut total_bytes = 0usize;
 
             loop {
@@ -3484,9 +3615,16 @@ async fn handle_websocket_intercept(
                         match client_msg {
                             Some(Ok(msg)) => {
                                 total_bytes += msg.len();
-                                if recorded_frames.len() < 256 {
-                                    recorded_frames.push(record_ws_frame(recorded_frames.len() + 1, "outbound", &msg));
-                                    update_ws_session(&ctx, session_id, total_bytes, &recorded_frames);
+                                let frame = if recorded_count < MAX_WS_FRAMES {
+                                    recorded_count += 1;
+                                    Some(record_ws_frame(recorded_count, "outbound", &msg))
+                                } else {
+                                    None
+                                };
+                                if let Some(updated_summary) =
+                                    ctx.store.append_ws_frame(session_id, frame, total_bytes, MAX_WS_FRAMES)
+                                {
+                                    let _ = ctx.event_tx.send(updated_summary);
                                 }
                                 if upstream_sink.send(msg).await.is_err() {
                                     break;
@@ -3499,9 +3637,16 @@ async fn handle_websocket_intercept(
                         match upstream_msg {
                             Some(Ok(msg)) => {
                                 total_bytes += msg.len();
-                                if recorded_frames.len() < 256 {
-                                    recorded_frames.push(record_ws_frame(recorded_frames.len() + 1, "inbound", &msg));
-                                    update_ws_session(&ctx, session_id, total_bytes, &recorded_frames);
+                                let frame = if recorded_count < MAX_WS_FRAMES {
+                                    recorded_count += 1;
+                                    Some(record_ws_frame(recorded_count, "inbound", &msg))
+                                } else {
+                                    None
+                                };
+                                if let Some(updated_summary) =
+                                    ctx.store.append_ws_frame(session_id, frame, total_bytes, MAX_WS_FRAMES)
+                                {
+                                    let _ = ctx.event_tx.send(updated_summary);
                                 }
                                 if client_sink.send(msg).await.is_err() {
                                     break;
@@ -3511,6 +3656,10 @@ async fn handle_websocket_intercept(
                         }
                     }
                 }
+            }
+
+            if let Some(final_summary) = ctx.store.finalize_ws_stream(session_id) {
+                let _ = ctx.event_tx.send(final_summary);
             }
         }
     });
@@ -3727,22 +3876,6 @@ fn record_ws_frame(
     }
 }
 
-fn update_ws_session(
-    ctx: &SharedProxyContext,
-    session_id: u64,
-    total_bytes: usize,
-    frames: &[WebSocketFrameRecord],
-) {
-    if let Some(mut detail) = ctx.store.get(session_id) {
-        detail.summary.body_size = total_bytes;
-        detail.websocket_frames = frames.to_vec();
-        detail.response_body_text = serde_json::to_string_pretty(frames).ok();
-        let summary = detail.summary.clone();
-        ctx.store.insert(detail);
-        let _ = ctx.event_tx.send(summary);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn apply_request_breakpoint_edits(
     verdict: &crate::models::BreakpointResolution,
@@ -3795,6 +3928,75 @@ fn apply_request_breakpoint_edits(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_sse_chunk(
+    sse_ctx: &SharedProxyContext,
+    session_id: u64,
+    chunk_slice: &[u8],
+    pending_parse_buf: &mut Vec<u8>,
+    total_parsed_events: &mut usize,
+    total_bytes: usize,
+    chunk_offset_ms: u64,
+    max_events: usize,
+) {
+    if *total_parsed_events < max_events && pending_parse_buf.len() < MAX_CAPTURED_BODY_BYTES {
+        let room = MAX_CAPTURED_BODY_BYTES - pending_parse_buf.len();
+        let take = chunk_slice.len().min(room);
+        pending_parse_buf.extend_from_slice(&chunk_slice[..take]);
+    }
+    let new_events = drain_complete_sse_events_incremental(
+        pending_parse_buf,
+        total_parsed_events,
+        chunk_offset_ms,
+        max_events,
+    );
+    if let Some(updated_summary) = sse_ctx.store.append_sse_chunk(
+        session_id,
+        crate::storage::SseChunkUpdate {
+            chunk_slice,
+            new_events,
+            total_bytes,
+            duration_ms: chunk_offset_ms,
+            max_capture_bytes: MAX_CAPTURED_BODY_BYTES,
+            max_events,
+        },
+    ) {
+        let _ = sse_ctx.event_tx.send(updated_summary);
+    }
+}
+
+fn drain_complete_sse_events_incremental(
+    pending_buf: &mut Vec<u8>,
+    total_parsed_events: &mut usize,
+    offset_ms: u64,
+    max_events: usize,
+) -> Vec<SseEventRecord> {
+    if *total_parsed_events >= max_events {
+        pending_buf.clear();
+        return Vec::new();
+    }
+    let mut cursor = 0usize;
+    let mut new_events = Vec::new();
+    while cursor < pending_buf.len() && *total_parsed_events < max_events {
+        let slice = &pending_buf[cursor..];
+        let Some((rel_end, delim_len)) = find_sse_delimiter(slice) else {
+            break;
+        };
+        let block = &slice[..rel_end];
+        cursor += rel_end + delim_len;
+        if let Some(ev) = parse_single_sse_block(block, *total_parsed_events + 1, offset_ms) {
+            *total_parsed_events += 1;
+            new_events.push(ev);
+        }
+    }
+    if *total_parsed_events >= max_events {
+        pending_buf.clear();
+    } else if cursor > 0 {
+        pending_buf.drain(..cursor);
+    }
+    new_events
 }
 
 fn drain_complete_sse_events(
@@ -4547,9 +4749,12 @@ mod tests {
             breakpoints,
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            upstream_redirect_client: build_upstream_client(true).unwrap(),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
         });
 
         // 3. Bind outer proxy listener and issue CONNECT tunnel
@@ -4559,7 +4764,7 @@ mod tests {
 
         tokio::spawn(async move {
             if let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await {
-                let proc_info = resolve_client_process(client_addr, Some(proxy_addr.port()));
+                let proc_info = resolve_client_process_async(client_addr, Some(proxy_addr.port())).await;
                 let io = TokioIo::new(tcp_stream);
                 let service = service_fn(move |req: Request<Incoming>| {
                     let c = proxy_ctx.clone();
@@ -4657,9 +4862,12 @@ mod tests {
             breakpoints: breakpoints.clone(),
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            upstream_redirect_client: build_upstream_client(true).unwrap(),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
         });
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4901,9 +5109,12 @@ mod tests {
             breakpoints,
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            upstream_redirect_client: build_upstream_client(true).unwrap(),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
         });
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5040,9 +5251,12 @@ mod tests {
             breakpoints,
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            upstream_redirect_client: build_upstream_client(true).unwrap(),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
         });
 
         // Register a mock AutoResponder rule on allowlisted `https://localhost/...` so we can verify full MITM decryption
@@ -5171,9 +5385,12 @@ mod tests {
             breakpoints,
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            upstream_redirect_client: build_upstream_client(true).unwrap(),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(bound_port),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
         });
 
         let proxy_ctx = ctx.clone();
@@ -5369,9 +5586,12 @@ mod tests {
             breakpoints,
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            upstream_redirect_client: build_upstream_client(true).unwrap(),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
         });
 
         let proxy_ctx = ctx.clone();
@@ -5528,9 +5748,12 @@ mod tests {
             breakpoints,
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            upstream_redirect_client: build_upstream_client(true).unwrap(),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
         });
 
         // Also register an AutoResponder mock for telemetry.microsoft.com to test svchost/telemetry drop
@@ -5740,9 +5963,12 @@ mod tests {
             breakpoints,
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            upstream_redirect_client: build_upstream_client(true).unwrap(),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
         });
 
         let proxy_ctx = ctx.clone();
@@ -6003,9 +6229,12 @@ mod tests {
             breakpoints,
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            upstream_redirect_client: build_upstream_client(true).unwrap(),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
         });
 
         let proxy_ctx = ctx.clone();
@@ -6535,9 +6764,12 @@ mod tests {
             breakpoints,
             store: store.clone(),
             upstream_client: build_upstream_client(false).unwrap(),
+            upstream_redirect_client: build_upstream_client(true).unwrap(),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
         });
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -6682,5 +6914,31 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn collect_request_body_limited_enforces_limit_and_returns_payload_too_large() {
+        let within = collect_request_body_limited(Full::new(Bytes::from_static(b"hello")), 5)
+            .await
+            .expect("body equal to limit must succeed");
+        assert_eq!(within.as_ref(), b"hello");
+
+        let exceeded = collect_request_body_limited(Full::new(Bytes::from_static(b"hello!")), 5).await;
+        match exceeded {
+            Err(RequestBodyReadError::PayloadTooLarge(limit)) => assert_eq!(limit, 5),
+            other => panic!("expected PayloadTooLarge(5), got {other:?}"),
+        }
+
+        // Also test via multi-frame chunked StreamBody crossing the limit
+        let chunks = futures_util::stream::iter(vec![
+            Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"abc"))),
+            Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"def"))),
+            Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"ghi"))),
+        ]);
+        let streamed_exceeded = collect_request_body_limited(StreamBody::new(chunks), 8).await;
+        match streamed_exceeded {
+            Err(RequestBodyReadError::PayloadTooLarge(limit)) => assert_eq!(limit, 8),
+            other => panic!("expected PayloadTooLarge(8) on streamed body, got {other:?}"),
+        }
     }
 }

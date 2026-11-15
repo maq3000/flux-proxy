@@ -22,6 +22,16 @@ pub struct AppState {
     pub controller: Arc<ProxyEngineController>,
 }
 
+async fn run_blocking<F, T>(label: &'static str, f: F) -> Result<T, ProxyError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ProxyError::Custom(format!("{label} task join error: {e}")))
+}
+
 #[tauri::command]
 pub async fn get_proxy_status(state: State<'_, AppState>) -> Result<ProxyStatus, ProxyError> {
     Ok(state.controller.status().await)
@@ -69,9 +79,11 @@ pub async fn set_bind_configuration(
 pub async fn get_network_interfaces(
     include_virtual: Option<bool>,
 ) -> Result<Vec<NetworkInterfaceInfo>, ProxyError> {
-    Ok(list_network_interfaces_with_options(
-        include_virtual.unwrap_or(false),
-    ))
+    let include = include_virtual.unwrap_or(false);
+    run_blocking("List network interfaces", move || {
+        list_network_interfaces_with_options(include)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -97,7 +109,8 @@ pub async fn set_auto_system_proxy(
 
 #[tauri::command]
 pub async fn get_sessions(state: State<'_, AppState>) -> Result<Vec<SessionSummary>, ProxyError> {
-    Ok(state.controller.context.store.list_summaries())
+    let store = state.controller.context.store.clone();
+    run_blocking("Get sessions", move || store.list_summaries()).await
 }
 
 #[tauri::command]
@@ -105,12 +118,15 @@ pub async fn get_session_detail(
     id: u64,
     state: State<'_, AppState>,
 ) -> Result<Option<SessionDetail>, ProxyError> {
-    Ok(state.controller.context.store.get(id))
+    let store = state.controller.context.store.clone();
+    run_blocking("Get session detail", move || store.get(id)).await
 }
 
 #[tauri::command]
 pub async fn clear_sessions(state: State<'_, AppState>) -> Result<(), ProxyError> {
-    state.controller.context.store.clear();
+    let store = state.controller.context.store.clone();
+    run_blocking("Clear sessions", move || store.clear()).await?;
+    state.controller.context.emit_storage_stats_changed();
     Ok(())
 }
 
@@ -119,19 +135,28 @@ pub async fn delete_sessions(
     ids: Vec<u64>,
     state: State<'_, AppState>,
 ) -> Result<usize, ProxyError> {
-    Ok(state.controller.context.store.remove_many(&ids))
+    let store = state.controller.context.store.clone();
+    let removed = run_blocking("Delete sessions", move || store.remove_many(&ids)).await?;
+    state.controller.context.emit_storage_stats_changed();
+    Ok(removed)
 }
 
 #[tauri::command]
 pub async fn save_sessions_sqlite(state: State<'_, AppState>) -> Result<usize, ProxyError> {
-    state.controller.context.store.save_all_to_sqlite()
+    let store = state.controller.context.store.clone();
+    let saved = run_blocking("Save sessions SQLite", move || store.save_all_to_sqlite()).await??;
+    state.controller.context.emit_storage_stats_changed();
+    Ok(saved)
 }
 
 #[tauri::command]
 pub async fn load_sessions_sqlite(
     state: State<'_, AppState>,
 ) -> Result<Vec<SessionSummary>, ProxyError> {
-    state.controller.context.store.load_from_sqlite()
+    let store = state.controller.context.store.clone();
+    let loaded = run_blocking("Load sessions SQLite", move || store.load_from_sqlite()).await??;
+    state.controller.context.emit_storage_stats_changed();
+    Ok(loaded)
 }
 
 #[tauri::command]
@@ -141,11 +166,11 @@ pub async fn update_session_annotations(
     marked_color: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<SessionSummary>, ProxyError> {
-    state
-        .controller
-        .context
-        .store
-        .update_annotations(&ids, comment, marked_color)
+    let store = state.controller.context.store.clone();
+    run_blocking("Update session annotations", move || {
+        store.update_annotations(&ids, comment, marked_color)
+    })
+    .await?
 }
 
 #[tauri::command]
@@ -303,7 +328,11 @@ pub async fn codec_transform(
     input: String,
     input_is_base64: Option<bool>,
 ) -> Result<CodecTransformResult, ProxyError> {
-    execute_codec_transform(operation, &input, input_is_base64.unwrap_or(false))
+    let is_b64 = input_is_base64.unwrap_or(false);
+    run_blocking("Codec transform", move || {
+        execute_codec_transform(operation, &input, is_b64)
+    })
+    .await?
 }
 
 #[tauri::command]
@@ -311,7 +340,13 @@ pub async fn set_session_retention_limit(
     limit: Option<usize>,
     state: State<'_, AppState>,
 ) -> Result<(), ProxyError> {
-    state.controller.context.store.set_retention_limit(limit)
+    let store = state.controller.context.store.clone();
+    run_blocking("Set session retention limit", move || {
+        store.set_retention_limit(limit)
+    })
+    .await??;
+    state.controller.context.emit_storage_stats_changed();
+    Ok(())
 }
 
 #[tauri::command]
@@ -324,6 +359,7 @@ pub async fn set_drop_non_matching(
         .context
         .filters
         .set_drop_non_matching(enabled);
+    state.controller.context.emit_storage_stats_changed();
     Ok(())
 }
 
@@ -331,12 +367,13 @@ pub async fn set_drop_non_matching(
 pub async fn get_memory_storage_stats(
     state: State<'_, AppState>,
 ) -> Result<StorageStats, ProxyError> {
+    let store = state.controller.context.store.clone();
     let drop_enabled = state
         .controller
         .context
         .filters
         .is_drop_non_matching_enabled();
-    Ok(state.controller.context.store.storage_stats(drop_enabled))
+    run_blocking("Get storage stats", move || store.storage_stats(drop_enabled)).await
 }
 
 #[tauri::command]
@@ -349,9 +386,11 @@ pub async fn clear_sqlite_database(
         .context
         .filters
         .is_drop_non_matching_enabled();
-    tokio::task::spawn_blocking(move || store.clear_sqlite_archive(drop_enabled))
+    let stats = tokio::task::spawn_blocking(move || store.clear_sqlite_archive(drop_enabled))
         .await
-        .map_err(|e| ProxyError::Custom(format!("Clear SQLite task join error: {e}")))?
+        .map_err(|e| ProxyError::Custom(format!("Clear SQLite task join error: {e}")))??;
+    state.controller.context.emit_storage_stats_changed();
+    Ok(stats)
 }
 
 #[tauri::command]
@@ -364,7 +403,11 @@ pub async fn set_clear_db_on_exit(
     enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<bool, ProxyError> {
-    state.controller.context.store.set_clear_db_on_exit(enabled)
+    let store = state.controller.context.store.clone();
+    run_blocking("Set clear DB on exit", move || {
+        store.set_clear_db_on_exit(enabled)
+    })
+    .await?
 }
 
 #[tauri::command]
@@ -373,11 +416,11 @@ pub async fn load_session_body(
     is_response: bool,
     state: State<'_, AppState>,
 ) -> Result<LoadedSessionBody, ProxyError> {
-    state
-        .controller
-        .context
-        .store
-        .load_session_body(id, is_response)
+    let store = state.controller.context.store.clone();
+    run_blocking("Load session body", move || {
+        store.load_session_body(id, is_response)
+    })
+    .await?
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -562,16 +605,18 @@ pub async fn import_sessions_file(
         validate_user_file_path(&file_path, Some(&["har", "saz", "json", "zip"]), true)?;
     let store = state.controller.context.store.clone();
     let event_tx = state.controller.context.event_tx.clone();
-    tokio::task::spawn_blocking(move || {
+    let summaries = tokio::task::spawn_blocking(move || {
         let details = import_sessions_from_path(&validated_path)?;
         let summaries = store.import_sessions(details);
         for summary in &summaries {
             let _ = event_tx.send(summary.clone());
         }
-        Ok(summaries)
+        Ok::<_, ProxyError>(summaries)
     })
     .await
-    .map_err(|e| ProxyError::Custom(format!("Import task join error: {e}")))?
+    .map_err(|e| ProxyError::Custom(format!("Import task join error: {e}")))??;
+    state.controller.context.emit_storage_stats_changed();
+    Ok(summaries)
 }
 
 #[tauri::command]
@@ -582,7 +627,7 @@ pub async fn import_sessions_bytes(
 ) -> Result<Vec<SessionSummary>, ProxyError> {
     let store = state.controller.context.store.clone();
     let event_tx = state.controller.context.event_tx.clone();
-    tokio::task::spawn_blocking(move || {
+    let summaries = tokio::task::spawn_blocking(move || {
         let cleaned: String = data_base64.chars().filter(|c| !c.is_whitespace()).collect();
         let raw_bytes = base64::engine::general_purpose::STANDARD
             .decode(&cleaned)
@@ -592,10 +637,12 @@ pub async fn import_sessions_bytes(
         for summary in &summaries {
             let _ = event_tx.send(summary.clone());
         }
-        Ok(summaries)
+        Ok::<_, ProxyError>(summaries)
     })
     .await
-    .map_err(|e| ProxyError::Custom(format!("Import bytes task join error: {e}")))?
+    .map_err(|e| ProxyError::Custom(format!("Import bytes task join error: {e}")))??;
+    state.controller.context.emit_storage_stats_changed();
+    Ok(summaries)
 }
 
 #[tauri::command]

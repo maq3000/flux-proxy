@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use base64::Engine as _;
 use dashmap::DashMap;
 
-use crate::models::{LoadedSessionBody, ProxyError, SessionDetail, SessionSummary, StorageStats};
+use crate::models::{
+    LoadedSessionBody, ProxyError, SessionDetail, SessionSummary, SseEventRecord, StorageStats,
+    WebSocketFrameRecord,
+};
 use crate::storage::sqlite::SqliteArchive;
 
 /// Default maximum number of sessions kept in RAM before FIFO eviction to SQLite.
@@ -19,12 +22,38 @@ pub const DEFAULT_SESSION_RETENTION_LIMIT: usize = 10_000;
 /// and stripped from in-memory `DashMap` entries to guarantee OOM protection.
 pub const BODY_OFFLOAD_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
 
+#[derive(Clone, Debug, Default)]
+struct LiveSseAccumulator {
+    raw_bytes: Vec<u8>,
+    events: Vec<SseEventRecord>,
+    total_bytes: usize,
+    duration_ms: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LiveWsAccumulator {
+    frames: Vec<WebSocketFrameRecord>,
+    total_bytes: usize,
+}
+
+/// Parameters for an incremental SSE stream chunk append.
+pub struct SseChunkUpdate<'a> {
+    pub chunk_slice: &'a [u8],
+    pub new_events: Vec<SseEventRecord>,
+    pub total_bytes: usize,
+    pub duration_ms: u64,
+    pub max_capture_bytes: usize,
+    pub max_events: usize,
+}
+
 /// Dual-tier traffic store:
 /// 1. Lock-free in-memory `DashMap` Ring Buffer for sub-millisecond capture & inspection.
 /// 2. Embedded WAL-mode SQLite archive (`rusqlite`) for FIFO spill, heavy body offloading, and persistence.
 pub struct TrafficStore {
     next_id: AtomicU64,
     sessions: DashMap<u64, Arc<SessionDetail>>,
+    sse_streams: DashMap<u64, LiveSseAccumulator>,
+    ws_streams: DashMap<u64, LiveWsAccumulator>,
     sqlite: SqliteArchive,
     db_path: PathBuf,
     clear_db_on_exit_pref_path: PathBuf,
@@ -45,6 +74,8 @@ impl TrafficStore {
         Ok(Self {
             next_id: AtomicU64::new(1),
             sessions: DashMap::with_capacity(16_384),
+            sse_streams: DashMap::new(),
+            ws_streams: DashMap::new(),
             sqlite,
             db_path,
             clear_db_on_exit_pref_path,
@@ -312,8 +343,17 @@ impl TrafficStore {
         let mut evicted_batch = Vec::with_capacity(excess);
 
         for &old_id in &keys[..excess] {
+            let live_sse = self.sse_streams.remove(&old_id).map(|(_, v)| v);
+            let live_ws = self.ws_streams.remove(&old_id).map(|(_, v)| v);
             if let Some((_, arc_detail)) = self.sessions.remove(&old_id) {
-                evicted_batch.push((*arc_detail).clone());
+                let mut detail = (*arc_detail).clone();
+                if let Some(sse) = live_sse {
+                    apply_sse_to_detail(&mut detail, sse.raw_bytes, sse.events, sse.total_bytes, sse.duration_ms);
+                }
+                if let Some(ws) = live_ws {
+                    apply_ws_to_detail(&mut detail, ws.frames, ws.total_bytes);
+                }
+                evicted_batch.push(detail);
             }
         }
 
@@ -454,9 +494,168 @@ impl TrafficStore {
         Ok(updated_summaries)
     }
 
+    fn hydrate_live_streams(&self, detail: &mut SessionDetail) {
+        let id = detail.summary.id;
+        if let Some(sse) = self.sse_streams.get(&id) {
+            apply_sse_to_detail(
+                detail,
+                sse.raw_bytes.clone(),
+                sse.events.clone(),
+                sse.total_bytes,
+                sse.duration_ms,
+            );
+        }
+        if let Some(ws) = self.ws_streams.get(&id) {
+            apply_ws_to_detail(detail, ws.frames.clone(), ws.total_bytes);
+        }
+    }
+
+    /// Incrementally appends an SSE chunk and parsed events without re-encoding the
+    /// accumulated body to Base64/UTF-8 on every chunk ($O(\text{chunk\_len})$ per update).
+    /// The full Base64/text representation is materialized lazily on `get`/`load_session_body`
+    /// or once on stream close via [`Self::finalize_sse_stream`].
+    pub fn append_sse_chunk(
+        &self,
+        id: u64,
+        update: SseChunkUpdate<'_>,
+    ) -> Option<SessionSummary> {
+        if !self.sessions.contains_key(&id) {
+            return None;
+        }
+
+        let SseChunkUpdate {
+            chunk_slice,
+            new_events,
+            total_bytes,
+            duration_ms,
+            max_capture_bytes,
+            max_events,
+        } = update;
+
+        {
+            let mut acc = self.sse_streams.entry(id).or_default();
+            if acc.raw_bytes.len() < max_capture_bytes && !chunk_slice.is_empty() {
+                let room = max_capture_bytes - acc.raw_bytes.len();
+                let take = chunk_slice.len().min(room);
+                acc.raw_bytes.extend_from_slice(&chunk_slice[..take]);
+            }
+            for mut ev in new_events {
+                if acc.events.len() >= max_events {
+                    break;
+                }
+                ev.index = acc.events.len() + 1;
+                acc.events.push(ev);
+            }
+            acc.total_bytes = total_bytes;
+            acc.duration_ms = duration_ms;
+        }
+
+        let mut entry = self.sessions.get_mut(&id)?;
+        let detail_mut = Arc::make_mut(entry.value_mut());
+        detail_mut.summary.body_size = total_bytes;
+        detail_mut.summary.duration_ms = duration_ms;
+        Some(detail_mut.summary.clone())
+    }
+
+    /// Finalizes an SSE stream: commits the accumulated raw body and parsed events into the session,
+    /// performing Base64/UTF-8 encoding (or SQLite offload if > 2 MiB) a single time.
+    pub fn finalize_sse_stream(
+        &self,
+        id: u64,
+        duration_ms: u64,
+        trailing_event: Option<SseEventRecord>,
+        max_events: usize,
+    ) -> Option<SessionSummary> {
+        let mut live = self.sse_streams.remove(&id).map(|(_, v)| v);
+        if let Some(mut ev) = trailing_event {
+            let acc = live.get_or_insert_with(LiveSseAccumulator::default);
+            if acc.events.len() < max_events {
+                ev.index = acc.events.len() + 1;
+                acc.events.push(ev);
+            }
+        }
+
+        let acc = live?;
+
+        let mut offload_failed = false;
+        let offloaded = if acc.raw_bytes.len() > BODY_OFFLOAD_THRESHOLD_BYTES {
+            match self.sqlite.save_offloaded_body(id, true, &acc.raw_bytes) {
+                Ok(()) => true,
+                Err(err) => {
+                    offload_failed = true;
+                    tracing::error!(
+                        "Failed to offload finalized SSE body for session #{id}: {err}"
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        let mut entry = self.sessions.get_mut(&id)?;
+        let detail_mut = Arc::make_mut(entry.value_mut());
+        detail_mut.summary.body_size = detail_mut.summary.body_size.max(acc.total_bytes);
+        detail_mut.summary.duration_ms = duration_ms;
+        detail_mut.sse_events = acc.events;
+        if offloaded {
+            detail_mut.body_offloaded = true;
+            detail_mut.response_body_base64 = String::new();
+            detail_mut.response_body_text = None;
+        } else if !offload_failed || detail_mut.response_body_base64.is_empty() {
+            detail_mut.response_body_base64 =
+                base64::engine::general_purpose::STANDARD.encode(&acc.raw_bytes);
+            detail_mut.response_body_text =
+                Some(String::from_utf8_lossy(&acc.raw_bytes).into_owned());
+        }
+        Some(detail_mut.summary.clone())
+    }
+
+    /// Incrementally appends a WebSocket frame in $O(1)$ without re-serializing all frames
+    /// to JSON on every message. JSON preview is generated lazily on inspect or once on close.
+    pub fn append_ws_frame(
+        &self,
+        id: u64,
+        frame: Option<WebSocketFrameRecord>,
+        total_bytes: usize,
+        max_frames: usize,
+    ) -> Option<SessionSummary> {
+        if !self.sessions.contains_key(&id) {
+            return None;
+        }
+
+        {
+            let mut acc = self.ws_streams.entry(id).or_default();
+            if let Some(mut rec) = frame {
+                if acc.frames.len() < max_frames {
+                    rec.index = acc.frames.len() + 1;
+                    acc.frames.push(rec);
+                }
+            }
+            acc.total_bytes = total_bytes;
+        }
+
+        let mut entry = self.sessions.get_mut(&id)?;
+        let detail_mut = Arc::make_mut(entry.value_mut());
+        detail_mut.summary.body_size = total_bytes;
+        Some(detail_mut.summary.clone())
+    }
+
+    /// Finalizes a WebSocket stream: materializes `websocket_frames` and JSON preview once on close.
+    pub fn finalize_ws_stream(&self, id: u64) -> Option<SessionSummary> {
+        let (_, acc) = self.ws_streams.remove(&id)?;
+        let mut entry = self.sessions.get_mut(&id)?;
+        let detail_mut = Arc::make_mut(entry.value_mut());
+        apply_ws_to_detail(detail_mut, acc.frames, acc.total_bytes);
+        Some(detail_mut.summary.clone())
+    }
+
     fn get_from_ram_or_sqlite(&self, id: u64) -> Result<Option<SessionDetail>, ProxyError> {
         if let Some(entry) = self.sessions.get(&id) {
-            return Ok(Some((**entry).clone()));
+            let mut detail = (**entry).clone();
+            drop(entry);
+            self.hydrate_live_streams(&mut detail);
+            return Ok(Some(detail));
         }
         self.sqlite.load_session_by_id(id)
     }
@@ -496,6 +695,8 @@ impl TrafficStore {
 
     pub fn clear(&self) {
         self.sessions.clear();
+        self.sse_streams.clear();
+        self.ws_streams.clear();
         if let Err(err) = self.sqlite.delete_unarchived_offloaded_bodies() {
             tracing::error!("Failed to delete unarchived offloaded bodies on clear: {err}");
             eprintln!("Failed to delete unarchived offloaded bodies on clear: {err}");
@@ -505,6 +706,8 @@ impl TrafficStore {
     pub fn remove_many(&self, ids: &[u64]) -> usize {
         let mut removed = 0usize;
         for &id in ids {
+            self.sse_streams.remove(&id);
+            self.ws_streams.remove(&id);
             if self.sessions.remove(&id).is_some() {
                 removed += 1;
             }
@@ -520,7 +723,11 @@ impl TrafficStore {
         let mut all: Vec<SessionDetail> = self
             .sessions
             .iter()
-            .map(|entry| (**entry.value()).clone())
+            .map(|entry| {
+                let mut detail = (**entry.value()).clone();
+                self.hydrate_live_streams(&mut detail);
+                detail
+            })
             .collect();
         all.sort_unstable_by_key(|d| d.summary.id);
         self.sqlite.persist_batch(&all)
@@ -631,6 +838,32 @@ impl TrafficStore {
             }
         }
         summaries
+    }
+}
+
+fn apply_sse_to_detail(
+    detail: &mut SessionDetail,
+    raw_bytes: Vec<u8>,
+    events: Vec<SseEventRecord>,
+    total_bytes: usize,
+    duration_ms: u64,
+) {
+    detail.summary.body_size = detail.summary.body_size.max(total_bytes);
+    detail.summary.duration_ms = duration_ms.max(detail.summary.duration_ms);
+    detail.sse_events = events;
+    detail.response_body_base64 = base64::engine::general_purpose::STANDARD.encode(&raw_bytes);
+    detail.response_body_text = Some(String::from_utf8_lossy(&raw_bytes).into_owned());
+}
+
+fn apply_ws_to_detail(
+    detail: &mut SessionDetail,
+    frames: Vec<WebSocketFrameRecord>,
+    total_bytes: usize,
+) {
+    detail.summary.body_size = detail.summary.body_size.max(total_bytes);
+    if !frames.is_empty() {
+        detail.response_body_text = serde_json::to_string_pretty(&frames).ok();
+        detail.websocket_frames = frames;
     }
 }
 
@@ -1014,5 +1247,144 @@ mod tests {
 
         drop(reloaded_store);
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn incremental_sse_and_ws_streams_append_and_hydrate_lazily() {
+        let db_path = unique_temp_db("incremental_sse_ws");
+        let store = TrafficStore::new(db_path.clone()).expect("init TrafficStore");
+
+        // 1. SSE incremental append + lazy get() + finalization
+        let sse_id = store.allocate_id();
+        let mut sse_initial = make_session(sse_id, b"");
+        sse_initial.summary.body_size = 0;
+        sse_initial.response_body_base64.clear();
+        sse_initial.response_body_text = Some(String::new());
+        store.insert(sse_initial);
+
+        let chunk1 = b"event: message\ndata: hello\n\n";
+        let ev1 = SseEventRecord {
+            index: 1,
+            id: None,
+            event: "message".into(),
+            data: "hello".into(),
+            retry: None,
+            byte_length: chunk1.len(),
+            offset_ms: 10,
+            timestamp: "2026-11-15T10:00:00Z".into(),
+        };
+        let sum1 = store
+            .append_sse_chunk(
+                sse_id,
+                SseChunkUpdate {
+                    chunk_slice: chunk1,
+                    new_events: vec![ev1],
+                    total_bytes: chunk1.len(),
+                    duration_ms: 10,
+                    max_capture_bytes: 64 * 1024 * 1024,
+                    max_events: 1024,
+                },
+            )
+            .expect("append chunk1");
+        assert_eq!(sum1.body_size, chunk1.len());
+
+        // Raw RAM entry stays lightweight while streaming (no eager base64 / event cloning)
+        {
+            let raw_entry = store.sessions.get(&sse_id).unwrap();
+            assert!(raw_entry.response_body_base64.is_empty());
+            assert!(raw_entry.sse_events.is_empty());
+        }
+
+        // Lazy inspection via get() materializes full body + events on demand
+        let live_sse = store.get(sse_id).expect("lazy get during SSE stream");
+        assert_eq!(live_sse.sse_events.len(), 1);
+        assert_eq!(live_sse.sse_events[0].data, "hello");
+        assert_eq!(
+            live_sse.response_body_text.as_deref(),
+            Some("event: message\ndata: hello\n\n")
+        );
+
+        let chunk2 = b"data: world\n\n";
+        let ev2 = SseEventRecord {
+            index: 2,
+            id: None,
+            event: "message".into(),
+            data: "world".into(),
+            retry: None,
+            byte_length: chunk2.len(),
+            offset_ms: 25,
+            timestamp: "2026-11-15T10:00:01Z".into(),
+        };
+        let _ = store
+            .append_sse_chunk(
+                sse_id,
+                SseChunkUpdate {
+                    chunk_slice: chunk2,
+                    new_events: vec![ev2],
+                    total_bytes: chunk1.len() + chunk2.len(),
+                    duration_ms: 25,
+                    max_capture_bytes: 64 * 1024 * 1024,
+                    max_events: 1024,
+                },
+            )
+            .expect("append chunk2");
+
+        let final_sum = store
+            .finalize_sse_stream(sse_id, 30, None, 1024)
+            .expect("finalize SSE stream");
+        assert_eq!(final_sum.duration_ms, 30);
+        assert!(store.sse_streams.get(&sse_id).is_none());
+
+        let finalized_sse = store.get(sse_id).expect("get finalized SSE");
+        assert_eq!(finalized_sse.sse_events.len(), 2);
+        assert_eq!(
+            finalized_sse.response_body_text.as_deref(),
+            Some("event: message\ndata: hello\n\ndata: world\n\n")
+        );
+
+        // 2. WebSocket incremental append + lazy get() + finalization
+        let ws_id = store.allocate_id();
+        let mut ws_initial = make_session(ws_id, b"");
+        ws_initial.summary.body_size = 0;
+        ws_initial.response_body_base64.clear();
+        ws_initial.response_body_text = Some("[WebSocket Tunnel Established]".into());
+        store.insert(ws_initial);
+
+        let frame1 = WebSocketFrameRecord {
+            index: 1,
+            direction: "outbound".into(),
+            opcode: "text".into(),
+            payload_preview: "ping".into(),
+            byte_length: 4,
+            timestamp: "2026-11-15T10:00:02Z".into(),
+        };
+        let ws_sum = store
+            .append_ws_frame(ws_id, Some(frame1), 4, 256)
+            .expect("append ws frame");
+        assert_eq!(ws_sum.body_size, 4);
+
+        // Raw RAM entry has not serialized JSON or copied frames yet
+        {
+            let raw_entry = store.sessions.get(&ws_id).unwrap();
+            assert!(raw_entry.websocket_frames.is_empty());
+        }
+
+        // Lazy inspection materializes frames & pretty JSON
+        let live_ws = store.get(ws_id).expect("lazy get during WS stream");
+        assert_eq!(live_ws.websocket_frames.len(), 1);
+        assert!(live_ws
+            .response_body_text
+            .as_deref()
+            .unwrap()
+            .contains("\"ping\""));
+
+        let finalized_sum = store.finalize_ws_stream(ws_id).expect("finalize WS");
+        assert_eq!(finalized_sum.body_size, 4);
+        assert!(store.ws_streams.get(&ws_id).is_none());
+        let finalized_ws = store.get(ws_id).expect("get finalized WS");
+        assert_eq!(finalized_ws.websocket_frames.len(), 1);
+
+        drop(store);
+        cleanup_temp_db(&db_path);
     }
 }

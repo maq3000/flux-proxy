@@ -160,3 +160,7 @@ pub fn run() {
         }
     });
 }
+
+#[cfg(all(test, target_os = "windows"))]
+#[link(name = "resource")]
+extern "C" {}

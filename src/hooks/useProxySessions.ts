@@ -673,25 +673,85 @@ export function useProxySessions() {
     }, 3200);
   }, []);
 
+  const lastStorageStatsSyncRef = useRef<number>(0);
+
+  const applyStorageStats = useCallback((nextStats: StorageStats) => {
+    lastStorageStatsSyncRef.current = Date.now();
+    setStorageStats((prev) => {
+      if (
+        prev.ramSessions === nextStats.ramSessions &&
+        prev.sqliteSizeBytes === nextStats.sqliteSizeBytes &&
+        prev.droppedSessionsCount === nextStats.droppedSessionsCount &&
+        prev.sessionRetentionLimit === nextStats.sessionRetentionLimit &&
+        prev.dropNonMatching === nextStats.dropNonMatching
+      ) {
+        return prev;
+      }
+      return nextStats;
+    });
+  }, []);
+
   const refreshStorageStats = useCallback(async () => {
+    if (
+      typeof document !== "undefined" &&
+      document.visibilityState === "hidden"
+    ) {
+      return;
+    }
     try {
       const nextStats = await proxyBridge.getMemoryStorageStats();
-      setStorageStats((prev) => {
-        if (
-          prev.ramSessions === nextStats.ramSessions &&
-          prev.sqliteSizeBytes === nextStats.sqliteSizeBytes &&
-          prev.droppedSessionsCount === nextStats.droppedSessionsCount &&
-          prev.sessionRetentionLimit === nextStats.sessionRetentionLimit &&
-          prev.dropNonMatching === nextStats.dropNonMatching
-        ) {
-          return prev;
-        }
-        return nextStats;
-      });
+      applyStorageStats(nextStats);
     } catch {
       // ignore transient IPC poll error
     }
-  }, []);
+  }, [applyStorageStats]);
+
+  const applyProxyStatusUpdate = useCallback(
+    (next: ProxyStatus) => {
+      const prev = statusRef.current;
+
+      if (
+        next.systemProxyError &&
+        next.systemProxyError !== prev.systemProxyError
+      ) {
+        showToast(`⚠️ ${next.systemProxyError}`);
+      } else if (
+        prev.systemProxyEnabled &&
+        !next.systemProxyEnabled &&
+        prev.running &&
+        next.running &&
+        next.autoSystemProxy
+      ) {
+        showToast("⚠️ Системный прокси ОС был сброшен внешней программой");
+      }
+
+      statusRef.current = next;
+      setStatus((curr) => {
+        const sameBoundIps =
+          (curr.boundIps?.length ?? 0) === (next.boundIps?.length ?? 0) &&
+          (curr.boundIps ?? []).every((ip, idx) => ip === next.boundIps?.[idx]);
+        if (
+          curr.running === next.running &&
+          curr.bindAddr === next.bindAddr &&
+          curr.port === next.port &&
+          curr.activeSessions === next.activeSessions &&
+          curr.systemProxyEnabled === next.systemProxyEnabled &&
+          curr.autoSystemProxy === next.autoSystemProxy &&
+          Boolean(curr.allowRemote) === Boolean(next.allowRemote) &&
+          curr.bindMode === next.bindMode &&
+          (curr.specificBindIp ?? null) === (next.specificBindIp ?? null) &&
+          Boolean(curr.alsoBindLoopback ?? true) ===
+            Boolean(next.alsoBindLoopback ?? true) &&
+          sameBoundIps &&
+          (curr.systemProxyError ?? null) === (next.systemProxyError ?? null)
+        ) {
+          return curr;
+        }
+        return next;
+      });
+    },
+    [showToast]
+  );
 
   const flushPendingSessions = useCallback(() => {
     rafHandleRef.current = null;
@@ -726,7 +786,13 @@ export function useProxySessions() {
       }
       return next;
     });
-    void refreshStorageStats();
+    if (
+      (typeof document === "undefined" ||
+        document.visibilityState !== "hidden") &&
+      Date.now() - lastStorageStatsSyncRef.current >= 1000
+    ) {
+      void refreshStorageStats();
+    }
   }, [refreshStorageStats]);
 
   // Initial load + Sync backend filter config (TLS Bypass + Header Mutations + Ring Buffer + Drop Non-Matching) + Real-time Tauri IPC subscription
@@ -735,6 +801,8 @@ export function useProxySessions() {
     let unlistenFn: (() => void) | null = null;
     let unlistenRemovedFn: (() => void) | null = null;
     let unlistenBpFn: (() => void) | null = null;
+    let unlistenStatusFn: (() => void) | null = null;
+    let unlistenStatsFn: (() => void) | null = null;
 
     async function bootstrap() {
       // Push persisted retention limit, dropNonMatching, TLS Bypass, Header Mutation & Breakpoint rules into Rust / Preview engine on boot
@@ -837,7 +905,7 @@ export function useProxySessions() {
       setBackendFilterConfig(syncedCfg);
       setBreakpointConfig(syncedBpCfg);
       setPausedBreakpoints(initialPaused);
-      setStorageStats(initialStats);
+      applyStorageStats(initialStats);
       statusRef.current = effectiveStatus;
       setStatus(effectiveStatus);
       if (effectiveStatus.systemProxyError) {
@@ -889,7 +957,6 @@ export function useProxySessions() {
           setSelectedIdState((prev) =>
             prev !== null && removedSet.has(prev) ? null : prev
           );
-          void refreshStorageStats();
         }
       );
 
@@ -897,6 +964,20 @@ export function useProxySessions() {
         if (!mounted) return;
         setPausedBreakpoints(items);
       });
+
+      unlistenStatusFn = await proxyBridge.subscribeStatusChanged(
+        (nextStatus) => {
+          if (!mounted) return;
+          applyProxyStatusUpdate(nextStatus);
+        }
+      );
+
+      unlistenStatsFn = await proxyBridge.subscribeStorageStatsChanged(
+        (nextStats) => {
+          if (!mounted) return;
+          applyStorageStats(nextStats);
+        }
+      );
     }
 
     void bootstrap();
@@ -906,6 +987,8 @@ export function useProxySessions() {
       if (unlistenFn) unlistenFn();
       if (unlistenRemovedFn) unlistenRemovedFn();
       if (unlistenBpFn) unlistenBpFn();
+      if (unlistenStatusFn) unlistenStatusFn();
+      if (unlistenStatsFn) unlistenStatsFn();
       if (rafHandleRef.current !== null) {
         window.cancelAnimationFrame(rafHandleRef.current);
       }
@@ -913,17 +996,7 @@ export function useProxySessions() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flushPendingSessions]);
 
-  // Periodic storage & dropped-sessions telemetry polling (RAM sessions, SQLite bytes, Dropped count)
-  useEffect(() => {
-    const intervalId = window.setInterval(() => {
-      void refreshStorageStats();
-    }, 1500);
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [refreshStorageStats]);
-
-  // Periodic OS System Proxy status reconciliation (detects external VPN / OS proxy hijack or reset)
+  // Low-frequency fallback reconciliation when tab is visible (primary updates arrive via push events)
   useEffect(() => {
     let active = true;
 
@@ -931,68 +1004,46 @@ export function useProxySessions() {
       try {
         const next = await proxyBridge.getStatus();
         if (!active) return;
-        const prev = statusRef.current;
-
-        if (
-          next.systemProxyError &&
-          next.systemProxyError !== prev.systemProxyError
-        ) {
-          showToast(`⚠️ ${next.systemProxyError}`);
-        } else if (
-          prev.systemProxyEnabled &&
-          !next.systemProxyEnabled &&
-          prev.running &&
-          next.running &&
-          next.autoSystemProxy
-        ) {
-          showToast("⚠️ Системный прокси ОС был сброшен внешней программой");
-        }
-
-        statusRef.current = next;
-        setStatus((curr) => {
-          const sameBoundIps =
-            (curr.boundIps?.length ?? 0) === (next.boundIps?.length ?? 0) &&
-            (curr.boundIps ?? []).every(
-              (ip, idx) => ip === next.boundIps?.[idx]
-            );
-          if (
-            curr.running === next.running &&
-            curr.bindAddr === next.bindAddr &&
-            curr.port === next.port &&
-            curr.activeSessions === next.activeSessions &&
-            curr.systemProxyEnabled === next.systemProxyEnabled &&
-            curr.autoSystemProxy === next.autoSystemProxy &&
-            Boolean(curr.allowRemote) === Boolean(next.allowRemote) &&
-            curr.bindMode === next.bindMode &&
-            (curr.specificBindIp ?? null) === (next.specificBindIp ?? null) &&
-            Boolean(curr.alsoBindLoopback ?? true) ===
-              Boolean(next.alsoBindLoopback ?? true) &&
-            sameBoundIps &&
-            (curr.systemProxyError ?? null) === (next.systemProxyError ?? null)
-          ) {
-            return curr;
-          }
-          return next;
-        });
+        applyProxyStatusUpdate(next);
       } catch {
         // ignore transient IPC poll error
       }
     };
 
-    const intervalId = window.setInterval(() => {
-      void reconcileStatus();
-    }, 3500);
-    const onWindowFocus = () => {
+    const reconcileAll = () => {
+      if (
+        typeof document !== "undefined" &&
+        document.visibilityState === "hidden"
+      ) {
+        return;
+      }
+      void refreshStorageStats();
       void reconcileStatus();
     };
+
+    const intervalId = window.setInterval(reconcileAll, 15_000);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        reconcileAll();
+      }
+    };
+    const onWindowFocus = () => {
+      reconcileAll();
+    };
     window.addEventListener("focus", onWindowFocus);
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibilityChange);
+    }
 
     return () => {
       active = false;
       window.clearInterval(intervalId);
       window.removeEventListener("focus", onWindowFocus);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
     };
-  }, [showToast]);
+  }, [applyProxyStatusUpdate, refreshStorageStats]);
 
   const selectedSummarySignature = useMemo(() => {
     if (selectedId === null) return "";

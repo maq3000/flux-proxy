@@ -14,11 +14,156 @@ struct PendingBreakpoint {
     tx: oneshot::Sender<BreakpointResolution>,
 }
 
+#[derive(Clone, Debug)]
+enum CompiledUrlPattern {
+    MatchAll,
+    Substring(String),
+    Regex(Option<Regex>),
+}
+
+impl CompiledUrlPattern {
+    fn compile(pattern: &str) -> Self {
+        let trimmed = pattern.trim();
+        if trimmed.is_empty() || trimmed == "*" {
+            return Self::MatchAll;
+        }
+        if let Some(re_pat) = strip_regex_prefix(trimmed) {
+            let compiled = match Regex::new(re_pat.trim()) {
+                Ok(re) => Some(re),
+                Err(err) => {
+                    tracing::warn!(pattern = %pattern, "Invalid breakpoint regex pattern: {err}");
+                    None
+                }
+            };
+            return Self::Regex(compiled);
+        }
+
+        let pat_lower = trimmed.to_ascii_lowercase();
+        if pat_lower.contains('*') || pat_lower.contains('?') {
+            let anchor_start = pat_lower.starts_with('^');
+            let anchor_end = pat_lower.ends_with('$');
+            let inner = pat_lower.strip_prefix('^').unwrap_or(&pat_lower);
+            let inner = inner.strip_suffix('$').unwrap_or(inner);
+
+            let mut regex_str = String::from("(?i)");
+            if anchor_start {
+                regex_str.push('^');
+            }
+            for ch in inner.chars() {
+                if ch == '*' {
+                    regex_str.push_str(".*");
+                } else if ch == '?' {
+                    regex_str.push('.');
+                } else {
+                    regex_str.push_str(&regex::escape(&ch.to_string()));
+                }
+            }
+            if anchor_end {
+                regex_str.push('$');
+            }
+            let compiled = match Regex::new(&regex_str) {
+                Ok(re) => Some(re),
+                Err(err) => {
+                    tracing::warn!(pattern = %pattern, "Invalid wildcard breakpoint regex: {err}");
+                    None
+                }
+            };
+            return Self::Regex(compiled);
+        }
+
+        Self::Substring(pat_lower)
+    }
+
+    fn matches(&self, url_lower: &mut Option<String>, raw_url: &str) -> bool {
+        match self {
+            Self::MatchAll => true,
+            Self::Substring(needle) => {
+                let lowered = url_lower.get_or_insert_with(|| raw_url.to_ascii_lowercase());
+                lowered.contains(needle)
+            }
+            Self::Regex(re_opt) => re_opt.as_ref().is_some_and(|re| re.is_match(raw_url)),
+        }
+    }
+
+    #[cfg(test)]
+    fn compiled_regex(&self) -> Option<&Regex> {
+        match self {
+            Self::Regex(re_opt) => re_opt.as_ref(),
+            Self::MatchAll | Self::Substring(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CompiledBreakpointRule {
+    rule: BreakpointRule,
+    compiled_pattern: CompiledUrlPattern,
+    method_filter_trimmed: Option<String>,
+}
+
+impl CompiledBreakpointRule {
+    fn compile(rule: BreakpointRule) -> Self {
+        let compiled_pattern = CompiledUrlPattern::compile(&rule.url_pattern);
+        let method_filter_trimmed = rule
+            .method_filter
+            .as_deref()
+            .map(str::trim)
+            .filter(|mf| !mf.is_empty() && !mf.eq_ignore_ascii_case("ANY"))
+            .map(str::to_owned);
+        Self {
+            rule,
+            compiled_pattern,
+            method_filter_trimmed,
+        }
+    }
+
+    fn matches(&self, stage: BreakpointStage, method: &str, url_lower: &mut Option<String>, raw_url: &str) -> bool {
+        if !self.rule.enabled {
+            return false;
+        }
+        let stage_matches = matches!(
+            (self.rule.stage, stage),
+            (BreakpointStage::Both, _)
+                | (BreakpointStage::Request, BreakpointStage::Request)
+                | (BreakpointStage::Response, BreakpointStage::Response)
+        );
+        if !stage_matches {
+            return false;
+        }
+        if let Some(ref mf) = self.method_filter_trimmed {
+            if !mf.eq_ignore_ascii_case(method) {
+                return false;
+            }
+        }
+        self.compiled_pattern.matches(url_lower, raw_url)
+    }
+}
+
+struct CompiledBreakpointState {
+    config: BreakpointConfig,
+    compiled_rules: Vec<CompiledBreakpointRule>,
+}
+
+impl CompiledBreakpointState {
+    fn from_config(config: BreakpointConfig) -> Self {
+        let compiled_rules = config
+            .rules
+            .iter()
+            .cloned()
+            .map(CompiledBreakpointRule::compile)
+            .collect();
+        Self {
+            config,
+            compiled_rules,
+        }
+    }
+}
+
 /// Live Breakpoint Engine (Fiddler Classic F11 / Alt+F11 / `bpu` / `bpafter` equivalent).
 /// Parks intercepted HTTP/HTTPS requests & responses on `tokio::sync::oneshot::channel`
 /// while waiting for interactive developer edits or abort verdicts from the UI.
 pub struct BreakpointEngine {
-    config: RwLock<BreakpointConfig>,
+    state: RwLock<CompiledBreakpointState>,
     pending: DashMap<String, PendingBreakpoint>,
     snapshot_tx: Option<mpsc::UnboundedSender<Vec<PausedBreakpointItem>>>,
 }
@@ -32,64 +177,45 @@ impl Default for BreakpointEngine {
 impl BreakpointEngine {
     pub fn new(snapshot_tx: Option<mpsc::UnboundedSender<Vec<PausedBreakpointItem>>>) -> Self {
         Self {
-            config: RwLock::new(default_breakpoint_config()),
+            state: RwLock::new(CompiledBreakpointState::from_config(default_breakpoint_config())),
             pending: DashMap::new(),
             snapshot_tx,
         }
     }
 
     pub fn get_config(&self) -> BreakpointConfig {
-        self.config
+        self.state
             .read()
-            .map(|g| g.clone())
+            .map(|g| g.config.clone())
             .unwrap_or_else(|_| default_breakpoint_config())
     }
 
     pub fn update_config(&self, mut next: BreakpointConfig) -> BreakpointConfig {
         next.timeout_secs = next.timeout_secs.clamp(5, 600);
-        if let Ok(mut guard) = self.config.write() {
-            *guard = next.clone();
+        let compiled_state = CompiledBreakpointState::from_config(next.clone());
+        if let Ok(mut guard) = self.state.write() {
+            *guard = compiled_state;
         }
         next
     }
 
     /// Evaluates whether an HTTP request (`BreakpointStage::Request`) or upstream response
     /// (`BreakpointStage::Response`) should pause at an interactive breakpoint.
+    /// Patterns and regexes are precompiled during config updates; no regex compilation occurs here.
     pub fn should_break(&self, stage: BreakpointStage, method: &str, url: &str) -> bool {
-        let Ok(guard) = self.config.read() else {
+        let Ok(guard) = self.state.read() else {
             return false;
         };
 
         match stage {
-            BreakpointStage::Request if guard.break_before_request => return true,
-            BreakpointStage::Response if guard.break_after_response => return true,
+            BreakpointStage::Request if guard.config.break_before_request => return true,
+            BreakpointStage::Response if guard.config.break_after_response => return true,
             _ => {}
         }
 
-        let url_lower = url.to_ascii_lowercase();
-        for rule in &guard.rules {
-            if !rule.enabled {
-                continue;
-            }
-            let stage_matches = matches!(
-                (rule.stage, stage),
-                (BreakpointStage::Both, _)
-                    | (BreakpointStage::Request, BreakpointStage::Request)
-                    | (BreakpointStage::Response, BreakpointStage::Response)
-            );
-            if !stage_matches {
-                continue;
-            }
-            if let Some(ref mf) = rule.method_filter {
-                let mf_trimmed = mf.trim();
-                if !mf_trimmed.is_empty()
-                    && !mf_trimmed.eq_ignore_ascii_case("ANY")
-                    && !mf_trimmed.eq_ignore_ascii_case(method)
-                {
-                    continue;
-                }
-            }
-            if url_pattern_matches(&url_lower, url, &rule.url_pattern) {
+        let mut url_lower: Option<String> = None;
+        for compiled_rule in &guard.compiled_rules {
+            if compiled_rule.matches(stage, method, &mut url_lower, url) {
                 return true;
             }
         }
@@ -101,9 +227,9 @@ impl BreakpointEngine {
     /// on which `handle_intercepted_request` awaits the developer's verdict.
     pub fn park(&self, mut item: PausedBreakpointItem) -> (oneshot::Receiver<BreakpointResolution>, u64) {
         let timeout_secs = self
-            .config
+            .state
             .read()
-            .map(|g| g.timeout_secs.clamp(5, 600))
+            .map(|g| g.config.timeout_secs.clamp(5, 600))
             .unwrap_or(120);
         item.timeout_secs = timeout_secs;
 
@@ -195,44 +321,10 @@ fn strip_regex_prefix(s: &str) -> Option<&str> {
     }
 }
 
+#[cfg(test)]
 fn url_pattern_matches(url_lower: &str, raw_url: &str, pattern: &str) -> bool {
-    let trimmed = pattern.trim();
-    if trimmed.is_empty() || trimmed == "*" {
-        return true;
-    }
-    if let Some(re_pat) = strip_regex_prefix(trimmed) {
-        return Regex::new(re_pat.trim())
-            .map(|re| re.is_match(raw_url))
-            .unwrap_or(false);
-    }
-    let pat_lower = trimmed.to_ascii_lowercase();
-    if pat_lower.contains('*') || pat_lower.contains('?') {
-        let anchor_start = pat_lower.starts_with('^');
-        let anchor_end = pat_lower.ends_with('$');
-        let inner = pat_lower.strip_prefix('^').unwrap_or(&pat_lower);
-        let inner = inner.strip_suffix('$').unwrap_or(inner);
-
-        let mut regex_str = String::from("(?i)");
-        if anchor_start {
-            regex_str.push('^');
-        }
-        for ch in inner.chars() {
-            if ch == '*' {
-                regex_str.push_str(".*");
-            } else if ch == '?' {
-                regex_str.push('.');
-            } else {
-                regex_str.push_str(&regex::escape(&ch.to_string()));
-            }
-        }
-        if anchor_end {
-            regex_str.push('$');
-        }
-        return Regex::new(&regex_str)
-            .map(|re| re.is_match(raw_url))
-            .unwrap_or(false);
-    }
-    url_lower.contains(&pat_lower)
+    let mut cached_lower = Some(url_lower.to_string());
+    CompiledUrlPattern::compile(pattern).matches(&mut cached_lower, raw_url)
 }
 
 #[allow(dead_code)]
@@ -339,5 +431,60 @@ mod tests {
         // Case-insensitive `regex:` prefix and UTF-8 safety
         assert!(url_pattern_matches(&lower, url, "ReGeX:/v1/[a-z]+/sessions"));
         assert!(!url_pattern_matches(&lower, url, "ab😀cd"));
+    }
+
+    #[test]
+    fn precompiles_breakpoint_regex_and_wildcards_on_update_config() {
+        let engine = BreakpointEngine::new(None);
+        let mut cfg = default_breakpoint_config();
+        cfg.rules.push(make_bpu_rule(
+            r"regex:^https://api\.example\.com/v\d+/pay/[a-f0-9]+$",
+            BreakpointStage::Request,
+        ));
+        cfg.rules.push(make_bpu_rule(
+            "https://*.stripe.com/*/sessions",
+            BreakpointStage::Both,
+        ));
+        cfg.rules.push(make_bpu_rule(
+            "/healthz",
+            BreakpointStage::Response,
+        ));
+        cfg.rules.push(make_bpu_rule(
+            "regex:[unclosed",
+            BreakpointStage::Request,
+        ));
+        engine.update_config(cfg);
+
+        {
+            let guard = engine.state.read().unwrap();
+            assert!(guard.compiled_rules[0].compiled_pattern.compiled_regex().is_some());
+            assert!(guard.compiled_rules[1].compiled_pattern.compiled_regex().is_some());
+            assert!(guard.compiled_rules[2].compiled_pattern.compiled_regex().is_none());
+            assert!(guard.compiled_rules[3].compiled_pattern.compiled_regex().is_none());
+        }
+
+        let started = std::time::Instant::now();
+        let mut matched_count = 0usize;
+        for _ in 0..5_000 {
+            if engine.should_break(
+                BreakpointStage::Request,
+                "POST",
+                "https://api.example.com/v2/pay/deadbeef",
+            ) {
+                matched_count += 1;
+            }
+        }
+        assert_eq!(matched_count, 5_000);
+        assert!(started.elapsed().as_secs_f64() < 5.0);
+        assert!(!engine.should_break(
+            BreakpointStage::Request,
+            "GET",
+            "https://api.example.com/healthz",
+        ));
+        assert!(engine.should_break(
+            BreakpointStage::Response,
+            "GET",
+            "https://api.example.com/healthz",
+        ));
     }
 }
