@@ -53,10 +53,31 @@ const TABS: {
   { id: "jwt", label: "JWT Inspector", icon: KeyRound },
   { id: "base64", label: "Base64", icon: Sparkles },
   { id: "url", label: "URL Codec", icon: Link2 },
-  { id: "compression", label: "Gzip / Brotli / Deflate", icon: FileArchive },
+  { id: "compression", label: "Gzip / Brotli / Deflate / Zstd", icon: FileArchive },
   { id: "hex", label: "Hex ↔ Text", icon: Binary },
   { id: "timestamp", label: "Timestamp ↔ ISO", icon: Clock },
 ];
+
+function flipCodecOp(op: CodecOperation): CodecOperation {
+  switch (op) {
+    case "gzipCompress":
+      return "gzipDecompress";
+    case "gzipDecompress":
+      return "gzipCompress";
+    case "brotliCompress":
+      return "brotliDecompress";
+    case "brotliDecompress":
+      return "brotliCompress";
+    case "deflateCompress":
+      return "deflateDecompress";
+    case "deflateDecompress":
+      return "deflateCompress";
+    case "zstdCompress":
+      return "zstdDecompress";
+    case "zstdDecompress":
+      return "zstdCompress";
+  }
+}
 
 export const TextWizardModal: React.FC<TextWizardModalProps> = ({
   open,
@@ -145,14 +166,15 @@ export const TextWizardModal: React.FC<TextWizardModalProps> = ({
     return () => window.clearInterval(id);
   }, [open]);
 
-  // Execute native Rust / WebStream Gzip, Brotli, Deflate codec when compression tab is active
+  // Execute native Rust / WebStream Gzip, Brotli, Deflate, Zstd codec when compression tab is active
   useEffect(() => {
     if (!open || activeTab !== "compression") return;
     let active = true;
     const isDecompress =
       codecOp === "gzipDecompress" ||
       codecOp === "brotliDecompress" ||
-      codecOp === "deflateDecompress";
+      codecOp === "deflateDecompress" ||
+      codecOp === "zstdDecompress";
 
     setCodecBusy(true);
     setCodecError(null);
@@ -318,7 +340,7 @@ export const TextWizardModal: React.FC<TextWizardModalProps> = ({
               TextWizard &amp; JWT Decoder
             </h2>
             <p className="text-[11px] text-muted">
-              Мгновенное декодирование JWT (exp/nbf), Base64, URL, Gzip/Brotli/Deflate, Hex и Unix Timestamp
+              Мгновенное декодирование JWT (exp/nbf), Base64, URL, Gzip/Brotli/Deflate/Zstd, Hex и Unix Timestamp
             </p>
           </div>
         </div>
@@ -722,7 +744,7 @@ export const TextWizardModal: React.FC<TextWizardModalProps> = ({
           </div>
         )}
 
-        {/* 4. COMPRESSION: GZIP / BROTLI / DEFLATE */}
+        {/* 4. COMPRESSION: GZIP / BROTLI / DEFLATE / ZSTD */}
         {activeTab === "compression" && (
           <div className="space-y-2.5">
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -735,6 +757,8 @@ export const TextWizardModal: React.FC<TextWizardModalProps> = ({
                     { id: "brotliDecompress", label: "Brotli Decompress" },
                     { id: "deflateCompress", label: "Deflate Compress" },
                     { id: "deflateDecompress", label: "Deflate Decompress" },
+                    { id: "zstdCompress", label: "Zstd Compress" },
+                    { id: "zstdDecompress", label: "Zstd Decompress" },
                   ] as { id: CodecOperation; label: string }[]
                 ).map((item) => (
                   <button
@@ -754,7 +778,8 @@ export const TextWizardModal: React.FC<TextWizardModalProps> = ({
 
               {(codecOp === "gzipCompress" ||
                 codecOp === "brotliCompress" ||
-                codecOp === "deflateCompress") && (
+                codecOp === "deflateCompress" ||
+                codecOp === "zstdCompress") && (
                 <label className="inline-flex cursor-pointer items-center gap-1.5 text-xs text-muted">
                   <input
                     type="checkbox"
@@ -800,39 +825,45 @@ export const TextWizardModal: React.FC<TextWizardModalProps> = ({
                     )}
                   </span>
 
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (codecOp.endsWith("Compress")) {
-                        setInput(codecResult.outputBase64);
-                        setCodecOp(
-                          codecOp === "gzipCompress"
-                            ? "gzipDecompress"
-                            : codecOp === "brotliCompress"
-                              ? "brotliDecompress"
-                              : "deflateDecompress"
-                        );
-                      } else if (codecResult.outputText !== null && codecResult.outputText !== undefined) {
-                        setInput(codecResult.outputText);
-                        setCodecInputBase64(false);
-                        setCodecOp(
-                          codecOp === "gzipDecompress"
-                            ? "gzipCompress"
-                            : codecOp === "brotliDecompress"
-                              ? "brotliCompress"
-                              : "deflateCompress"
-                        );
-                      }
-                    }}
-                    className="inline-flex items-center gap-1 rounded border border-hairline bg-elevated px-2 py-0.5 text-[11px] text-sky-300 hover:bg-hover"
-                  >
-                    <ArrowDownUp className="h-3 w-3" />
-                    <span>
-                      {codecOp.endsWith("Compress")
-                        ? "Проверить распаковку (Base64 → Вход)"
-                        : "Сжать обратно (Текст → Вход)"}
-                    </span>
-                  </button>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (codecOp.endsWith("Compress")) {
+                          setInput(codecResult.outputBase64);
+                          setCodecOp(flipCodecOp(codecOp));
+                        } else if (
+                          codecResult.outputText !== null &&
+                          codecResult.outputText !== undefined
+                        ) {
+                          setInput(codecResult.outputText);
+                          setCodecInputBase64(false);
+                          setCodecOp(flipCodecOp(codecOp));
+                        }
+                      }}
+                      className="inline-flex items-center gap-1 rounded border border-hairline bg-elevated px-2 py-0.5 text-[11px] text-sky-300 hover:bg-hover"
+                    >
+                      <ArrowDownUp className="h-3 w-3" />
+                      <span>
+                        {codecOp.endsWith("Compress")
+                          ? "Проверить распаковку (Base64 → Вход)"
+                          : "Сжать обратно (Текст → Вход)"}
+                      </span>
+                    </button>
+                    {codecOp.endsWith("Compress") && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setInput(codecResult.outputHex);
+                          setCodecOp(flipCodecOp(codecOp));
+                        }}
+                        className="inline-flex items-center gap-1 rounded border border-hairline bg-elevated px-2 py-0.5 text-[11px] text-emerald-300 hover:bg-hover"
+                      >
+                        <ArrowDownUp className="h-3 w-3" />
+                        <span>Hex → Вход</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 {codecResult.outputText !== null &&

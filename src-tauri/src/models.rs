@@ -392,6 +392,8 @@ pub enum CodecOperation {
     BrotliDecompress,
     DeflateCompress,
     DeflateDecompress,
+    ZstdCompress,
+    ZstdDecompress,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

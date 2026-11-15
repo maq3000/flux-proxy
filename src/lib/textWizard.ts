@@ -531,7 +531,7 @@ function invalidTs(error: string): TimestampConversionResult {
 
 // ============================================================================
 // Browser Preview Fallback for CompressionStream / DecompressionStream
-// (Used only when running outside Tauri; Tauri invokes native Rust flate2 + brotli)
+// (Used only when running outside Tauri; Tauri invokes native Rust flate2 + brotli + zstd)
 // ============================================================================
 export async function browserPreviewCodecTransform(
   operation: CodecOperation,
@@ -541,7 +541,8 @@ export async function browserPreviewCodecTransform(
   const isCompress =
     operation === "gzipCompress" ||
     operation === "brotliCompress" ||
-    operation === "deflateCompress";
+    operation === "deflateCompress" ||
+    operation === "zstdCompress";
 
   const rawBytes = isCompress
     ? inputIsBase64
@@ -565,8 +566,12 @@ export async function browserPreviewCodecTransform(
     }
   } else if (operation === "brotliCompress") {
     outBytes = await brotliCompressFallback(rawBytes);
-  } else {
+  } else if (operation === "brotliDecompress") {
     outBytes = await brotliDecompressFallback(rawBytes);
+  } else if (operation === "zstdCompress") {
+    outBytes = await zstdCompressFallback(rawBytes);
+  } else {
+    outBytes = await zstdDecompressFallback(rawBytes);
   }
 
   let outputText: string | null = null;
@@ -727,6 +732,123 @@ async function brotliDecompressFallback(input: Uint8Array): Promise<Uint8Array> 
   throw new Error(
     "Словарный поток Brotli требует запуска в Tauri Rust runtime (`cargo tauri dev`), где подключён нативный крейт brotli."
   );
+}
+
+async function zstdCompressFallback(input: Uint8Array): Promise<Uint8Array> {
+  try {
+    return await runWebStreamCodec(input, "zstd", "compress");
+  } catch {
+    // Emit a valid RFC 8878 Zstandard frame using Raw_Block framing (128 KiB max per block)
+  }
+
+  // Magic (0xFD2FB528 LE) + FHD (0x00) + Window_Descriptor (0x40 => 256 KiB window)
+  const header = new Uint8Array([0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x40]);
+  const chunks: Uint8Array[] = [header];
+
+  if (input.length === 0) {
+    chunks.push(new Uint8Array([0x01, 0x00, 0x00]));
+  } else {
+    const maxBlockSize = 131072; // 128 KiB RFC 8878 maximum raw block size
+    let offset = 0;
+    while (offset < input.length) {
+      const end = Math.min(input.length, offset + maxBlockSize);
+      const slice = input.subarray(offset, end);
+      offset = end;
+      const isLast = offset >= input.length ? 1 : 0;
+      const blockHeader = (slice.length << 3) | isLast;
+      chunks.push(
+        new Uint8Array([
+          blockHeader & 0xff,
+          (blockHeader >>> 8) & 0xff,
+          (blockHeader >>> 16) & 0xff,
+        ]),
+        slice
+      );
+    }
+  }
+
+  const total = chunks.reduce((acc, c) => acc + c.length, 0);
+  const out = new Uint8Array(total);
+  let pos = 0;
+  for (const c of chunks) {
+    out.set(c, pos);
+    pos += c.length;
+  }
+  return out;
+}
+
+async function zstdDecompressFallback(input: Uint8Array): Promise<Uint8Array> {
+  try {
+    return await runWebStreamCodec(input, "zstd", "decompress");
+  } catch {
+    // Fallback to RFC 8878 Raw/RLE block parser in Browser Preview
+  }
+
+  if (
+    input.length < 8 ||
+    input[0] !== 0x28 ||
+    input[1] !== 0xb5 ||
+    input[2] !== 0x2f ||
+    input[3] !== 0xfd
+  ) {
+    throw new Error("Некорректный заголовок кадра Zstandard (ожидается magic 28 B5 2F FD)");
+  }
+
+  const fhd = input[4];
+  const fcsFlag = (fhd >>> 6) & 0x03;
+  const singleSegment = (fhd & 0x20) !== 0;
+  const dictIdFlag = fhd & 0x03;
+
+  let pos = 5;
+  if (!singleSegment) {
+    pos += 1; // Window_Descriptor
+  }
+  const dictSizes = [0, 1, 2, 4];
+  pos += dictSizes[dictIdFlag];
+
+  const fcsSize =
+    fcsFlag === 0 ? (singleSegment ? 1 : 0) : fcsFlag === 1 ? 2 : fcsFlag === 2 ? 4 : 8;
+  pos += fcsSize;
+
+  const outParts: Uint8Array[] = [];
+  while (pos + 3 <= input.length) {
+    const hdr = input[pos] | (input[pos + 1] << 8) | (input[pos + 2] << 16);
+    pos += 3;
+    const lastBlock = (hdr & 0x01) === 1;
+    const blockType = (hdr >>> 1) & 0x03;
+    const blockSize = hdr >>> 3;
+
+    if (blockType === 0) {
+      if (pos + blockSize > input.length) {
+        throw new Error("Повреждённый Zstandard Raw_Block (выход за пределы буфера)");
+      }
+      outParts.push(input.subarray(pos, pos + blockSize));
+      pos += blockSize;
+    } else if (blockType === 1) {
+      if (pos + 1 > input.length) {
+        throw new Error("Повреждённый Zstandard RLE_Block");
+      }
+      outParts.push(new Uint8Array(blockSize).fill(input[pos]));
+      pos += 1;
+    } else {
+      throw new Error(
+        "Сжатый поток Zstandard требует запуска в Tauri Rust runtime (`cargo tauri dev`), где подключён нативный крейт zstd."
+      );
+    }
+
+    if (lastBlock) {
+      const total = outParts.reduce((a, b) => a + b.length, 0);
+      const merged = new Uint8Array(total);
+      let offset = 0;
+      for (const p of outParts) {
+        merged.set(p, offset);
+        offset += p.length;
+      }
+      return merged;
+    }
+  }
+
+  throw new Error("Неполный или повреждённый поток Zstandard");
 }
 
 // ============================================================================

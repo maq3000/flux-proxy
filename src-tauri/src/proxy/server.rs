@@ -42,7 +42,53 @@ use crate::proxy::sysproxy::SystemProxyManager;
 use crate::storage::{TrafficStore, BODY_OFFLOAD_THRESHOLD_BYTES};
 
 const MAX_CAPTURED_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB safety cap per body (> 2 MiB offloaded to SQLite)
+const ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES: usize = 256 * 1024; // 256 KiB
 type ProxyBoxBody = BoxBody<Bytes, Infallible>;
+
+pub(crate) fn has_zstd_content_encoding(headers: &[HeaderPair]) -> bool {
+    headers.iter().any(|h| {
+        h.name.trim().eq_ignore_ascii_case("content-encoding")
+            && h.value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("zstd"))
+    })
+}
+
+pub(crate) async fn maybe_decompress_zstd(headers: &[HeaderPair], body: Bytes) -> (Bytes, bool) {
+    if !has_zstd_content_encoding(headers) {
+        return (body, false);
+    }
+    if body.is_empty() {
+        return (body, true);
+    }
+
+    let decode_res = if body.len() > ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES {
+        let body_for_task = body.clone();
+        match tokio::task::spawn_blocking(move || zstd::decode_all(body_for_task.as_ref())).await {
+            Ok(res) => res,
+            Err(join_err) => {
+                tracing::warn!(
+                    "zstd spawn_blocking task failed ({} bytes): {join_err}",
+                    body.len()
+                );
+                return (body, false);
+            }
+        }
+    } else {
+        zstd::decode_all(body.as_ref())
+    };
+
+    match decode_res {
+        Ok(decoded) => (Bytes::from(decoded), true),
+        Err(err) => {
+            tracing::warn!(
+                "Failed to decompress zstd response body ({} bytes): {err}",
+                body.len()
+            );
+            (body, false)
+        }
+    }
+}
 
 #[inline]
 fn evaluate_should_store_session(ctx: &SharedProxyContext, summary: &SessionSummary) -> bool {
@@ -1004,8 +1050,8 @@ impl ProxyEngineController {
             &full_url,
             &mut resp_headers,
         );
-        let mut resp_bytes = match upstream_resp.bytes().await {
-            Ok(b) => b.to_vec(),
+        let raw_resp_bytes = match upstream_resp.bytes().await {
+            Ok(b) => b,
             Err(err) => {
                 record_error_session(
                     &self.context,
@@ -1032,6 +1078,9 @@ impl ProxyEngineController {
                 return Err(err.into());
             }
         };
+        let (decompressed_resp_bytes, _zstd_decompressed) =
+            maybe_decompress_zstd(&resp_headers, raw_resp_bytes).await;
+        let mut resp_bytes = decompressed_resp_bytes.to_vec();
 
         // Live Breakpoint: After Response (Alt+F11 / `bpafter`)
         if self
@@ -1929,6 +1978,7 @@ async fn handle_intercepted_request(
 
     // 4a. Real-time Server-Sent Events (`text/event-stream`) zero-buffering pass-through & chunk capture
     if is_sse_stream && !should_break_resp {
+        let sse_has_zstd = has_zstd_content_encoding(&resp_headers);
         let capped_req = &body_bytes[..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
         let initial_summary = SessionSummary {
             id: session_id,
@@ -1984,18 +2034,45 @@ async fn handle_intercepted_request(
         let sse_ctx = ctx.clone();
 
         tokio::spawn(async move {
+            use std::io::Write;
+
             let mut raw_accum: Vec<u8> = Vec::new();
             let mut parse_cursor = 0usize;
             let mut recorded_events: Vec<SseEventRecord> = Vec::new();
             let mut total_bytes = 0usize;
+            let mut zstd_decoder = if sse_has_zstd {
+                match zstd::stream::write::Decoder::new(Vec::<u8>::new()) {
+                    Ok(dec) => Some(dec),
+                    Err(err) => {
+                        tracing::warn!("Failed to initialize SSE zstd stream decoder: {err}");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
 
             while let Ok(Some(chunk)) = upstream_resp.chunk().await {
+                let effective_chunk = if let Some(dec) = zstd_decoder.as_mut() {
+                    if let Err(err) = dec.write_all(&chunk).and_then(|()| dec.flush()) {
+                        tracing::warn!("SSE zstd stream decode error: {err}");
+                        break;
+                    }
+                    let decoded = std::mem::take(dec.get_mut());
+                    if decoded.is_empty() {
+                        continue;
+                    }
+                    Bytes::from(decoded)
+                } else {
+                    chunk
+                };
+
                 let chunk_offset_ms = start.elapsed().as_millis() as u64;
-                total_bytes += chunk.len();
+                total_bytes += effective_chunk.len();
 
                 if raw_accum.len() < MAX_CAPTURED_BODY_BYTES {
                     let room = MAX_CAPTURED_BODY_BYTES - raw_accum.len();
-                    raw_accum.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                    raw_accum.extend_from_slice(&effective_chunk[..effective_chunk.len().min(room)]);
                 }
 
                 // Extract complete SSE blocks (`\n\n` or `\r\n\r\n`) arrived so far
@@ -2019,8 +2096,40 @@ async fn handle_intercepted_request(
                     let _ = sse_ctx.event_tx.send(updated_summary);
                 }
 
-                if chunk_tx.send(Ok(Frame::data(chunk))).await.is_err() {
+                if chunk_tx.send(Ok(Frame::data(effective_chunk))).await.is_err() {
                     break;
+                }
+            }
+
+            if let Some(mut dec) = zstd_decoder {
+                let _ = dec.flush();
+                let tail_decoded = std::mem::take(dec.get_mut());
+                if !tail_decoded.is_empty() {
+                    let chunk_offset_ms = start.elapsed().as_millis() as u64;
+                    total_bytes += tail_decoded.len();
+                    if raw_accum.len() < MAX_CAPTURED_BODY_BYTES {
+                        let room = MAX_CAPTURED_BODY_BYTES - raw_accum.len();
+                        raw_accum.extend_from_slice(&tail_decoded[..tail_decoded.len().min(room)]);
+                    }
+                    drain_complete_sse_events(
+                        &raw_accum,
+                        &mut parse_cursor,
+                        chunk_offset_ms,
+                        &mut recorded_events,
+                    );
+                    if let Some(mut detail) = sse_ctx.store.get(session_id) {
+                        detail.summary.body_size = total_bytes;
+                        detail.summary.duration_ms = chunk_offset_ms;
+                        detail.response_body_base64 =
+                            base64::engine::general_purpose::STANDARD.encode(&raw_accum);
+                        detail.response_body_text =
+                            Some(String::from_utf8_lossy(&raw_accum).into_owned());
+                        detail.sse_events = recorded_events.clone();
+                        let updated_summary = detail.summary.clone();
+                        sse_ctx.store.insert(detail);
+                        let _ = sse_ctx.event_tx.send(updated_summary);
+                    }
+                    let _ = chunk_tx.send(Ok(Frame::data(Bytes::from(tail_decoded)))).await;
                 }
             }
 
@@ -2065,7 +2174,7 @@ async fn handle_intercepted_request(
     }
 
     // 4b. Standard Buffered Upstream Response (+ Optional Live Breakpoint After Response)
-    let mut resp_bytes = match upstream_resp.bytes().await {
+    let raw_resp_bytes = match upstream_resp.bytes().await {
         Ok(b) => b,
         Err(err) => {
             return record_and_return_error(
@@ -2088,6 +2197,11 @@ async fn handle_intercepted_request(
             );
         }
     };
+
+    let has_zstd = has_zstd_content_encoding(&resp_headers);
+    let (mut resp_bytes, zstd_decompressed) =
+        maybe_decompress_zstd(&resp_headers, raw_resp_bytes).await;
+    let mut preserve_content_encoding = has_zstd && !zstd_decompressed;
 
     // 4c. Live Breakpoint: After Response (Alt+F11 / `bpafter`)
     if should_break_resp {
@@ -2208,12 +2322,14 @@ async fn handle_intercepted_request(
                     {
                         content_type = ct_hdr.value.clone();
                     }
+                    preserve_content_encoding = false;
                     bp_modified = true;
                 }
                 if let Some(txt) = verdict.response_body_text {
                     let next_b = Bytes::from(txt.into_bytes());
                     if next_b != resp_bytes {
                         resp_bytes = next_b;
+                        preserve_content_encoding = false;
                         bp_modified = true;
                     }
                 } else if let Some(b64) = verdict.response_body_base64 {
@@ -2222,6 +2338,7 @@ async fn handle_intercepted_request(
                         let next_b = Bytes::from(decoded);
                         if next_b != resp_bytes {
                             resp_bytes = next_b;
+                            preserve_content_encoding = false;
                             bp_modified = true;
                         }
                     }
@@ -2301,12 +2418,14 @@ async fn handle_intercepted_request(
     let mut builder =
         Response::builder().status(StatusCode::from_u16(final_status).unwrap_or(StatusCode::OK));
     for h in &resp_headers {
-        // Reqwest transparently decompresses bodies when gzip/brotli features are enabled,
-        // so strip content-encoding & content-length before re-framing via Hyper Full<Bytes>.
+        // Reqwest transparently decompresses gzip/brotli/deflate bodies and
+        // `maybe_decompress_zstd` handles `content-encoding: zstd`, so strip
+        // `content-encoding` & `content-length` before re-framing via Hyper Full<Bytes>
+        // unless zstd decompression failed (`preserve_content_encoding == true`).
         // Also strip HTTP/3 QUIC discovery headers (`alt-svc`, `alternate-protocol`) when enabled.
         if !is_hop_by_hop_header(&h.name)
-            && !h.name.eq_ignore_ascii_case("content-encoding")
-            && !h.name.eq_ignore_ascii_case("content-length")
+            && !(h.name.eq_ignore_ascii_case("content-encoding") && !preserve_content_encoding)
+            && !(h.name.eq_ignore_ascii_case("content-length") && !preserve_content_encoding)
             && !(strip_alt_svc && is_alt_svc_header(&h.name))
         {
             builder = builder.header(&h.name, &h.value);
@@ -4979,5 +5098,241 @@ mod tests {
         assert!(html.contains("evil.com&quot; onmouseover=&quot;alert(2)"));
         assert!(html.contains("AB:CD&#39;&lt;img src=x onerror=alert(3)&gt;"));
         assert!(html.contains("Определено устройство: iOS / iPadOS"));
+    }
+
+    #[tokio::test]
+    async fn transparently_decompresses_zstd_upstream_responses_for_client_and_traffic_store() {
+        let json_plain = r#"{"service":"FluxProxy","codec":"zstd","ok":true}"#;
+        let html_plain = "<!DOCTYPE html><html><body><h1>Zstd OK</h1></body></html>";
+        let large_plain = "FluxProxyZstdLargePayload-".repeat(12_000); // > 256 KiB
+        assert!(large_plain.len() > ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES);
+        let sse_plain = "id: z1\nevent: delta\ndata: {\"ok\":true}\n\ndata: [DONE]\n\n";
+        let corrupt_payload = b"NOT_A_VALID_ZSTD_FRAME";
+
+        let json_zstd = zstd::encode_all(json_plain.as_bytes(), 3).unwrap();
+        let html_zstd = zstd::encode_all(html_plain.as_bytes(), 3).unwrap();
+        let large_zstd = zstd::encode_all(large_plain.as_bytes(), 3).unwrap();
+        let sse_zstd = zstd::encode_all(sse_plain.as_bytes(), 3).unwrap();
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp_stream, _)) = upstream_listener.accept().await else {
+                    break;
+                };
+                let json_zstd = json_zstd.clone();
+                let html_zstd = html_zstd.clone();
+                let large_zstd = large_zstd.clone();
+                let sse_zstd = sse_zstd.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let json_zstd = json_zstd.clone();
+                        let html_zstd = html_zstd.clone();
+                        let large_zstd = large_zstd.clone();
+                        let sse_zstd = sse_zstd.clone();
+                        async move {
+                            let resp = match req.uri().path() {
+                                "/zstd-json" => Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/json; charset=utf-8")
+                                    .header("Content-Encoding", "zstd")
+                                    .body(Full::new(Bytes::from(json_zstd)))
+                                    .unwrap(),
+                                "/zstd-html" => Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                                    .header("Content-Encoding", "br, ZSTD")
+                                    .body(Full::new(Bytes::from(html_zstd)))
+                                    .unwrap(),
+                                "/zstd-large" => Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+                                    .header("Content-Encoding", "zstd")
+                                    .body(Full::new(Bytes::from(large_zstd)))
+                                    .unwrap(),
+                                "/zstd-sse" => Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "text/event-stream; charset=utf-8")
+                                    .header("Content-Encoding", "zstd")
+                                    .body(Full::new(Bytes::from(sse_zstd)))
+                                    .unwrap(),
+                                "/zstd-corrupt" => Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/octet-stream")
+                                    .header("Content-Encoding", "zstd")
+                                    .body(Full::new(Bytes::from_static(corrupt_payload)))
+                                    .unwrap(),
+                                _ => Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap(),
+                            };
+                            Ok::<_, Infallible>(resp)
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("fluxproxy-test-zstd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("zstd.sqlite")).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            store: store.clone(),
+            upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(proxy_addr.port()),
+        });
+
+        let proxy_ctx = ctx.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await else {
+                    break;
+                };
+                let c = proxy_ctx.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let inner_c = c.clone();
+                        async move {
+                            Ok::<_, Infallible>(
+                                handle_outer_proxy_request(req, client_addr, None, inner_c).await,
+                            )
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, service)
+                        .await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap();
+
+        // 1. JSON with `Content-Encoding: zstd`
+        let json_resp = client
+            .get(format!("http://127.0.0.1:{}/zstd-json", upstream_addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(json_resp.status(), StatusCode::OK);
+        assert!(json_resp.headers().get("content-encoding").is_none());
+        assert_eq!(json_resp.text().await.unwrap(), json_plain);
+
+        // 2. HTML with `Content-Encoding: br, ZSTD`
+        let html_resp = client
+            .get(format!("http://127.0.0.1:{}/zstd-html", upstream_addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(html_resp.status(), StatusCode::OK);
+        assert!(html_resp.headers().get("content-encoding").is_none());
+        assert_eq!(html_resp.text().await.unwrap(), html_plain);
+
+        // 3. Large (> 256 KB) payload via `spawn_blocking`
+        let large_resp = client
+            .get(format!("http://127.0.0.1:{}/zstd-large", upstream_addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(large_resp.status(), StatusCode::OK);
+        assert!(large_resp.headers().get("content-encoding").is_none());
+        assert_eq!(large_resp.text().await.unwrap(), large_plain);
+
+        // 4. SSE stream with `Content-Encoding: zstd`
+        let sse_resp = client
+            .get(format!("http://127.0.0.1:{}/zstd-sse", upstream_addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+        assert!(sse_resp.headers().get("content-encoding").is_none());
+        assert_eq!(sse_resp.text().await.unwrap(), sse_plain);
+
+        // 5. Corrupt zstd frame preserves `Content-Encoding: zstd` and returns original bytes
+        let corrupt_resp = client
+            .get(format!("http://127.0.0.1:{}/zstd-corrupt", upstream_addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(corrupt_resp.status(), StatusCode::OK);
+        assert_eq!(
+            corrupt_resp
+                .headers()
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("zstd")
+        );
+        assert_eq!(corrupt_resp.bytes().await.unwrap().as_ref(), corrupt_payload);
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let summaries = store.list_summaries();
+        let json_summary = summaries
+            .iter()
+            .find(|s| s.path == "/zstd-json")
+            .expect("missing /zstd-json session");
+        let json_detail = store.get(json_summary.id).unwrap();
+        assert_eq!(json_detail.response_body_text.as_deref(), Some(json_plain));
+        assert_eq!(json_detail.summary.body_size, json_plain.len());
+
+        let html_summary = summaries
+            .iter()
+            .find(|s| s.path == "/zstd-html")
+            .expect("missing /zstd-html session");
+        let html_detail = store.get(html_summary.id).unwrap();
+        assert_eq!(html_detail.response_body_text.as_deref(), Some(html_plain));
+        assert_eq!(html_detail.summary.body_size, html_plain.len());
+
+        let large_summary = summaries
+            .iter()
+            .find(|s| s.path == "/zstd-large")
+            .expect("missing /zstd-large session");
+        let large_detail = store.get(large_summary.id).unwrap();
+        assert_eq!(large_detail.response_body_text.as_deref(), Some(large_plain.as_str()));
+        assert_eq!(large_detail.summary.body_size, large_plain.len());
+
+        let sse_summary = summaries
+            .iter()
+            .find(|s| s.path == "/zstd-sse")
+            .expect("missing /zstd-sse session");
+        let sse_detail = store.get(sse_summary.id).unwrap();
+        assert_eq!(sse_detail.response_body_text.as_deref(), Some(sse_plain));
+        assert_eq!(sse_detail.sse_events.len(), 2);
+        assert_eq!(sse_detail.sse_events[0].event, "delta");
+        assert_eq!(sse_detail.sse_events[1].data, "[DONE]");
+
+        let corrupt_summary = summaries
+            .iter()
+            .find(|s| s.path == "/zstd-corrupt")
+            .expect("missing /zstd-corrupt session");
+        let corrupt_detail = store.get(corrupt_summary.id).unwrap();
+        assert_eq!(corrupt_detail.summary.body_size, corrupt_payload.len());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

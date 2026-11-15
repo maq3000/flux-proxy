@@ -2390,11 +2390,19 @@ export const proxyBridge = {
     inputIsBase64 = false
   ): Promise<CodecTransformResult> {
     if (isTauriRuntime()) {
-      return invoke<CodecTransformResult>("codec_transform", {
-        operation,
-        input,
-        inputIsBase64,
-      });
+      try {
+        return await invoke<CodecTransformResult>("codec_transform", {
+          operation,
+          input,
+          inputIsBase64,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.toLowerCase().includes("unknown variant")) {
+          return browserPreviewCodecTransform(operation, input, inputIsBase64);
+        }
+        throw err;
+      }
     }
     return browserPreviewCodecTransform(operation, input, inputIsBase64);
   },

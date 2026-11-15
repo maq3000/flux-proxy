@@ -395,7 +395,9 @@ export type CodecOperation =
   | "brotliCompress"
   | "brotliDecompress"
   | "deflateCompress"
-  | "deflateDecompress";
+  | "deflateDecompress"
+  | "zstdCompress"
+  | "zstdDecompress";
 
 export interface CodecTransformResult {
   outputBase64: string;

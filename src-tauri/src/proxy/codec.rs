@@ -7,7 +7,7 @@ use flate2::Compression;
 
 use crate::models::{CodecOperation, CodecTransformResult, ProxyError};
 
-/// Executes binary compression / decompression transforms (Gzip, Brotli, Deflate)
+/// Executes binary compression / decompression transforms (Gzip, Brotli, Deflate, Zstd)
 /// for the built-in TextWizard utility.
 ///
 /// - For `*Compress` operations, `input` is treated as UTF-8 text (unless `input_is_base64 == true`).
@@ -20,7 +20,8 @@ pub fn execute_codec_transform(
     let raw_bytes = match operation {
         CodecOperation::GzipCompress
         | CodecOperation::BrotliCompress
-        | CodecOperation::DeflateCompress => {
+        | CodecOperation::DeflateCompress
+        | CodecOperation::ZstdCompress => {
             if input_is_base64 {
                 decode_base64_or_hex(input)?
             } else {
@@ -29,7 +30,8 @@ pub fn execute_codec_transform(
         }
         CodecOperation::GzipDecompress
         | CodecOperation::BrotliDecompress
-        | CodecOperation::DeflateDecompress => decode_base64_or_hex(input)?,
+        | CodecOperation::DeflateDecompress
+        | CodecOperation::ZstdDecompress => decode_base64_or_hex(input)?,
     };
 
     let input_len = raw_bytes.len();
@@ -83,6 +85,10 @@ pub fn execute_codec_transform(
             }
             out
         }
+        CodecOperation::ZstdCompress => zstd::encode_all(raw_bytes.as_slice(), 3)
+            .map_err(|e| ProxyError::Custom(format!("Zstd compression failed: {e}")))?,
+        CodecOperation::ZstdDecompress => zstd::decode_all(raw_bytes.as_slice())
+            .map_err(|e| ProxyError::Custom(format!("Zstd decompression failed: {e}")))?,
     };
 
     let output_len = out_bytes.len();
@@ -160,5 +166,32 @@ mod tests {
                 execute_codec_transform(dec_op, &compressed.output_base64, true).unwrap();
             assert_eq!(decompressed.output_text.as_deref(), Some(sample));
         }
+    }
+
+    #[test]
+    fn roundtrips_zstd() {
+        let sample = "{\"service\":\"FluxProxy\",\"codec\":\"Zstandard 🚀\",\"items\":[1,2,3,4,5]}";
+
+        let compressed =
+            execute_codec_transform(CodecOperation::ZstdCompress, sample, false).unwrap();
+        assert!(!compressed.output_base64.is_empty());
+        assert!(!compressed.output_hex.is_empty());
+        assert!(compressed.output_hex.starts_with("28b52ffd"));
+
+        let from_b64 = execute_codec_transform(
+            CodecOperation::ZstdDecompress,
+            &compressed.output_base64,
+            true,
+        )
+        .unwrap();
+        assert_eq!(from_b64.output_text.as_deref(), Some(sample));
+
+        let from_hex = execute_codec_transform(
+            CodecOperation::ZstdDecompress,
+            &compressed.output_hex,
+            true,
+        )
+        .unwrap();
+        assert_eq!(from_hex.output_text.as_deref(), Some(sample));
     }
 }
