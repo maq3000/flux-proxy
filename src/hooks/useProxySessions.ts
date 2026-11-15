@@ -580,6 +580,7 @@ export function useProxySessions() {
   useEffect(() => {
     let mounted = true;
     let unlistenFn: (() => void) | null = null;
+    let unlistenRemovedFn: (() => void) | null = null;
     let unlistenBpFn: (() => void) | null = null;
 
     async function bootstrap() {
@@ -704,6 +705,36 @@ export function useProxySessions() {
         }
       });
 
+      unlistenRemovedFn = await proxyBridge.subscribeSessionsRemoved(
+        (removedIds) => {
+          if (!mounted || removedIds.length === 0) return;
+          const removedSet = new Set(removedIds);
+          if (pendingQueueRef.current.length > 0) {
+            pendingQueueRef.current = pendingQueueRef.current.filter(
+              (item) => !removedSet.has(item.id)
+            );
+          }
+          setSessions((prev) => {
+            const next = prev.filter((item) => !removedSet.has(item.id));
+            return next.length === prev.length ? prev : next;
+          });
+          setSelectedIds((prev) => {
+            const next = prev.filter((id) => !removedSet.has(id));
+            return next.length === prev.length ? prev : next;
+          });
+          if (
+            selectionAnchorIdRef.current !== null &&
+            removedSet.has(selectionAnchorIdRef.current)
+          ) {
+            selectionAnchorIdRef.current = null;
+          }
+          setSelectedIdState((prev) =>
+            prev !== null && removedSet.has(prev) ? null : prev
+          );
+          void refreshStorageStats();
+        }
+      );
+
       unlistenBpFn = await proxyBridge.subscribeBreakpointsChanged((items) => {
         if (!mounted) return;
         setPausedBreakpoints(items);
@@ -715,6 +746,7 @@ export function useProxySessions() {
     return () => {
       mounted = false;
       if (unlistenFn) unlistenFn();
+      if (unlistenRemovedFn) unlistenRemovedFn();
       if (unlistenBpFn) unlistenBpFn();
       if (rafHandleRef.current !== null) {
         window.cancelAnimationFrame(rafHandleRef.current);
@@ -798,7 +830,7 @@ export function useProxySessions() {
     if (selectedId === null) return "";
     const found = sessions.find((s) => s.id === selectedId);
     if (!found) return "";
-    return `${found.status}:${found.bodySize}:${found.durationMs}:${found.breakpointPaused ?? ""}:${found.breakpointModified ? "1" : "0"}:${found.comment ?? ""}:${found.markedColor ?? ""}`;
+    return `${found.status}:${found.bodySize}:${found.durationMs}:${found.contentType}:${found.error ?? ""}:${found.breakpointPaused ?? ""}:${found.breakpointModified ? "1" : "0"}:${found.comment ?? ""}:${found.markedColor ?? ""}`;
   }, [selectedId, sessions]);
 
   // Fetch full SessionDetail on-demand when selected row changes or updates in-place
@@ -825,7 +857,7 @@ export function useProxySessions() {
     const r = sessions.find((s) => s.id === diffRightId);
     const sig = (s?: SessionSummary) =>
       s
-        ? `${s.status}:${s.bodySize}:${s.durationMs}:${s.comment ?? ""}:${s.markedColor ?? ""}`
+        ? `${s.status}:${s.bodySize}:${s.durationMs}:${s.contentType}:${s.error ?? ""}:${s.comment ?? ""}:${s.markedColor ?? ""}`
         : "none";
     return `${diffLeftId}(${sig(l)})|${diffRightId}(${sig(r)})`;
   }, [diffLeftId, diffRightId, sessions]);
@@ -1225,15 +1257,26 @@ export function useProxySessions() {
     const qLower = trimmed.toLowerCase();
 
     const result = sessions.filter((s) => {
+      const isInFlight = s.status === 0 && !s.error && !s.tlsBypassed;
       // 1. Quick Category Bar
       if (quickCategory !== "all") {
         const tone = getRowSemanticTone(s);
-        if (quickCategory === "json" && tone !== "json") return false;
-        if (quickCategory === "images" && tone !== "image") return false;
-        if (quickCategory === "errors" && tone !== "error") return false;
+        if (quickCategory === "json" && !isInFlight && tone !== "json") {
+          return false;
+        }
+        if (quickCategory === "images" && !isInFlight && tone !== "image") {
+          return false;
+        }
+        if (quickCategory === "errors" && !isInFlight && tone !== "error") {
+          return false;
+        }
         if (quickCategory === "ws" && tone !== "ws") return false;
-        if (quickCategory === "sse" && tone !== "sse") return false;
-        if (quickCategory === "mocked" && !s.isMocked) return false;
+        if (quickCategory === "sse" && !isInFlight && tone !== "sse") {
+          return false;
+        }
+        if (quickCategory === "mocked" && !isInFlight && !s.isMocked) {
+          return false;
+        }
         if (quickCategory === "marked" && !s.comment && !s.markedColor) {
           return false;
         }

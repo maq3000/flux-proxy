@@ -731,6 +731,43 @@ export function buildSimulatedSession(id: number): SessionDetail {
   };
 }
 
+/**
+ * Constructs the Phase 1 (In-Flight) snapshot sent immediately before upstream latency completes.
+ */
+export function buildInFlightSnapshot(detail: SessionDetail): SessionDetail {
+  return {
+    ...detail,
+    summary: {
+      ...detail.summary,
+      status: 0,
+      contentType: "",
+      bodySize: 0,
+      durationMs: 0,
+      isMocked: false,
+      matchedRuleId: null,
+      error: null,
+      breakpointPaused: null,
+    },
+    responseHeaders: [],
+    responseBodyBase64: "",
+    responseBodyText: null,
+    sseEvents: [],
+    websocketFrames: [],
+    bodyOffloaded: false,
+  };
+}
+
+/**
+ * Returns a realistic UI-observable simulated upstream delay (ms) between Phase 1 and Phase 2 in Browser Preview.
+ */
+export function getSimulatedTwoPhaseDelayMs(detail: SessionDetail): number {
+  const target = detail.summary.durationMs;
+  if (target > 0) {
+    return Math.min(Math.max(target, 260), 1400);
+  }
+  return 320;
+}
+
 export const DEFAULT_AUTORESPONDER_RULES: AutoResponderRule[] = [
   {
     id: "rule-mock-auth",

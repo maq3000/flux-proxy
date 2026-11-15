@@ -552,8 +552,30 @@ function extractSessionFieldNumber(
   }
 }
 
-function evalCondition(s: SessionSummary, cond: CompiledCondition): boolean {
+function isResponseDependentField(field: FilterField): boolean {
+  return (
+    field === "status" ||
+    field === "contentType" ||
+    field === "bodySize" ||
+    field === "durationMs"
+  );
+}
+
+function isInFlightPendingSession(s: SessionSummary): boolean {
+  return s.status === 0 && !s.error && !s.tlsBypassed;
+}
+
+function evalCondition(
+  s: SessionSummary,
+  cond: CompiledCondition,
+  isInFlight = false,
+  mode: "include" | "exclude" = "include"
+): boolean {
   const { rule, regex, numericTarget, lowerValue } = cond;
+  if (isInFlight && isResponseDependentField(rule.field)) {
+    return mode !== "exclude";
+  }
+
   const op = rule.operator;
 
   if (op === "gt" || op === "gte" || op === "lt" || op === "lte") {
@@ -606,13 +628,15 @@ function evalCondition(s: SessionSummary, cond: CompiledCondition): boolean {
 
 function evalDnfGroups(
   s: SessionSummary,
-  groups: CompiledCondition[][]
+  groups: CompiledCondition[][],
+  isInFlight = false,
+  mode: "include" | "exclude" = "include"
 ): boolean {
   // (G1_c1 AND G1_c2) OR (G2_c1) ...
   for (const conjunction of groups) {
     let groupMatched = true;
     for (const cond of conjunction) {
-      if (!evalCondition(s, cond)) {
+      if (!evalCondition(s, cond, isInFlight, mode)) {
         groupMatched = false;
         break;
       }
@@ -1366,8 +1390,10 @@ export function evaluateSessionAgainstFilters(
   thresholds: NoiseThresholdsConfig,
   compiledHostList?: CompiledHostListFilter
 ): boolean {
+  const isInFlight = isInFlightPendingSession(s);
+
   // 1. Thresholds & Noise Cleanup
-  if (thresholds.hide304NotModified && s.status === 304) {
+  if (!isInFlight && thresholds.hide304NotModified && s.status === 304) {
     return false;
   }
   if (
@@ -1382,23 +1408,25 @@ export function evaluateSessionAgainstFilters(
   ) {
     return false;
   }
-  if (
-    thresholds.minBodySizeBytes !== null &&
-    s.bodySize < thresholds.minBodySizeBytes
-  ) {
-    return false;
-  }
-  if (
-    thresholds.maxBodySizeBytes !== null &&
-    s.bodySize > thresholds.maxBodySizeBytes
-  ) {
-    return false;
-  }
-  if (
-    thresholds.onlySlowRequests &&
-    s.durationMs < thresholds.timeHeatWarningMs
-  ) {
-    return false;
+  if (!isInFlight) {
+    if (
+      thresholds.minBodySizeBytes !== null &&
+      s.bodySize < thresholds.minBodySizeBytes
+    ) {
+      return false;
+    }
+    if (
+      thresholds.maxBodySizeBytes !== null &&
+      s.bodySize > thresholds.maxBodySizeBytes
+    ) {
+      return false;
+    }
+    if (
+      thresholds.onlySlowRequests &&
+      s.durationMs < thresholds.timeHeatWarningMs
+    ) {
+      return false;
+    }
   }
 
   // 2. Bulk Hosts & URL Filter (Whitelist / Blacklist — O(1) Set + cached RegExp)
@@ -1418,12 +1446,12 @@ export function evaluateSessionAgainstFilters(
 
   if (thresholds.hideStaticAssets) {
     const ct = s.contentType.toLowerCase();
-    if (
-      ct.startsWith("image/") ||
-      ct.startsWith("font/") ||
-      ct.includes("text/css") ||
-      STATIC_ASSET_EXT_RE.test(s.path)
-    ) {
+    const ctIsStatic =
+      !isInFlight &&
+      (ct.startsWith("image/") ||
+        ct.startsWith("font/") ||
+        ct.includes("text/css"));
+    if (ctIsStatic || STATIC_ASSET_EXT_RE.test(s.path)) {
       return false;
     }
   }
@@ -1435,14 +1463,14 @@ export function evaluateSessionAgainstFilters(
 
   if (
     compiled.excludeGroups.length > 0 &&
-    evalDnfGroups(s, compiled.excludeGroups)
+    evalDnfGroups(s, compiled.excludeGroups, isInFlight, "exclude")
   ) {
     return false;
   }
 
   if (
     compiled.includeGroups.length > 0 &&
-    !evalDnfGroups(s, compiled.includeGroups)
+    !evalDnfGroups(s, compiled.includeGroups, isInFlight, "include")
   ) {
     return false;
   }
@@ -1932,12 +1960,13 @@ export function evaluateShouldStoreSessionInPreview(
     return true;
   }
 
+  const isInFlight = isInFlightPendingSession(summary);
   const th: NoiseThresholdsConfig = {
     ...DEFAULT_NOISE_THRESHOLDS,
     ...(config.noiseThresholds ?? {}),
   };
 
-  if (th.hide304NotModified && summary.status === 304) return false;
+  if (!isInFlight && th.hide304NotModified && summary.status === 304) return false;
   if (th.hideOptionsPreflight && summary.method.toUpperCase() === "OPTIONS") {
     return false;
   }
@@ -1947,23 +1976,25 @@ export function evaluateShouldStoreSessionInPreview(
   ) {
     return false;
   }
-  if (th.minBodySizeBytes !== null && summary.bodySize < th.minBodySizeBytes) {
-    return false;
-  }
-  if (th.maxBodySizeBytes !== null && summary.bodySize > th.maxBodySizeBytes) {
-    return false;
-  }
-  if (th.onlySlowRequests && summary.durationMs < th.timeHeatWarningMs) {
-    return false;
+  if (!isInFlight) {
+    if (th.minBodySizeBytes !== null && summary.bodySize < th.minBodySizeBytes) {
+      return false;
+    }
+    if (th.maxBodySizeBytes !== null && summary.bodySize > th.maxBodySizeBytes) {
+      return false;
+    }
+    if (th.onlySlowRequests && summary.durationMs < th.timeHeatWarningMs) {
+      return false;
+    }
   }
   if (th.hideStaticAssets) {
     const ct = summary.contentType.toLowerCase();
-    if (
-      ct.startsWith("image/") ||
-      ct.startsWith("font/") ||
-      ct.includes("text/css") ||
-      STATIC_ASSET_EXT_RE.test(summary.path)
-    ) {
+    const ctIsStatic =
+      !isInFlight &&
+      (ct.startsWith("image/") ||
+        ct.startsWith("font/") ||
+        ct.includes("text/css"));
+    if (ctIsStatic || STATIC_ASSET_EXT_RE.test(summary.path)) {
       return false;
     }
   }
@@ -1998,26 +2029,37 @@ export function evaluateShouldStoreSessionInPreview(
     let catOk = true;
     if (cat === "json") {
       catOk =
-        !isErr &&
-        !isWs &&
-        !ct.includes("text/event-stream") &&
-        !ct.startsWith("image/") &&
-        (ct.includes("json") ||
-          ct.includes("graphql") ||
-          ct.includes("grpc") ||
-          ct.includes("protobuf") ||
-          summary.path.startsWith("/api/") ||
-          summary.path.startsWith("/v1/"));
+        isInFlight ||
+        (!isErr &&
+          !isWs &&
+          !ct.includes("text/event-stream") &&
+          !ct.startsWith("image/") &&
+          (ct.includes("json") ||
+            ct.includes("graphql") ||
+            ct.includes("grpc") ||
+            ct.includes("protobuf") ||
+            summary.path.startsWith("/api/") ||
+            summary.path.startsWith("/v1/")));
     } else if (cat === "images") {
-      catOk = !isErr && !isWs && ct.startsWith("image/");
+      catOk = isInFlight || (!isErr && !isWs && ct.startsWith("image/"));
     } else if (cat === "sse") {
-      catOk = !isErr && !isWs && ct.includes("text/event-stream");
+      catOk =
+        isInFlight || (!isErr && !isWs && ct.includes("text/event-stream"));
+    } else if (cat === "xhr") {
+      catOk =
+        isInFlight ||
+        ct.includes("json") ||
+        ct.includes("xml") ||
+        ct.includes("graphql") ||
+        ct.includes("grpc") ||
+        ct.includes("protobuf") ||
+        ct.includes("event-stream");
     } else if (cat === "ws") {
       catOk = !isErr && isWs;
     } else if (cat === "errors") {
-      catOk = isErr;
+      catOk = isInFlight || isErr;
     } else if (cat === "mocked") {
-      catOk = Boolean(summary.isMocked || summary.breakpointModified);
+      catOk = isInFlight || Boolean(summary.isMocked || summary.breakpointModified);
     } else if (cat === "marked") {
       catOk = Boolean(summary.comment || summary.markedColor);
     }
@@ -2043,15 +2085,23 @@ export function evaluateShouldStoreSessionInPreview(
     const compiledMat = compileFilterMatrix(config.captureFilterRules);
     if (
       compiledMat.excludeGroups.length > 0 &&
-      evalDnfGroups(summary, compiledMat.excludeGroups)
+      evalDnfGroups(summary, compiledMat.excludeGroups, isInFlight, "exclude")
     ) {
       return false;
     }
     if (compiledMat.includeGroups.length > 0) {
-      if (!evalDnfGroups(summary, compiledMat.includeGroups)) {
+      if (
+        !evalDnfGroups(summary, compiledMat.includeGroups, isInFlight, "include")
+      ) {
         return false;
       }
-      explicitlyIncluded = true;
+      explicitlyIncluded =
+        !isInFlight ||
+        compiledMat.includeGroups.some(
+          (conj) =>
+            conj.every((c) => evalCondition(summary, c, isInFlight, "include")) &&
+            conj.some((c) => !isResponseDependentField(c.rule.field))
+        );
     }
   }
 

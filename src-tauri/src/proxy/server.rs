@@ -63,13 +63,23 @@ fn encode_inline_or_offload(raw: &[u8]) -> (String, Option<String>, bool) {
 
 fn record_completed_session(
     ctx: &SharedProxyContext,
-    detail: SessionDetail,
+    mut detail: SessionDetail,
     raw_req_body: Option<&[u8]>,
     raw_resp_body: Option<&[u8]>,
 ) -> bool {
+    if let Some(existing) = ctx.store.get(detail.summary.id) {
+        if detail.summary.comment.is_none() {
+            detail.summary.comment = existing.summary.comment;
+        }
+        if detail.summary.marked_color.is_none() {
+            detail.summary.marked_color = existing.summary.marked_color;
+        }
+    }
+
     if !evaluate_should_store_session(ctx, &detail.summary) {
         if ctx.store.get(detail.summary.id).is_some() {
             ctx.store.remove_many(&[detail.summary.id]);
+            let _ = ctx.removed_tx.send(vec![detail.summary.id]);
         }
         ctx.store.increment_dropped_sessions();
         return false;
@@ -82,6 +92,165 @@ fn record_completed_session(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
+fn record_in_flight_session(
+    ctx: &SharedProxyContext,
+    session_id: u64,
+    timestamp: String,
+    protocol: String,
+    scheme: String,
+    method: String,
+    host: String,
+    path: String,
+    url: String,
+    process_name: Option<String>,
+    process_pid: Option<u32>,
+    headers_mutated: bool,
+    breakpoint_modified: bool,
+    client_ip: Option<String>,
+    client_addr: String,
+    tls_version: Option<String>,
+    request_headers: Vec<HeaderPair>,
+    req_body_bytes: &[u8],
+) -> bool {
+    let existing = ctx.store.get(session_id);
+    let comment = existing.as_ref().and_then(|d| d.summary.comment.clone());
+    let marked_color = existing
+        .as_ref()
+        .and_then(|d| d.summary.marked_color.clone());
+
+    let summary = SessionSummary {
+        id: session_id,
+        status: 0,
+        protocol,
+        scheme,
+        method,
+        host,
+        path,
+        url,
+        content_type: String::new(),
+        body_size: 0,
+        duration_ms: 0,
+        timestamp,
+        is_mocked: false,
+        matched_rule_id: None,
+        error: None,
+        process_name,
+        process_pid,
+        tls_bypassed: false,
+        headers_mutated,
+        breakpoint_paused: None,
+        breakpoint_modified,
+        comment,
+        marked_color,
+        client_ip,
+    };
+
+    if !evaluate_should_store_session(ctx, &summary) {
+        if existing.is_some() {
+            ctx.store.remove_many(&[session_id]);
+            let _ = ctx.removed_tx.send(vec![session_id]);
+        }
+        return false;
+    }
+
+    let capped_req = &req_body_bytes[..req_body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
+    let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
+    let detail = SessionDetail {
+        summary: summary.clone(),
+        request_headers,
+        response_headers: Vec::new(),
+        request_body_base64: req_b64,
+        response_body_base64: String::new(),
+        request_body_text: req_txt,
+        response_body_text: None,
+        tls_version,
+        client_addr,
+        websocket_frames: Vec::new(),
+        sse_events: Vec::new(),
+        body_offloaded: false,
+        request_body_offloaded: req_offloaded,
+    };
+
+    ctx.store.insert_with_bodies(detail, Some(capped_req), None);
+    let _ = ctx.event_tx.send(summary);
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_error_session(
+    ctx: &SharedProxyContext,
+    session_id: u64,
+    protocol: String,
+    scheme: &str,
+    method: &str,
+    host: &str,
+    path: &str,
+    url: &str,
+    req_headers: Vec<HeaderPair>,
+    req_body: &[u8],
+    duration_ms: u64,
+    timestamp: String,
+    process_name: Option<String>,
+    process_pid: Option<u32>,
+    tls_bypassed: bool,
+    headers_mutated: bool,
+    breakpoint_modified: bool,
+    client_ip: Option<String>,
+    client_addr: String,
+    err_msg: &str,
+) {
+    let summary = SessionSummary {
+        id: session_id,
+        status: 502,
+        protocol,
+        scheme: scheme.to_string(),
+        method: method.to_string(),
+        host: host.to_string(),
+        path: path.to_string(),
+        url: url.to_string(),
+        content_type: "text/plain; charset=utf-8".to_string(),
+        body_size: err_msg.len(),
+        duration_ms,
+        timestamp,
+        is_mocked: false,
+        matched_rule_id: None,
+        error: Some(err_msg.to_string()),
+        process_name,
+        process_pid,
+        tls_bypassed,
+        headers_mutated,
+        breakpoint_paused: None,
+        breakpoint_modified,
+        comment: None,
+        marked_color: None,
+        client_ip,
+    };
+
+    let capped_req = &req_body[..req_body.len().min(MAX_CAPTURED_BODY_BYTES)];
+    let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
+    let detail = SessionDetail {
+        summary,
+        request_headers: req_headers,
+        response_headers: vec![HeaderPair {
+            name: "Content-Type".into(),
+            value: "text/plain; charset=utf-8".into(),
+        }],
+        request_body_base64: req_b64,
+        response_body_base64: base64::engine::general_purpose::STANDARD.encode(err_msg.as_bytes()),
+        request_body_text: req_txt,
+        response_body_text: Some(err_msg.to_string()),
+        tls_version: None,
+        client_addr,
+        websocket_frames: Vec::new(),
+        sse_events: Vec::new(),
+        body_offloaded: false,
+        request_body_offloaded: req_offloaded,
+    };
+
+    record_completed_session(ctx, detail, Some(capped_req), None);
+}
+
 pub struct SharedProxyContext {
     pub ca: Arc<CertificateAuthority>,
     pub rules: Arc<RuleEngine>,
@@ -90,6 +259,7 @@ pub struct SharedProxyContext {
     pub store: Arc<TrafficStore>,
     pub upstream_client: reqwest::Client,
     pub event_tx: mpsc::UnboundedSender<SessionSummary>,
+    pub removed_tx: mpsc::UnboundedSender<Vec<u64>>,
     pub active_port: AtomicU16,
 }
 
@@ -125,6 +295,7 @@ impl ProxyEngineController {
             .build()?;
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SessionSummary>();
+        let (removed_tx, mut removed_rx) = mpsc::unbounded_channel::<Vec<u64>>();
         let (bp_tx, mut bp_rx) = mpsc::unbounded_channel::<Vec<PausedBreakpointItem>>();
         let breakpoints = Arc::new(BreakpointEngine::new(Some(bp_tx)));
 
@@ -139,6 +310,19 @@ impl ProxyEngineController {
                     maybe_bp = bp_rx.recv() => {
                         if let Some(snapshot) = maybe_bp {
                             let _ = app_handle.emit("proxy://breakpoints-changed", snapshot);
+                        }
+                    }
+                    maybe_removed = removed_rx.recv() => {
+                        if let Some(removed_ids) = maybe_removed {
+                            if !removed_ids.is_empty() {
+                                // Drain any buffered/queued Phase 1 events sent before removal so a
+                                // removed session can never be flushed to the UI after `sessions-removed`.
+                                while let Ok(item) = event_rx.try_recv() {
+                                    buffer.push(item);
+                                }
+                                buffer.retain(|s| !removed_ids.contains(&s.id));
+                                let _ = app_handle.emit("proxy://sessions-removed", removed_ids);
+                            }
                         }
                     }
                     maybe_item = event_rx.recv() => {
@@ -171,6 +355,7 @@ impl ProxyEngineController {
             store,
             upstream_client,
             event_tx,
+            removed_tx,
             active_port: AtomicU16::new(8888),
         });
 
@@ -751,7 +936,66 @@ impl ProxyEngineController {
             builder = builder.body(req_bytes.clone());
         }
 
-        let upstream_resp = builder.send().await?;
+        let in_flight_proto = if scheme == "https" {
+            "HTTPS/2".to_string()
+        } else {
+            "HTTP/1.1".to_string()
+        };
+        let in_flight_tls = if scheme == "https" {
+            Some("TLS 1.3 (Composer)".to_string())
+        } else {
+            None
+        };
+        record_in_flight_session(
+            &self.context,
+            session_id,
+            timestamp.clone(),
+            in_flight_proto.clone(),
+            scheme.clone(),
+            method_str.clone(),
+            host.clone(),
+            path.clone(),
+            full_url.clone(),
+            Some("flux-proxy (Composer)".into()),
+            Some(self_pid),
+            req_mutated,
+            bp_modified,
+            Some("127.0.0.1".into()),
+            "Composer (Local)".into(),
+            in_flight_tls,
+            req_headers.clone(),
+            &req_bytes,
+        );
+
+        let upstream_resp = match builder.send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                record_error_session(
+                    &self.context,
+                    session_id,
+                    in_flight_proto,
+                    &scheme,
+                    &method_str,
+                    &host,
+                    &path,
+                    &full_url,
+                    req_headers,
+                    &req_bytes,
+                    start.elapsed().as_millis() as u64,
+                    timestamp,
+                    Some("flux-proxy (Composer)".into()),
+                    Some(self_pid),
+                    false,
+                    req_mutated,
+                    bp_modified,
+                    Some("127.0.0.1".into()),
+                    "Composer (Local)".into(),
+                    &format!("Upstream connection error: {err}"),
+                );
+                return Err(err.into());
+            }
+        };
+
         let mut status = upstream_resp.status().as_u16();
         let version_str = format_http_version(&scheme, upstream_resp.version());
         let mut resp_headers = extract_reqwest_headers(upstream_resp.headers());
@@ -760,7 +1004,34 @@ impl ProxyEngineController {
             &full_url,
             &mut resp_headers,
         );
-        let mut resp_bytes = upstream_resp.bytes().await?.to_vec();
+        let mut resp_bytes = match upstream_resp.bytes().await {
+            Ok(b) => b.to_vec(),
+            Err(err) => {
+                record_error_session(
+                    &self.context,
+                    session_id,
+                    version_str,
+                    &scheme,
+                    &method_str,
+                    &host,
+                    &path,
+                    &full_url,
+                    req_headers,
+                    &req_bytes,
+                    start.elapsed().as_millis() as u64,
+                    timestamp,
+                    Some("flux-proxy (Composer)".into()),
+                    Some(self_pid),
+                    false,
+                    req_mutated || resp_mutated,
+                    bp_modified,
+                    Some("127.0.0.1".into()),
+                    "Composer (Local)".into(),
+                    &format!("Failed reading upstream response body: {err}"),
+                );
+                return Err(err.into());
+            }
+        };
 
         // Live Breakpoint: After Response (Alt+F11 / `bpafter`)
         if self
@@ -801,6 +1072,28 @@ impl ProxyEngineController {
             match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
                 Ok(Ok(verdict)) => {
                     if verdict.action == BreakpointAction::Abort {
+                        record_error_session(
+                            &self.context,
+                            session_id,
+                            version_str,
+                            &scheme,
+                            &method_str,
+                            &host,
+                            &path,
+                            &full_url,
+                            req_headers,
+                            &req_bytes,
+                            start.elapsed().as_millis() as u64,
+                            timestamp,
+                            Some("flux-proxy (Composer)".into()),
+                            Some(self_pid),
+                            false,
+                            req_mutated || resp_mutated,
+                            true,
+                            Some("127.0.0.1".into()),
+                            "Composer (Local)".into(),
+                            "Response aborted at Live Breakpoint",
+                        );
                         return Err(ProxyError::Custom(
                             "Response aborted at Live Breakpoint".into(),
                         ));
@@ -878,7 +1171,7 @@ impl ProxyEngineController {
         let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
         let (resp_b64, resp_txt, resp_offloaded) = encode_inline_or_offload(capped_resp);
         let detail = SessionDetail {
-            summary: summary.clone(),
+            summary,
             request_headers: req_headers,
             response_headers: resp_headers,
             request_body_base64: req_b64,
@@ -897,11 +1190,13 @@ impl ProxyEngineController {
             request_body_offloaded: req_offloaded,
         };
 
-        self.context
-            .store
-            .insert_with_bodies(detail.clone(), Some(capped_req), Some(capped_resp));
+        let _ = record_completed_session(
+            &self.context,
+            detail.clone(),
+            Some(capped_req),
+            Some(capped_resp),
+        );
         let stored = self.context.store.get(session_id).unwrap_or(detail);
-        let _ = self.context.event_tx.send(summary);
         Ok(stored)
     }
 }
@@ -1544,6 +1839,31 @@ async fn handle_intercepted_request(
     if !body_bytes.is_empty() {
         upstream_req = upstream_req.body(body_bytes.to_vec());
     }
+
+    record_in_flight_session(
+        &ctx,
+        session_id,
+        timestamp.clone(),
+        resolve_protocol_label(&scheme_str, alpn, req_version),
+        scheme_str.clone(),
+        method_str.clone(),
+        host_header.clone(),
+        path_and_query.clone(),
+        full_url.clone(),
+        client_proc.as_ref().map(|p| p.name.clone()),
+        client_proc.as_ref().map(|p| p.pid),
+        req_mutated,
+        bp_modified,
+        Some(normalize_client_ip(client_addr)),
+        client_addr.to_string(),
+        if scheme_str == "https" {
+            Some("TLS 1.3 (MITM)".into())
+        } else {
+            None
+        },
+        req_headers.clone(),
+        &body_bytes,
+    );
 
     let mut upstream_resp = match upstream_req.send().await {
         Ok(r) => r,
@@ -2687,59 +3007,33 @@ fn record_and_return_error(
     breakpoint_modified: bool,
     err_msg: String,
 ) -> Response<ProxyBoxBody> {
-    let summary = SessionSummary {
-        id: session_id,
-        status: 502,
-        protocol: if tls_bypassed {
-            "TLS-BYPASS".into()
-        } else {
-            scheme.to_ascii_uppercase()
-        },
-        scheme: scheme.to_string(),
-        method: method.to_string(),
-        host: host.to_string(),
-        path: path.to_string(),
-        url: url.to_string(),
-        content_type: "text/plain; charset=utf-8".to_string(),
-        body_size: err_msg.len(),
-        duration_ms: start.elapsed().as_millis() as u64,
+    let protocol = if tls_bypassed {
+        "TLS-BYPASS".into()
+    } else {
+        scheme.to_ascii_uppercase()
+    };
+    record_error_session(
+        ctx,
+        session_id,
+        protocol,
+        scheme,
+        method,
+        host,
+        path,
+        url,
+        req_headers,
+        &req_body,
+        start.elapsed().as_millis() as u64,
         timestamp,
-        is_mocked: false,
-        matched_rule_id: None,
-        error: Some(err_msg.clone()),
-        process_name: client_proc.map(|p| p.name.clone()),
-        process_pid: client_proc.map(|p| p.pid),
+        client_proc.map(|p| p.name.clone()),
+        client_proc.map(|p| p.pid),
         tls_bypassed,
-        headers_mutated: false,
-        breakpoint_paused: None,
+        false,
         breakpoint_modified,
-        comment: None,
-        marked_color: None,
-        client_ip: Some(normalize_client_ip(client_addr)),
-    };
-
-    let capped_req = &req_body[..req_body.len().min(MAX_CAPTURED_BODY_BYTES)];
-    let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
-    let detail = SessionDetail {
-        summary: summary.clone(),
-        request_headers: req_headers,
-        response_headers: vec![HeaderPair {
-            name: "Content-Type".into(),
-            value: "text/plain; charset=utf-8".into(),
-        }],
-        request_body_base64: req_b64,
-        response_body_base64: base64::engine::general_purpose::STANDARD.encode(err_msg.as_bytes()),
-        request_body_text: req_txt,
-        response_body_text: Some(err_msg.clone()),
-        tls_version: None,
-        client_addr: client_addr.to_string(),
-        websocket_frames: Vec::new(),
-        sse_events: Vec::new(),
-        body_offloaded: false,
-        request_body_offloaded: req_offloaded,
-    };
-
-    record_completed_session(ctx, detail, Some(capped_req), None);
+        Some(normalize_client_ip(client_addr)),
+        client_addr.to_string(),
+        &err_msg,
+    );
     plain_response(StatusCode::BAD_GATEWAY, &err_msg)
 }
 
@@ -3323,6 +3617,7 @@ mod tests {
         });
         let store = Arc::new(TrafficStore::new(tmp_dir.join("test.sqlite")).unwrap());
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
         let ctx = Arc::new(SharedProxyContext {
             ca,
             rules,
@@ -3331,6 +3626,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             event_tx,
+            removed_tx,
             active_port: AtomicU16::new(0),
         });
 
@@ -3431,6 +3727,7 @@ mod tests {
         });
         let store = Arc::new(TrafficStore::new(tmp_dir.join("bp.sqlite")).unwrap());
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
         let ctx = Arc::new(SharedProxyContext {
             ca,
             rules,
@@ -3439,6 +3736,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             event_tx,
+            removed_tx,
             active_port: AtomicU16::new(0),
         });
 
@@ -3673,6 +3971,7 @@ mod tests {
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("signalr.sqlite")).unwrap());
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
         let ctx = Arc::new(SharedProxyContext {
             ca,
             rules,
@@ -3681,6 +3980,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             event_tx,
+            removed_tx,
             active_port: AtomicU16::new(0),
         });
 
@@ -3810,6 +4110,7 @@ mod tests {
 
         let store = Arc::new(TrafficStore::new(tmp_dir.join("targeted.sqlite")).unwrap());
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
         let ctx = Arc::new(SharedProxyContext {
             ca: ca.clone(),
             rules: rules.clone(),
@@ -3818,6 +4119,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             event_tx,
+            removed_tx,
             active_port: AtomicU16::new(0),
         });
 
@@ -3934,6 +4236,7 @@ mod tests {
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("mobile.sqlite")).unwrap());
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
 
         // Bind on 0.0.0.0:0 ("Allow remote connections / Listen on all network interfaces")
         let proxy_listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
@@ -3947,6 +4250,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             event_tx,
+            removed_tx,
             active_port: AtomicU16::new(bound_port),
         });
 
@@ -4103,6 +4407,7 @@ mod tests {
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("altsvc.sqlite")).unwrap());
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
 
         // Mock rule for HTTPS/2 `https://localhost:9443/...` carrying Alt-Svc & Alternate-Protocol
         rules.upsert_rule(crate::models::AutoResponderRule {
@@ -4143,6 +4448,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             event_tx,
+            removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
         });
 
@@ -4278,6 +4584,7 @@ mod tests {
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("capdrop.sqlite")).unwrap());
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
 
         // Enable `drop_non_matching_on_capture` + hide 304 Not Modified + path filter `/api/*`
         let mut cfg = filters.get_config();
@@ -4300,6 +4607,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             event_tx,
+            removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
         });
 
@@ -4408,9 +4716,248 @@ mod tests {
         assert_eq!(store.len(), 1);
         assert_eq!(store.dropped_sessions_count(), 3);
 
-        let emitted = event_rx.try_recv().expect("matching session emitted");
-        assert_eq!(emitted.path, "/api/orders");
+        let emitted_phase1 = event_rx.try_recv().expect("phase 1 in-flight session emitted");
+        assert_eq!(emitted_phase1.path, "/api/orders");
+        assert_eq!(emitted_phase1.status, 0);
+        let emitted_phase2 = event_rx.try_recv().expect("phase 2 completed session emitted");
+        assert_eq!(emitted_phase2.id, emitted_phase1.id);
+        assert_eq!(emitted_phase2.path, "/api/orders");
+        assert_eq!(emitted_phase2.status, 200);
         assert!(event_rx.try_recv().is_err(), "no dropped session may be emitted");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn two_phase_capture_emits_in_flight_and_updates_or_removes_on_response() {
+        use tokio::sync::Notify;
+
+        // 1. Upstream server with controllable response delay via Notify
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let entered_notify = Arc::new(Notify::new());
+        let release_notify = Arc::new(Notify::new());
+
+        let upstream_entered = entered_notify.clone();
+        let upstream_release = release_notify.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp_stream, _)) = upstream_listener.accept().await else {
+                    break;
+                };
+                let entered = upstream_entered.clone();
+                let release = upstream_release.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let entered = entered.clone();
+                        let release = release.clone();
+                        async move {
+                            let path = req.uri().path().to_string();
+                            let _ = req.into_body().collect().await;
+                            entered.notify_one();
+                            release.notified().await;
+                            if path == "/api/cached-304" {
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(StatusCode::NOT_MODIFIED)
+                                        .body(Full::new(Bytes::new()))
+                                        .unwrap(),
+                                )
+                            } else {
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header(CONTENT_TYPE, "application/json")
+                                        .body(Full::new(Bytes::from_static(b"{\"phase\":2}")))
+                                        .unwrap(),
+                                )
+                            }
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        let tmp_dir =
+            std::env::temp_dir().join(format!("fluxproxy-test-twophase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("twophase.sqlite")).unwrap());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, mut removed_rx) = mpsc::unbounded_channel();
+
+        // Enable `drop_non_matching_on_capture` + `hide_304_not_modified` + matrix include `status == 200`
+        let mut cfg = filters.get_config();
+        cfg.drop_non_matching_on_capture = true;
+        cfg.noise_thresholds.hide_304_not_modified = true;
+        cfg.capture_matrix_enabled = true;
+        cfg.capture_filter_rules = vec![crate::models::CaptureFilterRule {
+            id: "inc-200".into(),
+            enabled: true,
+            action: "include".into(),
+            logical_op: "AND".into(),
+            field: "status".into(),
+            operator: "equals".into(),
+            value: "200".into(),
+        }];
+        filters.update_config(cfg);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            store: store.clone(),
+            upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(proxy_addr.port()),
+        });
+
+        let proxy_ctx = ctx.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await else {
+                    break;
+                };
+                let c = proxy_ctx.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let inner_c = c.clone();
+                        let proc_info = Some(ClientProcessInfo {
+                            pid: 4242,
+                            name: "node.exe".into(),
+                        });
+                        async move {
+                            Ok::<_, Infallible>(
+                                handle_outer_proxy_request(req, client_addr, proc_info, inner_c)
+                                    .await,
+                            )
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, service)
+                        .await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap();
+
+        // Part A: Slow upstream POST -> verify Phase 1 (`status: 0` + request body), annotate, then verify Phase 2 update
+        let url_ok = format!("http://127.0.0.1:{}/api/slow-submit", upstream_addr.port());
+        let client_ok = client.clone();
+        let req_task = tokio::spawn(async move {
+            client_ok
+                .post(url_ok)
+                .header("X-Trace-Id", "two-phase-1")
+                .body("{\"action\":\"create\"}")
+                .send()
+                .await
+                .unwrap()
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), entered_notify.notified())
+            .await
+            .expect("upstream received request headers");
+
+        let phase1 = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("phase 1 event arrives immediately")
+            .expect("phase 1 summary");
+        assert_eq!(phase1.status, 0);
+        assert_eq!(phase1.duration_ms, 0);
+        assert_eq!(phase1.body_size, 0);
+        assert_eq!(phase1.content_type, "");
+
+        let stored_p1 = store.get(phase1.id).expect("in-flight session stored");
+        assert_eq!(stored_p1.summary.status, 0);
+        assert!(stored_p1
+            .request_headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case("x-trace-id") && h.value == "two-phase-1"));
+        assert_eq!(
+            stored_p1.request_body_text.as_deref(),
+            Some("{\"action\":\"create\"}")
+        );
+        assert!(stored_p1.response_headers.is_empty());
+
+        // Annotate while request is still in-flight
+        store
+            .annotate_session(
+                phase1.id,
+                Some("waiting on upstream".into()),
+                Some("amber".into()),
+            )
+            .unwrap();
+
+        // Allow upstream to respond
+        release_notify.notify_one();
+        let resp_ok = req_task.await.unwrap();
+        assert_eq!(resp_ok.status(), StatusCode::OK);
+
+        let phase2 = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("phase 2 event arrives")
+            .expect("phase 2 summary");
+        assert_eq!(phase2.id, phase1.id);
+        assert_eq!(phase2.status, 200);
+        assert!(phase2.body_size > 0);
+        assert_eq!(phase2.comment.as_deref(), Some("waiting on upstream"));
+        assert_eq!(phase2.marked_color.as_deref(), Some("amber"));
+
+        let stored_p2 = store.get(phase1.id).expect("completed session updated in place");
+        assert_eq!(stored_p2.summary.status, 200);
+        assert_eq!(
+            stored_p2.response_body_text.as_deref(),
+            Some("{\"phase\":2}")
+        );
+        assert_eq!(
+            stored_p2.summary.comment.as_deref(),
+            Some("waiting on upstream")
+        );
+        assert_eq!(stored_p2.summary.marked_color.as_deref(), Some("amber"));
+        assert!(removed_rx.try_recv().is_err());
+
+        // Part B: Request that passes Phase 1 (`status: 0`) but gets dropped in Phase 2 (`304 Not Modified`)
+        let url_304 = format!("http://127.0.0.1:{}/api/cached-304", upstream_addr.port());
+        let client_304 = client.clone();
+        let req_304_task = tokio::spawn(async move { client_304.get(url_304).send().await.unwrap() });
+
+        tokio::time::timeout(Duration::from_secs(5), entered_notify.notified())
+            .await
+            .expect("upstream received 304 request");
+
+        let p1_304 = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("phase 1 for 304 arrives before response")
+            .expect("summary");
+        assert_eq!(p1_304.status, 0);
+        assert!(store.get(p1_304.id).is_some());
+
+        release_notify.notify_one();
+        let resp_304 = req_304_task.await.unwrap();
+        assert_eq!(resp_304.status(), StatusCode::NOT_MODIFIED);
+
+        let removed = tokio::time::timeout(Duration::from_secs(2), removed_rx.recv())
+            .await
+            .expect("removed event arrives")
+            .expect("removed ids");
+        assert_eq!(removed, vec![p1_304.id]);
+        assert!(store.get(p1_304.id).is_none());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

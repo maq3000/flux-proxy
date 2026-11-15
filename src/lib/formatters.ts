@@ -31,6 +31,9 @@ export type RowSemanticTone =
  * - Redirects (3xx) -> Amber
  */
 export function getRowSemanticTone(session: SessionSummary): RowSemanticTone {
+  if (session.status === 0 && !session.error && !session.tlsBypassed) {
+    return "default";
+  }
   if (session.error || session.status >= 400) return "error";
   if (
     session.status === 101 ||
@@ -169,6 +172,14 @@ export function buildRawHttpRequest(detail: SessionDetail): string {
 export function buildRawHttpResponse(detail: SessionDetail): string {
   const { summary, responseHeaders, responseBodyText, responseBodyBase64 } =
     detail;
+  if (
+    summary.status === 0 &&
+    !summary.breakpointPaused &&
+    !summary.error &&
+    !summary.tlsBypassed
+  ) {
+    return "# Waiting for upstream response (In-Flight)...\r\n";
+  }
   const httpVer = summary.protocol.includes("2") ? "HTTP/2" : "HTTP/1.1";
   const statusText = statusReasonPhrase(summary.status);
   const headerLines = responseHeaders

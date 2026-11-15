@@ -33,9 +33,11 @@ import {
   encodeTextToBase64,
 } from "./formatters";
 import {
+  buildInFlightSnapshot,
   buildSimulatedSession,
   DEFAULT_AUTORESPONDER_RULES,
   DEFAULT_CLEAR_DB_ON_EXIT,
+  getSimulatedTwoPhaseDelayMs,
   PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
   PREVIEW_SQLITE_ARCHIVE_STORAGE_KEY,
   PREVIEW_SQLITE_COUNT_STORAGE_KEY,
@@ -159,6 +161,7 @@ class BrowserPreviewEngine {
   );
   private pausedBreakpoints = new Map<string, ParkedPreviewEntry>();
   private listeners = new Set<(batch: SessionSummary[]) => void>();
+  private removedListeners = new Set<(ids: number[]) => void>();
   private bpListeners = new Set<(items: PausedBreakpointItem[]) => void>();
   private timer: number | null = null;
 
@@ -295,13 +298,47 @@ class BrowserPreviewEngine {
     }
   }
 
-  private commitCompletedSession(detail: SessionDetail): SessionDetail {
-    if (!evaluateShouldStoreSessionInPreview(detail.summary, this.filterConfig)) {
-      this.store.delete(detail.summary.id);
-      this.droppedSessionsCount += 1;
-      return detail;
+  private mergePreservedAnnotations(detail: SessionDetail): SessionDetail {
+    const existing = this.store.get(detail.summary.id);
+    if (!existing) return detail;
+    return {
+      ...detail,
+      summary: {
+        ...detail.summary,
+        comment: detail.summary.comment ?? existing.summary.comment ?? null,
+        markedColor:
+          detail.summary.markedColor ?? existing.summary.markedColor ?? null,
+      },
+    };
+  }
+
+  private commitInFlightSession(detail: SessionDetail): boolean {
+    const merged = this.mergePreservedAnnotations(detail);
+    const hadExisting = this.store.has(merged.summary.id);
+    if (!evaluateShouldStoreSessionInPreview(merged.summary, this.filterConfig)) {
+      if (hadExisting) {
+        this.store.delete(merged.summary.id);
+        this.emitRemoved([merged.summary.id]);
+      }
+      return false;
     }
-    const stored = this.insertIntoStoreWithRingBuffer(detail);
+    const stored = this.insertIntoStoreWithRingBuffer(merged);
+    this.emitBatch([stored.summary]);
+    return true;
+  }
+
+  private commitCompletedSession(detail: SessionDetail): SessionDetail {
+    const merged = this.mergePreservedAnnotations(detail);
+    const hadExisting = this.store.has(merged.summary.id);
+    if (!evaluateShouldStoreSessionInPreview(merged.summary, this.filterConfig)) {
+      if (hadExisting) {
+        this.store.delete(merged.summary.id);
+        this.emitRemoved([merged.summary.id]);
+      }
+      this.droppedSessionsCount += 1;
+      return merged;
+    }
+    const stored = this.insertIntoStoreWithRingBuffer(merged);
     this.emitBatch([stored.summary]);
     return stored;
   }
@@ -657,6 +694,16 @@ class BrowserPreviewEngine {
       }
     }
 
+    // Two-Phase Capture Phase 1: emit In-Flight session (status: 0) before simulated upstream response arrives
+    if (!detail.summary.tlsBypassed && !detail.summary.isMocked) {
+      const inFlight = buildInFlightSnapshot(detail);
+      inFlight.summary.breakpointModified = bpModified;
+      this.commitInFlightSession(inFlight);
+      await new Promise<void>((resolve) =>
+        window.setTimeout(resolve, getSimulatedTwoPhaseDelayMs(detail))
+      );
+    }
+
     if (
       !detail.summary.tlsBypassed &&
       detail.summary.scheme !== "wss" &&
@@ -795,10 +842,24 @@ class BrowserPreviewEngine {
     }
   }
 
+  private emitRemoved(ids: number[]) {
+    if (ids.length === 0) return;
+    for (const cb of this.removedListeners) {
+      cb(ids);
+    }
+  }
+
   subscribe(cb: (batch: SessionSummary[]) => void): () => void {
     this.listeners.add(cb);
     return () => {
       this.listeners.delete(cb);
+    };
+  }
+
+  subscribeRemoved(cb: (ids: number[]) => void): () => void {
+    this.removedListeners.add(cb);
+    return () => {
+      this.removedListeners.delete(cb);
     };
   }
 
@@ -1421,6 +1482,41 @@ class BrowserPreviewEngine {
         websocketFrames: [],
       };
     } else {
+      this.commitInFlightSession({
+        summary: {
+          id,
+          status: 0,
+          protocol: parsedUrl.protocol === "https:" ? "HTTPS/2" : "HTTP/1.1",
+          scheme: parsedUrl.protocol.replace(":", ""),
+          method: effectiveMethod,
+          host: parsedUrl.host,
+          path: `${parsedUrl.pathname}${parsedUrl.search}`,
+          url: effectiveUrl,
+          contentType: "",
+          bodySize: 0,
+          durationMs: 0,
+          timestamp: new Date().toISOString(),
+          isMocked: false,
+          matchedRuleId: null,
+          error: null,
+          processName: "flux-proxy (Composer)",
+          processPid: 9001,
+          tlsBypassed: false,
+          headersMutated: reqMut.mutated,
+          breakpointPaused: null,
+          breakpointModified: bpModified,
+        },
+        requestHeaders: effectiveReqHeaders,
+        responseHeaders: [],
+        requestBodyBase64: effectiveBody ? encodeTextToBase64(effectiveBody) : "",
+        responseBodyBase64: "",
+        requestBodyText: effectiveBody || null,
+        responseBodyText: null,
+        tlsVersion: parsedUrl.protocol === "https:" ? "TLS 1.3 (Pending)" : "Plaintext",
+        clientAddr: "Composer (Local)",
+        websocketFrames: [],
+      });
+      await new Promise((r) => window.setTimeout(r, 260));
       // Attempt browser CORS fetch; gracefully fall back to synthetic echoed response if CORS blocks
       try {
         const headersInit: Record<string, string> = {};
@@ -1604,9 +1700,8 @@ class BrowserPreviewEngine {
       }
     }
 
-    const storedFinal = this.insertIntoStoreWithRingBuffer(finalDetail);
-    this.emitBatch([storedFinal.summary]);
-    return storedFinal;
+    const storedFinal = this.commitCompletedSession(finalDetail);
+    return storedFinal ?? finalDetail;
   }
 
   exportPreviewSessions(
@@ -2324,6 +2419,19 @@ export const proxyBridge = {
       });
     }
     return previewEngine.subscribe(onBatch);
+  },
+
+  async subscribeSessionsRemoved(
+    onRemoved: (ids: number[]) => void
+  ): Promise<UnlistenFn> {
+    if (isTauriRuntime()) {
+      return listen<number[]>("proxy://sessions-removed", (event) => {
+        if (Array.isArray(event.payload) && event.payload.length > 0) {
+          onRemoved(event.payload);
+        }
+      });
+    }
+    return previewEngine.subscribeRemoved(onRemoved);
   },
 
   async pickSaveFileDialog(options: {

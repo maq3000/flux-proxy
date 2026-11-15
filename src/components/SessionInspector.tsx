@@ -457,8 +457,15 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
   const isImage = isSafeRasterImage || isSvgImage;
   const isReqOffloaded = Boolean(effectiveDetail.requestBodyOffloaded);
   const isRespOffloaded = Boolean(effectiveDetail.bodyOffloaded);
-  const respStatusColor =
-    summary.status >= 500 || summary.status === 502 || summary.status === 504
+  const isInFlightPending =
+    summary.status === 0 &&
+    !summary.breakpointPaused &&
+    !summary.error &&
+    !summary.tlsBypassed;
+
+  const respStatusColor = isInFlightPending
+    ? "animate-pulse text-accent"
+    : summary.status >= 500 || summary.status === 502 || summary.status === 504
       ? "text-status5xx-fg"
       : summary.status >= 400
         ? "text-status4xx-fg"
@@ -634,7 +641,11 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
               </button>
             )}
           <span className="hidden font-mono tabular-nums lg:inline">
-            {formatBytes(summary.bodySize)} • {formatDuration(summary.durationMs)}
+            {isInFlightPending ? (
+              <span className="animate-pulse text-accent">Pending...</span>
+            ) : (
+              `${formatBytes(summary.bodySize)} • ${formatDuration(summary.durationMs)}`
+            )}
           </span>
           {onReplaySession && (
             <button
@@ -998,7 +1009,8 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
               <span
                 className={`mr-1.5 shrink-0 font-mono text-[10px] font-bold uppercase tracking-wider ${respStatusColor}`}
               >
-                Response ({summary.status || "WAIT"})
+                Response (
+                {isInFlightPending ? "Pending..." : summary.status || "WAIT"})
               </span>
               {RESPONSE_TABS.map((t) => {
                 const badge =
@@ -1081,7 +1093,27 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
           </div>
 
           <div className="flex-1 overflow-hidden bg-canvas">
-            {respTab === "headers" && (
+            {isInFlightPending ? (
+              <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">
+                <div className="flex h-9 w-9 items-center justify-center rounded-full bg-accent/10 ring-1 ring-accent/30">
+                  <Loader2
+                    className="h-4 w-4 animate-spin text-accent"
+                    aria-hidden="true"
+                  />
+                </div>
+                <div className="max-w-xs space-y-1">
+                  <div className="text-xs font-semibold text-fg">
+                    Ожидание ответа от сервера (In-Flight)...
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-muted">
+                    Запрос отправлен в upstream. Заголовки и тело ответа появятся
+                    автоматически сразу после получения ответа.
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <>
+                {respTab === "headers" && (
               <KeyValueTable
                 items={effectiveDetail.responseHeaders}
                 emptyLabel="No response headers"
@@ -1268,6 +1300,8 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
               ) : (
                 <HexViewer base64Data={effectiveDetail.responseBodyBase64} />
               ))}
+              </>
+            )}
           </div>
         </Panel>
       </PanelGroup>

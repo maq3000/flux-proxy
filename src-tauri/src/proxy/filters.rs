@@ -155,9 +155,11 @@ impl ProxyFilterEngine {
             return true;
         }
 
+        let is_in_flight = summary.status == 0 && summary.error.is_none() && !summary.tls_bypassed;
+
         // 1. Noise Thresholds
         let th = &guard.config.noise_thresholds;
-        if th.hide_304_not_modified && summary.status == 304 {
+        if !is_in_flight && th.hide_304_not_modified && summary.status == 304 {
             return false;
         }
         if th.hide_options_preflight && summary.method.eq_ignore_ascii_case("OPTIONS") {
@@ -168,26 +170,28 @@ impl ProxyFilterEngine {
         {
             return false;
         }
-        if let Some(min_b) = th.min_body_size_bytes {
-            if summary.body_size < min_b {
+        if !is_in_flight {
+            if let Some(min_b) = th.min_body_size_bytes {
+                if summary.body_size < min_b {
+                    return false;
+                }
+            }
+            if let Some(max_b) = th.max_body_size_bytes {
+                if summary.body_size > max_b {
+                    return false;
+                }
+            }
+            if th.only_slow_requests && summary.duration_ms < th.time_heat_warning_ms {
                 return false;
             }
-        }
-        if let Some(max_b) = th.max_body_size_bytes {
-            if summary.body_size > max_b {
-                return false;
-            }
-        }
-        if th.only_slow_requests && summary.duration_ms < th.time_heat_warning_ms {
-            return false;
         }
         if th.hide_static_assets {
             let ct = summary.content_type.to_ascii_lowercase();
-            if ct.starts_with("image/")
-                || ct.starts_with("font/")
-                || ct.contains("text/css")
-                || guard.static_asset_ext_re.is_match(&summary.path)
-            {
+            let ct_is_static = !is_in_flight
+                && (ct.starts_with("image/")
+                    || ct.starts_with("font/")
+                    || ct.contains("text/css"));
+            if ct_is_static || guard.static_asset_ext_re.is_match(&summary.path) {
                 return false;
             }
         }
@@ -242,21 +246,26 @@ impl ProxyFilterEngine {
                 let is_err = summary.status >= 400 || summary.error.is_some();
                 let cat_ok = match cat_str {
                     "json" => {
-                        !is_err
-                            && !is_ws
-                            && !ct.contains("text/event-stream")
-                            && !ct.starts_with("image/")
-                            && (ct.contains("json")
-                                || ct.contains("graphql")
-                                || ct.contains("grpc")
-                                || ct.contains("protobuf")
-                                || summary.path.starts_with("/api/")
-                                || summary.path.starts_with("/v1/"))
+                        if is_in_flight {
+                            true
+                        } else {
+                            !is_err
+                                && !is_ws
+                                && !ct.contains("text/event-stream")
+                                && !ct.starts_with("image/")
+                                && (ct.contains("json")
+                                    || ct.contains("graphql")
+                                    || ct.contains("grpc")
+                                    || ct.contains("protobuf")
+                                    || summary.path.starts_with("/api/")
+                                    || summary.path.starts_with("/v1/"))
+                        }
                     }
-                    "images" => !is_err && !is_ws && ct.starts_with("image/"),
-                    "sse" => !is_err && !is_ws && ct.contains("text/event-stream"),
+                    "images" => is_in_flight || (!is_err && !is_ws && ct.starts_with("image/")),
+                    "sse" => is_in_flight || (!is_err && !is_ws && ct.contains("text/event-stream")),
                     "xhr" => {
-                        ct.contains("json")
+                        is_in_flight
+                            || ct.contains("json")
                             || ct.contains("xml")
                             || ct.contains("graphql")
                             || ct.contains("grpc")
@@ -264,8 +273,8 @@ impl ProxyFilterEngine {
                             || ct.contains("event-stream")
                     }
                     "ws" => !is_err && is_ws,
-                    "errors" => is_err,
-                    "mocked" => summary.is_mocked || summary.breakpoint_modified,
+                    "errors" => is_in_flight || is_err,
+                    "mocked" => is_in_flight || summary.is_mocked || summary.breakpoint_modified,
                     "marked" => summary.comment.is_some() || summary.marked_color.is_some(),
                     _ => true,
                 };
@@ -304,16 +313,31 @@ impl ProxyFilterEngine {
         let mut explicitly_included = false;
         if guard.config.capture_matrix_enabled {
             if !guard.compiled_capture_matrix.exclude_groups.is_empty()
-                && eval_capture_dnf_groups(summary, &guard.compiled_capture_matrix.exclude_groups)
+                && eval_capture_dnf_groups(
+                    summary,
+                    &guard.compiled_capture_matrix.exclude_groups,
+                    is_in_flight,
+                    true,
+                )
             {
                 return false;
             }
             if !guard.compiled_capture_matrix.include_groups.is_empty() {
-                if !eval_capture_dnf_groups(summary, &guard.compiled_capture_matrix.include_groups)
-                {
+                if !eval_capture_dnf_groups(
+                    summary,
+                    &guard.compiled_capture_matrix.include_groups,
+                    is_in_flight,
+                    false,
+                ) {
                     return false;
                 }
-                explicitly_included = true;
+                explicitly_included = !is_in_flight
+                    || guard.compiled_capture_matrix.include_groups.iter().any(|conj| {
+                        conj.iter().all(|c| eval_capture_condition(summary, c, is_in_flight, false))
+                            && conj
+                                .iter()
+                                .any(|c| !is_response_dependent_capture_field(&c.rule.field))
+                    });
             }
         }
 
@@ -1613,7 +1637,23 @@ fn extract_summary_field_num(s: &SessionSummary, field: &str) -> Option<f64> {
     }
 }
 
-fn eval_capture_condition(s: &SessionSummary, cond: &CompiledCaptureCondition) -> bool {
+fn is_response_dependent_capture_field(field: &str) -> bool {
+    matches!(field, "status" | "contentType" | "bodySize" | "durationMs")
+}
+
+fn eval_capture_condition(
+    s: &SessionSummary,
+    cond: &CompiledCaptureCondition,
+    is_in_flight: bool,
+    is_exclude: bool,
+) -> bool {
+    if is_in_flight && is_response_dependent_capture_field(&cond.rule.field) {
+        // In Phase 1 (in-flight, status == 0), response fields are not yet known:
+        // - Inside exclude groups: return false so we don't prematurely drop the request.
+        // - Inside include groups: return true so we allow the in-flight request until Phase 2 re-evaluates.
+        return !is_exclude;
+    }
+
     let op = cond.rule.operator.as_str();
     if matches!(op, "gt" | "gte" | "lt" | "lte") {
         let (Some(actual), Some(target)) = (
@@ -1669,9 +1709,14 @@ fn eval_capture_condition(s: &SessionSummary, cond: &CompiledCaptureCondition) -
 fn eval_capture_dnf_groups(
     s: &SessionSummary,
     groups: &[Vec<CompiledCaptureCondition>],
+    is_in_flight: bool,
+    is_exclude: bool,
 ) -> bool {
     for conjunction in groups {
-        if conjunction.iter().all(|c| eval_capture_condition(s, c)) {
+        if conjunction
+            .iter()
+            .all(|c| eval_capture_condition(s, c, is_in_flight, is_exclude))
+        {
             return true;
         }
     }
@@ -2154,5 +2199,83 @@ mod tests {
             "api.example.com",
             "ReGeX:^api\\.example\\.com$"
         ));
+    }
+
+    #[test]
+    fn evaluate_should_store_session_defers_response_filters_during_in_flight_phase() {
+        let engine = ProxyFilterEngine::new();
+        let mut cfg = engine.get_config();
+        cfg.drop_non_matching_on_capture = true;
+        cfg.noise_thresholds.only_slow_requests = true;
+        cfg.noise_thresholds.time_heat_warning_ms = 500;
+        cfg.noise_thresholds.min_body_size_bytes = Some(100);
+        cfg.noise_thresholds.max_body_size_bytes = Some(4096);
+        cfg.capture_matrix_enabled = true;
+        cfg.capture_filter_rules = vec![
+            CaptureFilterRule {
+                id: "inc-status".into(),
+                enabled: true,
+                action: "include".into(),
+                logical_op: "AND".into(),
+                field: "status".into(),
+                operator: "equals".into(),
+                value: "200".into(),
+            },
+            CaptureFilterRule {
+                id: "exc-status-204".into(),
+                enabled: true,
+                action: "exclude".into(),
+                logical_op: "AND".into(),
+                field: "status".into(),
+                operator: "equals".into(),
+                value: "204".into(),
+            },
+            CaptureFilterRule {
+                id: "exc-noise-host".into(),
+                enabled: true,
+                action: "exclude".into(),
+                logical_op: "OR".into(),
+                field: "host".into(),
+                operator: "contains".into(),
+                value: "noise.local".into(),
+            },
+        ];
+        engine.update_config(cfg);
+
+        // Phase 1 in-flight API request (status: 0, body_size: 0, duration_ms: 0, content_type: "")
+        // must NOT be dropped by status/bodySize/onlySlowRequests rules.
+        let mut in_flight_api =
+            make_summary_for_filter("POST", "api.example.com", "/v1/orders", 0, Some("node.exe"));
+        in_flight_api.content_type = String::new();
+        in_flight_api.body_size = 0;
+        in_flight_api.duration_ms = 0;
+        assert!(engine.evaluate_should_store_session(&in_flight_api));
+
+        // Phase 1 in-flight request to excluded host MUST still be dropped immediately.
+        let mut in_flight_noise =
+            make_summary_for_filter("GET", "ads.noise.local", "/pixel", 0, Some("chrome.exe"));
+        in_flight_noise.content_type = String::new();
+        in_flight_noise.body_size = 0;
+        in_flight_noise.duration_ms = 0;
+        assert!(!engine.evaluate_should_store_session(&in_flight_noise));
+
+        // Phase 1 in-flight OPTIONS preflight MUST still be dropped if hide_options_preflight is set,
+        // and fast response in Phase 2 fails `only_slow_requests`.
+        let mut fast_200 = in_flight_api.clone();
+        fast_200.status = 200;
+        fast_200.content_type = "application/json".into();
+        fast_200.body_size = 512;
+        fast_200.duration_ms = 40;
+        assert!(!engine.evaluate_should_store_session(&fast_200));
+
+        // Phase 2 slow 200 within body bounds passes everything.
+        let mut slow_200 = fast_200;
+        slow_200.duration_ms = 750;
+        assert!(engine.evaluate_should_store_session(&slow_200));
+
+        // Phase 2 slow 204 fails include(status==200) and matches exclude(status==204).
+        let mut slow_204 = slow_200;
+        slow_204.status = 204;
+        assert!(!engine.evaluate_should_store_session(&slow_204));
     }
 }

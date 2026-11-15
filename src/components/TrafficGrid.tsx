@@ -117,7 +117,11 @@ function getCellSampleText(s: SessionSummary, colId: ColumnId): string {
     case "id":
       return String(s.id);
     case "status":
-      return s.breakpointPaused ? "WAIT" : String(s.status);
+      return s.breakpointPaused
+        ? "WAIT"
+        : s.status === 0 && !s.tlsBypassed && !s.error
+          ? "..."
+          : String(s.status);
     case "method":
       return s.method;
     case "protocol":
@@ -133,9 +137,13 @@ function getCellSampleText(s: SessionSummary, colId: ColumnId): string {
           ? s.clientIp
           : "—";
     case "size":
-      return formatBytes(s.bodySize);
+      return s.status === 0 && !s.breakpointPaused && !s.tlsBypassed && !s.error
+        ? "--"
+        : formatBytes(s.bodySize);
     case "time":
-      return formatDuration(s.durationMs);
+      return s.status === 0 && !s.breakpointPaused && !s.tlsBypassed && !s.error
+        ? "..."
+        : formatDuration(s.durationMs);
     case "comment":
       return s.comment ?? "";
   }
@@ -870,8 +878,15 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
                                 ? "text-muted hover:bg-hover/70 hover:text-fg"
                                 : "text-fg hover:bg-hover/70";
 
+              const isInFlightPending =
+                s.status === 0 &&
+                !s.breakpointPaused &&
+                !s.tlsBypassed &&
+                !s.error;
+
               // Softened HTTP status badge colors:
-              // 2xx muted emerald, 3xx soft sky blue, 4xx pastel amber, 5xx pastel coral, 101 soft lavender
+              // 2xx muted emerald, 3xx soft sky blue, 4xx pastel amber, 5xx pastel coral, 101 soft lavender,
+              // 0 (In-Flight Pending) pulsing accent badge
               const statusBadgeClasses = s.breakpointPaused
                 ? "animate-pulse bg-status4xx-bg text-status4xx-fg ring-1 ring-inset ring-status4xx-fg/40"
                 : s.tlsBypassed
@@ -884,12 +899,16 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
                         ? "bg-statusWs-bg text-statusWs-fg"
                         : s.status >= 300
                           ? "bg-status3xx-bg text-status3xx-fg"
-                          : "bg-status2xx-bg text-status2xx-fg";
+                          : isInFlightPending
+                            ? "animate-pulse bg-elevated text-accent ring-1 ring-inset ring-accent/35"
+                            : "bg-status2xx-bg text-status2xx-fg";
 
               const isCriticalSlow =
+                !isInFlightPending &&
                 thresholds.timeHeatEnabled &&
                 s.durationMs >= thresholds.timeHeatCriticalMs;
               const isWarningSlow =
+                !isInFlightPending &&
                 thresholds.timeHeatEnabled &&
                 !isCriticalSlow &&
                 s.durationMs >= thresholds.timeHeatWarningMs;
@@ -974,9 +993,20 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
                             className="min-w-0 truncate px-2"
                           >
                             <span
+                              title={
+                                s.breakpointPaused
+                                  ? "Запрос/ответ поставлен на Live Breakpoint"
+                                  : isInFlightPending
+                                    ? "Pending (In-Flight) — ожидание ответа от upstream сервера"
+                                    : undefined
+                              }
                               className={`inline-block rounded px-1.5 py-0.2 text-[10px] font-semibold ${statusBadgeClasses}`}
                             >
-                              {s.breakpointPaused ? "WAIT" : s.status}
+                              {s.breakpointPaused
+                                ? "WAIT"
+                                : isInFlightPending
+                                  ? "..."
+                                  : s.status}
                             </span>
                           </span>
                         );
@@ -1134,7 +1164,16 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
                             role="gridcell"
                             className="min-w-0 truncate px-2 text-right text-[11px] text-muted"
                           >
-                            {formatBytes(s.bodySize)}
+                            {isInFlightPending ? (
+                              <span
+                                className="text-subtle"
+                                title="Ожидание ответа..."
+                              >
+                                --
+                              </span>
+                            ) : (
+                              formatBytes(s.bodySize)
+                            )}
                           </span>
                         );
 
@@ -1145,7 +1184,14 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
                             role="gridcell"
                             className="flex min-w-0 items-center justify-end px-2 text-right text-[11px]"
                           >
-                            {isCriticalSlow ? (
+                            {isInFlightPending ? (
+                              <span
+                                className="animate-pulse text-muted"
+                                title="Запрос выполняется (In-Flight)..."
+                              >
+                                ...
+                              </span>
+                            ) : isCriticalSlow ? (
                               <span
                                 title={`Critical Latency (>= ${thresholds.timeHeatCriticalMs} ms)`}
                                 className="inline-flex items-center gap-0.5 rounded bg-status5xx-bg px-1.5 py-0.2 font-semibold text-status5xx-fg"
