@@ -2589,7 +2589,10 @@ fn find_sse_delimiter(slice: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-fn parse_sse_events_from_bytes(buf: &[u8], total_duration_ms: u64) -> Vec<SseEventRecord> {
+pub(crate) fn parse_sse_events_from_bytes(
+    buf: &[u8],
+    total_duration_ms: u64,
+) -> Vec<SseEventRecord> {
     let mut cursor = 0usize;
     let mut out = Vec::new();
     drain_complete_sse_events(buf, &mut cursor, total_duration_ms, &mut out);

@@ -13,12 +13,85 @@ use rcgen::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use sha2::{Digest, Sha256};
-use time::{Duration, OffsetDateTime};
+use time::{Duration, OffsetDateTime, UtcOffset};
 
 use crate::models::{CaCertificateInfo, ProxyError};
 
 pub const ROOT_CA_COMMON_NAME: &str = "FluxProxy Local Debugging Root CA";
 const LINUX_SYSTEM_CA_CERT_PATH: &str = "/usr/local/share/ca-certificates/fluxproxy-root-ca.crt";
+
+fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+fn format_valid_until(dt: OffsetDateTime) -> String {
+    let utc = dt.to_offset(UtcOffset::UTC);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        utc.year(),
+        utc.month() as u8,
+        utc.day(),
+        utc.hour(),
+        utc.minute(),
+        utc.second(),
+    )
+}
+
+fn extract_der_from_pem(pem_str: &str) -> Result<Vec<u8>, ProxyError> {
+    const BEGIN_MARKER: &str = "-----BEGIN CERTIFICATE-----";
+    const END_MARKER: &str = "-----END CERTIFICATE-----";
+
+    let begin_idx = pem_str
+        .find(BEGIN_MARKER)
+        .ok_or_else(|| ProxyError::Custom("Missing BEGIN CERTIFICATE marker in Root CA PEM".into()))?;
+    let after_begin = &pem_str[begin_idx + BEGIN_MARKER.len()..];
+    let end_idx = after_begin
+        .find(END_MARKER)
+        .ok_or_else(|| ProxyError::Custom("Missing END CERTIFICATE marker in Root CA PEM".into()))?;
+
+    let b64_compact: String = after_begin[..end_idx]
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    if b64_compact.is_empty() {
+        return Err(ProxyError::Custom("Empty Root CA certificate PEM block".into()));
+    }
+    base64::engine::general_purpose::STANDARD
+        .decode(b64_compact)
+        .map_err(|e| ProxyError::Custom(format!("Invalid base64 in Root CA PEM: {e}")))
+}
+
+fn encode_der_to_pem(der: &[u8]) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        if let Ok(line) = std::str::from_utf8(chunk) {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push_str("-----END CERTIFICATE-----\n");
+    out
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn cert_file_matches_ca_der(installed_bytes: &[u8], active_ca_der: &[u8]) -> bool {
+    if installed_bytes.is_empty() || active_ca_der.is_empty() {
+        return false;
+    }
+    let active_digest = sha256_digest(active_ca_der);
+    if sha256_digest(installed_bytes) == active_digest {
+        return true;
+    }
+    if let Ok(text) = std::str::from_utf8(installed_bytes) {
+        if let Ok(installed_der) = extract_der_from_pem(text) {
+            return sha256_digest(&installed_der) == active_digest;
+        }
+    }
+    false
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OsCommandSpec {
@@ -117,9 +190,10 @@ impl CertificateAuthority {
         let key_pem_path = ca_dir.join("fluxproxy-root-ca.key");
         let legacy_key_pem_path = ca_dir.join("fluxproxy-root-ca-key.pem");
 
-        let (ca_cert, ca_key, ca_pem, der_bytes) =
-            if cert_pem_path.exists() && (key_pem_path.exists() || legacy_key_pem_path.exists()) {
-                let cert_pem = fs::read_to_string(&cert_pem_path)?;
+        let has_key = key_pem_path.exists() || legacy_key_pem_path.exists();
+
+        let (ca_cert, ca_key, ca_pem, der_bytes, valid_until) =
+            if has_key && (cert_pem_path.exists() || cert_cer_path.exists()) {
                 let key_pem = if key_pem_path.exists() {
                     enforce_private_key_permissions(&key_pem_path)?;
                     if legacy_key_pem_path.exists() {
@@ -133,11 +207,33 @@ impl CertificateAuthority {
                     migrated
                 };
                 let ca_key = KeyPair::from_pem(&key_pem)?;
-                let mut params = CertificateParams::from_ca_cert_pem(&cert_pem)?;
+
+                let (cert_pem, loaded_der, mut params) = if cert_pem_path.exists() {
+                    let pem_text = fs::read_to_string(&cert_pem_path)?;
+                    let parsed_der = extract_der_from_pem(&pem_text)?;
+                    let parsed_params = CertificateParams::from_ca_cert_pem(&pem_text)?;
+                    match fs::read(&cert_cer_path) {
+                        Ok(existing_cer) if existing_cer == parsed_der => {}
+                        _ => {
+                            // Recreate missing or corrupted `.cer` strictly from the loaded CA PEM
+                            fs::write(&cert_cer_path, &parsed_der)?;
+                        }
+                    }
+                    (pem_text, parsed_der, parsed_params)
+                } else {
+                    let existing_der = fs::read(&cert_cer_path)?;
+                    let cert_der_ref = CertificateDer::from(existing_der.as_slice());
+                    let parsed_params = CertificateParams::from_ca_cert_der(&cert_der_ref)?;
+                    let pem_text = encode_der_to_pem(&existing_der);
+                    fs::write(&cert_pem_path, &pem_text)?;
+                    (pem_text, existing_der, parsed_params)
+                };
+
+                let valid_until = format_valid_until(params.not_after);
                 params.use_authority_key_identifier_extension = true;
+                // Construct signer handle only for leaf signing; `cert_pem` & `loaded_der` remain the source of truth
                 let ca_cert = params.self_signed(&ca_key)?;
-                let der = fs::read(&cert_cer_path).unwrap_or_else(|_| ca_cert.der().to_vec());
-                (ca_cert, ca_key, cert_pem, der)
+                (ca_cert, ca_key, cert_pem, loaded_der, valid_until)
             } else {
                 let mut params = CertificateParams::default();
                 params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -158,6 +254,7 @@ impl CertificateAuthority {
                 let now = OffsetDateTime::now_utc();
                 params.not_before = now - Duration::days(1);
                 params.not_after = now + Duration::days(3650);
+                let valid_until = format_valid_until(params.not_after);
 
                 let ca_key = KeyPair::generate()?;
                 let ca_cert = params.self_signed(&ca_key)?;
@@ -168,12 +265,10 @@ impl CertificateAuthority {
                 fs::write(&cert_cer_path, &der_bytes)?;
                 write_private_key_securely(&key_pem_path, &ca_key.serialize_pem())?;
 
-                (ca_cert, ca_key, pem_text, der_bytes)
+                (ca_cert, ca_key, pem_text, der_bytes, valid_until)
             };
 
-        let mut hasher = Sha256::new();
-        hasher.update(&der_bytes);
-        let digest = hex::encode_upper(hasher.finalize());
+        let digest = hex::encode_upper(sha256_digest(&der_bytes));
         let sha256_fingerprint = digest
             .as_bytes()
             .chunks(2)
@@ -192,7 +287,7 @@ impl CertificateAuthority {
             cert_cer_path,
             key_pem_path,
             sha256_fingerprint,
-            valid_until: "10 years (Local Root CA)".to_string(),
+            valid_until,
             leaf_cache,
         })
     }
@@ -240,7 +335,9 @@ impl CertificateAuthority {
 
         #[cfg(target_os = "linux")]
         {
-            Path::new(LINUX_SYSTEM_CA_CERT_PATH).exists()
+            fs::read(LINUX_SYSTEM_CA_CERT_PATH)
+                .map(|bytes| cert_file_matches_ca_der(&bytes, &self.ca_der))
+                .unwrap_or(false)
         }
 
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
@@ -738,5 +835,76 @@ mod tests {
         assert_eq!(calls[1], "update-ca-certificates --fresh");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_preserves_exact_ca_der_rebuilds_corrupted_cer_and_parses_real_valid_until() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxproxy_ca_reload_consistency_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        let ca1 = CertificateAuthority::init_or_load(&dir).expect("init CA");
+        let info1 = ca1.info();
+        assert_ne!(info1.valid_until, "10 years (Local Root CA)");
+        assert!(info1.valid_until.ends_with(" UTC"));
+        let expected_year = (OffsetDateTime::now_utc() + Duration::days(3650))
+            .year()
+            .to_string();
+        assert!(
+            info1.valid_until.starts_with(&expected_year),
+            "expected valid_until year {expected_year}, got {}",
+            info1.valid_until
+        );
+
+        let pem_path = dir.join("ca").join("fluxproxy-root-ca.pem");
+        let cer_path = dir.join("ca").join("fluxproxy-root-ca.cer");
+
+        // Corrupt `.cer` and verify reload repairs it strictly from the persisted `.pem`
+        fs::write(&cer_path, b"corrupted-cer-bytes").expect("corrupt cer");
+        let ca2 = CertificateAuthority::init_or_load(&dir).expect("reload CA with corrupted cer");
+        assert_eq!(ca2.root_ca_der(), ca1.root_ca_der());
+        assert_eq!(ca2.root_ca_pem(), ca1.root_ca_pem());
+        assert_eq!(ca2.info().sha256_fingerprint, info1.sha256_fingerprint);
+        assert_eq!(ca2.info().valid_until, info1.valid_until);
+        assert_eq!(fs::read(&cer_path).unwrap(), ca1.root_ca_der());
+
+        // Delete `.pem` and verify reload recovers `.pem` from `.cer` preserving fingerprint
+        fs::remove_file(&pem_path).expect("remove pem");
+        let ca3 = CertificateAuthority::init_or_load(&dir).expect("reload CA from cer");
+        assert_eq!(ca3.root_ca_der(), ca1.root_ca_der());
+        assert_eq!(ca3.info().sha256_fingerprint, info1.sha256_fingerprint);
+        assert!(pem_path.exists());
+
+        // Minting a leaf cert still succeeds with reloaded CA
+        let _leaf = ca3
+            .server_config_for_host("reloaded.fluxproxy.test")
+            .expect("sign leaf cert after CA reload");
+
+        // Verify Linux trust matcher compares contents/digest rather than mere file existence
+        assert!(cert_file_matches_ca_der(
+            ca1.root_ca_pem().as_bytes(),
+            ca1.root_ca_der()
+        ));
+        assert!(cert_file_matches_ca_der(
+            ca1.root_ca_der(),
+            ca1.root_ca_der()
+        ));
+
+        let other_dir = std::env::temp_dir().join(format!(
+            "fluxproxy_ca_other_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&other_dir);
+        let other_ca = CertificateAuthority::init_or_load(&other_dir).expect("init other CA");
+        assert!(!cert_file_matches_ca_der(
+            other_ca.root_ca_pem().as_bytes(),
+            ca1.root_ca_der()
+        ));
+        assert!(!cert_file_matches_ca_der(b"not a cert", ca1.root_ca_der()));
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&other_dir);
     }
 }

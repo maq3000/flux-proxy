@@ -14,6 +14,18 @@ use crate::models::{
     HeaderPair, ProxyError, SessionDetail, SessionSummary, SseEventRecord, WebSocketFrameRecord,
 };
 
+/// Maximum allowed archive/JSON import file size on disk or in memory (256 MiB).
+pub const MAX_IMPORT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Maximum uncompressed size allowed for a single `.saz` ZIP entry or decompressed wire payload (64 MiB).
+pub const MAX_SAZ_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Maximum cumulative uncompressed bytes across all entries in a `.saz` ZIP archive (512 MiB).
+pub const MAX_SAZ_TOTAL_UNCOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Initial buffer allocation cap when reading an untrusted ZIP entry whose header size could be spoofed.
+const MAX_SAZ_INITIAL_PREALLOC_BYTES: usize = 64 * 1024;
+
 // ============================================================================
 // HAR 1.2 Data Model (W3C / Jan Odvarko Spec + Chrome DevTools Extensions)
 // ============================================================================
@@ -598,6 +610,47 @@ pub fn write_saz_file(path: &Path, sessions: &[SessionDetail]) -> Result<usize, 
     write_saz_to_writer(writer, sessions)
 }
 
+/// Reads a bounded `.saz` entry using `Read::take` with a capped initial buffer allocation
+/// so a malformed/ZIP-bomb archive cannot exhaust RAM or surpass size limits.
+fn read_bounded_saz_entry<R: Read>(
+    entry: &mut R,
+    declared_size: u64,
+    remaining_total: u64,
+    entry_name: &str,
+) -> Result<Vec<u8>, ProxyError> {
+    if declared_size > MAX_SAZ_ENTRY_BYTES {
+        return Err(ProxyError::Custom(format!(
+            "Запись SAZ '{entry_name}' слишком велика ({declared_size} байт > лимит {MAX_SAZ_ENTRY_BYTES} байт)"
+        )));
+    }
+    if declared_size > remaining_total {
+        return Err(ProxyError::Custom(format!(
+            "Суммарный распакованный размер архива SAZ превышает лимит {MAX_SAZ_TOTAL_UNCOMPRESSED_BYTES} байт (на записи '{entry_name}')"
+        )));
+    }
+
+    let read_limit = MAX_SAZ_ENTRY_BYTES.min(remaining_total);
+    let initial_cap = (declared_size as usize).min(MAX_SAZ_INITIAL_PREALLOC_BYTES);
+    let mut buf = Vec::with_capacity(initial_cap);
+
+    entry
+        .take(read_limit.saturating_add(1))
+        .read_to_end(&mut buf)?;
+
+    if (buf.len() as u64) > MAX_SAZ_ENTRY_BYTES {
+        return Err(ProxyError::Custom(format!(
+            "Распакованная запись SAZ '{entry_name}' превышает лимит {MAX_SAZ_ENTRY_BYTES} байт (подозрение на ZIP-бомбу)"
+        )));
+    }
+    if (buf.len() as u64) > remaining_total {
+        return Err(ProxyError::Custom(format!(
+            "Суммарный распакованный размер архива SAZ превышает лимит {MAX_SAZ_TOTAL_UNCOMPRESSED_BYTES} байт (подозрение на ZIP-бомбу)"
+        )));
+    }
+
+    Ok(buf)
+}
+
 /// Reads a Fiddler Classic `.saz` archive from any `Read + Seek` source into `Vec<SessionDetail>`.
 pub fn read_saz_from_reader<R: Read + Seek>(reader: R) -> Result<Vec<SessionDetail>, ProxyError> {
     let mut archive = ZipArchive::new(reader)
@@ -613,6 +666,7 @@ pub fn read_saz_from_reader<R: Read + Seek>(reader: R) -> Result<Vec<SessionDeta
     }
 
     let mut grouped: BTreeMap<(u64, String), RawSazParts> = BTreeMap::new();
+    let mut total_uncompressed_bytes: u64 = 0;
 
     for i in 0..archive.len() {
         let mut entry = archive
@@ -654,8 +708,11 @@ pub fn read_saz_from_reader<R: Read + Seek>(reader: R) -> Result<Vec<SessionDeta
             .or_else(|_| key_str.parse::<u64>())
             .unwrap_or(u64::MAX);
 
-        let mut buf = Vec::with_capacity(entry.size() as usize);
-        entry.read_to_end(&mut buf)?;
+        let remaining_total = MAX_SAZ_TOTAL_UNCOMPRESSED_BYTES.saturating_sub(total_uncompressed_bytes);
+        let declared_size = entry.size();
+        let entry_name = normalized.clone();
+        let buf = read_bounded_saz_entry(&mut entry, declared_size, remaining_total, &entry_name)?;
+        total_uncompressed_bytes = total_uncompressed_bytes.saturating_add(buf.len() as u64);
 
         let slot = grouped
             .entry((numeric_order, key_str.to_string()))
@@ -700,8 +757,16 @@ pub fn read_saz_from_reader<R: Read + Seek>(reader: R) -> Result<Vec<SessionDeta
     Ok(sessions)
 }
 
-/// Reads a Fiddler Classic `.saz` archive from disk.
+/// Validates file size before opening and reads a Fiddler Classic `.saz` archive from disk.
 pub fn read_saz_file(path: &Path) -> Result<Vec<SessionDetail>, ProxyError> {
+    let meta = std::fs::metadata(path)?;
+    if meta.len() > MAX_IMPORT_FILE_BYTES {
+        return Err(ProxyError::Custom(format!(
+            "Размер файла {} ({} байт) превышает допустимый лимит импорта ({MAX_IMPORT_FILE_BYTES} байт)",
+            path.display(),
+            meta.len()
+        )));
+    }
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     read_saz_from_reader(reader)
@@ -792,6 +857,29 @@ pub fn export_sessions_to_path(
     }
 }
 
+/// Reads up to `max_bytes` from `path` after verifying file metadata length to avoid unbounded allocation.
+fn read_bounded_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, ProxyError> {
+    let meta = std::fs::metadata(path)?;
+    if meta.len() > max_bytes {
+        return Err(ProxyError::Custom(format!(
+            "Размер файла {} ({} байт) превышает лимит импорта ({max_bytes} байт)",
+            path.display(),
+            meta.len()
+        )));
+    }
+    let file = File::open(path)?;
+    let initial_cap = (meta.len() as usize).min(1024 * 1024);
+    let mut bytes = Vec::with_capacity(initial_cap);
+    file.take(max_bytes.saturating_add(1)).read_to_end(&mut bytes)?;
+    if (bytes.len() as u64) > max_bytes {
+        return Err(ProxyError::Custom(format!(
+            "Размер файла {} превышает лимит импорта ({max_bytes} байт)",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
 /// Unified importer reading `.saz`, `.har`, or `.json` from disk (auto-detecting ZIP magic & JSON shape).
 pub fn import_sessions_from_path(path: &Path) -> Result<Vec<SessionDetail>, ProxyError> {
     if !path.exists() {
@@ -800,7 +888,7 @@ pub fn import_sessions_from_path(path: &Path) -> Result<Vec<SessionDetail>, Prox
             path.display()
         )));
     }
-    let bytes = std::fs::read(path)?;
+    let bytes = read_bounded_file(path, MAX_IMPORT_FILE_BYTES)?;
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -815,6 +903,12 @@ pub fn import_sessions_from_bytes(
 ) -> Result<Vec<SessionDetail>, ProxyError> {
     if bytes.is_empty() {
         return Err(ProxyError::Custom("Импортируемый файл пуст".into()));
+    }
+    if (bytes.len() as u64) > MAX_IMPORT_FILE_BYTES {
+        return Err(ProxyError::Custom(format!(
+            "Размер файла ({} байт) превышает допустимый лимит импорта ({MAX_IMPORT_FILE_BYTES} байт)",
+            bytes.len()
+        )));
     }
 
     let lower_name = file_name.to_ascii_lowercase();
@@ -1480,7 +1574,7 @@ fn build_raw_http_response_bytes(detail: &SessionDetail) -> Vec<u8> {
     }
 
     let http_version = wire_http_version(&s.protocol);
-    let status = if s.status == 0 { 200 } else { s.status };
+    let status = s.status;
     let reason = canonical_status_reason(status);
     let mut head = format!("{http_version} {status} {reason}\r\n");
 
@@ -1605,6 +1699,11 @@ fn build_saz_metadata_xml(detail: &SessionDetail, sid: usize) -> String {
     if let Some(err) = &s.error {
         flags.push(("x-fluxproxy-error".into(), err.clone()));
     }
+    if !detail.sse_events.is_empty() {
+        if let Ok(sse_json) = serde_json::to_string(&detail.sse_events) {
+            flags.push(("x-fluxproxy-sse-events".into(), sse_json));
+        }
+    }
 
     let mut flags_xml = String::new();
     for (k, v) in flags {
@@ -1698,19 +1797,17 @@ fn parse_saz_metadata_xml(xml: &str) -> ParsedSazMeta {
     }
 
     let mut search_from = 0usize;
-    while let Some(rel_pos) = cleaned[search_from..].find("<SessionFlag") {
-        let abs_start = search_from + rel_pos;
-        let Some(rel_end) = cleaned[abs_start..].find('>') else {
-            break;
-        };
-        let tag_slice = &cleaned[abs_start..=abs_start + rel_end];
+    while let Some((abs_start, abs_end)) =
+        find_xml_tag_fragment_bounds(cleaned, search_from, "SessionFlag")
+    {
+        let tag_slice = &cleaned[abs_start..=abs_end];
         if let (Some(name), Some(val)) = (
             extract_xml_attr(tag_slice, "N"),
             extract_xml_attr(tag_slice, "V"),
         ) {
             meta.flags.insert(name.to_ascii_lowercase(), val);
         }
-        search_from = abs_start + rel_end + 1;
+        search_from = abs_end + 1;
     }
 
     meta
@@ -1728,8 +1825,8 @@ fn build_session_from_saz_parts(
     let (req_start_line, request_headers, raw_req_body) = split_raw_http_message(client_bytes);
     let (resp_status_line, response_headers, raw_resp_body) = split_raw_http_message(server_bytes);
 
-    let decoded_req_body = decode_http_wire_body(raw_req_body, &request_headers);
-    let decoded_resp_body = decode_http_wire_body(raw_resp_body, &response_headers);
+    let decoded_req_body = decode_http_body(raw_req_body, &request_headers);
+    let decoded_resp_body = decode_http_body(raw_resp_body, &response_headers);
 
     let (method, raw_target, req_http_ver) = parse_http_request_line(&req_start_line);
     let (resp_http_ver, status) = parse_http_status_line(&resp_status_line);
@@ -1854,6 +1951,22 @@ fn build_session_from_saz_parts(
     };
 
     let websocket_frames = ws_text.map(parse_saz_websocket_log).unwrap_or_default();
+    let sse_events = meta
+        .flags
+        .get("x-fluxproxy-sse-events")
+        .and_then(|raw| serde_json::from_str::<Vec<SseEventRecord>>(raw).ok())
+        .filter(|events| !events.is_empty())
+        .unwrap_or_else(|| {
+            if content_type
+                .to_ascii_lowercase()
+                .contains("text/event-stream")
+                && !decoded_resp_body.is_empty()
+            {
+                crate::proxy::server::parse_sse_events_from_bytes(&decoded_resp_body, duration_ms)
+            } else {
+                Vec::new()
+            }
+        });
 
     SessionDetail {
         summary: SessionSummary {
@@ -1900,7 +2013,7 @@ fn build_session_from_saz_parts(
         tls_version,
         client_addr,
         websocket_frames,
-        sse_events: Vec::new(),
+        sse_events,
         body_offloaded: false,
         request_body_offloaded: false,
     }
@@ -1944,91 +2057,109 @@ fn split_raw_http_message(raw: &[u8]) -> (String, Vec<HeaderPair>, &[u8]) {
     (start_line, headers, body_bytes)
 }
 
-fn decode_http_wire_body(raw_body: &[u8], headers: &[HeaderPair]) -> Vec<u8> {
+fn decode_http_body(raw_body: &[u8], headers: &[HeaderPair]) -> Vec<u8> {
     if raw_body.is_empty() {
         return Vec::new();
     }
 
-    let is_chunked = find_header_value(headers, "transfer-encoding")
-        .is_some_and(|te| te.to_ascii_lowercase().contains("chunked"));
+    let is_chunked = headers.iter().any(|h| {
+        h.name.eq_ignore_ascii_case("transfer-encoding")
+            && h.value.to_ascii_lowercase().contains("chunked")
+    });
 
     let unchunked = if is_chunked {
-        try_decode_chunked_body(raw_body).unwrap_or_else(|| raw_body.to_vec())
+        decode_chunked(raw_body).unwrap_or_else(|| raw_body.to_vec())
     } else {
         raw_body.to_vec()
     };
 
-    let Some(encoding) = find_header_value(headers, "content-encoding") else {
-        return unchunked;
-    };
+    // HTTP `Content-Encoding` lists transformations in the order applied (`inner, ..., outer`),
+    // so decoding must unwrap from right to left (LIFO stack).
+    let encodings: Vec<String> = headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case("content-encoding"))
+        .flat_map(|h| h.value.split(','))
+        .map(|tok| tok.trim().to_ascii_lowercase())
+        .filter(|tok| !tok.is_empty() && tok != "identity")
+        .collect();
 
-    let enc_lower = encoding.trim().to_ascii_lowercase();
-    if enc_lower.contains("gzip") {
-        if unchunked.len() >= 2 && unchunked[0] == 0x1f && unchunked[1] == 0x8b {
-            let mut out = Vec::new();
-            if GzDecoder::new(unchunked.as_slice())
-                .read_to_end(&mut out)
-                .is_ok()
-            {
-                return out;
-            }
-        }
-    } else if enc_lower == "br" || enc_lower.contains("brotli") {
-        let mut out = Vec::new();
-        if brotli::Decompressor::new(unchunked.as_slice(), 4096)
-            .read_to_end(&mut out)
-            .is_ok()
-        {
-            return out;
-        }
-    } else if enc_lower.contains("deflate") {
-        let mut out = Vec::new();
-        if ZlibDecoder::new(unchunked.as_slice())
-            .read_to_end(&mut out)
-            .is_ok()
-        {
-            return out;
-        }
-        out.clear();
-        if DeflateDecoder::new(unchunked.as_slice())
-            .read_to_end(&mut out)
-            .is_ok()
-        {
-            return out;
-        }
+    if encodings.is_empty() {
+        return unchunked;
     }
 
-    unchunked
+    let mut current = unchunked.clone();
+    for enc in encodings.iter().rev() {
+        let Some(next) = decode_single_content_encoding(&current, enc) else {
+            return unchunked;
+        };
+        current = next;
+    }
+
+    current
 }
 
-fn try_decode_chunked_body(input: &[u8]) -> Option<Vec<u8>> {
+fn read_bounded_decoder_output<R: Read>(decoder: R, max_bytes: u64) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    decoder.take(max_bytes.saturating_add(1)).read_to_end(&mut out).ok()?;
+    if (out.len() as u64) > max_bytes {
+        return None;
+    }
+    Some(out)
+}
+
+fn decode_single_content_encoding(input: &[u8], encoding: &str) -> Option<Vec<u8>> {
+    match encoding {
+        "gzip" | "x-gzip" => {
+            if input.len() >= 2 && input[0] == 0x1f && input[1] == 0x8b {
+                read_bounded_decoder_output(GzDecoder::new(input), MAX_SAZ_ENTRY_BYTES)
+            } else {
+                None
+            }
+        }
+        "br" | "brotli" => read_bounded_decoder_output(
+            brotli::Decompressor::new(input, 4096),
+            MAX_SAZ_ENTRY_BYTES,
+        ),
+        "deflate" | "x-deflate" => {
+            read_bounded_decoder_output(ZlibDecoder::new(input), MAX_SAZ_ENTRY_BYTES).or_else(|| {
+                read_bounded_decoder_output(DeflateDecoder::new(input), MAX_SAZ_ENTRY_BYTES)
+            })
+        }
+        _ => None,
+    }
+}
+
+fn decode_chunked(input: &[u8]) -> Option<Vec<u8>> {
     let mut pos = 0usize;
     let mut out = Vec::new();
     let mut parsed_any_chunk = false;
 
     while pos < input.len() {
         let line_end = find_subslice(&input[pos..], b"\r\n")?;
-        let size_line = std::str::from_utf8(&input[pos..pos + line_end]).ok()?;
+        let line_slice_end = pos.checked_add(line_end)?;
+        let size_line = std::str::from_utf8(&input[pos..line_slice_end]).ok()?;
         let hex_part = size_line.split(';').next()?.trim();
         if hex_part.is_empty() {
             return None;
         }
         let chunk_size = usize::from_str_radix(hex_part, 16).ok()?;
-        pos += line_end + 2;
+        pos = line_slice_end.checked_add(2)?;
 
         if chunk_size == 0 {
             return Some(out);
         }
 
-        if pos + chunk_size > input.len() {
+        let chunk_end = pos.checked_add(chunk_size)?;
+        if chunk_end > input.len() {
             return None;
         }
-        out.extend_from_slice(&input[pos..pos + chunk_size]);
-        pos += chunk_size;
+        out.extend_from_slice(&input[pos..chunk_end]);
+        pos = chunk_end;
         parsed_any_chunk = true;
 
-        if pos + 2 <= input.len() && &input[pos..pos + 2] == b"\r\n" {
-            pos += 2;
+        let after_crlf = pos.checked_add(2)?;
+        if after_crlf <= input.len() && &input[pos..after_crlf] == b"\r\n" {
+            pos = after_crlf;
         } else {
             return None;
         }
@@ -2041,12 +2172,43 @@ fn try_decode_chunked_body(input: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-fn is_matching_compressed_magic(encoding_val: &str, body: &[u8]) -> bool {
-    let lower = encoding_val.to_ascii_lowercase();
-    if lower.contains("gzip") {
-        return body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b;
+fn has_valid_zlib_header(body: &[u8]) -> bool {
+    if body.len() < 2 {
+        return false;
     }
-    false
+    let cmf = body[0];
+    let flg = body[1];
+    (cmf & 0x0f) == 8 && (cmf >> 4) <= 7 && ((u16::from(cmf) << 8) | u16::from(flg)) % 31 == 0
+}
+
+fn is_matching_compressed_magic(encoding_val: &str, body: &[u8]) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    let outer = encoding_val
+        .rsplit(',')
+        .next()
+        .unwrap_or(encoding_val)
+        .trim()
+        .to_ascii_lowercase();
+    match outer.as_str() {
+        "gzip" | "x-gzip" => body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b,
+        "deflate" | "x-deflate" => {
+            if has_valid_zlib_header(body)
+                && read_bounded_decoder_output(ZlibDecoder::new(body), MAX_SAZ_ENTRY_BYTES)
+                    .is_some()
+            {
+                return true;
+            }
+            read_bounded_decoder_output(DeflateDecoder::new(body), MAX_SAZ_ENTRY_BYTES).is_some()
+        }
+        "br" | "brotli" => read_bounded_decoder_output(
+            brotli::Decompressor::new(body, 4096),
+            MAX_SAZ_ENTRY_BYTES,
+        )
+        .is_some(),
+        _ => false,
+    }
 }
 
 fn parse_http_request_line(line: &str) -> (String, String, String) {
@@ -2094,10 +2256,7 @@ fn reconstruct_saz_url(
 
     if let Some((sch, rest)) = raw_target.split_once("://") {
         let scheme = sch.to_ascii_lowercase();
-        let (host, path) = match rest.find('/') {
-            Some(idx) => (rest[..idx].to_string(), rest[idx..].to_string()),
-            None => (rest.to_string(), "/".to_string()),
-        };
+        let (host, path) = parse_authority_and_path(rest);
         let final_host = if !host.is_empty() {
             host
         } else {
@@ -2131,10 +2290,16 @@ fn reconstruct_saz_url(
 fn decode_xml_bytes(buf: &[u8]) -> String {
     if buf.starts_with(&[0xEF, 0xBB, 0xBF]) {
         String::from_utf8_lossy(&buf[3..]).into_owned()
-    } else if buf.len() >= 2 && buf[0] == 0xFF && buf[1] == 0xFE {
+    } else if buf.starts_with(&[0xFF, 0xFE]) {
         let u16s: Vec<u16> = buf[2..]
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&u16s)
+    } else if buf.starts_with(&[0xFE, 0xFF]) {
+        let u16s: Vec<u16> = buf[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
         String::from_utf16_lossy(&u16s)
     } else {
@@ -2170,25 +2335,110 @@ fn xml_unescape(input: &str) -> String {
         .replace("&amp;", "&")
 }
 
-fn extract_xml_tag_fragment<'a>(xml: &'a str, tag_name: &str) -> Option<&'a str> {
+fn is_xml_tag_name_delimiter(b: u8) -> bool {
+    b.is_ascii_whitespace() || b == b'/' || b == b'>'
+}
+
+fn find_xml_tag_end_respecting_quotes(s: &str) -> Option<usize> {
+    let mut in_quote: Option<char> = None;
+    for (idx, ch) in s.char_indices() {
+        match in_quote {
+            Some(q) if ch == q => in_quote = None,
+            Some(_) => {}
+            None if ch == '"' || ch == '\'' => in_quote = Some(ch),
+            None if ch == '>' => return Some(idx),
+            None => {}
+        }
+    }
+    None
+}
+
+fn find_xml_tag_fragment_bounds(
+    xml: &str,
+    mut search_from: usize,
+    tag_name: &str,
+) -> Option<(usize, usize)> {
     let needle = format!("<{tag_name}");
-    let start = xml.find(&needle)?;
-    let end = xml[start..].find('>')?;
-    Some(&xml[start..=start + end])
+    while search_from < xml.len() {
+        let rel_start = xml[search_from..].find(&needle)?;
+        let abs_start = search_from + rel_start;
+        let after_name = abs_start + needle.len();
+        if let Some(&delim) = xml.as_bytes().get(after_name) {
+            if is_xml_tag_name_delimiter(delim) {
+                let rel_end = find_xml_tag_end_respecting_quotes(&xml[abs_start..])?;
+                return Some((abs_start, abs_start + rel_end));
+            }
+        }
+        search_from = after_name;
+    }
+    None
+}
+
+fn extract_xml_tag_fragment<'a>(xml: &'a str, tag_name: &str) -> Option<&'a str> {
+    let (start, end) = find_xml_tag_fragment_bounds(xml, 0, tag_name)?;
+    Some(&xml[start..=end])
 }
 
 fn extract_xml_attr(tag: &str, attr_name: &str) -> Option<String> {
-    let double_pat = format!("{attr_name}=\"");
-    if let Some(idx) = tag.find(&double_pat) {
-        let val_start = idx + double_pat.len();
-        let val_end = tag[val_start..].find('"')?;
-        return Some(xml_unescape(&tag[val_start..val_start + val_end]));
+    let bytes = tag.as_bytes();
+    let mut i = 0usize;
+    let mut in_quote: Option<u8> = None;
+
+    // Skip tag name after leading `<tagName`
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
+        i += 1;
     }
-    let single_pat = format!("{attr_name}='");
-    if let Some(idx) = tag.find(&single_pat) {
-        let val_start = idx + single_pat.len();
-        let val_end = tag[val_start..].find('\'')?;
-        return Some(xml_unescape(&tag[val_start..val_start + val_end]));
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_quote {
+            if b == q {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+            i += 1;
+            continue;
+        }
+        if b.is_ascii_whitespace() || b == b'/' || b == b'>' {
+            i += 1;
+            continue;
+        }
+
+        // Scan attribute name
+        let name_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'>'
+            && bytes[i] != b'/'
+        {
+            i += 1;
+        }
+        let name = &tag[name_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let q = bytes[i];
+                let val_start = i + 1;
+                let rel_end = tag.as_bytes()[val_start..].iter().position(|&c| c == q)?;
+                let val_end = val_start + rel_end;
+                if name == attr_name {
+                    return Some(xml_unescape(&tag[val_start..val_end]));
+                }
+                i = val_end + 1;
+                continue;
+            }
+        }
     }
     None
 }
@@ -2385,22 +2635,30 @@ fn ensure_valid_har_url(url: &str, scheme: &str, host: &str, path: &str) -> Stri
     format!("{sch}://{h}{p}")
 }
 
+fn parse_authority_and_path(rest: &str) -> (String, String) {
+    let (authority, path) = match rest.find(['/', '?']) {
+        Some(idx) => {
+            let p = &rest[idx..];
+            let normalized_path = if p.starts_with('?') {
+                format!("/{p}")
+            } else {
+                p.to_string()
+            };
+            (&rest[..idx], normalized_path)
+        }
+        None => (rest, "/".to_string()),
+    };
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_part)| host_part)
+        .to_string();
+    (host, path)
+}
+
 fn split_url_components(url: &str, headers: &[HeaderPair]) -> (String, String, String) {
     if let Some((sch, rest)) = url.split_once("://") {
         let scheme = sch.to_ascii_lowercase();
-        let after_auth = rest.rsplit_once('@').map_or(rest, |(_, host_part)| host_part);
-        let (host, path) = match after_auth.find(['/', '?']) {
-            Some(idx) => {
-                let p = &after_auth[idx..];
-                let normalized_path = if p.starts_with('?') {
-                    format!("/{p}")
-                } else {
-                    p.to_string()
-                };
-                (after_auth[..idx].to_string(), normalized_path)
-            }
-            None => (after_auth.to_string(), "/".to_string()),
-        };
+        let (host, path) = parse_authority_and_path(rest);
         return (scheme, host, path);
     }
 
@@ -2409,6 +2667,8 @@ fn split_url_components(url: &str, headers: &[HeaderPair]) -> (String, String, S
         .to_string();
     let path = if url.starts_with('/') {
         url.to_string()
+    } else if url.starts_with('?') {
+        format!("/{url}")
     } else if url.is_empty() {
         "/".to_string()
     } else {
@@ -2646,7 +2906,7 @@ fn infer_devtools_resource_type(protocol: &str, scheme: &str, mime: &str) -> Str
 
 fn canonical_status_reason(status: u16) -> &'static str {
     match status {
-        0 => "",
+        0 => "No Response",
         100 => "Continue",
         101 => "Switching Protocols",
         200 => "OK",
@@ -3086,5 +3346,163 @@ mod tests {
         let resp_head = resp_raw.split("\r\n\r\n").next().unwrap();
         assert!(!resp_head.contains('\0'));
         assert!(!resp_head.contains("\r\nSet-Cookie:"));
+    }
+
+    #[test]
+    fn rejects_saz_zip_bomb_entry_and_oversized_limits() {
+        // 1. Spoofed declared_size > MAX_SAZ_ENTRY_BYTES rejected before full allocation
+        let tiny_data = b"hello";
+        let mut cursor = Cursor::new(tiny_data);
+        let err = read_bounded_saz_entry(
+            &mut cursor,
+            MAX_SAZ_ENTRY_BYTES + 1,
+            MAX_SAZ_TOTAL_UNCOMPRESSED_BYTES,
+            "raw/0001_s.txt",
+        )
+        .expect_err("must reject oversized entry");
+        assert!(err.to_string().contains("слишком велика"));
+
+        // 2. Spoofed small declared_size (0), actual uncompressed stream exceeds remaining_total
+        let actual_data = vec![b'A'; 1024];
+        let mut cursor2 = Cursor::new(&actual_data);
+        let err2 = read_bounded_saz_entry(&mut cursor2, 0, 512, "raw/0002_s.txt")
+            .expect_err("must reject uncompressed zip-bomb stream exceeding total cap");
+        assert!(err2.to_string().contains("ZIP-бомбу"));
+
+        // 3. Within limits succeeds cleanly
+        let mut cursor3 = Cursor::new(&actual_data);
+        let ok = read_bounded_saz_entry(
+            &mut cursor3,
+            actual_data.len() as u64,
+            MAX_SAZ_TOTAL_UNCOMPRESSED_BYTES,
+            "raw/0003_s.txt",
+        )
+        .expect("within limits");
+        assert_eq!(ok.len(), 1024);
+    }
+
+    #[test]
+    fn decode_chunked_uses_checked_arithmetic_and_rejects_overflow() {
+        let huge_hex = format!("{:x}\r\nabc\r\n0\r\n\r\n", usize::MAX);
+        assert!(decode_chunked(huge_hex.as_bytes()).is_none());
+
+        let near_max = format!("{:x}\r\nabc\r\n0\r\n\r\n", usize::MAX - 2);
+        assert!(decode_chunked(near_max.as_bytes()).is_none());
+
+        let valid = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(decode_chunked(valid).as_deref(), Some(b"hello world".as_slice()));
+    }
+
+    #[test]
+    fn decodes_utf16be_xml_and_handles_tag_delimiters_and_quoted_gt() {
+        let xml = r#"<?xml version="1.0" encoding="utf-16"?><Root><SessionTimers ClientConnected="2026-11-09T08:00:00Z" /><Session SID="1" BitFlags="1" Note="a > b"><SessionFlags><SessionFlag N="ui-comments" V="x > y &amp; N='fake'" /></SessionFlags></Session></Root>"#;
+        let mut utf16be = vec![0xFEu8, 0xFFu8];
+        for code_unit in xml.encode_utf16() {
+            utf16be.extend_from_slice(&code_unit.to_be_bytes());
+        }
+        let decoded = decode_xml_bytes(&utf16be);
+        assert_eq!(decoded, xml);
+
+        // Must match `<Session ...>`, not `<SessionTimers ...>`
+        let session_frag = extract_xml_tag_fragment(&decoded, "Session").unwrap();
+        assert!(session_frag.starts_with("<Session "));
+        assert!(session_frag.ends_with("Note=\"a > b\">"));
+        assert_eq!(extract_xml_attr(session_frag, "BitFlags").as_deref(), Some("1"));
+
+        let meta = parse_saz_metadata_xml(&decoded);
+        assert_eq!(meta.bit_flags, 1);
+        assert_eq!(
+            meta.flags.get("ui-comments").map(String::as_str),
+            Some("x > y & N='fake'")
+        );
+    }
+
+    #[test]
+    fn unifies_url_parsing_with_query_without_slash_and_at_signs() {
+        let headers = vec![HeaderPair {
+            name: "Host".into(),
+            value: "fallback.local".into(),
+        }];
+
+        let (sch1, host1, path1) =
+            split_url_components("http://user:p@ss@api.example.com:8080?a=1&b=2", &headers);
+        assert_eq!(sch1, "http");
+        assert_eq!(host1, "api.example.com:8080");
+        assert_eq!(path1, "/?a=1&b=2");
+
+        let (sch2, host2, path2, url2) = reconstruct_saz_url(
+            "GET",
+            "http://user:p@ss@api.example.com:8080?a=1&b=2",
+            "http",
+            &headers,
+        );
+        assert_eq!((sch2, host2, path2), (sch1, host1, path1));
+        assert_eq!(url2, "http://api.example.com:8080/?a=1&b=2");
+
+        // Ensure `@` inside path does not strip host as userinfo
+        let (_, host3, path3) =
+            split_url_components("https://api.example.com/users/@alice?tab=1", &headers);
+        assert_eq!(host3, "api.example.com");
+        assert_eq!(path3, "/users/@alice?tab=1");
+    }
+
+    #[test]
+    fn decodes_stacked_content_encoding_right_to_left_and_matches_br_deflate_magic() {
+        let plain = br#"{"stacked":true,"message":"gzip inside brotli"}"#;
+
+        // Inner layer: gzip
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(plain).unwrap();
+        let gzipped = gz.finish().unwrap();
+
+        // Outer layer: brotli
+        let mut br_out = Vec::new();
+        {
+            let mut br_enc = brotli::CompressorWriter::new(&mut br_out, 4096, 5, 22);
+            br_enc.write_all(&gzipped).unwrap();
+        }
+
+        let headers = vec![HeaderPair {
+            name: "Content-Encoding".into(),
+            value: "gzip, br".into(),
+        }];
+        let decoded = decode_http_body(&br_out, &headers);
+        assert_eq!(decoded, plain);
+
+        // `is_matching_compressed_magic` must detect genuine brotli and deflate, and reject plain text
+        assert!(is_matching_compressed_magic("br", &br_out));
+        assert!(!is_matching_compressed_magic("br", plain));
+
+        let mut deflate_enc = flate2::write::ZlibEncoder::new(Vec::new(), Compression::default());
+        deflate_enc.write_all(plain).unwrap();
+        let deflated = deflate_enc.finish().unwrap();
+        assert!(is_matching_compressed_magic("deflate", &deflated));
+        assert!(!is_matching_compressed_magic("deflate", plain));
+    }
+
+    #[test]
+    fn preserves_status_zero_and_sse_events_across_saz_roundtrip() {
+        let mut sessions = sample_sessions();
+        sessions[0].summary.status = 0;
+        sessions[0].sse_events = vec![SseEventRecord {
+            index: 1,
+            id: Some("evt-1".into()),
+            event: "token".into(),
+            data: "{\"delta\":\"hi\"}".into(),
+            retry: None,
+            byte_length: 14,
+            offset_ms: 12,
+            timestamp: "2026-11-09T09:15:30.262Z".into(),
+        }];
+
+        let mut cursor = Cursor::new(Vec::new());
+        write_saz_to_writer(&mut cursor, &sessions).expect("write SAZ");
+        cursor.set_position(0);
+        let imported = read_saz_from_reader(cursor).expect("read SAZ");
+
+        assert_eq!(imported[0].summary.status, 0);
+        assert_eq!(imported[0].sse_events.len(), 1);
+        assert_eq!(imported[0].sse_events[0].id.as_deref(), Some("evt-1"));
+        assert_eq!(imported[0].sse_events[0].event, "token");
     }
 }

@@ -1,6 +1,7 @@
 pub mod export_import;
 pub mod sqlite;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -105,71 +106,99 @@ impl TrafficStore {
         raw_resp_body: Option<&[u8]>,
     ) {
         let id = detail.summary.id;
-        // Preserve user annotations (`comment` / `marked_color`) when an active stream or breakpoint updates in-place
-        if let Some(existing) = self.sessions.get(&id) {
-            if detail.summary.comment.is_none() && existing.summary.comment.is_some() {
-                detail.summary.comment = existing.summary.comment.clone();
-            }
-            if detail.summary.marked_color.is_none() && existing.summary.marked_color.is_some() {
-                detail.summary.marked_color = existing.summary.marked_color.clone();
-            }
-        }
 
-        // Offload heavy response body (> 2 MiB) to SQLite to prevent heap bloat / OOM
+        // Offload heavy response body (> 2 MiB) to SQLite to prevent heap bloat / OOM.
+        // Note: re-offload even when `detail.body_offloaded` is already true (e.g. growing SSE streams).
         if let Some(resp_bytes) = raw_resp_body {
-            if resp_bytes.len() > BODY_OFFLOAD_THRESHOLD_BYTES
-                && self.sqlite.save_offloaded_body(id, true, resp_bytes).is_ok()
-            {
-                detail.body_offloaded = true;
-                detail.summary.body_size = detail.summary.body_size.max(resp_bytes.len());
-                detail.response_body_base64 = String::new();
-                detail.response_body_text = None;
+            if resp_bytes.len() > BODY_OFFLOAD_THRESHOLD_BYTES {
+                match self.sqlite.save_offloaded_body(id, true, resp_bytes) {
+                    Ok(()) => {
+                        detail.body_offloaded = true;
+                        detail.summary.body_size = detail.summary.body_size.max(resp_bytes.len());
+                        detail.response_body_base64 = String::new();
+                        detail.response_body_text = None;
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            "Failed to offload response body for session #{id}: {err}"
+                        );
+                        eprintln!("Failed to offload response body for session #{id}: {err}");
+                    }
+                }
             }
-        } else if !detail.body_offloaded {
-            if let Some(decoded_resp) = extract_heavy_payload_bytes(
-                &detail.response_body_base64,
-                detail.response_body_text.as_deref(),
-            ) {
-                if self
-                    .sqlite
-                    .save_offloaded_body(id, true, &decoded_resp)
-                    .is_ok()
-                {
+        } else if let Some(decoded_resp) = extract_heavy_payload_bytes(
+            &detail.response_body_base64,
+            detail.response_body_text.as_deref(),
+        ) {
+            match self.sqlite.save_offloaded_body(id, true, &decoded_resp) {
+                Ok(()) => {
                     detail.body_offloaded = true;
                     detail.summary.body_size = detail.summary.body_size.max(decoded_resp.len());
                     detail.response_body_base64 = String::new();
                     detail.response_body_text = None;
                 }
-            }
-        }
-
-        // Offload heavy request body (> 2 MiB) to SQLite as well
-        if let Some(req_bytes) = raw_req_body {
-            if req_bytes.len() > BODY_OFFLOAD_THRESHOLD_BYTES
-                && self.sqlite.save_offloaded_body(id, false, req_bytes).is_ok()
-            {
-                detail.request_body_offloaded = true;
-                detail.request_body_base64 = String::new();
-                detail.request_body_text = None;
-            }
-        } else if !detail.request_body_offloaded {
-            if let Some(decoded_req) = extract_heavy_payload_bytes(
-                &detail.request_body_base64,
-                detail.request_body_text.as_deref(),
-            ) {
-                if self
-                    .sqlite
-                    .save_offloaded_body(id, false, &decoded_req)
-                    .is_ok()
-                {
-                    detail.request_body_offloaded = true;
-                    detail.request_body_base64 = String::new();
-                    detail.request_body_text = None;
+                Err(err) => {
+                    tracing::error!(
+                        "Failed to offload response body for session #{id}: {err}"
+                    );
+                    eprintln!("Failed to offload response body for session #{id}: {err}");
                 }
             }
         }
 
-        self.sessions.insert(id, Arc::new(detail));
+        // Offload heavy request body (> 2 MiB) to SQLite as well.
+        if let Some(req_bytes) = raw_req_body {
+            if req_bytes.len() > BODY_OFFLOAD_THRESHOLD_BYTES {
+                match self.sqlite.save_offloaded_body(id, false, req_bytes) {
+                    Ok(()) => {
+                        detail.request_body_offloaded = true;
+                        detail.request_body_base64 = String::new();
+                        detail.request_body_text = None;
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            "Failed to offload request body for session #{id}: {err}"
+                        );
+                        eprintln!("Failed to offload request body for session #{id}: {err}");
+                    }
+                }
+            }
+        } else if let Some(decoded_req) = extract_heavy_payload_bytes(
+            &detail.request_body_base64,
+            detail.request_body_text.as_deref(),
+        ) {
+            match self.sqlite.save_offloaded_body(id, false, &decoded_req) {
+                Ok(()) => {
+                    detail.request_body_offloaded = true;
+                    detail.request_body_base64 = String::new();
+                    detail.request_body_text = None;
+                }
+                Err(err) => {
+                    tracing::error!(
+                        "Failed to offload request body for session #{id}: {err}"
+                    );
+                    eprintln!("Failed to offload request body for session #{id}: {err}");
+                }
+            }
+        }
+
+        // Preserve user annotations (`comment` / `marked_color`) atomically under the DashMap shard lock
+        match self.sessions.entry(id) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                let existing = occupied.get();
+                if detail.summary.comment.is_none() && existing.summary.comment.is_some() {
+                    detail.summary.comment = existing.summary.comment.clone();
+                }
+                if detail.summary.marked_color.is_none() && existing.summary.marked_color.is_some()
+                {
+                    detail.summary.marked_color = existing.summary.marked_color.clone();
+                }
+                occupied.insert(Arc::new(detail));
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(Arc::new(detail));
+            }
+        }
 
         if let Some(limit) = self.retention_limit() {
             if self.sessions.len() > limit {
@@ -208,7 +237,16 @@ impl TrafficStore {
         }
 
         if !evicted_batch.is_empty() {
-            let _ = self.sqlite.persist_batch(&evicted_batch);
+            if let Err(err) = self.sqlite.persist_batch(&evicted_batch) {
+                tracing::error!(
+                    "Failed to persist {} evicted sessions to SQLite: {err}",
+                    evicted_batch.len()
+                );
+                eprintln!(
+                    "Failed to persist {} evicted sessions to SQLite: {err}",
+                    evicted_batch.len()
+                );
+            }
         }
     }
 
@@ -230,10 +268,7 @@ impl TrafficStore {
             });
         }
 
-        let maybe_detail = match self.get(id) {
-            Some(d) => Some(d),
-            None => self.sqlite.load_session_by_id(id)?,
-        };
+        let maybe_detail = self.get_from_ram_or_sqlite(id)?;
 
         if let Some(detail) = maybe_detail {
             let (body_base64, body_text) = if is_response {
@@ -268,12 +303,12 @@ impl TrafficStore {
         )))
     }
 
-    pub fn update_annotations(
+    pub fn annotate_session(
         &self,
-        ids: &[u64],
+        id: u64,
         comment: Option<String>,
         marked_color: Option<String>,
-    ) -> Result<Vec<SessionSummary>, ProxyError> {
+    ) -> Result<Option<SessionSummary>, ProxyError> {
         let clean_comment = comment
             .map(|c| c.trim().to_string())
             .filter(|c| !c.is_empty());
@@ -281,28 +316,79 @@ impl TrafficStore {
             .map(|c| c.trim().to_string())
             .filter(|c| !c.is_empty());
 
+        if let Some(mut entry) = self.sessions.get_mut(&id) {
+            let detail_mut = Arc::make_mut(entry.value_mut());
+            detail_mut.summary.comment = clean_comment;
+            detail_mut.summary.marked_color = clean_color;
+            let snapshot = detail_mut.clone();
+            let summary = detail_mut.summary.clone();
+            drop(entry);
+
+            let _ = self.sqlite.sync_session_if_archived(&snapshot)?;
+            return Ok(Some(summary));
+        }
+
+        // Coordinate with eviction so an in-flight spill to `captured_sessions` cannot race.
+        let _guard = match self.eviction_lock.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if let Some(mut entry) = self.sessions.get_mut(&id) {
+            let detail_mut = Arc::make_mut(entry.value_mut());
+            detail_mut.summary.comment = clean_comment;
+            detail_mut.summary.marked_color = clean_color;
+            let snapshot = detail_mut.clone();
+            let summary = detail_mut.summary.clone();
+            drop(entry);
+
+            let _ = self.sqlite.sync_session_if_archived(&snapshot)?;
+            return Ok(Some(summary));
+        }
+
+        self.sqlite
+            .update_session_annotations(id, clean_comment, clean_color)
+    }
+
+    pub fn update_annotations(
+        &self,
+        ids: &[u64],
+        comment: Option<String>,
+        marked_color: Option<String>,
+    ) -> Result<Vec<SessionSummary>, ProxyError> {
+        let mut seen = HashSet::with_capacity(ids.len());
         let mut updated_summaries = Vec::with_capacity(ids.len());
 
         for &id in ids {
-            let maybe_next = self.sessions.get(&id).map(|entry| {
-                let mut cloned = (**entry).clone();
-                cloned.summary.comment = clean_comment.clone();
-                cloned.summary.marked_color = clean_color.clone();
-                cloned
-            });
-
-            if let Some(next_detail) = maybe_next {
-                let _ = self.sqlite.sync_session_if_archived(&next_detail)?;
-                updated_summaries.push(next_detail.summary.clone());
-                self.sessions.insert(id, Arc::new(next_detail));
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(summary) =
+                self.annotate_session(id, comment.clone(), marked_color.clone())?
+            {
+                updated_summaries.push(summary);
             }
         }
 
         Ok(updated_summaries)
     }
 
+    fn get_from_ram_or_sqlite(&self, id: u64) -> Result<Option<SessionDetail>, ProxyError> {
+        if let Some(entry) = self.sessions.get(&id) {
+            return Ok(Some((**entry).clone()));
+        }
+        self.sqlite.load_session_by_id(id)
+    }
+
     pub fn get(&self, id: u64) -> Option<SessionDetail> {
-        self.sessions.get(&id).map(|entry| (**entry).clone())
+        match self.get_from_ram_or_sqlite(id) {
+            Ok(opt) => opt,
+            Err(err) => {
+                tracing::warn!("Failed to load session #{id} from SQLite: {err}");
+                eprintln!("Failed to load session #{id} from SQLite: {err}");
+                None
+            }
+        }
     }
 
     pub fn get_archived(&self, id: u64) -> Result<Option<SessionDetail>, ProxyError> {
@@ -329,7 +415,10 @@ impl TrafficStore {
 
     pub fn clear(&self) {
         self.sessions.clear();
-        let _ = self.sqlite.delete_unarchived_offloaded_bodies();
+        if let Err(err) = self.sqlite.delete_unarchived_offloaded_bodies() {
+            tracing::error!("Failed to delete unarchived offloaded bodies on clear: {err}");
+            eprintln!("Failed to delete unarchived offloaded bodies on clear: {err}");
+        }
     }
 
     pub fn remove_many(&self, ids: &[u64]) -> usize {
@@ -339,7 +428,10 @@ impl TrafficStore {
                 removed += 1;
             }
         }
-        let _ = self.sqlite.delete_many(ids);
+        if let Err(err) = self.sqlite.delete_many(ids) {
+            tracing::error!("Failed to delete sessions from SQLite: {err}");
+            eprintln!("Failed to delete sessions from SQLite: {err}");
+        }
         removed
     }
 
@@ -356,16 +448,14 @@ impl TrafficStore {
     pub fn load_from_sqlite(&self) -> Result<Vec<SessionSummary>, ProxyError> {
         let fetch_cap = self.retention_limit().unwrap_or(DEFAULT_SESSION_RETENTION_LIMIT);
         let loaded = self.sqlite.load_recent(fetch_cap)?;
-        let mut max_id = self.next_id.load(Ordering::Relaxed);
+        let mut max_id = 1u64;
 
         for detail in loaded {
-            if detail.summary.id >= max_id {
-                max_id = detail.summary.id + 1;
-            }
+            max_id = max_id.max(detail.summary.id.saturating_add(1));
             self.sessions.insert(detail.summary.id, Arc::new(detail));
         }
 
-        self.next_id.store(max_id, Ordering::Relaxed);
+        self.next_id.fetch_max(max_id, Ordering::SeqCst);
         self.enforce_retention_limit();
         Ok(self.list_summaries())
     }
@@ -373,10 +463,7 @@ impl TrafficStore {
     /// Loads a `SessionDetail` from RAM or SQLite archive and hydrates any heavy (> 2 MiB)
     /// offloaded request/response bodies so archive exports (`HAR 1.2` / `SAZ`) are complete.
     pub fn get_hydrated(&self, id: u64) -> Result<Option<SessionDetail>, ProxyError> {
-        let Some(mut detail) = (match self.get(id) {
-            Some(d) => Some(d),
-            None => self.sqlite.load_session_by_id(id)?,
-        }) else {
+        let Some(mut detail) = self.get_from_ram_or_sqlite(id)? else {
             return Ok(None);
         };
 
@@ -437,10 +524,7 @@ impl TrafficStore {
             return Ok(raw_bytes);
         }
 
-        let maybe_detail = match self.get(id) {
-            Some(d) => Some(d),
-            None => self.sqlite.load_session_by_id(id)?,
-        };
+        let maybe_detail = self.get_from_ram_or_sqlite(id)?;
 
         if let Some(detail) = maybe_detail {
             return Ok(export_import::decode_detail_body_bytes(&detail, is_response));
@@ -586,9 +670,13 @@ mod tests {
         let remaining_ids: Vec<u64> = store.list_summaries().into_iter().map(|s| s.id).collect();
         assert_eq!(remaining_ids, vec![8, 9, 10, 11, 12]);
 
-        // Evicted sessions (1..=7) are freed from RAM DashMap, yet preserved in SQLite archive
+        // Evicted sessions (1..=7) are freed from RAM DashMap, yet transparently loaded from SQLite archive via `get`
         for evicted_id in 1..=7 {
-            assert!(store.get(evicted_id).is_none());
+            assert!(!store.sessions.contains_key(&evicted_id));
+            let via_get = store
+                .get(evicted_id)
+                .expect("get() must fall back to SQLite for evicted session");
+            assert_eq!(via_get.summary.id, evicted_id);
             let archived = store
                 .get_archived(evicted_id)
                 .expect("query sqlite")
@@ -675,6 +763,124 @@ mod tests {
         );
 
         drop(store);
+        cleanup_temp_db(&db_path);
+    }
+
+    #[test]
+    fn annotate_session_updates_sqlite_evicted_and_preserves_across_response_updates() {
+        let db_path = unique_temp_db("annotate_sync");
+        let store = TrafficStore::new(db_path.clone()).expect("init TrafficStore");
+        store.set_retention_limit(Some(2)).expect("set limit 2");
+
+        // Insert 3 sessions -> session #1 is evicted to SQLite
+        for _ in 0..3 {
+            let id = store.allocate_id();
+            store.insert(make_session(id, br#"{"ok":true}"#));
+        }
+        assert!(!store.sessions.contains_key(&1));
+
+        // Annotate evicted session #1 -> updates captured_sessions in SQLite
+        let evicted_updated = store
+            .update_annotations(&[1, 1, 2], Some("Pinned".into()), Some("amber".into()))
+            .expect("update annotations");
+        // Duplicate ID `1` is deduplicated
+        assert_eq!(evicted_updated.len(), 2);
+
+        let reloaded_evicted = store.get(1).expect("load evicted from sqlite");
+        assert_eq!(reloaded_evicted.summary.comment.as_deref(), Some("Pinned"));
+        assert_eq!(
+            reloaded_evicted.summary.marked_color.as_deref(),
+            Some("amber")
+        );
+
+        // Concurrent/subsequent response update on session #2 must preserve annotations
+        let mut resp_update = make_session(2, br#"{"updated":true}"#);
+        resp_update.summary.status = 201;
+        store.insert(resp_update);
+
+        let after_resp = store.get(2).expect("session 2 in RAM");
+        assert_eq!(after_resp.summary.status, 201);
+        assert_eq!(after_resp.summary.comment.as_deref(), Some("Pinned"));
+        assert_eq!(after_resp.summary.marked_color.as_deref(), Some("amber"));
+
+        drop(store);
+        cleanup_temp_db(&db_path);
+    }
+
+    #[test]
+    fn sse_streaming_over_2mb_reoffloads_even_when_body_offloaded_already_true() {
+        let db_path = unique_temp_db("sse_reoffload");
+        let store = TrafficStore::new(db_path.clone()).expect("init TrafficStore");
+
+        let id = store.allocate_id();
+        let initial_len = BODY_OFFLOAD_THRESHOLD_BYTES + 1024;
+        let first_payload = "data: a\n\n".repeat(initial_len / 9 + 1);
+        let mut s = make_session(id, first_payload.as_bytes());
+        s.response_headers = vec![HeaderPair {
+            name: "Content-Type".into(),
+            value: "text/event-stream".into(),
+        }];
+        store.insert(s);
+
+        let mid = store.get(id).expect("session present");
+        assert!(mid.body_offloaded);
+        assert!(mid.response_body_base64.is_empty());
+        assert!(mid.response_body_text.is_none());
+
+        // Simulate subsequent SSE chunk appending more bytes to detail already marked `body_offloaded = true`
+        let second_payload = format!("{first_payload}data: final-sse-chunk\n\n");
+        let mut next = mid;
+        next.summary.body_size = second_payload.len();
+        next.response_body_base64 =
+            base64::engine::general_purpose::STANDARD.encode(second_payload.as_bytes());
+        next.response_body_text = Some(second_payload.clone());
+        store.insert(next);
+
+        // RAM entry must still have multi-MB strings cleared, and SQLite must hold the updated payload
+        let after = store.get(id).expect("updated session present");
+        assert!(after.body_offloaded);
+        assert!(after.response_body_base64.is_empty());
+        assert!(after.response_body_text.is_none());
+
+        let loaded = store.load_session_body(id, true).expect("load updated body");
+        assert_eq!(loaded.body_size, second_payload.len());
+        assert!(loaded
+            .body_text
+            .as_deref()
+            .unwrap()
+            .ends_with("data: final-sse-chunk\n\n"));
+
+        drop(store);
+        cleanup_temp_db(&db_path);
+    }
+
+    #[test]
+    fn load_from_sqlite_advances_next_id_with_fetch_max_without_regressing() {
+        let db_path = unique_temp_db("next_id_fetch_max");
+        let store = TrafficStore::new(db_path.clone()).expect("init TrafficStore");
+
+        // Persist session #50 directly into SQLite
+        let archived = make_session(50, b"ok");
+        store.sqlite.persist_batch(&[archived]).unwrap();
+
+        // Simulate concurrent allocation advancing `next_id` past 50 -> e.g. to 101
+        for _ in 0..100 {
+            let _ = store.allocate_id();
+        }
+        assert!(store.next_id.load(Ordering::SeqCst) >= 101);
+
+        // Reloading from SQLite must NOT regress `next_id` back to 51
+        let _ = store.load_from_sqlite().unwrap();
+        let next = store.allocate_id();
+        assert!(next >= 101, "expected allocated id >= 101, got {next}");
+
+        // Conversely, on a fresh store opening the same DB, `next_id` advances to at least 51
+        let store2 = TrafficStore::new(db_path.clone()).expect("open second TrafficStore");
+        let _ = store2.load_from_sqlite().unwrap();
+        assert!(store2.allocate_id() >= 51);
+
+        drop(store);
+        drop(store2);
         cleanup_temp_db(&db_path);
     }
 }

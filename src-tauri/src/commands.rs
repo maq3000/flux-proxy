@@ -118,15 +118,11 @@ pub async fn update_session_annotations(
     marked_color: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<SessionSummary>, ProxyError> {
-    let updated = state
+    state
         .controller
         .context
         .store
-        .update_annotations(&ids, comment, marked_color)?;
-    for summary in &updated {
-        let _ = state.controller.context.event_tx.send(summary.clone());
-    }
-    Ok(updated)
+        .update_annotations(&ids, comment, marked_color)
 }
 
 #[tauri::command]

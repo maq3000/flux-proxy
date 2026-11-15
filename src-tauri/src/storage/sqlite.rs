@@ -4,7 +4,22 @@ use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::models::{ProxyError, SessionDetail};
+use crate::models::{ProxyError, SessionDetail, SessionSummary};
+
+fn populate_fallback_client_ip(detail: &mut SessionDetail) {
+    if detail.summary.client_ip.is_none() {
+        if let Ok(sock) = detail.client_addr.parse::<std::net::SocketAddr>() {
+            let ip = match sock.ip() {
+                std::net::IpAddr::V6(v6) => v6
+                    .to_ipv4_mapped()
+                    .map(std::net::IpAddr::V4)
+                    .unwrap_or(std::net::IpAddr::V6(v6)),
+                other => other,
+            };
+            detail.summary.client_ip = Some(ip.to_string());
+        }
+    }
+}
 
 pub struct SqliteArchive {
     conn: Mutex<Connection>,
@@ -21,6 +36,7 @@ impl SqliteArchive {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 5000;
              CREATE TABLE IF NOT EXISTS captured_sessions (
                  id INTEGER PRIMARY KEY,
                  timestamp TEXT NOT NULL,
@@ -130,6 +146,55 @@ impl SqliteArchive {
         Ok(affected > 0)
     }
 
+    /// Updates `comment` and `marked_color` for an evicted session stored in `captured_sessions`,
+    /// keeping `payload_json` synchronized as well. Returns `Ok(None)` if `id` is not archived.
+    pub fn update_session_annotations(
+        &self,
+        id: u64,
+        comment: Option<String>,
+        marked_color: Option<String>,
+    ) -> Result<Option<SessionSummary>, ProxyError> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| ProxyError::Custom("SQLite mutex poisoned".into()))?;
+
+        let raw: Option<String> = guard
+            .query_row(
+                "SELECT payload_json FROM captured_sessions WHERE id = ?1",
+                params![id as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        let Some(payload_json) = raw else {
+            return Ok(None);
+        };
+
+        let mut detail = serde_json::from_str::<SessionDetail>(&payload_json)
+            .map_err(|e| ProxyError::Custom(format!("JSON deserialize failed: {e}")))?;
+        populate_fallback_client_ip(&mut detail);
+        detail.summary.comment = comment;
+        detail.summary.marked_color = marked_color;
+
+        let updated_json = serde_json::to_string(&detail)
+            .map_err(|e| ProxyError::Custom(format!("JSON serialize failed: {e}")))?;
+
+        guard.execute(
+            "UPDATE captured_sessions
+             SET comment = ?1, marked_color = ?2, payload_json = ?3
+             WHERE id = ?4",
+            params![
+                detail.summary.comment,
+                detail.summary.marked_color,
+                updated_json,
+                id as i64
+            ],
+        )?;
+
+        Ok(Some(detail.summary))
+    }
+
     pub fn load_recent(&self, limit: usize) -> Result<Vec<SessionDetail>, ProxyError> {
         let guard = self
             .conn
@@ -165,18 +230,7 @@ impl SqliteArchive {
                 if col_color.is_some() {
                     detail.summary.marked_color = col_color;
                 }
-                if detail.summary.client_ip.is_none() {
-                    if let Ok(sock) = detail.client_addr.parse::<std::net::SocketAddr>() {
-                        let ip = match sock.ip() {
-                            std::net::IpAddr::V6(v6) => v6
-                                .to_ipv4_mapped()
-                                .map(std::net::IpAddr::V4)
-                                .unwrap_or(std::net::IpAddr::V6(v6)),
-                            other => other,
-                        };
-                        detail.summary.client_ip = Some(ip.to_string());
-                    }
-                }
+                populate_fallback_client_ip(&mut detail);
                 out.push(detail);
             }
         }
@@ -211,6 +265,7 @@ impl SqliteArchive {
         if col_color.is_some() {
             detail.summary.marked_color = col_color;
         }
+        populate_fallback_client_ip(&mut detail);
         Ok(Some(detail))
     }
 
@@ -315,7 +370,7 @@ impl SqliteArchive {
                 tx.prepare_cached("DELETE FROM offloaded_bodies WHERE session_id = ?1")?;
             for &id in ids {
                 removed += stmt.execute(params![id as i64])?;
-                let _ = body_stmt.execute(params![id as i64])?;
+                body_stmt.execute(params![id as i64])?;
             }
         }
         tx.commit()?;
@@ -431,6 +486,56 @@ mod tests {
             Some("#f59e0b")
         );
 
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    #[test]
+    fn configures_busy_timeout_and_updates_evicted_annotations() {
+        let tmp_path = std::env::temp_dir().join(format!(
+            "fluxproxy_test_sqlite_busy_{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp_path);
+
+        let archive = SqliteArchive::open(&tmp_path).expect("open sqlite archive");
+        {
+            let guard = archive.conn.lock().unwrap();
+            let timeout: i64 = guard
+                .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(timeout, 5000);
+        }
+
+        let mut item = sample_detail(17, None, None);
+        item.summary.client_ip = None;
+        item.client_addr = "10.0.0.42:51234".into();
+        archive.persist_batch(&[item]).unwrap();
+
+        let summary = archive
+            .update_session_annotations(17, Some("Evicted note".into()), Some("purple".into()))
+            .unwrap()
+            .expect("evicted row updated");
+        assert_eq!(summary.comment.as_deref(), Some("Evicted note"));
+        assert_eq!(summary.marked_color.as_deref(), Some("purple"));
+        assert_eq!(summary.client_ip.as_deref(), Some("10.0.0.42"));
+
+        let loaded = archive.load_session_by_id(17).unwrap().unwrap();
+        assert_eq!(loaded.summary.comment.as_deref(), Some("Evicted note"));
+        assert_eq!(loaded.summary.marked_color.as_deref(), Some("purple"));
+        assert_eq!(loaded.summary.client_ip.as_deref(), Some("10.0.0.42"));
+
+        let cleared = archive
+            .update_session_annotations(17, None, None)
+            .unwrap()
+            .unwrap();
+        assert!(cleared.comment.is_none());
+        assert!(cleared.marked_color.is_none());
+
+        let reloaded = archive.load_session_by_id(17).unwrap().unwrap();
+        assert!(reloaded.summary.comment.is_none());
+        assert!(reloaded.summary.marked_color.is_none());
+
+        drop(archive);
         let _ = std::fs::remove_file(&tmp_path);
     }
 }
