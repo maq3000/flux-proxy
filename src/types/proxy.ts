@@ -277,9 +277,11 @@ export interface CaCertificateInfo {
 export interface NetworkInterfaceInfo {
   name: string;
   ip: string;
-  kind: string; // "wifi" | "ethernet" | "other"
+  kind: string; // "wifi" | "ethernet" | "vpn" | "virtual" | "other"
   isPrimary: boolean;
 }
+
+export type BindHostMode = "loopback" | "all" | "specific";
 
 export interface ProxyStatus {
   running: boolean;
@@ -290,6 +292,10 @@ export interface ProxyStatus {
   autoSystemProxy: boolean;
   systemProxyError?: string | null;
   allowRemote?: boolean;
+  bindMode?: BindHostMode;
+  specificBindIp?: string | null;
+  alsoBindLoopback?: boolean;
+  boundIps?: string[];
 }
 
 export type ActiveNavSection = "traffic" | "composer" | "rules";

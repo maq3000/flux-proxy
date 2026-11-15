@@ -5,13 +5,13 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::models::{
-    AutoResponderRule, BreakpointAction, BreakpointConfig, BreakpointResolution,
+    AutoResponderRule, BindHostMode, BreakpointAction, BreakpointConfig, BreakpointResolution,
     CaCertificateInfo, CodecOperation, CodecTransformResult, ComposedRequest, LoadedSessionBody,
     NetworkInterfaceInfo, PausedBreakpointItem, ProxyError, ProxyFilterBackendConfig, ProxyStatus,
     SessionDetail, SessionSummary, StorageStats,
 };
 use crate::proxy::codec::execute_codec_transform;
-use crate::proxy::network::list_network_interfaces;
+use crate::proxy::network::list_network_interfaces_with_options;
 use crate::proxy::server::ProxyEngineController;
 use crate::storage::export_import::{
     export_sessions_to_path, import_sessions_from_bytes, import_sessions_from_path,
@@ -33,9 +33,11 @@ pub async fn start_proxy(
     port: Option<u16>,
     state: State<'_, AppState>,
 ) -> Result<ProxyStatus, ProxyError> {
-    let bind_host = host.unwrap_or_else(|| state.controller.preferred_bind_host());
     let bind_port = port.unwrap_or(8888);
-    state.controller.start(bind_host, bind_port).await
+    match host.map(|h| h.trim().to_string()).filter(|h| !h.is_empty()) {
+        Some(explicit_host) => state.controller.start(explicit_host, bind_port).await,
+        None => state.controller.start_with_config(bind_port).await,
+    }
 }
 
 #[tauri::command]
@@ -47,8 +49,29 @@ pub async fn set_allow_remote(
 }
 
 #[tauri::command]
-pub async fn get_network_interfaces() -> Result<Vec<NetworkInterfaceInfo>, ProxyError> {
-    Ok(list_network_interfaces())
+pub async fn set_bind_configuration(
+    bind_mode: BindHostMode,
+    specific_bind_ip: Option<String>,
+    also_bind_loopback: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<ProxyStatus, ProxyError> {
+    state
+        .controller
+        .set_bind_configuration(
+            bind_mode,
+            specific_bind_ip,
+            also_bind_loopback.unwrap_or(true),
+        )
+        .await
+}
+
+#[tauri::command]
+pub async fn get_network_interfaces(
+    include_virtual: Option<bool>,
+) -> Result<Vec<NetworkInterfaceInfo>, ProxyError> {
+    Ok(list_network_interfaces_with_options(
+        include_virtual.unwrap_or(false),
+    ))
 }
 
 #[tauri::command]

@@ -415,6 +415,18 @@ pub struct NetworkInterfaceInfo {
     pub is_primary: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum BindHostMode {
+    #[default]
+    #[serde(alias = "Loopback")]
+    Loopback,
+    #[serde(rename = "all", alias = "allInterfaces", alias = "AllInterfaces", alias = "All")]
+    AllInterfaces,
+    #[serde(alias = "Specific")]
+    Specific,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyStatus {
@@ -427,6 +439,14 @@ pub struct ProxyStatus {
     pub system_proxy_error: Option<String>,
     #[serde(default)]
     pub allow_remote: bool,
+    #[serde(default)]
+    pub bind_mode: BindHostMode,
+    #[serde(default)]
+    pub specific_bind_ip: Option<String>,
+    #[serde(default = "default_true")]
+    pub also_bind_loopback: bool,
+    #[serde(default)]
+    pub bound_ips: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]

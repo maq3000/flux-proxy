@@ -31,6 +31,7 @@ import {
   type FluxUserSettingsProfile,
 } from "../types/settings";
 import type {
+  BindHostMode,
   BreakpointAction,
   BreakpointConfig,
   BreakpointResolution,
@@ -57,12 +58,123 @@ const LS_ACTIVE_FILTER_STATE_KEY = "fluxproxy.activeFilterState.v1";
 const LS_BACKEND_FILTER_CFG_KEY = "fluxproxy.backendFilterConfig.v1";
 const LS_AUTO_SYSPROXY_KEY = "fluxproxy.autoSystemProxy.v1";
 const LS_ALLOW_REMOTE_KEY = "fluxproxy.allowRemote.v1";
+const LS_BIND_MODE_KEY = "fluxproxy.bindMode.v1";
+const LS_SPECIFIC_BIND_IP_KEY = "fluxproxy.specificBindIp.v1";
+const LS_ALSO_BIND_LOOPBACK_KEY = "fluxproxy.alsoBindLoopback.v1";
 const LS_PROXY_PORT_KEY = "fluxproxy.proxyPort.v1";
 const LS_FOLLOW_TAIL_KEY = "fluxproxy.followTail.v1";
 const LS_BREAKPOINT_CFG_KEY = "fluxproxy.breakpointConfig.v1";
 const LS_RETENTION_LIMIT_KEY = "fluxproxy.sessionRetentionLimit.v1";
 const LS_DROP_NON_MATCHING_KEY = "fluxproxy.dropNonMatching.v1";
 const LS_CLEAR_DB_ON_EXIT_KEY = PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY;
+
+interface PersistedBindConfig {
+  bindMode: BindHostMode;
+  specificBindIp: string | null;
+  alsoBindLoopback: boolean;
+}
+
+function loadPersistedBindConfig(): PersistedBindConfig | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const rawMode = window.localStorage.getItem(LS_BIND_MODE_KEY);
+    const rawSpecificIp = window.localStorage.getItem(LS_SPECIFIC_BIND_IP_KEY);
+    const rawAlsoLoopback = window.localStorage.getItem(
+      LS_ALSO_BIND_LOOPBACK_KEY
+    );
+    const rawLegacyRemote = window.localStorage.getItem(LS_ALLOW_REMOTE_KEY);
+
+    if (rawMode === null && rawLegacyRemote === null) {
+      return null;
+    }
+
+    let specificBindIp: string | null = null;
+    if (rawSpecificIp !== null) {
+      const parsedIp = JSON.parse(rawSpecificIp);
+      if (typeof parsedIp === "string" && parsedIp.trim().length > 0) {
+        specificBindIp = parsedIp.trim();
+      }
+    }
+
+    const alsoBindLoopback =
+      rawAlsoLoopback !== null ? Boolean(JSON.parse(rawAlsoLoopback)) : true;
+
+    let bindMode: BindHostMode = "loopback";
+    if (rawMode !== null) {
+      const parsedMode = JSON.parse(rawMode);
+      if (
+        parsedMode === "all" ||
+        parsedMode === "loopback" ||
+        (parsedMode === "specific" && specificBindIp)
+      ) {
+        bindMode = parsedMode;
+      }
+    } else if (rawLegacyRemote !== null) {
+      bindMode = Boolean(JSON.parse(rawLegacyRemote)) ? "all" : "loopback";
+    }
+
+    return { bindMode, specificBindIp, alsoBindLoopback };
+  } catch {
+    return null;
+  }
+}
+
+function computeBoundIpsForState(
+  bindMode: BindHostMode,
+  specificBindIp: string | null,
+  alsoBindLoopback: boolean
+): string[] {
+  if (bindMode === "all") return ["0.0.0.0"];
+  if (bindMode === "specific" && specificBindIp) {
+    if (alsoBindLoopback && specificBindIp !== "127.0.0.1") {
+      return [specificBindIp, "127.0.0.1"];
+    }
+    return [specificBindIp];
+  }
+  return ["127.0.0.1"];
+}
+
+function formatStatusEndpoints(statusObj: ProxyStatus): string {
+  const ips =
+    statusObj.boundIps && statusObj.boundIps.length > 0
+      ? statusObj.boundIps
+      : [statusObj.bindAddr];
+  return ips.map((ip) => `${ip}:${statusObj.port}`).join(" + ");
+}
+
+function persistBindConfigToLocalStorage(statusObj: ProxyStatus): void {
+  if (typeof window === "undefined") return;
+  const resolvedMode: BindHostMode =
+    statusObj.bindMode ??
+    (statusObj.allowRemote || statusObj.bindAddr === "0.0.0.0"
+      ? "all"
+      : "loopback");
+  const resolvedSpecificIp = statusObj.specificBindIp ?? null;
+  const resolvedAlsoLoopback = statusObj.alsoBindLoopback ?? true;
+  const resolvedAllowRemote =
+    resolvedMode === "all"
+      ? true
+      : resolvedMode === "specific" && resolvedSpecificIp
+        ? resolvedSpecificIp !== "127.0.0.1" && resolvedSpecificIp !== "::1"
+        : false;
+  try {
+    window.localStorage.setItem(LS_BIND_MODE_KEY, JSON.stringify(resolvedMode));
+    window.localStorage.setItem(
+      LS_SPECIFIC_BIND_IP_KEY,
+      JSON.stringify(resolvedSpecificIp)
+    );
+    window.localStorage.setItem(
+      LS_ALSO_BIND_LOOPBACK_KEY,
+      JSON.stringify(resolvedAlsoLoopback)
+    );
+    window.localStorage.setItem(
+      LS_ALLOW_REMOTE_KEY,
+      JSON.stringify(resolvedAllowRemote)
+    );
+  } catch {
+    // ignore storage quota errors
+  }
+}
 
 function loadPersistedProxyPort(): number {
   if (typeof window === "undefined") return 8888;
@@ -183,21 +295,42 @@ export function useProxySessions() {
     () => loadPersistedState<boolean | null>(LS_AUTO_SYSPROXY_KEY, null),
     []
   );
-  const initialAllowRemote = useMemo(
-    () => loadPersistedState<boolean | null>(LS_ALLOW_REMOTE_KEY, null),
-    []
-  );
+  const initialBindConfig = useMemo(() => loadPersistedBindConfig(), []);
   const initialPort = useMemo(() => loadPersistedProxyPort(), []);
+
+  const initialBindMode: BindHostMode =
+    initialBindConfig?.bindMode ?? "loopback";
+  const initialSpecificBindIp = initialBindConfig?.specificBindIp ?? null;
+  const initialAlsoBindLoopback = initialBindConfig?.alsoBindLoopback ?? true;
+  const initialBindAddr =
+    initialBindMode === "all"
+      ? "0.0.0.0"
+      : initialBindMode === "specific" && initialSpecificBindIp
+        ? initialSpecificBindIp
+        : "127.0.0.1";
+  const initialAllowRemote =
+    initialBindMode === "all" ||
+    (initialBindMode === "specific" &&
+      Boolean(initialSpecificBindIp) &&
+      initialSpecificBindIp !== "127.0.0.1");
 
   const [status, setStatus] = useState<ProxyStatus>({
     running: true,
-    bindAddr: initialAllowRemote ? "0.0.0.0" : "127.0.0.1",
+    bindAddr: initialBindAddr,
     port: initialPort,
     activeSessions: 0,
     systemProxyEnabled: initialAutoSysProxy ?? true,
     autoSystemProxy: initialAutoSysProxy ?? true,
     systemProxyError: null,
-    allowRemote: initialAllowRemote ?? false,
+    allowRemote: initialAllowRemote,
+    bindMode: initialBindMode,
+    specificBindIp: initialSpecificBindIp,
+    alsoBindLoopback: initialAlsoBindLoopback,
+    boundIps: computeBoundIpsForState(
+      initialBindMode,
+      initialSpecificBindIp,
+      initialAlsoBindLoopback
+    ),
   });
   const statusRef = useRef<ProxyStatus>(status);
   statusRef.current = status;
@@ -477,12 +610,32 @@ export function useProxySessions() {
       setUseRegex(false);
       setQuickCategory("all");
 
+      const detailBindMode: BindHostMode =
+        detail.proxy.bindMode ??
+        (detail.proxy.allowRemote ? "all" : "loopback");
+      const detailSpecificIp = detail.proxy.specificBindIp ?? null;
+      const detailAlsoLoopback = detail.proxy.alsoBindLoopback ?? true;
+      const detailBindAddr =
+        detailBindMode === "all"
+          ? "0.0.0.0"
+          : detailBindMode === "specific" && detailSpecificIp
+            ? detailSpecificIp
+            : "127.0.0.1";
+
       const nextStatusOptimistic: ProxyStatus = {
         ...statusRef.current,
         port: detail.proxy.port,
         autoSystemProxy: detail.proxy.autoSystemProxy,
         allowRemote: detail.proxy.allowRemote,
-        bindAddr: detail.proxy.allowRemote ? "0.0.0.0" : "127.0.0.1",
+        bindAddr: detailBindAddr,
+        bindMode: detailBindMode,
+        specificBindIp: detailSpecificIp,
+        alsoBindLoopback: detailAlsoLoopback,
+        boundIps: computeBoundIpsForState(
+          detailBindMode,
+          detailSpecificIp,
+          detailAlsoLoopback
+        ),
       };
       statusRef.current = nextStatusOptimistic;
       setStatus(nextStatusOptimistic);
@@ -632,22 +785,35 @@ export function useProxySessions() {
           effectiveStatus = await proxyBridge.setSystemProxy(false);
         }
       }
-      if (
-        initialAllowRemote !== null &&
-        Boolean(
-          effectiveStatus.allowRemote || effectiveStatus.bindAddr === "0.0.0.0"
-        ) !== initialAllowRemote
-      ) {
-        effectiveStatus = await proxyBridge.setAllowRemote(initialAllowRemote);
+      if (initialBindConfig !== null) {
+        const effMode: BindHostMode =
+          effectiveStatus.bindMode ??
+          (effectiveStatus.allowRemote ||
+          effectiveStatus.bindAddr === "0.0.0.0"
+            ? "all"
+            : "loopback");
+        const effSpecificIp = effectiveStatus.specificBindIp ?? null;
+        const effAlsoLoopback = effectiveStatus.alsoBindLoopback ?? true;
+        if (
+          effMode !== initialBindConfig.bindMode ||
+          (initialBindConfig.bindMode === "specific" &&
+            effSpecificIp !== initialBindConfig.specificBindIp) ||
+          effAlsoLoopback !== initialBindConfig.alsoBindLoopback
+        ) {
+          effectiveStatus = await proxyBridge.setBindConfiguration(
+            initialBindConfig.bindMode,
+            initialBindConfig.specificBindIp,
+            initialBindConfig.alsoBindLoopback
+          );
+        }
       }
       if (effectiveStatus.port !== initialPort) {
-        const bindHost =
-          effectiveStatus.allowRemote || effectiveStatus.bindAddr === "0.0.0.0"
-            ? "0.0.0.0"
-            : "127.0.0.1";
         if (effectiveStatus.running) {
           await proxyBridge.stopProxy();
-          effectiveStatus = await proxyBridge.startProxy(bindHost, initialPort);
+          effectiveStatus = await proxyBridge.startProxy(
+            undefined,
+            initialPort
+          );
         } else {
           effectiveStatus = proxyBridge.setPreviewPort(initialPort);
           effectiveStatus = { ...effectiveStatus, port: initialPort };
@@ -658,15 +824,7 @@ export function useProxySessions() {
           LS_AUTO_SYSPROXY_KEY,
           JSON.stringify(effectiveStatus.autoSystemProxy)
         );
-        window.localStorage.setItem(
-          LS_ALLOW_REMOTE_KEY,
-          JSON.stringify(
-            Boolean(
-              effectiveStatus.allowRemote ||
-                effectiveStatus.bindAddr === "0.0.0.0"
-            )
-          )
-        );
+        persistBindConfigToLocalStorage(effectiveStatus);
         window.localStorage.setItem(
           LS_PROXY_PORT_KEY,
           JSON.stringify(effectiveStatus.port)
@@ -792,6 +950,11 @@ export function useProxySessions() {
 
         statusRef.current = next;
         setStatus((curr) => {
+          const sameBoundIps =
+            (curr.boundIps?.length ?? 0) === (next.boundIps?.length ?? 0) &&
+            (curr.boundIps ?? []).every(
+              (ip, idx) => ip === next.boundIps?.[idx]
+            );
           if (
             curr.running === next.running &&
             curr.bindAddr === next.bindAddr &&
@@ -800,6 +963,11 @@ export function useProxySessions() {
             curr.systemProxyEnabled === next.systemProxyEnabled &&
             curr.autoSystemProxy === next.autoSystemProxy &&
             Boolean(curr.allowRemote) === Boolean(next.allowRemote) &&
+            curr.bindMode === next.bindMode &&
+            (curr.specificBindIp ?? null) === (next.specificBindIp ?? null) &&
+            Boolean(curr.alsoBindLoopback ?? true) ===
+              Boolean(next.alsoBindLoopback ?? true) &&
+            sameBoundIps &&
             (curr.systemProxyError ?? null) === (next.systemProxyError ?? null)
           ) {
             return curr;
@@ -1751,28 +1919,25 @@ export function useProxySessions() {
 
   const toggleProxy = useCallback(async () => {
     const current = statusRef.current;
-    const preferredHost =
-      current.allowRemote || current.bindAddr === "0.0.0.0"
-        ? "0.0.0.0"
-        : "127.0.0.1";
     const nextStatus = current.running
       ? await proxyBridge.stopProxy()
-      : await proxyBridge.startProxy(preferredHost, current.port);
+      : await proxyBridge.startProxy(undefined, current.port);
     statusRef.current = nextStatus;
     setStatus(nextStatus);
 
+    const endpoints = formatStatusEndpoints(nextStatus);
     if (nextStatus.running) {
       if (nextStatus.systemProxyError) {
         showToast(
-          `Захват запущен (${nextStatus.bindAddr}:${nextStatus.port}), но SysProxy недоступен: ${nextStatus.systemProxyError}`
+          `Захват запущен (${endpoints}), но SysProxy недоступен: ${nextStatus.systemProxyError}`
         );
       } else if (nextStatus.systemProxyEnabled) {
         showToast(
-          `Захват активен (${nextStatus.bindAddr}:${nextStatus.port}) • Системный прокси ОС включён`
+          `Захват активен (${endpoints}) • Системный прокси ОС включён`
         );
       } else {
         showToast(
-          `Захват активен (${nextStatus.bindAddr}:${nextStatus.port}) • Только локальный порт (HTTP_PROXY)`
+          `Захват активен (${endpoints}) • Только локальный порт (HTTP_PROXY)`
         );
       }
     } else {
@@ -1782,32 +1947,54 @@ export function useProxySessions() {
     }
   }, [showToast]);
 
-  const setAllowRemote = useCallback(
-    async (allow: boolean) => {
+  const setBindConfiguration = useCallback(
+    async (
+      bindMode: BindHostMode,
+      specificBindIp?: string | null,
+      alsoBindLoopback = true
+    ) => {
       try {
-        try {
-          window.localStorage.setItem(
-            LS_ALLOW_REMOTE_KEY,
-            JSON.stringify(allow)
-          );
-        } catch {
-          // ignore storage quota errors
-        }
-        const nextStatus = await proxyBridge.setAllowRemote(allow);
+        const nextStatus = await proxyBridge.setBindConfiguration(
+          bindMode,
+          specificBindIp ?? null,
+          alsoBindLoopback
+        );
+        persistBindConfigToLocalStorage(nextStatus);
         statusRef.current = nextStatus;
         setStatus(nextStatus);
-        showToast(
-          nextStatus.allowRemote || nextStatus.bindAddr === "0.0.0.0"
-            ? `📱 Удаленные подключения включены (${nextStatus.bindAddr}:${nextStatus.port} — LAN / Wi-Fi)`
-            : `🔒 Только локальные подключения (${nextStatus.bindAddr}:${nextStatus.port})`
-        );
+        const endpoints = formatStatusEndpoints(nextStatus);
+        if (nextStatus.bindMode === "all") {
+          showToast(
+            `📱 Все интерфейсы активны (${endpoints} — LAN / Wi-Fi)`
+          );
+        } else if (nextStatus.bindMode === "specific") {
+          showToast(`🎯 Выбранный интерфейс активен (${endpoints})`);
+        } else {
+          showToast(`🔒 Только локальные подключения (${endpoints})`);
+        }
       } catch (err) {
         showToast(
-          `⚠️ Ошибка переключения интерфейса 0.0.0.0: ${err instanceof Error ? err.message : String(err)}`
+          `⚠️ Ошибка переключения сетевого интерфейса: ${err instanceof Error ? err.message : String(err)}`
         );
+        throw err;
       }
     },
     [showToast]
+  );
+
+  const setAllowRemote = useCallback(
+    async (allow: boolean) => {
+      try {
+        await setBindConfiguration(
+          allow ? "all" : "loopback",
+          statusRef.current.specificBindIp ?? null,
+          statusRef.current.alsoBindLoopback ?? true
+        );
+      } catch {
+        // toast notification already emitted inside setBindConfiguration
+      }
+    },
+    [setBindConfiguration]
   );
 
   const setProxyPort = useCallback(
@@ -1838,14 +2025,10 @@ export function useProxySessions() {
       }
 
       try {
-        const bindHost =
-          curr.allowRemote || curr.bindAddr === "0.0.0.0"
-            ? "0.0.0.0"
-            : "127.0.0.1";
         let nextStatus: ProxyStatus;
         if (curr.running) {
           await proxyBridge.stopProxy();
-          nextStatus = await proxyBridge.startProxy(bindHost, nextPort);
+          nextStatus = await proxyBridge.startProxy(undefined, nextPort);
         } else {
           nextStatus = proxyBridge.setPreviewPort(nextPort);
           nextStatus = { ...nextStatus, port: nextPort };
@@ -1854,7 +2037,7 @@ export function useProxySessions() {
         setStatus(nextStatus);
         showToast(
           nextStatus.running
-            ? `🔌 Прокси перезапущен на ${nextStatus.bindAddr}:${nextStatus.port}`
+            ? `🔌 Прокси перезапущен на ${formatStatusEndpoints(nextStatus)}`
             : `🔌 Порт прокси изменён на ${nextStatus.port} (вступит в силу при захвате)`
         );
       } catch (err) {
@@ -1870,7 +2053,14 @@ export function useProxySessions() {
 
   const toggleAllowRemote = useCallback(async () => {
     const curr = statusRef.current;
-    const isRemote = Boolean(curr.allowRemote || curr.bindAddr === "0.0.0.0");
+    const isRemote = Boolean(
+      curr.allowRemote ||
+        curr.bindMode === "all" ||
+        (curr.bindMode === "specific" &&
+          curr.specificBindIp &&
+          curr.specificBindIp !== "127.0.0.1") ||
+        curr.bindAddr === "0.0.0.0"
+    );
     await setAllowRemote(!isRemote);
   }, [setAllowRemote]);
 
@@ -1880,18 +2070,25 @@ export function useProxySessions() {
       statusRef.current = nextStatus;
       setStatus(nextStatus);
 
+      const sysProxyHost =
+        nextStatus.bindMode === "specific" &&
+        nextStatus.specificBindIp &&
+        nextStatus.alsoBindLoopback === false
+          ? nextStatus.specificBindIp
+          : "127.0.0.1";
+
       if (enabled && nextStatus.systemProxyError) {
         showToast(`⚠️ ${nextStatus.systemProxyError}`);
       } else if (nextStatus.systemProxyEnabled) {
         showToast(
           nextStatus.running
-            ? `Системный прокси ОС направлен на 127.0.0.1:${nextStatus.port}`
-            : `Системный прокси ОС включён (127.0.0.1:${nextStatus.port}), но захват на паузе (F12)`
+            ? `Системный прокси ОС направлен на ${sysProxyHost}:${nextStatus.port}`
+            : `Системный прокси ОС включён (${sysProxyHost}:${nextStatus.port}), но захват на паузе (F12)`
         );
       } else {
         showToast(
           nextStatus.running
-            ? `Системный прокси ОС отключён • Открыт только порт ${nextStatus.bindAddr}:${nextStatus.port} (HTTP_PROXY)`
+            ? `Системный прокси ОС отключён • Открыт только порт ${formatStatusEndpoints(nextStatus)} (HTTP_PROXY)`
             : "Системный прокси ОС отключён"
         );
       }
@@ -2813,6 +3010,7 @@ export function useProxySessions() {
     // Core Proxy Actions
     toggleProxy,
     setProxyPort,
+    setBindConfiguration,
     setAllowRemote,
     toggleAllowRemote,
     setSystemProxyEnabled,

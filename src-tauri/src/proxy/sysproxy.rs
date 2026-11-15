@@ -5,10 +5,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::models::ProxyError;
+use crate::models::{BindHostMode, ProxyError};
 
 pub const BACKUP_FILE_NAME: &str = "system-proxy-backup.json";
 pub const PREFS_FILE_NAME: &str = "system-proxy-prefs.json";
+pub const LEGACY_ALLOW_REMOTE_FILE_NAME: &str = "allow_remote.pref";
 pub const DEFAULT_WINDOWS_PROXY_OVERRIDE: &str = "localhost;127.*;10.*;192.168.*;<local>";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -71,6 +72,24 @@ pub struct SystemProxyBackup {
     pub snapshot: PlatformProxySnapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BindConfigPref {
+    pub bind_mode: BindHostMode,
+    pub specific_bind_ip: Option<String>,
+    pub also_bind_loopback: bool,
+}
+
+impl Default for BindConfigPref {
+    fn default() -> Self {
+        Self {
+            bind_mode: BindHostMode::Loopback,
+            specific_bind_ip: None,
+            also_bind_loopback: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedSystemProxyPrefs {
@@ -78,6 +97,12 @@ struct PersistedSystemProxyPrefs {
     pub auto_system_proxy: bool,
     #[serde(default)]
     pub allow_remote: bool,
+    #[serde(default)]
+    pub bind_mode: Option<BindHostMode>,
+    #[serde(default)]
+    pub specific_bind_ip: Option<String>,
+    #[serde(default)]
+    pub also_bind_loopback: Option<bool>,
 }
 
 fn default_auto_system_proxy() -> bool {
@@ -89,6 +114,9 @@ impl Default for PersistedSystemProxyPrefs {
         Self {
             auto_system_proxy: true,
             allow_remote: false,
+            bind_mode: None,
+            specific_bind_ip: None,
+            also_bind_loopback: None,
         }
     }
 }
@@ -195,11 +223,52 @@ impl SystemProxyManager {
         &self.backup_path
     }
 
+    fn read_legacy_allow_remote_pref(&self) -> Option<bool> {
+        let legacy_path = self
+            .prefs_path
+            .parent()
+            .map(|dir| dir.join(LEGACY_ALLOW_REMOTE_FILE_NAME))?;
+        let raw = fs::read_to_string(legacy_path).ok()?;
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("true") || trimmed == "1" {
+            return Some(true);
+        }
+        if trimmed.eq_ignore_ascii_case("false") || trimmed == "0" {
+            return Some(false);
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(b) = val.as_bool() {
+                return Some(b);
+            }
+            if let Some(b) = val.get("allowRemote").and_then(|v| v.as_bool()) {
+                return Some(b);
+            }
+        }
+        None
+    }
+
     fn load_prefs(&self) -> PersistedSystemProxyPrefs {
-        let Ok(raw) = fs::read_to_string(&self.prefs_path) else {
-            return PersistedSystemProxyPrefs::default();
-        };
-        serde_json::from_str::<PersistedSystemProxyPrefs>(&raw).unwrap_or_default()
+        if let Ok(raw) = fs::read_to_string(&self.prefs_path) {
+            if let Ok(mut prefs) = serde_json::from_str::<PersistedSystemProxyPrefs>(&raw) {
+                if prefs.bind_mode.is_none() && !prefs.allow_remote {
+                    if let Some(true) = self.read_legacy_allow_remote_pref() {
+                        prefs.allow_remote = true;
+                    }
+                }
+                return prefs;
+            }
+        }
+
+        let mut prefs = PersistedSystemProxyPrefs::default();
+        if let Some(legacy_allow) = self.read_legacy_allow_remote_pref() {
+            prefs.allow_remote = legacy_allow;
+            prefs.bind_mode = Some(if legacy_allow {
+                BindHostMode::AllInterfaces
+            } else {
+                BindHostMode::Loopback
+            });
+        }
+        prefs
     }
 
     fn save_prefs(&self, prefs: &PersistedSystemProxyPrefs) {
@@ -221,13 +290,75 @@ impl SystemProxyManager {
         self.save_prefs(&prefs);
     }
 
+    pub fn load_bind_config_pref(&self) -> BindConfigPref {
+        let prefs = self.load_prefs();
+        let also_bind_loopback = prefs.also_bind_loopback.unwrap_or(true);
+        let cleaned_specific_ip = prefs
+            .specific_bind_ip
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s.parse::<std::net::IpAddr>().is_ok());
+
+        let bind_mode = match prefs.bind_mode {
+            Some(BindHostMode::Specific) => {
+                if cleaned_specific_ip.is_some() {
+                    BindHostMode::Specific
+                } else if prefs.allow_remote {
+                    BindHostMode::AllInterfaces
+                } else {
+                    BindHostMode::Loopback
+                }
+            }
+            Some(mode) => mode,
+            None => {
+                if prefs.allow_remote {
+                    BindHostMode::AllInterfaces
+                } else {
+                    BindHostMode::Loopback
+                }
+            }
+        };
+
+        BindConfigPref {
+            bind_mode,
+            specific_bind_ip: cleaned_specific_ip,
+            also_bind_loopback,
+        }
+    }
+
+    pub fn save_bind_config_pref(
+        &self,
+        bind_mode: BindHostMode,
+        specific_bind_ip: Option<String>,
+        also_bind_loopback: bool,
+    ) {
+        let mut prefs = self.load_prefs();
+        prefs.bind_mode = Some(bind_mode);
+        prefs.specific_bind_ip = specific_bind_ip
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        prefs.also_bind_loopback = Some(also_bind_loopback);
+        prefs.allow_remote = matches!(bind_mode, BindHostMode::AllInterfaces | BindHostMode::Specific);
+        self.save_prefs(&prefs);
+    }
+
     pub fn load_allow_remote_pref(&self) -> bool {
-        self.load_prefs().allow_remote
+        matches!(
+            self.load_bind_config_pref().bind_mode,
+            BindHostMode::AllInterfaces | BindHostMode::Specific
+        )
     }
 
     pub fn save_allow_remote_pref(&self, allow_remote: bool) {
         let mut prefs = self.load_prefs();
         prefs.allow_remote = allow_remote;
+        prefs.bind_mode = Some(if allow_remote {
+            BindHostMode::AllInterfaces
+        } else {
+            BindHostMode::Loopback
+        });
+        if allow_remote {
+            prefs.specific_bind_ip = None;
+        }
         self.save_prefs(&prefs);
     }
 
@@ -385,6 +516,10 @@ impl SystemProxyManager {
         }
     }
 
+    pub fn is_desired_enabled(&self) -> bool {
+        self.lock_inner().desired_enabled
+    }
+
     /// Rolls back dirty crash-leftover state if `auto_system_proxy` is disabled on startup or listener bind fails.
     pub fn rollback_if_dirty(&self) {
         let has_dirty_backup = {
@@ -508,6 +643,26 @@ pub fn normalize_sysproxy_host(bind_host: &str) -> String {
         "127.0.0.1".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+/// Resolves which host address the OS system proxy should point to based on the active bind mode.
+/// When loopback is listened on (`Loopback`, `AllInterfaces`, or `Specific` with `also_bind_loopback`),
+/// the OS system proxy points to `127.0.0.1`. Otherwise it points to the specific bound IP.
+pub fn resolve_sysproxy_host_for_bind(
+    bind_mode: BindHostMode,
+    specific_bind_ip: Option<&str>,
+    also_bind_loopback: bool,
+) -> String {
+    match bind_mode {
+        BindHostMode::Loopback | BindHostMode::AllInterfaces => "127.0.0.1".to_string(),
+        BindHostMode::Specific => {
+            if also_bind_loopback {
+                "127.0.0.1".to_string()
+            } else {
+                normalize_sysproxy_host(specific_bind_ip.unwrap_or("127.0.0.1"))
+            }
+        }
     }
 }
 
@@ -1958,5 +2113,59 @@ mod tests {
         // Non-mutating read check against real HKCU\...\Internet Settings
         let snap = platform::capture_snapshot().expect("read HKCU Internet Settings without admin");
         assert!(matches!(snap, PlatformProxySnapshot::Windows(_)));
+    }
+
+    #[test]
+    fn bind_config_prefs_persist_and_migrate_from_legacy_allow_remote() {
+        let dir = make_temp_test_dir("bind-config-prefs");
+        let backend = MockWindowsOsBackend::new(WindowsProxySnapshot::default());
+        let mgr = SystemProxyManager::with_backend(&dir, backend);
+
+        // Legacy allow_remote.pref migration when system-proxy-prefs.json does not exist yet
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(LEGACY_ALLOW_REMOTE_FILE_NAME), "true\n").unwrap();
+        let migrated = mgr.load_bind_config_pref();
+        assert_eq!(migrated.bind_mode, BindHostMode::AllInterfaces);
+        assert!(migrated.also_bind_loopback);
+        assert_eq!(migrated.specific_bind_ip, None);
+
+        // Saving Specific mode with dual listener persists cleanly
+        mgr.save_bind_config_pref(
+            BindHostMode::Specific,
+            Some("192.168.1.45".to_string()),
+            false,
+        );
+        let loaded = mgr.load_bind_config_pref();
+        assert_eq!(loaded.bind_mode, BindHostMode::Specific);
+        assert_eq!(loaded.specific_bind_ip.as_deref(), Some("192.168.1.45"));
+        assert!(!loaded.also_bind_loopback);
+
+        // Verify resolve_sysproxy_host_for_bind logic
+        assert_eq!(
+            resolve_sysproxy_host_for_bind(BindHostMode::Loopback, None, false),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            resolve_sysproxy_host_for_bind(BindHostMode::AllInterfaces, None, true),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            resolve_sysproxy_host_for_bind(
+                BindHostMode::Specific,
+                Some("192.168.1.45"),
+                true
+            ),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            resolve_sysproxy_host_for_bind(
+                BindHostMode::Specific,
+                Some("192.168.1.45"),
+                false
+            ),
+            "192.168.1.45"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

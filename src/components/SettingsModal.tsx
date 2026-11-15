@@ -10,6 +10,7 @@ import {
   FileJson,
   ListFilter,
   Plus,
+  RefreshCw,
   RotateCcw,
   Settings,
   Shield,
@@ -30,15 +31,18 @@ import {
   compileHostListFilter,
 } from "../lib/filterEngine";
 import { collectCurrentSettingsProfile } from "../lib/settingsManager";
+import { proxyBridge } from "../lib/tauriBridge";
 import { SESSION_RETENTION_PRESETS } from "../types/proxy";
 import type {
   AutoResponderRule,
+  BindHostMode,
   ColumnId,
   FilterConditionRule,
   FilterPreset,
   HostListFilterConfig,
   HostListFilterMode,
   InspectorDockPosition,
+  NetworkInterfaceInfo,
   NoiseThresholdsConfig,
   ProxyFilterBackendConfig,
   ProxyStatus,
@@ -134,7 +138,12 @@ export interface SettingsModalProps {
   status: ProxyStatus;
   onSetProxyPort: (port: number) => Promise<void>;
   onSetAutoSystemProxy: (auto: boolean) => Promise<void>;
-  onSetAllowRemote: (allow: boolean) => Promise<void>;
+  onSetAllowRemote?: (allow: boolean) => Promise<void>;
+  onSetBindConfiguration: (
+    bindMode: BindHostMode,
+    specificBindIp?: string | null,
+    alsoBindLoopback?: boolean
+  ) => Promise<void>;
   sessionRetentionLimit: number | null;
   onSetSessionRetentionLimit: (limit: number | null) => Promise<void> | void;
   dropNonMatching: boolean;
@@ -242,7 +251,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   status,
   onSetProxyPort,
   onSetAutoSystemProxy,
-  onSetAllowRemote,
+  onSetAllowRemote: _onSetAllowRemote,
+  onSetBindConfiguration,
   sessionRetentionLimit,
   onSetSessionRetentionLimit,
   dropNonMatching,
@@ -317,11 +327,54 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [rawJsonDraft, setRawJsonDraft] = useState("");
   const [copiedProfileJson, setCopiedProfileJson] = useState(false);
 
+  // Network interface binding selector (Loopback / AllInterfaces / Specific)
+  const [networkInterfaces, setNetworkInterfaces] = useState<
+    NetworkInterfaceInfo[]
+  >([]);
+  const [isLoadingInterfaces, setIsLoadingInterfaces] = useState(false);
+  const [isApplyingBind, setIsApplyingBind] = useState(false);
+  const [bindError, setBindError] = useState<string | null>(null);
+  const [selectedSpecificIpDraft, setSelectedSpecificIpDraft] =
+    useState<string>(status.specificBindIp ?? "");
+  const [pendingSpecificSelect, setPendingSpecificSelect] = useState(false);
+
+  const loadNetworkInterfaces = async () => {
+    setIsLoadingInterfaces(true);
+    try {
+      const list = await proxyBridge.getNetworkInterfaces(true);
+      setNetworkInterfaces(list);
+      setSelectedSpecificIpDraft((prev) => {
+        if (prev && list.some((iface) => iface.ip === prev)) return prev;
+        if (status.specificBindIp) return status.specificBindIp;
+        return list.find((iface) => iface.isPrimary)?.ip ?? list[0]?.ip ?? prev;
+      });
+    } catch (err) {
+      setBindError(
+        `Не удалось получить список интерфейсов: ${err instanceof Error ? err.message : String(err)}`
+      );
+    } finally {
+      setIsLoadingInterfaces(false);
+    }
+  };
+
   useEffect(() => {
     if (open) {
       setActiveTab(initialTab);
+      setBindError(null);
+      setPendingSpecificSelect(false);
+      void loadNetworkInterfaces();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, initialTab]);
+
+  useEffect(() => {
+    if (status.specificBindIp) {
+      setSelectedSpecificIpDraft(status.specificBindIp);
+    }
+    if (status.bindMode === "specific") {
+      setPendingSpecificSelect(false);
+    }
+  }, [status.specificBindIp, status.bindMode]);
 
   useEffect(() => {
     setPortDraft(String(status.port));
@@ -392,9 +445,321 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     [hostFilters]
   );
 
-  const isRemoteAllowed = Boolean(
-    status.allowRemote || status.bindAddr === "0.0.0.0"
+  const effectiveBindMode: BindHostMode = pendingSpecificSelect
+    ? "specific"
+    : status.bindMode ??
+      (status.allowRemote || status.bindAddr === "0.0.0.0"
+        ? "all"
+        : "loopback");
+
+  const activeBoundIps = useMemo(
+    () =>
+      status.boundIps && status.boundIps.length > 0
+        ? status.boundIps
+        : [status.bindAddr],
+    [status.boundIps, status.bindAddr]
   );
+
+  const activeEndpointsSummary = useMemo(
+    () => activeBoundIps.map((ip) => `${ip}:${status.port}`).join(" + "),
+    [activeBoundIps, status.port]
+  );
+
+  const resolvedSpecificIpCandidate =
+    selectedSpecificIpDraft ||
+    status.specificBindIp ||
+    networkInterfaces.find((iface) => iface.isPrimary)?.ip ||
+    networkInterfaces[0]?.ip ||
+    "";
+
+  const sysProxyTargetHost =
+    effectiveBindMode === "specific" &&
+    resolvedSpecificIpCandidate &&
+    status.alsoBindLoopback === false
+      ? resolvedSpecificIpCandidate
+      : "127.0.0.1";
+
+  const handleBindModeChange = async (nextMode: BindHostMode) => {
+    setBindError(null);
+    if (nextMode === "specific") {
+      const targetIp =
+        selectedSpecificIpDraft ||
+        status.specificBindIp ||
+        networkInterfaces.find((iface) => iface.isPrimary)?.ip ||
+        networkInterfaces[0]?.ip ||
+        "";
+      if (!targetIp) {
+        setPendingSpecificSelect(true);
+        setBindError(
+          "Не обнаружены доступные сетевые интерфейсы. Нажмите «Обновить» или выберите другой режим."
+        );
+        return;
+      }
+      setPendingSpecificSelect(false);
+      setSelectedSpecificIpDraft(targetIp);
+      setIsApplyingBind(true);
+      try {
+        await onSetBindConfiguration(
+          "specific",
+          targetIp,
+          status.alsoBindLoopback ?? true
+        );
+      } catch (err) {
+        setBindError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setIsApplyingBind(false);
+      }
+      return;
+    }
+
+    setPendingSpecificSelect(false);
+    setIsApplyingBind(true);
+    try {
+      await onSetBindConfiguration(
+        nextMode,
+        selectedSpecificIpDraft || status.specificBindIp || null,
+        status.alsoBindLoopback ?? true
+      );
+    } catch (err) {
+      setBindError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsApplyingBind(false);
+    }
+  };
+
+  const handleSpecificIpChange = async (nextIp: string) => {
+    setSelectedSpecificIpDraft(nextIp);
+    setBindError(null);
+    if (!nextIp) return;
+    setPendingSpecificSelect(false);
+    setIsApplyingBind(true);
+    try {
+      await onSetBindConfiguration(
+        "specific",
+        nextIp,
+        status.alsoBindLoopback ?? true
+      );
+    } catch (err) {
+      setBindError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsApplyingBind(false);
+    }
+  };
+
+  const handleAlsoBindLoopbackChange = async (checked: boolean) => {
+    const targetIp =
+      selectedSpecificIpDraft ||
+      status.specificBindIp ||
+      networkInterfaces.find((iface) => iface.isPrimary)?.ip ||
+      networkInterfaces[0]?.ip ||
+      "";
+    if (!targetIp) {
+      setBindError("Сначала выберите конкретный IP-интерфейс из списка.");
+      return;
+    }
+    setBindError(null);
+    setIsApplyingBind(true);
+    try {
+      await onSetBindConfiguration("specific", targetIp, checked);
+    } catch (err) {
+      setBindError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsApplyingBind(false);
+    }
+  };
+
+  const renderBindConfigurationSection = (sectionKey: "general" | "rules") => {
+    const radioName = `${baseId}-${sectionKey}-bind-mode`;
+    const isSpecific = effectiveBindMode === "specific";
+    const activeSpecificValue = resolvedSpecificIpCandidate;
+    const hasCurrentSpecificInList = Boolean(
+      activeSpecificValue &&
+        networkInterfaces.some((iface) => iface.ip === activeSpecificValue)
+    );
+    const alsoLoopbackChecked = status.alsoBindLoopback ?? true;
+
+    const options: {
+      value: BindHostMode;
+      title: string;
+      desc: string;
+    }[] = [
+      {
+        value: "loopback",
+        title: "Loopback (127.0.0.1)",
+        desc: "Принимать подключения только локально с этого ПК (изолированный безопасный режим).",
+      },
+      {
+        value: "all",
+        title: "All Interfaces (0.0.0.0)",
+        desc: "Слушать все сетевые интерфейсы: Wi-Fi, LAN, смартфоны iOS / Android, VPN и WSL.",
+      },
+      {
+        value: "specific",
+        title: "Specific Interface",
+        desc: "Выбрать конкретный сетевой адаптер (Wi-Fi, Ethernet, WSL, Docker, Hyper-V, VPN).",
+      },
+    ];
+
+    const body = (
+      <div className="space-y-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="font-semibold text-fg">
+            Привязка к сетевому интерфейсу (Bind Host)
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {activeBoundIps.map((ip) => (
+              <span
+                key={`${sectionKey}-${ip}`}
+                className="rounded border border-hairline bg-surface px-1.5 py-0.5 font-mono text-[10px] text-fg tabular-nums"
+              >
+                {ip}:{status.port}
+              </span>
+            ))}
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+          {options.map((opt) => {
+            const rId = `${baseId}-${sectionKey}-bind-${opt.value}`;
+            const checked = effectiveBindMode === opt.value;
+            return (
+              <label
+                key={opt.value}
+                htmlFor={rId}
+                className={`flex cursor-pointer items-start gap-2 rounded-lg border p-2.5 transition-colors ${
+                  checked
+                    ? "border-accent/50 bg-selected"
+                    : "border-hairline bg-surface hover:bg-hover"
+                } ${isApplyingBind ? "opacity-75" : ""}`}
+              >
+                <input
+                  id={rId}
+                  type="radio"
+                  name={radioName}
+                  value={opt.value}
+                  checked={checked}
+                  disabled={isApplyingBind}
+                  onChange={() => void handleBindModeChange(opt.value)}
+                  className="mt-0.5 cursor-pointer accent-[var(--accent-primary)]"
+                />
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold text-fg">
+                    {opt.title}
+                  </div>
+                  <div className="mt-0.5 text-[11px] leading-snug text-muted">
+                    {opt.desc}
+                  </div>
+                </div>
+              </label>
+            );
+          })}
+        </div>
+
+        {isSpecific && (
+          <div className="space-y-2 rounded-md border border-hairline bg-surface p-2.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <label
+                htmlFor={`${baseId}-${sectionKey}-iface-select`}
+                className="text-[11px] font-medium text-muted"
+              >
+                Интерфейс:
+              </label>
+              <select
+                id={`${baseId}-${sectionKey}-iface-select`}
+                value={activeSpecificValue}
+                disabled={
+                  isApplyingBind ||
+                  isLoadingInterfaces ||
+                  (networkInterfaces.length === 0 && !hasCurrentSpecificInList)
+                }
+                onChange={(e) => void handleSpecificIpChange(e.target.value)}
+                className="h-8 min-w-[240px] flex-1 rounded-md border border-strong bg-canvas px-2 font-mono text-xs text-fg focus:border-accent focus:outline-none"
+              >
+                {networkInterfaces.length === 0 && !hasCurrentSpecificInList && (
+                  <option value="">Нет доступных интерфейсов</option>
+                )}
+                {!hasCurrentSpecificInList && activeSpecificValue && (
+                  <option value={activeSpecificValue}>
+                    {activeSpecificValue} (Сохранённый / Offline)
+                  </option>
+                )}
+                {networkInterfaces.map((iface) => (
+                  <option key={`${iface.ip}-${iface.name}`} value={iface.ip}>
+                    {iface.name} — {iface.ip} ({iface.kind.toUpperCase()}
+                    {iface.isPrimary ? ", Primary" : ""})
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                disabled={isLoadingInterfaces || isApplyingBind}
+                onClick={() => void loadNetworkInterfaces()}
+                className="inline-flex h-8 items-center gap-1.5 rounded-md border border-strong bg-canvas px-2.5 text-[11px] font-medium text-fg hover:bg-hover disabled:opacity-50"
+              >
+                <RefreshCw
+                  className={`h-3.5 w-3.5 ${isLoadingInterfaces ? "animate-spin" : ""}`}
+                />
+                <span>Обновить</span>
+              </button>
+            </div>
+
+            <label
+              htmlFor={`${baseId}-${sectionKey}-also-loopback`}
+              className="flex cursor-pointer items-start gap-2 pt-0.5"
+            >
+              <input
+                id={`${baseId}-${sectionKey}-also-loopback`}
+                type="checkbox"
+                checked={alsoLoopbackChecked}
+                disabled={isApplyingBind || activeSpecificValue === "127.0.0.1"}
+                onChange={(e) =>
+                  void handleAlsoBindLoopbackChange(e.target.checked)
+                }
+                className="checkbox-native mt-0.5"
+              />
+              <div>
+                <div className="text-xs font-medium text-fg">
+                  Также слушать 127.0.0.1 для системного прокси ОС
+                </div>
+                <div className="text-[11px] text-muted">
+                  {alsoLoopbackChecked && activeSpecificValue !== "127.0.0.1"
+                    ? `Dual Listener: прокси принимает подключения и на ${activeSpecificValue}:${status.port}, и на 127.0.0.1:${status.port} (системный прокси ОС указывает на 127.0.0.1).`
+                    : `Один сокет: прокси и системный прокси ОС используют ${activeSpecificValue || "выбранный IP"}:${status.port}.`}
+                </div>
+              </div>
+            </label>
+          </div>
+        )}
+
+        {bindError && (
+          <div
+            role="alert"
+            className="flex items-start gap-2 rounded-md border border-status5xx-fg/40 bg-status5xx-bg/60 px-2.5 py-2 text-[11px] text-status5xx-fg"
+          >
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>{bindError}</span>
+          </div>
+        )}
+      </div>
+    );
+
+    if (sectionKey === "rules") {
+      return (
+        <fieldset className="space-y-2.5 rounded-lg border border-hairline bg-canvas p-3.5">
+          <legend className="px-1 text-xs font-semibold text-fg">
+            Сетевой интерфейс прокси (Bind Host)
+          </legend>
+          {body}
+        </fieldset>
+      );
+    }
+
+    return (
+      <div className="border-t border-hairline pt-2.5">
+        {body}
+      </div>
+    );
+  };
 
   const validatePortString = (raw: string): number | null => {
     const clean = raw.trim();
@@ -737,7 +1102,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           <span>Применить порт</span>
                         </button>
                         <span className="font-mono text-[11px] text-muted">
-                          Активен: {status.bindAddr}:{status.port}
+                          Активен: {activeEndpointsSummary}
                         </span>
                       </div>
                       {portError && (
@@ -773,31 +1138,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         </div>
                         <div className="text-[11px] text-muted">
                           При запуске захвата перенаправляет системный HTTP/HTTPS трафик на{" "}
-                          <code className="font-mono">127.0.0.1:{status.port}</code> и откатывает при выходе.
+                          <code className="font-mono">
+                            {sysProxyTargetHost}:{status.port}
+                          </code>{" "}
+                          и откатывает при выходе.
                         </div>
                       </div>
                     </label>
 
-                    <label
-                      htmlFor={`${baseId}-allow-remote`}
-                      className="flex cursor-pointer items-start gap-2.5"
-                    >
-                      <input
-                        id={`${baseId}-allow-remote`}
-                        type="checkbox"
-                        checked={isRemoteAllowed}
-                        onChange={(e) => void onSetAllowRemote(e.target.checked)}
-                        className="checkbox-native mt-0.5"
-                      />
-                      <div>
-                        <div className="font-medium text-fg">
-                          Разрешить подключения с удалённых устройств в LAN (0.0.0.0)
-                        </div>
-                        <div className="text-[11px] text-muted">
-                          Открывает приём трафика для смартфонов iOS / Android и виртуальных машин в локальной сети.
-                        </div>
-                      </div>
-                    </label>
+                    {renderBindConfigurationSection("general")}
                   </div>
                 </div>
 
@@ -1669,6 +2018,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                ============================================================== */}
             {activeTab === "rulesProxy" && (
               <>
+                {renderBindConfigurationSection("rules")}
+
                 <fieldset className="space-y-2.5 rounded-lg border border-hairline bg-canvas p-3.5">
                   <legend className="px-1 text-xs font-semibold text-fg">
                     Режим расшифровки HTTPS (TLS MITM Mode)

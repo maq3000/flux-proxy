@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type {
   AutoResponderRule,
+  BindHostMode,
   BreakpointAction,
   BreakpointConfig,
   BreakpointResolution,
@@ -133,6 +134,9 @@ interface ParkedPreviewEntry {
 // ============================================================================
 class BrowserPreviewEngine {
   private running = true;
+  private bindMode: BindHostMode = "loopback";
+  private specificBindIp: string | null = null;
+  private alsoBindLoopback = true;
   private bindAddr = "127.0.0.1";
   private allowRemote = false;
   private port = 8888;
@@ -175,13 +179,47 @@ class BrowserPreviewEngine {
           this.autoSystemProxy = Boolean(JSON.parse(rawAuto));
           this.systemProxyEnabled = this.running && this.autoSystemProxy;
         }
-        const rawRemote = window.localStorage.getItem(
-          "fluxproxy.allowRemote.v1"
+        const rawBindMode = window.localStorage.getItem(
+          "fluxproxy.bindMode.v1"
         );
-        if (rawRemote !== null) {
-          this.allowRemote = Boolean(JSON.parse(rawRemote));
-          this.bindAddr = this.allowRemote ? "0.0.0.0" : "127.0.0.1";
+        const rawSpecificIp = window.localStorage.getItem(
+          "fluxproxy.specificBindIp.v1"
+        );
+        const rawAlsoLoopback = window.localStorage.getItem(
+          "fluxproxy.alsoBindLoopback.v1"
+        );
+        if (rawSpecificIp !== null) {
+          const parsedIp = JSON.parse(rawSpecificIp);
+          this.specificBindIp =
+            typeof parsedIp === "string" && parsedIp.trim().length > 0
+              ? parsedIp.trim()
+              : null;
         }
+        if (rawAlsoLoopback !== null) {
+          this.alsoBindLoopback = Boolean(JSON.parse(rawAlsoLoopback));
+        }
+        if (rawBindMode !== null) {
+          const parsedMode = JSON.parse(rawBindMode);
+          if (
+            parsedMode === "loopback" ||
+            parsedMode === "all" ||
+            parsedMode === "specific"
+          ) {
+            if (parsedMode === "specific" && !this.specificBindIp) {
+              this.bindMode = "loopback";
+            } else {
+              this.bindMode = parsedMode;
+            }
+          }
+        } else {
+          const rawRemote = window.localStorage.getItem(
+            "fluxproxy.allowRemote.v1"
+          );
+          if (rawRemote !== null) {
+            this.bindMode = Boolean(JSON.parse(rawRemote)) ? "all" : "loopback";
+          }
+        }
+        this.syncDerivedBindState();
         const rawLimit = window.localStorage.getItem(
           "fluxproxy.sessionRetentionLimit.v1"
         );
@@ -906,6 +944,57 @@ class BrowserPreviewEngine {
     return entries.length;
   }
 
+  private getBoundIps(): string[] {
+    if (this.bindMode === "all") {
+      return ["0.0.0.0"];
+    }
+    if (this.bindMode === "specific" && this.specificBindIp) {
+      if (this.alsoBindLoopback && this.specificBindIp !== "127.0.0.1") {
+        return [this.specificBindIp, "127.0.0.1"];
+      }
+      return [this.specificBindIp];
+    }
+    return ["127.0.0.1"];
+  }
+
+  private syncDerivedBindState(): void {
+    if (this.bindMode === "all") {
+      this.bindAddr = "0.0.0.0";
+      this.allowRemote = true;
+    } else if (this.bindMode === "specific" && this.specificBindIp) {
+      this.bindAddr = this.specificBindIp;
+      this.allowRemote = this.specificBindIp !== "127.0.0.1";
+    } else {
+      this.bindMode = "loopback";
+      this.bindAddr = "127.0.0.1";
+      this.allowRemote = false;
+    }
+  }
+
+  private persistBindConfig(): void {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        "fluxproxy.bindMode.v1",
+        JSON.stringify(this.bindMode)
+      );
+      window.localStorage.setItem(
+        "fluxproxy.specificBindIp.v1",
+        JSON.stringify(this.specificBindIp)
+      );
+      window.localStorage.setItem(
+        "fluxproxy.alsoBindLoopback.v1",
+        JSON.stringify(this.alsoBindLoopback)
+      );
+      window.localStorage.setItem(
+        "fluxproxy.allowRemote.v1",
+        JSON.stringify(this.allowRemote)
+      );
+    } catch {
+      // ignore storage errors
+    }
+  }
+
   getStatus(): ProxyStatus {
     return {
       running: this.running,
@@ -915,18 +1004,29 @@ class BrowserPreviewEngine {
       systemProxyEnabled: this.systemProxyEnabled,
       autoSystemProxy: this.autoSystemProxy,
       systemProxyError: this.systemProxyError,
-      allowRemote: this.allowRemote || this.bindAddr === "0.0.0.0",
+      allowRemote: this.allowRemote,
+      bindMode: this.bindMode,
+      specificBindIp: this.specificBindIp,
+      alsoBindLoopback: this.alsoBindLoopback,
+      boundIps: this.getBoundIps(),
     };
   }
 
   setRunning(running: boolean, host?: string, port?: number): ProxyStatus {
     this.running = running;
     if (host) {
-      this.bindAddr = host;
-      this.allowRemote = host === "0.0.0.0" || host === "::";
-    } else {
-      this.bindAddr = this.allowRemote ? "0.0.0.0" : "127.0.0.1";
+      const trimmed = host.trim();
+      if (trimmed === "0.0.0.0" || trimmed === "::") {
+        this.bindMode = "all";
+      } else if (trimmed === "127.0.0.1" || trimmed === "::1") {
+        this.bindMode = "loopback";
+      } else if (trimmed.length > 0) {
+        this.bindMode = "specific";
+        this.specificBindIp = trimmed;
+      }
+      this.persistBindConfig();
     }
+    this.syncDerivedBindState();
     if (port) this.port = port;
     if (running) {
       if (this.autoSystemProxy) {
@@ -941,20 +1041,34 @@ class BrowserPreviewEngine {
     return this.getStatus();
   }
 
-  setAllowRemote(allow: boolean): ProxyStatus {
-    this.allowRemote = allow;
-    this.bindAddr = allow ? "0.0.0.0" : "127.0.0.1";
-    if (typeof window !== "undefined") {
-      try {
-        window.localStorage.setItem(
-          "fluxproxy.allowRemote.v1",
-          JSON.stringify(allow)
-        );
-      } catch {
-        // ignore storage errors
-      }
+  setBindConfiguration(
+    bindMode: BindHostMode,
+    specificBindIp?: string | null,
+    alsoBindLoopback = true
+  ): ProxyStatus {
+    const cleanIp =
+      specificBindIp && specificBindIp.trim().length > 0
+        ? specificBindIp.trim()
+        : null;
+    if (bindMode === "specific" && !cleanIp) {
+      throw new Error(
+        "Specific interface mode requires selecting a network interface IP."
+      );
     }
+    this.bindMode = bindMode;
+    this.specificBindIp = cleanIp ?? this.specificBindIp;
+    this.alsoBindLoopback = Boolean(alsoBindLoopback);
+    this.syncDerivedBindState();
+    this.persistBindConfig();
     return this.getStatus();
+  }
+
+  setAllowRemote(allow: boolean): ProxyStatus {
+    return this.setBindConfiguration(
+      allow ? "all" : "loopback",
+      this.specificBindIp,
+      this.alsoBindLoopback
+    );
   }
 
   setSystemProxy(enabled: boolean): ProxyStatus {
@@ -2016,11 +2130,34 @@ export const proxyBridge = {
     return previewEngine.setAllowRemote(allow);
   },
 
-  async getNetworkInterfaces(): Promise<NetworkInterfaceInfo[]> {
+  async setBindConfiguration(
+    bindMode: BindHostMode,
+    specificBindIp?: string | null,
+    alsoBindLoopback = true
+  ): Promise<ProxyStatus> {
     if (isTauriRuntime()) {
-      return invoke<NetworkInterfaceInfo[]>("get_network_interfaces");
+      return invoke<ProxyStatus>("set_bind_configuration", {
+        bindMode,
+        specificBindIp: specificBindIp ?? null,
+        alsoBindLoopback,
+      });
     }
-    return [
+    return previewEngine.setBindConfiguration(
+      bindMode,
+      specificBindIp,
+      alsoBindLoopback
+    );
+  },
+
+  async getNetworkInterfaces(
+    includeVirtual = false
+  ): Promise<NetworkInterfaceInfo[]> {
+    if (isTauriRuntime()) {
+      return invoke<NetworkInterfaceInfo[]>("get_network_interfaces", {
+        includeVirtual,
+      });
+    }
+    const baseInterfaces: NetworkInterfaceInfo[] = [
       {
         name: "Wi-Fi",
         ip: "192.168.1.45",
@@ -2031,6 +2168,30 @@ export const proxyBridge = {
         name: "Ethernet",
         ip: "10.0.0.24",
         kind: "ethernet",
+        isPrimary: false,
+      },
+    ];
+    if (!includeVirtual) {
+      return baseInterfaces;
+    }
+    return [
+      ...baseInterfaces,
+      {
+        name: "vEthernet (WSL)",
+        ip: "172.24.16.1",
+        kind: "virtual",
+        isPrimary: false,
+      },
+      {
+        name: "docker0 [Docker]",
+        ip: "172.17.0.1",
+        kind: "virtual",
+        isPrimary: false,
+      },
+      {
+        name: "Tailscale [Tailscale VPN]",
+        ip: "100.101.102.4",
+        kind: "vpn",
         isPrimary: false,
       },
     ];

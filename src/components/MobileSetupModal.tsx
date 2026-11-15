@@ -134,6 +134,13 @@ export const MobileSetupModal: React.FC<MobileSetupModalProps> = ({
       const list = await proxyBridge.getNetworkInterfaces();
       setInterfaces(list);
       setSelectedIp((prev) => {
+        if (
+          status.bindMode === "specific" &&
+          status.specificBindIp &&
+          list.some((item) => item.ip === status.specificBindIp)
+        ) {
+          return status.specificBindIp;
+        }
         if (prev && list.some((item) => item.ip === prev)) {
           return prev;
         }
@@ -149,7 +156,7 @@ export const MobileSetupModal: React.FC<MobileSetupModalProps> = ({
     } finally {
       setLoadingIfaces(false);
     }
-  }, [onNotify]);
+  }, [onNotify, status.bindMode, status.specificBindIp]);
 
   useEffect(() => {
     const el = dialogRef.current;
@@ -190,8 +197,29 @@ export const MobileSetupModal: React.FC<MobileSetupModalProps> = ({
     }
   };
 
+  const effectiveBindMode =
+    status.bindMode ??
+    (status.allowRemote ||
+    status.bindAddr === "0.0.0.0" ||
+    status.bindAddr === "::"
+      ? "all"
+      : "loopback");
+
+  const boundIpsList =
+    status.boundIps && status.boundIps.length > 0
+      ? status.boundIps
+      : [status.bindAddr];
+
+  const activeEndpointsSummary = boundIpsList
+    .map((ip) => `${ip}:${status.port}`)
+    .join(" + ");
+
   const isRemoteAllowed = Boolean(
-    status.allowRemote || status.bindAddr === "0.0.0.0" || status.bindAddr === "::"
+    effectiveBindMode === "all" ||
+      (effectiveBindMode === "specific" &&
+        status.specificBindIp !== "127.0.0.1" &&
+        status.bindAddr !== "127.0.0.1") ||
+      status.allowRemote
   );
 
   const trimmedCustomIp = customIp.trim();
@@ -333,14 +361,16 @@ export const MobileSetupModal: React.FC<MobileSetupModalProps> = ({
                   }`}
                 >
                   {status.running
-                    ? `${status.bindAddr}:${status.port}`
+                    ? activeEndpointsSummary
                     : "Listener Paused"}
                 </span>
               </div>
               <p className="mt-0.5 text-[11px] text-muted">
-                {isRemoteAllowed
+                {effectiveBindMode === "all"
                   ? "Прокси слушает все сетевые интерфейсы (Wi-Fi / Ethernet). Убедитесь, что смартфон подключен к той же сети Wi-Fi и брандмауэр ОС разрешает входящий порт."
-                  : "Сейчас прокси принимает соединения только локально (127.0.0.1). Включите эту опцию, чтобы iPhone или Android в вашей Wi-Fi сети мог подключиться."}
+                  : isRemoteAllowed
+                    ? `Прокси привязан к выбранному интерфейсу (${activeEndpointsSummary}). Убедитесь, что подключаемое устройство находится в этой подсети.`
+                    : "Сейчас прокси принимает соединения только локально (127.0.0.1). Включите эту опцию, чтобы iPhone или Android в вашей Wi-Fi сети мог подключиться."}
               </p>
             </div>
           </label>

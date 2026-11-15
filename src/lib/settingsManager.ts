@@ -24,6 +24,7 @@ import { proxyBridge } from "./tauriBridge";
 import { DEFAULT_SESSION_RETENTION_LIMIT } from "../types/proxy";
 import type {
   AutoResponderRule,
+  BindHostMode,
   ColumnId,
   FilterConditionRule,
   FilterField,
@@ -71,6 +72,9 @@ export const SETTINGS_STORAGE_KEYS = {
   backendFilterConfig: "fluxproxy.backendFilterConfig.v1",
   autoSystemProxy: "fluxproxy.autoSystemProxy.v1",
   allowRemote: "fluxproxy.allowRemote.v1",
+  bindMode: "fluxproxy.bindMode.v1",
+  specificBindIp: "fluxproxy.specificBindIp.v1",
+  alsoBindLoopback: "fluxproxy.alsoBindLoopback.v1",
   proxyPort: "fluxproxy.proxyPort.v1",
   autoResponder: "fluxproxy.autoResponder.v1",
   sessionRetentionLimit: "fluxproxy.sessionRetentionLimit.v1",
@@ -80,6 +84,7 @@ export const SETTINGS_STORAGE_KEYS = {
 
 const VALID_THEMES = new Set<ThemePreference>(["dark", "light", "system"]);
 const VALID_DOCK_POSITIONS = new Set<InspectorDockPosition>(["bottom", "right"]);
+const VALID_BIND_MODES = new Set<BindHostMode>(["loopback", "all", "specific"]);
 const VALID_TLS_MODES = new Set<TlsInterceptMode>([
   "interceptAll",
   "targetedOnly",
@@ -217,6 +222,9 @@ export function createDefaultSettingsProfile(): FluxUserSettingsProfile {
       port: 8888,
       autoSystemProxy: true,
       allowRemote: false,
+      bindMode: "loopback",
+      specificBindIp: null,
+      alsoBindLoopback: true,
       tlsInterceptMode: DEFAULT_BACKEND_FILTER_CONFIG.tlsInterceptMode,
       tlsBypassRules: structuredClone(
         DEFAULT_BACKEND_FILTER_CONFIG.tlsBypassRules
@@ -322,6 +330,21 @@ const SCHEMA_MIGRATIONS: Record<number, SchemaMigrationFn> = {
     }
     if (proxy.allowRemote === undefined && draft.allowRemote !== undefined) {
       proxy.allowRemote = draft.allowRemote;
+    }
+    if (proxy.bindMode === undefined && draft.bindMode !== undefined) {
+      proxy.bindMode = draft.bindMode;
+    }
+    if (
+      proxy.specificBindIp === undefined &&
+      draft.specificBindIp !== undefined
+    ) {
+      proxy.specificBindIp = draft.specificBindIp;
+    }
+    if (
+      proxy.alsoBindLoopback === undefined &&
+      draft.alsoBindLoopback !== undefined
+    ) {
+      proxy.alsoBindLoopback = draft.alsoBindLoopback;
     }
     if (proxy.clearDbOnExit === undefined) {
       if (draft.clearDbOnExit !== undefined) {
@@ -1182,6 +1205,61 @@ export function validateAndMigrateSettingsProfileWithReport(
     }
   }
 
+  const legacyAllowRemote = sanitizeBoolean(
+    rawProxy.allowRemote,
+    defaults.proxy.allowRemote,
+    "proxy.allowRemote",
+    warnings
+  );
+
+  let specificBindIp: string | null = null;
+  if (rawProxy.specificBindIp !== undefined && rawProxy.specificBindIp !== null) {
+    if (typeof rawProxy.specificBindIp === "string") {
+      const trimmed = rawProxy.specificBindIp.trim();
+      specificBindIp = trimmed.length > 0 ? trimmed : null;
+    } else {
+      warnings.push("Поле «proxy.specificBindIp» должно быть строкой — сброшено.");
+    }
+  }
+
+  const alsoBindLoopback =
+    rawProxy.alsoBindLoopback !== undefined
+      ? sanitizeBoolean(
+          rawProxy.alsoBindLoopback,
+          true,
+          "proxy.alsoBindLoopback",
+          warnings
+        )
+      : true;
+
+  let bindMode: BindHostMode = legacyAllowRemote ? "all" : "loopback";
+  if (rawProxy.bindMode !== undefined) {
+    if (
+      typeof rawProxy.bindMode === "string" &&
+      VALID_BIND_MODES.has(rawProxy.bindMode as BindHostMode)
+    ) {
+      const candidate = rawProxy.bindMode as BindHostMode;
+      if (candidate === "specific" && !specificBindIp) {
+        warnings.push(
+          "Поле «proxy.bindMode = specific» без указанного «proxy.specificBindIp» — выполнен откат."
+        );
+      } else {
+        bindMode = candidate;
+      }
+    } else {
+      warnings.push(
+        "Поле «proxy.bindMode» некорректно — выполнена миграция из allowRemote."
+      );
+    }
+  }
+
+  const resolvedAllowRemote =
+    bindMode === "all"
+      ? true
+      : bindMode === "specific" && specificBindIp
+        ? specificBindIp !== "127.0.0.1" && specificBindIp !== "::1"
+        : false;
+
   let sessionRetentionLimit: number | null = DEFAULT_SESSION_RETENTION_LIMIT;
   if (rawProxy.sessionRetentionLimit !== undefined) {
     if (rawProxy.sessionRetentionLimit === null) {
@@ -1269,12 +1347,10 @@ export function validateAndMigrateSettingsProfileWithReport(
         "proxy.autoSystemProxy",
         warnings
       ),
-      allowRemote: sanitizeBoolean(
-        rawProxy.allowRemote,
-        defaults.proxy.allowRemote,
-        "proxy.allowRemote",
-        warnings
-      ),
+      allowRemote: resolvedAllowRemote,
+      bindMode,
+      specificBindIp,
+      alsoBindLoopback,
       tlsInterceptMode,
       tlsBypassRules: sanitizeTlsRuleList(
         rawProxy.tlsBypassRules,
@@ -1416,6 +1492,21 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
     SETTINGS_STORAGE_KEYS.allowRemote,
     defaults.proxy.allowRemote
   );
+  const hasStoredBindMode =
+    typeof window !== "undefined" &&
+    window.localStorage.getItem(SETTINGS_STORAGE_KEYS.bindMode) !== null;
+  const storedBindMode = readLocalStorageJson<BindHostMode | null>(
+    SETTINGS_STORAGE_KEYS.bindMode,
+    null
+  );
+  const storedSpecificBindIp = readLocalStorageJson<string | null>(
+    SETTINGS_STORAGE_KEYS.specificBindIp,
+    null
+  );
+  const storedAlsoBindLoopback = readLocalStorageJson<boolean>(
+    SETTINGS_STORAGE_KEYS.alsoBindLoopback,
+    true
+  );
   const storedPort = readLocalStorageJson<number>(
     SETTINGS_STORAGE_KEYS.proxyPort,
     defaults.proxy.port
@@ -1441,6 +1532,38 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
   });
 
   const live = liveSnapshotGetter ? liveSnapshotGetter() : {};
+
+  const effectiveAllowRemote = live.proxy?.allowRemote ?? storedAllowRemote;
+  const rawSpecificBindIp =
+    live.proxy?.specificBindIp !== undefined
+      ? live.proxy.specificBindIp
+      : storedSpecificBindIp;
+  const resolvedSpecificBindIp =
+    typeof rawSpecificBindIp === "string" && rawSpecificBindIp.trim().length > 0
+      ? rawSpecificBindIp.trim()
+      : null;
+  const candidateBindMode: BindHostMode =
+    live.proxy?.bindMode ??
+    (hasStoredBindMode && storedBindMode && VALID_BIND_MODES.has(storedBindMode)
+      ? storedBindMode
+      : effectiveAllowRemote
+        ? "all"
+        : "loopback");
+  const resolvedBindMode: BindHostMode =
+    candidateBindMode === "specific" && !resolvedSpecificBindIp
+      ? effectiveAllowRemote
+        ? "all"
+        : "loopback"
+      : candidateBindMode;
+  const resolvedAlsoBindLoopback =
+    live.proxy?.alsoBindLoopback ?? storedAlsoBindLoopback;
+  const resolvedAllowRemote =
+    resolvedBindMode === "all"
+      ? true
+      : resolvedBindMode === "specific" && resolvedSpecificBindIp
+        ? resolvedSpecificBindIp !== "127.0.0.1" &&
+          resolvedSpecificBindIp !== "::1"
+        : false;
 
   const mergedCandidate: FluxUserSettingsProfile = {
     schemaVersion: CURRENT_SETTINGS_SCHEMA_VERSION,
@@ -1506,7 +1629,10 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
     proxy: {
       port: live.proxy?.port ?? storedPort,
       autoSystemProxy: live.proxy?.autoSystemProxy ?? storedAutoSysProxy,
-      allowRemote: live.proxy?.allowRemote ?? storedAllowRemote,
+      allowRemote: resolvedAllowRemote,
+      bindMode: resolvedBindMode,
+      specificBindIp: resolvedSpecificBindIp,
+      alsoBindLoopback: resolvedAlsoBindLoopback,
       tlsInterceptMode:
         live.proxy?.tlsInterceptMode ??
         storedBackendCfg.tlsInterceptMode ??
@@ -1778,6 +1904,21 @@ function atomicWriteProfileToLocalStorage(
       SETTINGS_STORAGE_KEYS.allowRemote,
       JSON.stringify(profile.proxy.allowRemote),
     ],
+    [
+      SETTINGS_STORAGE_KEYS.bindMode,
+      JSON.stringify(
+        profile.proxy.bindMode ??
+          (profile.proxy.allowRemote ? "all" : "loopback")
+      ),
+    ],
+    [
+      SETTINGS_STORAGE_KEYS.specificBindIp,
+      JSON.stringify(profile.proxy.specificBindIp ?? null),
+    ],
+    [
+      SETTINGS_STORAGE_KEYS.alsoBindLoopback,
+      JSON.stringify(profile.proxy.alsoBindLoopback ?? true),
+    ],
     [SETTINGS_STORAGE_KEYS.proxyPort, JSON.stringify(profile.proxy.port)],
     [
       SETTINGS_STORAGE_KEYS.autoResponder,
@@ -1887,21 +2028,37 @@ export async function applySettingsProfile(
     }
   }
 
-  const currentRemote = Boolean(
-    latestStatus.allowRemote || latestStatus.bindAddr === "0.0.0.0"
-  );
-  if (currentRemote !== normalized.proxy.allowRemote) {
-    latestStatus = await proxyBridge.setAllowRemote(
-      normalized.proxy.allowRemote
+  const currentMode: BindHostMode =
+    latestStatus.bindMode ??
+    (latestStatus.allowRemote || latestStatus.bindAddr === "0.0.0.0"
+      ? "all"
+      : "loopback");
+  const currentSpecificIp = latestStatus.specificBindIp ?? null;
+  const currentAlsoLoopback = latestStatus.alsoBindLoopback ?? true;
+
+  const targetMode: BindHostMode =
+    normalized.proxy.bindMode ??
+    (normalized.proxy.allowRemote ? "all" : "loopback");
+  const targetSpecificIp = normalized.proxy.specificBindIp ?? null;
+  const targetAlsoLoopback = normalized.proxy.alsoBindLoopback ?? true;
+
+  if (
+    currentMode !== targetMode ||
+    (targetMode === "specific" && currentSpecificIp !== targetSpecificIp) ||
+    currentAlsoLoopback !== targetAlsoLoopback
+  ) {
+    latestStatus = await proxyBridge.setBindConfiguration(
+      targetMode,
+      targetSpecificIp,
+      targetAlsoLoopback
     );
   }
 
   if (latestStatus.port !== normalized.proxy.port) {
-    const desiredHost = normalized.proxy.allowRemote ? "0.0.0.0" : "127.0.0.1";
     if (latestStatus.running) {
       await proxyBridge.stopProxy();
       latestStatus = await proxyBridge.startProxy(
-        desiredHost,
+        undefined,
         normalized.proxy.port
       );
     } else {

@@ -170,6 +170,7 @@ export const App: React.FC = () => {
     clearSqliteDatabase,
     toggleProxy,
     setProxyPort,
+    setBindConfiguration,
     setAllowRemote,
     toggleAllowRemote,
     toggleSystemProxy,
@@ -661,8 +662,16 @@ export const App: React.FC = () => {
       port: status.port,
       autoSystemProxy: status.autoSystemProxy,
       allowRemote: Boolean(
-        status.allowRemote || status.bindAddr === "0.0.0.0"
+        status.allowRemote ||
+          status.bindMode === "all" ||
+          (status.bindMode === "specific" &&
+            status.specificBindIp &&
+            status.specificBindIp !== "127.0.0.1") ||
+          status.bindAddr === "0.0.0.0"
       ),
+      bindMode: status.bindMode,
+      specificBindIp: status.specificBindIp ?? null,
+      alsoBindLoopback: status.alsoBindLoopback ?? true,
       tlsInterceptMode: backendFilterConfig.tlsInterceptMode,
       tlsBypassRules: backendFilterConfig.tlsBypassRules,
       tlsTargetRules: backendFilterConfig.tlsTargetRules,
@@ -2414,26 +2423,57 @@ export const App: React.FC = () => {
             {status.systemProxyError
               ? "SysProxy: Warn"
               : status.systemProxyEnabled
-                ? `SysProxy: 127.0.0.1:${status.port}`
+                ? `SysProxy: ${
+                    status.bindMode === "specific" &&
+                    status.specificBindIp &&
+                    status.alsoBindLoopback === false
+                      ? status.specificBindIp
+                      : "127.0.0.1"
+                  }:${status.port}`
                 : status.running
                   ? "Port Only"
                   : "Proxy Off"}
           </button>
           <span className="hidden text-subtle md:inline">•</span>
-          <button
-            type="button"
-            onClick={() => setMobileModalOpen(true)}
-            title="Подключить мобильное устройство iOS / Android по Wi-Fi (Ctrl+Shift+M)"
-            className={`hidden shrink-0 hover:underline md:inline ${
-              status.allowRemote || status.bindAddr === "0.0.0.0"
-                ? "text-status2xx-fg"
-                : "text-muted"
-            }`}
-          >
-            {status.allowRemote || status.bindAddr === "0.0.0.0"
-              ? `LAN: 0.0.0.0:${status.port}`
-              : "Mobile: Local Only"}
-          </button>
+          {(() => {
+            const boundIpsList =
+              status.boundIps && status.boundIps.length > 0
+                ? status.boundIps
+                : [status.bindAddr];
+            const boundEndpoints = boundIpsList
+              .map((ip) => `${ip}:${status.port}`)
+              .join(" + ");
+            const effectiveMode =
+              status.bindMode ??
+              (status.allowRemote || status.bindAddr === "0.0.0.0"
+                ? "all"
+                : "loopback");
+            const isRemoteActive = Boolean(
+              effectiveMode === "all" ||
+                (effectiveMode === "specific" &&
+                  status.specificBindIp !== "127.0.0.1" &&
+                  status.bindAddr !== "127.0.0.1") ||
+                status.allowRemote
+            );
+            const prefix =
+              effectiveMode === "all"
+                ? "LAN"
+                : effectiveMode === "specific"
+                  ? "Bind"
+                  : "Local";
+            return (
+              <button
+                type="button"
+                onClick={() => setMobileModalOpen(true)}
+                title={`Активные интерфейсы: ${boundEndpoints}. Нажмите для настройки мобильного подключения (Ctrl+Shift+M)`}
+                className={`hidden shrink-0 font-mono hover:underline md:inline ${
+                  isRemoteActive ? "text-status2xx-fg" : "text-muted"
+                }`}
+              >
+                {`${prefix}: ${boundEndpoints}`}
+              </button>
+            );
+          })()}
           <span className="hidden text-subtle md:inline">•</span>
           <button
             type="button"
@@ -2598,6 +2638,7 @@ export const App: React.FC = () => {
         onSetProxyPort={setProxyPort}
         onSetAutoSystemProxy={setAutoSystemProxy}
         onSetAllowRemote={setAllowRemote}
+        onSetBindConfiguration={setBindConfiguration}
         sessionRetentionLimit={sessionRetentionLimit}
         onSetSessionRetentionLimit={setSessionRetentionLimit}
         dropNonMatching={dropNonMatching}

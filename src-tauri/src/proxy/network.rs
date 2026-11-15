@@ -90,23 +90,41 @@ pub fn detect_primary_outbound_ipv4() -> Option<Ipv4Addr> {
 /// Returns active local LAN IPv4 network interfaces (Wi-Fi, Ethernet), excluding loopback (`127.0.0.1`),
 /// link-local (`169.254.x.x`), CGNAT/VPN (`100.64.0.0/10`), and virtual adapters (WSL, Hyper-V, Docker, VMware, VirtualBox, etc.).
 pub fn list_network_interfaces() -> Vec<NetworkInterfaceInfo> {
+    list_network_interfaces_with_options(false)
+}
+
+/// Returns active IPv4 network interfaces. When `include_virtual` is `true`, virtual and tunnel/VPN
+/// interfaces (WSL, Docker, Hyper-V, VMware, VirtualBox, Tailscale, WireGuard, OpenVPN, etc.) are
+/// included alongside physical Wi-Fi and Ethernet adapters, with clear `kind` and `name`.
+pub fn list_network_interfaces_with_options(include_virtual: bool) -> Vec<NetworkInterfaceInfo> {
     let primary_ip = detect_primary_outbound_ipv4();
-    let mut list = query_active_lan_interfaces(primary_ip);
+    let mut list = query_active_lan_interfaces(primary_ip, include_virtual);
 
     // Ensure primary outbound LAN IP is always present even if an unusual OS driver hid its adapter metadata
     if let Some(primary) = primary_ip {
         let primary_str = primary.to_string();
-        if !list.iter().any(|item| item.ip == primary_str) && !is_cgnat_or_vpn_ipv4(primary) {
+        if !list.iter().any(|item| item.ip == primary_str)
+            && (include_virtual || !is_cgnat_or_vpn_ipv4(primary))
+        {
+            let kind = if is_cgnat_or_vpn_ipv4(primary) {
+                "vpn".to_string()
+            } else {
+                "wifi".to_string()
+            };
             list.push(NetworkInterfaceInfo {
-                name: "Primary Network".to_string(),
+                name: if kind == "vpn" {
+                    "Primary VPN Network".to_string()
+                } else {
+                    "Primary Network".to_string()
+                },
                 ip: primary_str,
-                kind: "wifi".to_string(),
-                is_primary: true,
+                kind,
+                is_primary: !is_cgnat_or_vpn_ipv4(primary),
             });
         }
     }
 
-    // Sort: primary interface first, then Wi-Fi, then Ethernet, then alphabetical
+    // Sort: primary interface first, then Wi-Fi, Ethernet, VPN, Virtual, then alphabetical
     list.sort_by(|a, b| {
         b.is_primary
             .cmp(&a.is_primary)
@@ -118,7 +136,14 @@ pub fn list_network_interfaces() -> Vec<NetworkInterfaceInfo> {
     // If none was marked primary yet (e.g. isolated offline Wi-Fi router without default WAN gateway),
     // promote the top Wi-Fi/Ethernet interface as primary for convenience.
     if !list.is_empty() && !list.iter().any(|i| i.is_primary) {
-        list[0].is_primary = true;
+        if let Some(physical) = list
+            .iter_mut()
+            .find(|i| i.kind == "wifi" || i.kind == "ethernet")
+        {
+            physical.is_primary = true;
+        } else if !include_virtual {
+            list[0].is_primary = true;
+        }
     }
 
     list
@@ -128,7 +153,9 @@ fn kind_priority(kind: &str) -> u8 {
     match kind {
         "wifi" => 0,
         "ethernet" => 1,
-        _ => 2,
+        "vpn" => 2,
+        "virtual" => 3,
+        _ => 4,
     }
 }
 
@@ -144,6 +171,147 @@ pub(crate) fn is_cgnat_or_vpn_ipv4(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
     // RFC 6598 100.64.0.0/10 (commonly used by Tailscale / Carrier-Grade NAT)
     octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+pub(crate) fn is_noise_pseudo_adapter(name: &str, description: &str) -> bool {
+    let combined = format!(
+        "{} {}",
+        name.trim().to_ascii_lowercase(),
+        description.trim().to_ascii_lowercase()
+    );
+
+    const NOISE_KEYWORDS: &[&str] = &[
+        "loopback",
+        "pseudo-interface",
+        "teredo",
+        "isatap",
+        "6to4",
+        "ip-https",
+        "wan miniport",
+        "npcap",
+        "winpcap",
+        "wi-fi direct virtual",
+        "hosted network virtual",
+        "bluetooth",
+        "kernel debug",
+    ];
+
+    NOISE_KEYWORDS.iter().any(|kw| combined.contains(kw))
+}
+
+fn has_token(text: &str, token: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| part == token)
+}
+
+pub(crate) fn classify_virtual_or_vpn_adapter(
+    name: &str,
+    description: &str,
+    ip: Ipv4Addr,
+) -> Option<(&'static str, &'static str)> {
+    let lower_name = name.trim().to_ascii_lowercase();
+    let lower_desc = description.trim().to_ascii_lowercase();
+    let combined = format!("{lower_name} {lower_desc}");
+
+    if combined.contains("wsl") {
+        return Some(("virtual", "WSL"));
+    }
+    if combined.contains("docker")
+        || combined.contains("podman")
+        || (!lower_name.starts_with("vethernet")
+            && (lower_name.starts_with("veth") || has_token(&combined, "veth")))
+        || lower_name.starts_with("br-")
+        || has_token(&lower_name, "br")
+    {
+        return Some(("virtual", "Docker"));
+    }
+    if combined.contains("hyper-v") || combined.contains("vethernet") {
+        return Some(("virtual", "Hyper-V"));
+    }
+    if combined.contains("vmware")
+        || combined.contains("vmnet")
+        || combined.contains("virtualbox")
+        || combined.contains("vbox")
+        || combined.contains("virbr")
+        || combined.contains("parallels")
+        || combined.contains("virtual adapter")
+    {
+        return Some(("virtual", "VM"));
+    }
+    if combined.contains("tailscale") {
+        return Some(("vpn", "Tailscale VPN"));
+    }
+    if combined.contains("wireguard")
+        || combined.contains("wintun")
+        || lower_name.starts_with("wg")
+        || has_token(&combined, "wg")
+    {
+        return Some(("vpn", "WireGuard VPN"));
+    }
+    if combined.contains("zerotier") {
+        return Some(("vpn", "ZeroTier VPN"));
+    }
+    if combined.contains("openvpn")
+        || combined.contains("anyconnect")
+        || combined.contains("fortissl")
+        || combined.contains("pangp")
+        || combined.contains("globalprotect")
+        || combined.contains("tap-windows")
+        || combined.contains("tap adapter")
+        || combined.contains("radmin")
+        || combined.contains("hamachi")
+        || combined.contains("nordlynx")
+        || combined.contains("protonvpn")
+        || lower_name.starts_with("utun")
+        || lower_name.starts_with("tun")
+        || lower_name.starts_with("tap")
+        || lower_name.starts_with("ppp")
+        || has_token(&combined, "tun")
+        || has_token(&combined, "utun")
+        || is_cgnat_or_vpn_ipv4(ip)
+    {
+        return Some(("vpn", "VPN"));
+    }
+
+    None
+}
+
+pub(crate) fn enrich_interface_name_and_kind(
+    raw_name: &str,
+    description: &str,
+    ip: Ipv4Addr,
+    default_kind: &str,
+) -> (String, String) {
+    let trimmed = raw_name.trim();
+    if let Some((v_kind, label)) = classify_virtual_or_vpn_adapter(trimmed, description, ip) {
+        let lower = trimmed.to_ascii_lowercase();
+        let label_primary = label
+            .split_whitespace()
+            .next()
+            .unwrap_or(label)
+            .to_ascii_lowercase();
+        let display_name = if lower.contains(&label.to_ascii_lowercase())
+            || (!label_primary.is_empty() && lower.contains(&label_primary))
+        {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed} [{label}]")
+        };
+        return (display_name, v_kind.to_string());
+    }
+
+    if default_kind == "vpn" || default_kind == "virtual" {
+        let tag = if default_kind == "vpn" { "VPN" } else { "Virtual" };
+        let lower = trimmed.to_ascii_lowercase();
+        let display_name = if lower.contains(&tag.to_ascii_lowercase()) {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed} [{tag}]")
+        };
+        return (display_name, default_kind.to_string());
+    }
+
+    (trimmed.to_string(), default_kind.to_string())
 }
 
 pub(crate) fn is_virtual_or_excluded_adapter(name: &str, description: &str) -> bool {
@@ -243,8 +411,11 @@ fn collect_all_host_ipv4s() -> HashSet<Ipv4Addr> {
 }
 
 #[cfg(target_os = "windows")]
-fn query_active_lan_interfaces(primary_ip: Option<Ipv4Addr>) -> Vec<NetworkInterfaceInfo> {
-    win_imp::query_interfaces(primary_ip)
+fn query_active_lan_interfaces(
+    primary_ip: Option<Ipv4Addr>,
+    include_virtual: bool,
+) -> Vec<NetworkInterfaceInfo> {
+    win_imp::query_interfaces(primary_ip, include_virtual)
 }
 
 #[cfg(target_os = "windows")]
@@ -379,12 +550,18 @@ mod win_imp {
         }
     }
 
-    pub fn query_interfaces(primary_ip: Option<Ipv4Addr>) -> Vec<NetworkInterfaceInfo> {
+    pub fn query_interfaces(
+        primary_ip: Option<Ipv4Addr>,
+        include_virtual: bool,
+    ) -> Vec<NetworkInterfaceInfo> {
         let mut seen_ips = HashSet::new();
         let mut results = Vec::new();
 
         for (ip, if_index) in get_raw_ipv4_rows() {
-            if !is_usable_lan_ipv4(ip) || is_cgnat_or_vpn_ipv4(ip) || !seen_ips.insert(ip) {
+            if !is_usable_lan_ipv4(ip)
+                || (!include_virtual && is_cgnat_or_vpn_ipv4(ip))
+                || !seen_ips.insert(ip)
+            {
                 continue;
             }
 
@@ -394,10 +571,15 @@ mod win_imp {
                 continue;
             }
 
-            if matches!(
-                if_row.dw_type,
-                IF_TYPE_SOFTWARE_LOOPBACK | IF_TYPE_TUNNEL | IF_TYPE_PPP | IF_TYPE_PROP_VIRTUAL
-            ) {
+            if if_row.dw_type == IF_TYPE_SOFTWARE_LOOPBACK {
+                continue;
+            }
+            if !include_virtual
+                && matches!(
+                    if_row.dw_type,
+                    IF_TYPE_TUNNEL | IF_TYPE_PPP | IF_TYPE_PROP_VIRTUAL
+                )
+            {
                 continue;
             }
 
@@ -425,25 +607,36 @@ mod win_imp {
                 }
             });
 
-            if is_virtual_or_excluded_adapter(&alias, &description) {
+            if is_noise_pseudo_adapter(&alias, &description) {
+                continue;
+            }
+            if !include_virtual && is_virtual_or_excluded_adapter(&alias, &description) {
                 continue;
             }
 
-            let kind = match if_row.dw_type {
-                IF_TYPE_IEEE80211 => "wifi".to_string(),
+            let base_kind = match if_row.dw_type {
+                IF_TYPE_IEEE80211 => "wifi",
                 IF_TYPE_ETHERNET_CSMACD => {
                     let guessed = classify_interface_kind(&alias, &description);
                     if guessed == "wifi" {
-                        "wifi".to_string()
+                        "wifi"
                     } else {
-                        "ethernet".to_string()
+                        "ethernet"
                     }
                 }
-                _ => classify_interface_kind(&alias, &description).to_string(),
+                IF_TYPE_TUNNEL | IF_TYPE_PPP => "vpn",
+                IF_TYPE_PROP_VIRTUAL => "virtual",
+                _ => classify_interface_kind(&alias, &description),
+            };
+
+            let (name, kind) = if include_virtual {
+                enrich_interface_name_and_kind(&alias, &description, ip, base_kind)
+            } else {
+                (alias, base_kind.to_string())
             };
 
             results.push(NetworkInterfaceInfo {
-                name: alias,
+                name,
                 ip: ip.to_string(),
                 kind,
                 is_primary: primary_ip == Some(ip),
@@ -471,13 +664,19 @@ fn collect_all_host_ipv4s() -> HashSet<Ipv4Addr> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn query_active_lan_interfaces(primary_ip: Option<Ipv4Addr>) -> Vec<NetworkInterfaceInfo> {
+fn query_active_lan_interfaces(
+    primary_ip: Option<Ipv4Addr>,
+    include_virtual: bool,
+) -> Vec<NetworkInterfaceInfo> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     let hw_ports = unix_imp::macos_hardware_port_names();
 
     for (ip, raw_name) in unix_imp::enumerate_unix_ipv4s() {
-        if !is_usable_lan_ipv4(ip) || is_cgnat_or_vpn_ipv4(ip) || !seen.insert(ip) {
+        if !is_usable_lan_ipv4(ip)
+            || (!include_virtual && is_cgnat_or_vpn_ipv4(ip))
+            || !seen.insert(ip)
+        {
             continue;
         }
         let friendly = hw_ports
@@ -485,19 +684,28 @@ fn query_active_lan_interfaces(primary_ip: Option<Ipv4Addr>) -> Vec<NetworkInter
             .cloned()
             .unwrap_or_else(|| raw_name.clone());
 
-        if is_virtual_or_excluded_adapter(&raw_name, &friendly) {
+        if is_noise_pseudo_adapter(&raw_name, &friendly) {
+            continue;
+        }
+        if !include_virtual && is_virtual_or_excluded_adapter(&raw_name, &friendly) {
             continue;
         }
 
-        let display_name = if friendly != raw_name {
+        let base_display = if friendly != raw_name {
             format!("{friendly} ({raw_name})")
         } else {
             raw_name.clone()
         };
 
-        let kind = classify_interface_kind(&raw_name, &friendly).to_string();
+        let base_kind = classify_interface_kind(&raw_name, &friendly);
+        let (name, kind) = if include_virtual {
+            enrich_interface_name_and_kind(&base_display, &friendly, ip, base_kind)
+        } else {
+            (base_display, base_kind.to_string())
+        };
+
         out.push(NetworkInterfaceInfo {
-            name: display_name,
+            name,
             ip: ip.to_string(),
             kind,
             is_primary: primary_ip == Some(ip),
@@ -657,8 +865,88 @@ mod tests {
             assert_ne!(iface.ip, "127.0.0.1");
             assert!(!iface.ip.starts_with("169.254."));
         }
+        let with_virtual = list_network_interfaces_with_options(true);
+        for iface in &with_virtual {
+            assert_ne!(iface.ip, "127.0.0.1");
+            assert!(!iface.ip.starts_with("169.254."));
+        }
+        assert!(with_virtual.len() >= interfaces.len());
         assert!(is_host_own_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         // Arbitrary unallocated LAN IP should not match this host (unless coincidentally assigned)
         let _ = is_host_own_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 250)));
+    }
+
+    #[test]
+    fn classifies_virtual_and_vpn_interfaces_when_included() {
+        assert_eq!(
+            enrich_interface_name_and_kind(
+                "vEthernet (WSL)",
+                "Hyper-V Virtual Ethernet Adapter",
+                Ipv4Addr::new(172, 24, 16, 1),
+                "ethernet"
+            ),
+            ("vEthernet (WSL)".to_string(), "virtual".to_string())
+        );
+        assert_eq!(
+            enrich_interface_name_and_kind(
+                "vEthernet (Default Switch)",
+                "Hyper-V Virtual Ethernet Adapter",
+                Ipv4Addr::new(172, 28, 0, 1),
+                "ethernet"
+            ),
+            (
+                "vEthernet (Default Switch) [Hyper-V]".to_string(),
+                "virtual".to_string()
+            )
+        );
+        assert_eq!(
+            enrich_interface_name_and_kind(
+                "docker0",
+                "Docker Bridge",
+                Ipv4Addr::new(172, 17, 0, 1),
+                "ethernet"
+            ),
+            ("docker0".to_string(), "virtual".to_string())
+        );
+        assert_eq!(
+            enrich_interface_name_and_kind(
+                "br-123456",
+                "Docker Bridge",
+                Ipv4Addr::new(172, 18, 0, 1),
+                "ethernet"
+            ),
+            ("br-123456 [Docker]".to_string(), "virtual".to_string())
+        );
+        assert_eq!(
+            enrich_interface_name_and_kind(
+                "Tailscale",
+                "Tailscale Tunnel",
+                Ipv4Addr::new(100, 101, 102, 4),
+                "vpn"
+            ),
+            ("Tailscale".to_string(), "vpn".to_string())
+        );
+        assert_eq!(
+            enrich_interface_name_and_kind(
+                "tun0",
+                "Wintun Userspace Tunnel",
+                Ipv4Addr::new(10, 8, 0, 2),
+                "vpn"
+            ),
+            ("tun0 [WireGuard VPN]".to_string(), "vpn".to_string())
+        );
+        assert_eq!(
+            enrich_interface_name_and_kind(
+                "Wi-Fi",
+                "Intel(R) Wi-Fi 6E AX211 160MHz",
+                Ipv4Addr::new(192, 168, 1, 45),
+                "wifi"
+            ),
+            ("Wi-Fi".to_string(), "wifi".to_string())
+        );
+        assert!(is_noise_pseudo_adapter(
+            "Teredo Tunneling Pseudo-Interface",
+            "Microsoft Teredo Tunneling Adapter"
+        ));
     }
 }

@@ -59,11 +59,11 @@ pub fn run() {
                 .expect("Failed to create ProxyEngineController"),
             );
 
-            // Auto-start proxy listener on preferred bind host (127.0.0.1 or 0.0.0.0 if Remote Devices is enabled)
+            // Auto-start proxy listener using saved bind configuration (Loopback, AllInterfaces, or Specific + Dual Listener)
             let startup_controller = controller.clone();
             tauri::async_runtime::spawn(async move {
-                let bind_host = startup_controller.preferred_bind_host();
-                if let Err(err) = startup_controller.start(bind_host.clone(), 8888).await {
+                if let Err(err) = startup_controller.start_with_config(8888).await {
+                    let bind_host = startup_controller.preferred_bind_host();
                     tracing::warn!("Could not auto-bind {bind_host}:8888 on startup: {err}");
                 }
             });
@@ -86,6 +86,7 @@ pub fn run() {
             commands::start_proxy,
             commands::stop_proxy,
             commands::set_allow_remote,
+            commands::set_bind_configuration,
             commands::get_network_interfaces,
             commands::set_system_proxy,
             commands::set_auto_system_proxy,

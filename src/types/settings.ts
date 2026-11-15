@@ -1,6 +1,7 @@
 import type { ThemePreference } from "../hooks/useTheme";
 import type {
   AutoResponderRule,
+  BindHostMode,
   ColumnId,
   FilterConditionRule,
   FilterPreset,
@@ -47,6 +48,9 @@ export interface FluxUserProxySettings {
   port: number;
   autoSystemProxy: boolean;
   allowRemote: boolean;
+  bindMode?: BindHostMode;
+  specificBindIp?: string | null;
+  alsoBindLoopback?: boolean;
   tlsInterceptMode: TlsInterceptMode;
   tlsBypassRules: TlsBypassRule[];
   tlsTargetRules: TlsBypassRule[];

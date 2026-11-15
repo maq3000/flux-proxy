@@ -26,9 +26,9 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::models::{
-    BreakpointAction, BreakpointStage, ComposedRequest, HeaderMutationDirection, HeaderPair,
-    PausedBreakpointItem, ProxyError, ProxyStatus, RuleActionType, SessionDetail, SessionSummary,
-    SseEventRecord, WebSocketFrameRecord,
+    BindHostMode, BreakpointAction, BreakpointStage, ComposedRequest, HeaderMutationDirection,
+    HeaderPair, PausedBreakpointItem, ProxyError, ProxyStatus, RuleActionType, SessionDetail,
+    SessionSummary, SseEventRecord, WebSocketFrameRecord,
 };
 use crate::proxy::breakpoints::BreakpointEngine;
 use crate::proxy::ca::CertificateAuthority;
@@ -38,7 +38,7 @@ use crate::proxy::filters::{
 use crate::proxy::network::{is_host_own_ip, normalize_client_ip};
 use crate::proxy::process::{resolve_client_process, ClientProcessInfo};
 use crate::proxy::rules::RuleEngine;
-use crate::proxy::sysproxy::SystemProxyManager;
+use crate::proxy::sysproxy::{resolve_sysproxy_host_for_bind, SystemProxyManager};
 use crate::storage::{TrafficStore, BODY_OFFLOAD_THRESHOLD_BYTES};
 
 const MAX_CAPTURED_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB safety cap per body (> 2 MiB offloaded to SQLite)
@@ -311,9 +311,189 @@ pub struct SharedProxyContext {
 
 struct ControllerRuntimeState {
     bind_addr: (String, u16),
+    bind_mode: BindHostMode,
+    specific_bind_ip: Option<String>,
+    also_bind_loopback: bool,
+    bound_ips: Vec<String>,
     shutdown_tx: Option<watch::Sender<bool>>,
+    listener_handles: Vec<tokio::task::JoinHandle<()>>,
     auto_system_proxy: bool,
     allow_remote: bool,
+}
+
+fn format_bind_sock_addr(ip: &str, port: u16) -> String {
+    if ip.contains(':') && !ip.starts_with('[') {
+        format!("[{ip}]:{port}")
+    } else {
+        format!("{ip}:{port}")
+    }
+}
+
+pub(crate) fn resolve_bind_plan(
+    bind_mode: BindHostMode,
+    specific_bind_ip: Option<&str>,
+    also_bind_loopback: bool,
+) -> Result<(BindHostMode, String, Option<String>, Vec<String>, bool), ProxyError> {
+    match bind_mode {
+        BindHostMode::Loopback => Ok((
+            BindHostMode::Loopback,
+            "127.0.0.1".to_string(),
+            None,
+            vec!["127.0.0.1".to_string()],
+            false,
+        )),
+        BindHostMode::AllInterfaces => Ok((
+            BindHostMode::AllInterfaces,
+            "0.0.0.0".to_string(),
+            None,
+            vec!["0.0.0.0".to_string()],
+            true,
+        )),
+        BindHostMode::Specific => {
+            let trimmed = specific_bind_ip.map(str::trim).unwrap_or("");
+            if trimmed.is_empty() {
+                return Err(ProxyError::Custom(
+                    "Для режима Specific необходимо указать IP-адрес сетевого интерфейса"
+                        .to_string(),
+                ));
+            }
+            let parsed = trimmed.parse::<IpAddr>().map_err(|_| {
+                ProxyError::Custom(format!(
+                    "Некорректный IP-адрес интерфейса: '{trimmed}'"
+                ))
+            })?;
+            let ip_str = parsed.to_string();
+
+            if parsed.is_unspecified() {
+                return Ok((
+                    BindHostMode::AllInterfaces,
+                    "0.0.0.0".to_string(),
+                    None,
+                    vec!["0.0.0.0".to_string()],
+                    true,
+                ));
+            }
+
+            if ip_str == "127.0.0.1" || ip_str == "::1" {
+                return Ok((
+                    BindHostMode::Specific,
+                    ip_str.clone(),
+                    Some(ip_str.clone()),
+                    vec![ip_str],
+                    false,
+                ));
+            }
+
+            let mut bound_ips = vec![ip_str.clone()];
+            if also_bind_loopback {
+                bound_ips.push("127.0.0.1".to_string());
+            }
+            Ok((
+                BindHostMode::Specific,
+                ip_str.clone(),
+                Some(ip_str),
+                bound_ips,
+                true,
+            ))
+        }
+    }
+}
+
+async fn bind_single_listener_with_retry(
+    ip: &str,
+    port: u16,
+    retry_attempts: usize,
+) -> Result<TcpListener, std::io::Error> {
+    let addr = format_bind_sock_addr(ip, port);
+    let attempts = retry_attempts.max(1);
+    let mut last_err = None;
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        match TcpListener::bind(&addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(err) => {
+                let retryable = err.kind() == std::io::ErrorKind::AddrInUse;
+                last_err = Some(err);
+                if !retryable {
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("bind attempt should produce listener or error"))
+}
+
+pub(crate) async fn bind_listeners_with_cleanup(
+    target_ips: &[String],
+    port: u16,
+    retry_attempts: usize,
+) -> Result<(Vec<(TcpListener, String)>, u16), ProxyError> {
+    let Some(primary_ip) = target_ips.first() else {
+        return Err(ProxyError::Custom(
+            "Список адресов для прослушивания пуст".to_string(),
+        ));
+    };
+
+    let primary_listener =
+        match bind_single_listener_with_retry(primary_ip, port, retry_attempts).await {
+            Ok(l) => l,
+            Err(err) => {
+                let addr = format_bind_sock_addr(primary_ip, port);
+                if err.kind() == std::io::ErrorKind::AddrInUse {
+                    return Err(ProxyError::Custom(format!(
+                        "Адрес {addr} уже занят другим процессом (AddrInUse): {err}"
+                    )));
+                }
+                return Err(ProxyError::Custom(format!(
+                    "Не удалось привязать сокет {addr}: {err}"
+                )));
+            }
+        };
+
+    let actual_port = primary_listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or(port);
+    let mut listeners = Vec::with_capacity(target_ips.len());
+    listeners.push((primary_listener, primary_ip.clone()));
+
+    for extra_ip in &target_ips[1..] {
+        match bind_single_listener_with_retry(extra_ip, actual_port, retry_attempts).await {
+            Ok(extra_listener) => {
+                listeners.push((extra_listener, extra_ip.clone()));
+            }
+            Err(err) => {
+                let extra_addr = format_bind_sock_addr(extra_ip, actual_port);
+                let primary_addr = format_bind_sock_addr(primary_ip, actual_port);
+                // Explicitly drop already-bound listeners so the primary port is immediately released
+                drop(listeners);
+                let reason = if err.kind() == std::io::ErrorKind::AddrInUse {
+                    "AddrInUse — порт уже занят"
+                } else {
+                    "ошибка привязки сокета"
+                };
+                return Err(ProxyError::Custom(format!(
+                    "Не удалось привязать дополнительный локальный сокет {extra_addr} ({reason}): {err}. Основной сокет {primary_addr} был остановлен."
+                )));
+            }
+        }
+    }
+
+    Ok((listeners, actual_port))
+}
+
+async fn shutdown_listeners(
+    shutdown_tx: Option<watch::Sender<bool>>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+) {
+    if let Some(tx) = shutdown_tx {
+        let _ = tx.send(true);
+    }
+    for handle in handles {
+        let _ = tokio::time::timeout(Duration::from_millis(500), handle).await;
+    }
 }
 
 pub struct ProxyEngineController {
@@ -332,18 +512,9 @@ impl ProxyEngineController {
         sysproxy: Arc<SystemProxyManager>,
         app_handle: AppHandle,
     ) -> Result<Self, ProxyError> {
-        // CRITICAL: `.no_proxy()` prevents infinite recursion when OS system proxy points to us!
-        let upstream_client = reqwest::Client::builder()
-            .no_proxy()
-            .pool_idle_timeout(Duration::from_secs(90))
-            .connect_timeout(Duration::from_secs(15))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SessionSummary>();
         let (removed_tx, mut removed_rx) = mpsc::unbounded_channel::<Vec<u64>>();
         let (bp_tx, mut bp_rx) = mpsc::unbounded_channel::<Vec<PausedBreakpointItem>>();
-        let breakpoints = Arc::new(BreakpointEngine::new(Some(bp_tx)));
 
         // 60 FPS (16 ms) micro-batching IPC loop for sessions + zero-latency push for Live Breakpoints
         tauri::async_runtime::spawn(async move {
@@ -393,6 +564,85 @@ impl ProxyEngineController {
             }
         });
 
+        Self::new_with_channels(
+            ca,
+            rules,
+            filters,
+            store,
+            sysproxy,
+            event_tx,
+            removed_tx,
+            bp_tx,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        ca: Arc<CertificateAuthority>,
+        rules: Arc<RuleEngine>,
+        filters: Arc<ProxyFilterEngine>,
+        store: Arc<TrafficStore>,
+        sysproxy: Arc<SystemProxyManager>,
+    ) -> Result<Self, ProxyError> {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SessionSummary>();
+        let (removed_tx, mut removed_rx) = mpsc::unbounded_channel::<Vec<u64>>();
+        let (bp_tx, mut bp_rx) = mpsc::unbounded_channel::<Vec<PausedBreakpointItem>>();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    maybe_bp = bp_rx.recv() => {
+                        if maybe_bp.is_none() && event_rx.is_closed() && removed_rx.is_closed() {
+                            break;
+                        }
+                    }
+                    maybe_removed = removed_rx.recv() => {
+                        if maybe_removed.is_none() && event_rx.is_closed() && bp_rx.is_closed() {
+                            break;
+                        }
+                    }
+                    maybe_item = event_rx.recv() => {
+                        if maybe_item.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Self::new_with_channels(
+            ca,
+            rules,
+            filters,
+            store,
+            sysproxy,
+            event_tx,
+            removed_tx,
+            bp_tx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_channels(
+        ca: Arc<CertificateAuthority>,
+        rules: Arc<RuleEngine>,
+        filters: Arc<ProxyFilterEngine>,
+        store: Arc<TrafficStore>,
+        sysproxy: Arc<SystemProxyManager>,
+        event_tx: mpsc::UnboundedSender<SessionSummary>,
+        removed_tx: mpsc::UnboundedSender<Vec<u64>>,
+        bp_tx: mpsc::UnboundedSender<Vec<PausedBreakpointItem>>,
+    ) -> Result<Self, ProxyError> {
+        // CRITICAL: `.no_proxy()` prevents infinite recursion when OS system proxy points to us!
+        let upstream_client = reqwest::Client::builder()
+            .no_proxy()
+            .pool_idle_timeout(Duration::from_secs(90))
+            .connect_timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+
+        let breakpoints = Arc::new(BreakpointEngine::new(Some(bp_tx)));
+
         let context = Arc::new(SharedProxyContext {
             ca,
             rules,
@@ -406,15 +656,25 @@ impl ProxyEngineController {
         });
 
         let initial_auto = sysproxy.load_auto_system_proxy_pref();
-        let initial_allow_remote = sysproxy.load_allow_remote_pref();
+        let bind_pref = sysproxy.load_bind_config_pref();
         if !initial_auto {
             sysproxy.rollback_if_dirty();
         }
-        let initial_bind_host = if initial_allow_remote {
-            "0.0.0.0".to_string()
-        } else {
-            "127.0.0.1".to_string()
-        };
+        let (initial_mode, initial_bind_host, initial_specific_ip, initial_bound_ips, initial_allow_remote) =
+            resolve_bind_plan(
+                bind_pref.bind_mode,
+                bind_pref.specific_bind_ip.as_deref(),
+                bind_pref.also_bind_loopback,
+            )
+            .unwrap_or_else(|_| {
+                (
+                    BindHostMode::Loopback,
+                    "127.0.0.1".to_string(),
+                    None,
+                    vec!["127.0.0.1".to_string()],
+                    false,
+                )
+            });
 
         Ok(Self {
             context,
@@ -422,7 +682,12 @@ impl ProxyEngineController {
             op_lock: Mutex::new(()),
             runtime_state: std::sync::Mutex::new(ControllerRuntimeState {
                 bind_addr: (initial_bind_host, 8888),
+                bind_mode: initial_mode,
+                specific_bind_ip: initial_specific_ip,
+                also_bind_loopback: bind_pref.also_bind_loopback,
+                bound_ips: initial_bound_ips,
                 shutdown_tx: None,
+                listener_handles: Vec::new(),
                 auto_system_proxy: initial_auto,
                 allow_remote: initial_allow_remote,
             }),
@@ -430,11 +695,7 @@ impl ProxyEngineController {
     }
 
     pub fn preferred_bind_host(&self) -> String {
-        if self.lock_runtime().allow_remote {
-            "0.0.0.0".to_string()
-        } else {
-            "127.0.0.1".to_string()
-        }
+        self.lock_runtime().bind_addr.0.clone()
     }
 
     fn lock_runtime(&self) -> std::sync::MutexGuard<'_, ControllerRuntimeState> {
@@ -445,7 +706,17 @@ impl ProxyEngineController {
     }
 
     fn build_status(&self) -> ProxyStatus {
-        let (running, bind_addr, port, auto_system_proxy, allow_remote) = {
+        let (
+            running,
+            bind_addr,
+            port,
+            auto_system_proxy,
+            allow_remote,
+            bind_mode,
+            specific_bind_ip,
+            also_bind_loopback,
+            bound_ips,
+        ) = {
             let guard = self.lock_runtime();
             (
                 guard.shutdown_tx.is_some(),
@@ -453,10 +724,16 @@ impl ProxyEngineController {
                 guard.bind_addr.1,
                 guard.auto_system_proxy,
                 guard.allow_remote || guard.bind_addr.0 == "0.0.0.0" || guard.bind_addr.0 == "::",
+                guard.bind_mode,
+                guard.specific_bind_ip.clone(),
+                guard.also_bind_loopback,
+                guard.bound_ips.clone(),
             )
         };
+        let sysproxy_host =
+            resolve_sysproxy_host_for_bind(bind_mode, specific_bind_ip.as_deref(), also_bind_loopback);
         let (system_proxy_enabled, system_proxy_error) =
-            self.sysproxy.status_for_listener(&bind_addr, port);
+            self.sysproxy.status_for_listener(&sysproxy_host, port);
 
         ProxyStatus {
             running,
@@ -467,6 +744,10 @@ impl ProxyEngineController {
             auto_system_proxy,
             system_proxy_error,
             allow_remote,
+            bind_mode,
+            specific_bind_ip,
+            also_bind_loopback,
+            bound_ips,
         }
     }
 
@@ -480,10 +761,10 @@ impl ProxyEngineController {
         addr_str: String,
         actual_port: u16,
         mut rx: watch::Receiver<bool>,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         self.context.active_port.store(actual_port, Ordering::Relaxed);
         let ctx = self.context.clone();
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             tracing::info!("FluxProxy MITM engine listening on http://{addr_str}");
             loop {
                 tokio::select! {
@@ -518,16 +799,67 @@ impl ProxyEngineController {
                                 });
                             }
                             Err(err) => {
-                                tracing::warn!("TCP accept error: {err}");
+                                tracing::warn!("TCP accept error on {addr_str}: {err}");
                             }
                         }
                     }
                 }
             }
-        });
+        })
+    }
+
+    fn spawn_listeners_for_bind(
+        &self,
+        listeners: Vec<(TcpListener, String)>,
+        actual_port: u16,
+    ) -> (watch::Sender<bool>, Vec<tokio::task::JoinHandle<()>>) {
+        let (tx, rx) = watch::channel(false);
+        let mut handles = Vec::with_capacity(listeners.len());
+        for (listener, ip) in listeners {
+            let addr_str = format_bind_sock_addr(&ip, actual_port);
+            let handle = self.spawn_accept_loop(listener, addr_str, actual_port, rx.clone());
+            handles.push(handle);
+        }
+        (tx, handles)
+    }
+
+    pub async fn start_with_config(&self, port: u16) -> Result<ProxyStatus, ProxyError> {
+        let (bind_mode, specific_bind_ip, also_bind_loopback) = {
+            let guard = self.lock_runtime();
+            (
+                guard.bind_mode,
+                guard.specific_bind_ip.clone(),
+                guard.also_bind_loopback,
+            )
+        };
+        self.start_internal(bind_mode, specific_bind_ip, also_bind_loopback, port)
+            .await
     }
 
     pub async fn start(&self, host: String, port: u16) -> Result<ProxyStatus, ProxyError> {
+        let trimmed = host.trim().to_string();
+        let also_bind_loopback = self.lock_runtime().also_bind_loopback;
+        let (bind_mode, specific_bind_ip) = if trimmed == "0.0.0.0" || trimmed == "::" {
+            (BindHostMode::AllInterfaces, None)
+        } else if trimmed.is_empty()
+            || trimmed == "127.0.0.1"
+            || trimmed.eq_ignore_ascii_case("localhost")
+        {
+            (BindHostMode::Loopback, None)
+        } else {
+            (BindHostMode::Specific, Some(trimmed))
+        };
+        self.start_internal(bind_mode, specific_bind_ip, also_bind_loopback, port)
+            .await
+    }
+
+    async fn start_internal(
+        &self,
+        bind_mode: BindHostMode,
+        specific_bind_ip: Option<String>,
+        also_bind_loopback: bool,
+        port: u16,
+    ) -> Result<ProxyStatus, ProxyError> {
         let _op = self.op_lock.lock().await;
 
         let (already_running, auto_system_proxy) = {
@@ -538,31 +870,41 @@ impl ProxyEngineController {
             return Ok(self.build_status());
         }
 
-        let addr_str = format!("{host}:{port}");
-        let listener = match TcpListener::bind(&addr_str).await {
-            Ok(l) => l,
-            Err(err) => {
-                self.sysproxy.rollback_if_dirty();
-                return Err(ProxyError::Io(err));
-            }
-        };
-        let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
-        let (tx, rx) = watch::channel(false);
+        let (eff_mode, primary_host, norm_specific_ip, target_ips, allow_remote) =
+            resolve_bind_plan(bind_mode, specific_bind_ip.as_deref(), also_bind_loopback)?;
+
+        let (listeners, actual_port) =
+            match bind_listeners_with_cleanup(&target_ips, port, 1).await {
+                Ok(bound) => bound,
+                Err(err) => {
+                    self.sysproxy.rollback_if_dirty();
+                    return Err(err);
+                }
+            };
+
+        let (tx, handles) = self.spawn_listeners_for_bind(listeners, actual_port);
 
         {
             let mut guard = self.lock_runtime();
-            guard.bind_addr = (host.clone(), actual_port);
-            guard.allow_remote = host == "0.0.0.0" || host == "::";
+            guard.bind_addr = (primary_host, actual_port);
+            guard.bind_mode = eff_mode;
+            guard.specific_bind_ip = norm_specific_ip.clone();
+            guard.also_bind_loopback = also_bind_loopback;
+            guard.bound_ips = target_ips;
+            guard.allow_remote = allow_remote;
             guard.shutdown_tx = Some(tx);
+            guard.listener_handles = handles;
         }
 
-        self.spawn_accept_loop(listener, addr_str, actual_port, rx);
-
+        let sysproxy_host = resolve_sysproxy_host_for_bind(
+            eff_mode,
+            norm_specific_ip.as_deref(),
+            also_bind_loopback,
+        );
         if auto_system_proxy {
-            // `enable` normalizes `0.0.0.0` / `::` to `127.0.0.1:{actual_port}` automatically
-            if let Err(err) = self.sysproxy.enable(&host, actual_port) {
+            if let Err(err) = self.sysproxy.enable(&sysproxy_host, actual_port) {
                 tracing::warn!(
-                    "FluxProxy bound {host}:{actual_port}, but OS system proxy setup failed: {err}"
+                    "FluxProxy bound port {actual_port}, but OS system proxy setup failed for {sysproxy_host}:{actual_port}: {err}"
                 );
             }
         } else {
@@ -572,91 +914,172 @@ impl ProxyEngineController {
         Ok(self.build_status())
     }
 
-    /// Toggles «Allow remote connections / Listen on all network interfaces (`0.0.0.0`)» for
-    /// intercepting iOS & Android traffic over Wi-Fi/LAN, seamlessly rebinding the active TCP listener
-    /// without interrupting the local OS system proxy configuration.
-    pub async fn set_allow_remote(&self, allow: bool) -> Result<ProxyStatus, ProxyError> {
+    /// Configures network interface binding (`Loopback`, `AllInterfaces`, or `Specific` IP with optional
+    /// secondary `127.0.0.1` Dual Listener for OS system proxy), seamlessly rebinding active sockets
+    /// and updating OS system proxy if enabled.
+    pub async fn set_bind_configuration(
+        &self,
+        bind_mode: BindHostMode,
+        specific_bind_ip: Option<String>,
+        also_bind_loopback: bool,
+    ) -> Result<ProxyStatus, ProxyError> {
         let _op = self.op_lock.lock().await;
-        let desired_host = if allow {
-            "0.0.0.0".to_string()
-        } else {
-            "127.0.0.1".to_string()
-        };
 
-        let (was_running, prev_host, port) = {
+        let (eff_mode, primary_host, norm_specific_ip, target_ips, allow_remote) =
+            resolve_bind_plan(bind_mode, specific_bind_ip.as_deref(), also_bind_loopback)?;
+
+        let (
+            was_running,
+            port,
+            auto_system_proxy,
+            prev_mode,
+            prev_primary,
+            prev_specific_ip,
+            prev_also_loopback,
+            prev_bound_ips,
+            prev_allow_remote,
+            already_same_config,
+            old_tx,
+            old_handles,
+        ) = {
             let mut guard = self.lock_runtime();
             let running = guard.shutdown_tx.is_some();
-            let prev = guard.bind_addr.0.clone();
-            let p = guard.bind_addr.1;
-            guard.allow_remote = allow;
+            let same = guard.bind_mode == eff_mode
+                && guard.specific_bind_ip == norm_specific_ip
+                && guard.also_bind_loopback == also_bind_loopback
+                && guard.bound_ips == target_ips;
+            let p_mode = guard.bind_mode;
+            let p_primary = guard.bind_addr.0.clone();
+            let p_port = guard.bind_addr.1;
+            let p_spec = guard.specific_bind_ip.clone();
+            let p_loop = guard.also_bind_loopback;
+            let p_bound = guard.bound_ips.clone();
+            let p_allow = guard.allow_remote;
+            let auto_sys = guard.auto_system_proxy;
+            let tx = if running && !same {
+                guard.shutdown_tx.take()
+            } else {
+                None
+            };
+            let handles = if running && !same {
+                std::mem::take(&mut guard.listener_handles)
+            } else {
+                Vec::new()
+            };
             if !running {
-                guard.bind_addr.0 = desired_host.clone();
+                guard.bind_addr.0 = primary_host.clone();
+                guard.bind_mode = eff_mode;
+                guard.specific_bind_ip = norm_specific_ip.clone();
+                guard.also_bind_loopback = also_bind_loopback;
+                guard.bound_ips = target_ips.clone();
+                guard.allow_remote = allow_remote;
             }
-            (running, prev, p)
+            (
+                running,
+                p_port,
+                auto_sys,
+                p_mode,
+                p_primary,
+                p_spec,
+                p_loop,
+                p_bound,
+                p_allow,
+                same,
+                tx,
+                handles,
+            )
         };
-        self.sysproxy.save_allow_remote_pref(allow);
 
-        if !was_running || prev_host == desired_host {
+        self.sysproxy.save_bind_config_pref(
+            eff_mode,
+            norm_specific_ip.clone(),
+            also_bind_loopback,
+        );
+
+        if !was_running || already_same_config {
             return Ok(self.build_status());
         }
 
-        // Stop previous TCP listener so we can rebind the same port on the new interface
-        {
-            let mut guard = self.lock_runtime();
-            if let Some(tx) = guard.shutdown_tx.take() {
-                let _ = tx.send(true);
-            }
-        }
+        // Stop previous TCP listener(s) synchronously before rebinding the same port on the new interface(s)
+        shutdown_listeners(old_tx, old_handles).await;
 
-        let target_addr = format!("{desired_host}:{port}");
-        let mut bind_result = None;
-        for attempt in 0..5 {
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(30)).await;
-            } else {
-                tokio::task::yield_now().await;
-            }
-            match TcpListener::bind(&target_addr).await {
-                Ok(l) => {
-                    bind_result = Some(Ok(l));
-                    break;
-                }
-                Err(e) => {
-                    bind_result = Some(Err(e));
-                }
-            }
-        }
-
-        match bind_result.unwrap() {
-            Ok(listener) => {
-                let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
-                let (tx, rx) = watch::channel(false);
+        match bind_listeners_with_cleanup(&target_ips, port, 8).await {
+            Ok((listeners, actual_port)) => {
+                let (tx, handles) = self.spawn_listeners_for_bind(listeners, actual_port);
                 {
                     let mut guard = self.lock_runtime();
-                    guard.bind_addr = (desired_host.clone(), actual_port);
-                    guard.allow_remote = allow;
+                    guard.bind_addr = (primary_host, actual_port);
+                    guard.bind_mode = eff_mode;
+                    guard.specific_bind_ip = norm_specific_ip.clone();
+                    guard.also_bind_loopback = also_bind_loopback;
+                    guard.bound_ips = target_ips;
+                    guard.allow_remote = allow_remote;
                     guard.shutdown_tx = Some(tx);
+                    guard.listener_handles = handles;
                 }
-                self.spawn_accept_loop(listener, target_addr, actual_port, rx);
+
+                let sysproxy_enabled_before = self.sysproxy.is_desired_enabled();
+                if auto_system_proxy || sysproxy_enabled_before {
+                    let sysproxy_host = resolve_sysproxy_host_for_bind(
+                        eff_mode,
+                        norm_specific_ip.as_deref(),
+                        also_bind_loopback,
+                    );
+                    if let Err(err) = self.sysproxy.enable(&sysproxy_host, actual_port) {
+                        tracing::warn!(
+                            "Failed to update OS system proxy target to {sysproxy_host}:{actual_port}: {err}"
+                        );
+                    }
+                }
+
                 Ok(self.build_status())
             }
             Err(err) => {
-                // Attempt best-effort recovery onto previous host so capture isn't stranded
-                let fallback_addr = format!("{prev_host}:{port}");
-                if let Ok(fallback_listener) = TcpListener::bind(&fallback_addr).await {
-                    let (tx, rx) = watch::channel(false);
-                    {
-                        let mut guard = self.lock_runtime();
-                        guard.bind_addr = (prev_host.clone(), port);
-                        guard.allow_remote = prev_host == "0.0.0.0" || prev_host == "::";
-                        guard.shutdown_tx = Some(tx);
-                    }
-                    self.sysproxy.save_allow_remote_pref(!allow);
-                    self.spawn_accept_loop(fallback_listener, fallback_addr, port, rx);
+                // Attempt best-effort recovery onto previous bind configuration so capture isn't stranded
+                self.sysproxy.save_bind_config_pref(
+                    prev_mode,
+                    prev_specific_ip.clone(),
+                    prev_also_loopback,
+                );
+                if let Ok((fallback_listeners, actual_port)) =
+                    bind_listeners_with_cleanup(&prev_bound_ips, port, 3).await
+                {
+                    let (tx, handles) =
+                        self.spawn_listeners_for_bind(fallback_listeners, actual_port);
+                    let mut guard = self.lock_runtime();
+                    guard.bind_addr = (prev_primary, actual_port);
+                    guard.bind_mode = prev_mode;
+                    guard.specific_bind_ip = prev_specific_ip;
+                    guard.also_bind_loopback = prev_also_loopback;
+                    guard.bound_ips = prev_bound_ips;
+                    guard.allow_remote = prev_allow_remote;
+                    guard.shutdown_tx = Some(tx);
+                    guard.listener_handles = handles;
+                } else {
+                    let mut guard = self.lock_runtime();
+                    guard.bind_mode = prev_mode;
+                    guard.bind_addr = (prev_primary, port);
+                    guard.specific_bind_ip = prev_specific_ip;
+                    guard.also_bind_loopback = prev_also_loopback;
+                    guard.bound_ips = prev_bound_ips;
+                    guard.allow_remote = prev_allow_remote;
                 }
-                Err(ProxyError::Io(err))
+                Err(err)
             }
         }
+    }
+
+    /// Toggles «Allow remote connections / Listen on all network interfaces (`0.0.0.0`)» for
+    /// backward compatibility, mapping to `Loopback` vs `AllInterfaces`.
+    pub async fn set_allow_remote(&self, allow: bool) -> Result<ProxyStatus, ProxyError> {
+        let also_bind_loopback = self.lock_runtime().also_bind_loopback;
+        let mode = if allow {
+            BindHostMode::AllInterfaces
+        } else {
+            BindHostMode::Loopback
+        };
+        self.set_bind_configuration(mode, None, also_bind_loopback)
+            .await
     }
 
     pub async fn stop(&self) -> ProxyStatus {
@@ -664,12 +1087,14 @@ impl ProxyEngineController {
         self.context
             .breakpoints
             .resume_all(BreakpointAction::Continue);
-        {
+        let (tx, handles) = {
             let mut guard = self.lock_runtime();
-            if let Some(tx) = guard.shutdown_tx.take() {
-                let _ = tx.send(true);
-            }
-        }
+            (
+                guard.shutdown_tx.take(),
+                std::mem::take(&mut guard.listener_handles),
+            )
+        };
+        shutdown_listeners(tx, handles).await;
         if let Err(err) = self.sysproxy.disable() {
             tracing::warn!("Could not roll back OS system proxy on stop: {err}");
         }
@@ -680,10 +1105,20 @@ impl ProxyEngineController {
     /// (allowing `HTTP_PROXY=http://127.0.0.1:8888` CLI-only capture without routing OS browsers).
     pub async fn set_system_proxy(&self, enabled: bool) -> Result<ProxyStatus, ProxyError> {
         let _op = self.op_lock.lock().await;
-        let (bind_host, port) = self.lock_runtime().bind_addr.clone();
+        let (sysproxy_host, port) = {
+            let guard = self.lock_runtime();
+            (
+                resolve_sysproxy_host_for_bind(
+                    guard.bind_mode,
+                    guard.specific_bind_ip.as_deref(),
+                    guard.also_bind_loopback,
+                ),
+                guard.bind_addr.1,
+            )
+        };
 
         if enabled {
-            if let Err(err) = self.sysproxy.enable(&bind_host, port) {
+            if let Err(err) = self.sysproxy.enable(&sysproxy_host, port) {
                 tracing::warn!("Manual set_system_proxy(true) failed: {err}");
             }
         } else if let Err(err) = self.sysproxy.disable() {
@@ -696,21 +1131,25 @@ impl ProxyEngineController {
     /// Toggles Fiddler-style «Act as System Proxy» mode when capture starts/stops.
     pub async fn set_auto_system_proxy(&self, auto: bool) -> Result<ProxyStatus, ProxyError> {
         let _op = self.op_lock.lock().await;
-        let (running, bind_host, port) = {
+        let (running, sysproxy_host, port) = {
             let mut guard = self.lock_runtime();
             guard.auto_system_proxy = auto;
             (
                 guard.shutdown_tx.is_some(),
-                guard.bind_addr.0.clone(),
+                resolve_sysproxy_host_for_bind(
+                    guard.bind_mode,
+                    guard.specific_bind_ip.as_deref(),
+                    guard.also_bind_loopback,
+                ),
                 guard.bind_addr.1,
             )
         };
         self.sysproxy.save_auto_system_proxy_pref(auto);
 
         if auto && running {
-            let (currently_enabled, _) = self.sysproxy.status_for_listener(&bind_host, port);
+            let (currently_enabled, _) = self.sysproxy.status_for_listener(&sysproxy_host, port);
             if !currently_enabled {
-                if let Err(err) = self.sysproxy.enable(&bind_host, port) {
+                if let Err(err) = self.sysproxy.enable(&sysproxy_host, port) {
                     tracing::warn!("Auto system proxy attach failed: {err}");
                 }
             }
@@ -729,6 +1168,7 @@ impl ProxyEngineController {
             if let Some(tx) = guard.shutdown_tx.take() {
                 let _ = tx.send(true);
             }
+            guard.listener_handles.clear();
         }
         self.sysproxy.rollback_sync();
     }
@@ -5332,6 +5772,230 @@ mod tests {
             .expect("missing /zstd-corrupt session");
         let corrupt_detail = store.get(corrupt_summary.id).unwrap();
         assert_eq!(corrupt_detail.summary.body_size, corrupt_payload.len());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    struct RecordingOsProxyBackend {
+        applied_targets: std::sync::Mutex<Vec<(String, u16)>>,
+        active: std::sync::Mutex<Option<(String, u16)>>,
+    }
+
+    impl RecordingOsProxyBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                applied_targets: std::sync::Mutex::new(Vec::new()),
+                active: std::sync::Mutex::new(None),
+            })
+        }
+
+        fn last_target(&self) -> Option<(String, u16)> {
+            self.applied_targets.lock().unwrap().last().cloned()
+        }
+    }
+
+    impl crate::proxy::sysproxy::OsProxyBackend for RecordingOsProxyBackend {
+        fn capture_snapshot(
+            &self,
+        ) -> Result<crate::proxy::sysproxy::PlatformProxySnapshot, ProxyError> {
+            Ok(crate::proxy::sysproxy::PlatformProxySnapshot::Windows(
+                crate::proxy::sysproxy::WindowsProxySnapshot {
+                    proxy_enable: Some(0),
+                    proxy_server: None,
+                    proxy_override: None,
+                    auto_config_url: None,
+                },
+            ))
+        }
+
+        fn apply_system_proxy(
+            &self,
+            host: &str,
+            port: u16,
+            _baseline: &crate::proxy::sysproxy::PlatformProxySnapshot,
+        ) -> Result<(), ProxyError> {
+            self.applied_targets
+                .lock()
+                .unwrap()
+                .push((host.to_string(), port));
+            *self.active.lock().unwrap() = Some((host.to_string(), port));
+            Ok(())
+        }
+
+        fn restore_snapshot(
+            &self,
+            _snapshot: &crate::proxy::sysproxy::PlatformProxySnapshot,
+        ) -> Result<(), ProxyError> {
+            *self.active.lock().unwrap() = None;
+            Ok(())
+        }
+
+        fn inspect_active_state(
+            &self,
+            expected_host: &str,
+            expected_port: u16,
+        ) -> Result<crate::proxy::sysproxy::OsActiveProxyState, ProxyError> {
+            let cur = self.active.lock().unwrap().clone();
+            match cur {
+                Some((h, p)) => Ok(crate::proxy::sysproxy::OsActiveProxyState {
+                    matches_flux: h == expected_host && p == expected_port,
+                    any_proxy_enabled: true,
+                    current_target_summary: format!("{h}:{p}"),
+                }),
+                None => Ok(crate::proxy::sysproxy::OsActiveProxyState {
+                    matches_flux: false,
+                    any_proxy_enabled: false,
+                    current_target_summary: "disabled".to_string(),
+                }),
+            }
+        }
+    }
+
+    async fn pick_distinct_bindable_ip_for_test() -> Option<String> {
+        if let Ok(l) = TcpListener::bind("127.0.0.2:0").await {
+            drop(l);
+            return Some("127.0.0.2".to_string());
+        }
+        for iface in crate::proxy::network::list_network_interfaces_with_options(false) {
+            if iface.ip != "127.0.0.1" {
+                let addr = format!("{}:0", iface.ip);
+                if let Ok(l) = TcpListener::bind(&addr).await {
+                    drop(l);
+                    return Some(iface.ip);
+                }
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn multi_bind_dual_listener_stops_all_tasks_and_rolls_back_addr_in_use() {
+        let Some(specific_ip) = pick_distinct_bindable_ip_for_test().await else {
+            // Skip cleanly on restricted hosts with only 127.0.0.1 available
+            return;
+        };
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-multibind-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("multibind.sqlite")).unwrap());
+        let os_backend = RecordingOsProxyBackend::new();
+        let sysproxy = Arc::new(SystemProxyManager::with_backend(
+            &tmp_dir,
+            os_backend.clone(),
+        ));
+
+        let controller = ProxyEngineController::new_for_test(
+            ca,
+            rules,
+            filters,
+            store,
+            sysproxy,
+        )
+        .unwrap();
+
+        // Allocate an ephemeral port that is free right now, then start in Loopback mode
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let test_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let started = controller
+            .start("127.0.0.1".to_string(), test_port)
+            .await
+            .expect("start loopback on ephemeral port");
+        assert!(started.running);
+        assert_eq!(started.bind_mode, BindHostMode::Loopback);
+        assert_eq!(started.bound_ips, vec!["127.0.0.1".to_string()]);
+        assert_eq!(os_backend.last_target(), Some(("127.0.0.1".to_string(), test_port)));
+
+        // Rebind to Specific + also_bind_loopback = true (Dual Listener)
+        let dual_status = controller
+            .set_bind_configuration(BindHostMode::Specific, Some(specific_ip.clone()), true)
+            .await
+            .expect("rebind to dual listener");
+        assert!(dual_status.running);
+        assert_eq!(dual_status.bind_mode, BindHostMode::Specific);
+        assert_eq!(dual_status.specific_bind_ip.as_deref(), Some(specific_ip.as_str()));
+        assert!(dual_status.also_bind_loopback);
+        assert_eq!(
+            dual_status.bound_ips,
+            vec![specific_ip.clone(), "127.0.0.1".to_string()]
+        );
+        // OS system proxy stays on 127.0.0.1 when also_bind_loopback == true
+        assert_eq!(os_backend.last_target(), Some(("127.0.0.1".to_string(), test_port)));
+
+        // Verify TCP connections succeed on BOTH listeners
+        TcpStream::connect(format!("{specific_ip}:{test_port}"))
+            .await
+            .expect("connect to primary specific IP listener");
+        TcpStream::connect(format!("127.0.0.1:{test_port}"))
+            .await
+            .expect("connect to secondary loopback listener");
+
+        // Switch also_bind_loopback -> false: single socket on specific_ip, system proxy updated to specific_ip
+        let single_specific = controller
+            .set_bind_configuration(BindHostMode::Specific, Some(specific_ip.clone()), false)
+            .await
+            .expect("rebind to specific without loopback");
+        assert_eq!(single_specific.bound_ips, vec![specific_ip.clone()]);
+        assert!(!single_specific.also_bind_loopback);
+        assert_eq!(os_backend.last_target(), Some((specific_ip.clone(), test_port)));
+        assert!(
+            TcpListener::bind(format!("127.0.0.1:{test_port}")).await.is_ok(),
+            "loopback socket must be released when also_bind_loopback is disabled"
+        );
+
+        // Re-enable dual listener, then test stop() synchronously shuts down all listener tasks
+        let dual_again = controller
+            .set_bind_configuration(BindHostMode::Specific, Some(specific_ip.clone()), true)
+            .await
+            .expect("rebind back to dual listener");
+        assert_eq!(
+            dual_again.bound_ips,
+            vec![specific_ip.clone(), "127.0.0.1".to_string()]
+        );
+
+        let stopped = controller.stop().await;
+        assert!(!stopped.running);
+
+        // Both sockets must be released synchronously right after stop() returns
+        let rebind_primary = TcpListener::bind(format!("{specific_ip}:{test_port}"))
+            .await
+            .expect("primary specific socket must be free after stop");
+        drop(rebind_primary);
+        let rebind_loopback = TcpListener::bind(format!("127.0.0.1:{test_port}"))
+            .await
+            .expect("secondary loopback socket must be free after stop");
+        drop(rebind_loopback);
+
+        // Test AddrInUse cleanup: occupy 127.0.0.1:conflict_port, then attempt dual bind
+        // on [specific_ip, "127.0.0.1"]. First socket must be closed immediately when second fails.
+        let occupied_loopback = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let conflict_port = occupied_loopback.local_addr().unwrap().port();
+        let err = bind_listeners_with_cleanup(
+            &[specific_ip.clone(), "127.0.0.1".to_string()],
+            conflict_port,
+            1,
+        )
+        .await
+        .expect_err("second socket AddrInUse should fail dual bind");
+        assert!(
+            err.to_string().contains("AddrInUse"),
+            "error should explain AddrInUse: {err}"
+        );
+        // Primary specific_ip:conflict_port MUST have been closed by cleanup
+        let verify_primary_closed = TcpListener::bind(format!("{specific_ip}:{conflict_port}"))
+            .await
+            .expect("primary socket must be rolled back after second socket fails with AddrInUse");
+        drop(verify_primary_closed);
+        drop(occupied_loopback);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
