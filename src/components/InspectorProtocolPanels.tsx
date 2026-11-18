@@ -37,7 +37,7 @@ import type { TextWizardTab } from "./TextWizardModal";
 // ============================================================================
 export const SseInspectorPanel: React.FC<{
   detail: SessionDetail;
-  monacoTheme: "vs-dark" | "light";
+  monacoTheme: string;
 }> = ({ detail, monacoTheme }) => {
   const captionId = useId();
   const [selectedIdx, setSelectedIdx] = useState<number>(1);
@@ -499,7 +499,7 @@ export const MultipartInspectorPanel: React.FC<{
 export const ProtobufGrpcPanel: React.FC<{
   headers: HeaderPair[];
   bodyBase64: string;
-  monacoTheme: "vs-dark" | "light";
+  monacoTheme: string;
 }> = ({ headers, bodyBase64, monacoTheme }) => {
   const captionId = useId();
   const [forceDecode, setForceDecode] = useState(false);

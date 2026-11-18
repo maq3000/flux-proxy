@@ -77,7 +77,19 @@ import type {
 } from "./types/settings";
 
 export const App: React.FC = () => {
-  const { preference, resolvedTheme, setTheme, toggleLightDark } = useTheme();
+  const {
+    preference,
+    resolvedTheme,
+    themePreset,
+    customColorOverrides,
+    effectiveTokens,
+    setTheme,
+    setThemePreset,
+    setCustomColorOverride,
+    resetCustomColorOverride,
+    resetCustomColorOverrides,
+    toggleLightDark,
+  } = useTheme();
   const {
     compactToolbar,
     setCompactToolbar,
@@ -743,6 +755,8 @@ export const App: React.FC = () => {
   liveSnapshotRef.current = () => ({
     ui: {
       theme: preference,
+      themePreset,
+      customColorOverrides,
       compactToolbar,
       sidebarCollapsed,
       inspectorCollapsed,
@@ -2912,6 +2926,13 @@ export const App: React.FC = () => {
         onClose={() => setSettingsModalOpen(false)}
         themePreference={preference}
         onSetTheme={setTheme}
+        themePreset={themePreset}
+        customColorOverrides={customColorOverrides}
+        effectiveThemeTokens={effectiveTokens}
+        onSetThemePreset={setThemePreset}
+        onSetCustomColorOverride={setCustomColorOverride}
+        onResetCustomColorOverride={resetCustomColorOverride}
+        onResetCustomColorOverrides={resetCustomColorOverrides}
         compactToolbar={compactToolbar}
         onSetCompactToolbar={setCompactToolbar}
         sidebarCollapsed={sidebarCollapsed}

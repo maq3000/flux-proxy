@@ -15,6 +15,7 @@ import {
   Zap,
 } from "lucide-react";
 import { statusReasonPhrase, tryFormatJson } from "../lib/formatters";
+import { getMonacoThemeName } from "../lib/monaco";
 import { isTauriRuntime, proxyBridge } from "../lib/tauriBridge";
 import type {
   BreakpointAction,
@@ -306,7 +307,7 @@ export const BreakpointInterceptorModal: React.FC<
 }) => {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const titleId = useId();
-  const monacoTheme = resolvedTheme === "dark" ? "vs-dark" : "light";
+  const monacoTheme = getMonacoThemeName(resolvedTheme);
 
   const [tab, setTab] = useState<"intercept" | "rules">(initialMode);
   const [activeBpId, setActiveBpId] = useState<string | null>(

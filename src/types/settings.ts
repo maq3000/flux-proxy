@@ -1,5 +1,10 @@
 import type { ThemePreference } from "../hooks/useTheme";
 import type {
+  CustomColorOverrides,
+  ThemePresetId,
+  ThemeTokenKey,
+} from "../lib/themePresets";
+import type {
   AutoResponderRule,
   BindHostMode,
   BreakpointConfig,
@@ -17,6 +22,8 @@ import type {
   ToolbarGroupId,
 } from "./proxy";
 
+export type { CustomColorOverrides, ThemePresetId, ThemeTokenKey };
+
 export const CURRENT_SETTINGS_SCHEMA_VERSION = 1;
 export const DEFAULT_SETTINGS_EXPORT_FILENAME = "fluxproxy-settings-v1.json";
 export const SETTINGS_APPLIED_EVENT = "fluxproxy:settings-applied";
@@ -24,6 +31,8 @@ export const PROXY_STATUS_SYNCED_EVENT = "fluxproxy:proxy-status-synced";
 
 export interface FluxUserUiSettings {
   theme: ThemePreference;
+  themePreset?: ThemePresetId;
+  customColorOverrides?: CustomColorOverrides;
   compactToolbar: boolean;
   sidebarCollapsed: boolean;
   inspectorCollapsed: boolean;
@@ -127,6 +136,8 @@ export interface SettingsImportPreviewSummary {
   hiddenToolbarGroupsCount: number;
   compactToolbar: boolean;
   theme: ThemePreference;
+  themePreset?: ThemePresetId;
+  customColorOverridesCount?: number;
   inspectorPosition: InspectorDockPosition;
   inspectorSplitDirection: InspectorSplitDirection;
   proxyPort: number;

@@ -1,6 +1,7 @@
 import React, { useEffect, useId, useState } from "react";
 import Editor from "@monaco-editor/react";
 import { Clock, Plus, Save, Sliders, Trash2 } from "lucide-react";
+import { getMonacoThemeName } from "../lib/monaco";
 import type {
   AutoResponderRule,
   RuleActionType,
@@ -30,7 +31,7 @@ export const AutoResponderPanel: React.FC<AutoResponderPanelProps> = ({
   );
 
   const activeRule = rules.find((r) => r.id === selectedRuleId) ?? null;
-  const monacoTheme = resolvedTheme === "dark" ? "vs-dark" : "light";
+  const monacoTheme = getMonacoThemeName(resolvedTheme);
 
   const handleCreateRule = async () => {
     const newRule: AutoResponderRule = {
@@ -178,7 +179,7 @@ export const AutoResponderPanel: React.FC<AutoResponderPanelProps> = ({
 
 const RuleDetailForm: React.FC<{
   rule: AutoResponderRule;
-  monacoTheme: "vs-dark" | "light";
+  monacoTheme: string;
   onSave: (rule: AutoResponderRule) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
 }> = ({ rule, monacoTheme, onSave, onDelete }) => {

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import Editor from "@monaco-editor/react";
 import { AlertTriangle, Loader2, Plus, Send, Trash2, UploadCloud, X } from "lucide-react";
 import { formatBytes, formatDuration, tryFormatJson } from "../lib/formatters";
+import { getMonacoThemeName } from "../lib/monaco";
 import { proxyBridge } from "../lib/tauriBridge";
 import type {
   ComposedRequest,
@@ -114,7 +115,7 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
     }
   };
 
-  const monacoTheme = resolvedTheme === "dark" ? "vs-dark" : "light";
+  const monacoTheme = getMonacoThemeName(resolvedTheme);
 
   return (
     <div

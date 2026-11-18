@@ -12,7 +12,21 @@ import {
   writePersistedPanelLayouts,
   type InspectorSplitDirection,
 } from "../hooks/useUiPreferences";
-import type { ThemePreference } from "../hooks/useTheme";
+import {
+  CUSTOM_COLOR_OVERRIDES_STORAGE_KEY,
+  THEME_PREFERENCE_STORAGE_KEY,
+  THEME_PRESET_STORAGE_KEY,
+  type ThemePreference,
+} from "../hooks/useTheme";
+import {
+  isThemePresetId,
+  normalizeHexColor,
+  sanitizeCustomColorOverrides,
+  VALID_THEME_TOKEN_KEYS,
+  type CustomColorOverrides,
+  type ThemePresetId,
+  type ThemeTokenKey,
+} from "./themePresets";
 import {
   BUILT_IN_FILTER_PRESETS,
   compileHostListFilter,
@@ -77,7 +91,9 @@ import {
 export { PROXY_STATUS_SYNCED_EVENT, SETTINGS_APPLIED_EVENT };
 
 export const SETTINGS_STORAGE_KEYS = {
-  theme: "fluxproxy-color-scheme",
+  theme: THEME_PREFERENCE_STORAGE_KEY,
+  themePreset: THEME_PRESET_STORAGE_KEY,
+  customColorOverrides: CUSTOM_COLOR_OVERRIDES_STORAGE_KEY,
   uiLayout: "fluxproxy.uiLayout.v1",
   toolbarGroups: "fluxproxy.toolbarGroups.v1",
   visibleColumns: "fluxproxy.visibleColumns.v1",
@@ -232,6 +248,8 @@ export function createDefaultSettingsProfile(): FluxUserSettingsProfile {
     exportedAt: new Date().toISOString(),
     ui: {
       theme: "dark",
+      themePreset: "default-dark",
+      customColorOverrides: {},
       compactToolbar: DEFAULT_LAYOUT_PREFS.compactToolbar,
       sidebarCollapsed: DEFAULT_LAYOUT_PREFS.sidebarCollapsed,
       inspectorCollapsed: DEFAULT_LAYOUT_PREFS.inspectorCollapsed,
@@ -315,6 +333,15 @@ const SCHEMA_MIGRATIONS: Record<number, SchemaMigrationFn> = {
     };
     if (ui.theme === undefined && draft.theme !== undefined) {
       ui.theme = draft.theme;
+    }
+    if (ui.themePreset === undefined && draft.themePreset !== undefined) {
+      ui.themePreset = draft.themePreset;
+    }
+    if (
+      ui.customColorOverrides === undefined &&
+      draft.customColorOverrides !== undefined
+    ) {
+      ui.customColorOverrides = draft.customColorOverrides;
     }
     if (ui.columnWidths === undefined && draft.columnWidths !== undefined) {
       ui.columnWidths = draft.columnWidths;
@@ -1268,6 +1295,49 @@ export function validateAndMigrateSettingsProfileWithReport(
     }
   }
 
+  let themePreset: ThemePresetId =
+    theme === "light" ? "default-light" : "default-dark";
+  if (rawUi.themePreset !== undefined) {
+    if (isThemePresetId(rawUi.themePreset)) {
+      themePreset = rawUi.themePreset;
+    } else {
+      warnings.push(
+        "Поле «ui.themePreset» некорректно — выбран пресет по умолчанию."
+      );
+    }
+  }
+
+  let customColorOverrides: CustomColorOverrides = {};
+  if (rawUi.customColorOverrides !== undefined) {
+    if (isPlainObject(rawUi.customColorOverrides)) {
+      let invalidCount = 0;
+      for (const [tokenKey, tokenVal] of Object.entries(
+        rawUi.customColorOverrides
+      )) {
+        if (!VALID_THEME_TOKEN_KEYS.has(tokenKey as ThemeTokenKey)) {
+          invalidCount += 1;
+          continue;
+        }
+        const normalizedHex =
+          typeof tokenVal === "string" ? normalizeHexColor(tokenVal) : null;
+        if (!normalizedHex) {
+          invalidCount += 1;
+          continue;
+        }
+        customColorOverrides[tokenKey as ThemeTokenKey] = normalizedHex;
+      }
+      if (invalidCount > 0) {
+        warnings.push(
+          `В «ui.customColorOverrides» пропущено некорректных цветов: ${invalidCount}.`
+        );
+      }
+    } else {
+      warnings.push(
+        "Поле «ui.customColorOverrides» повреждено — кастомные цвета сброшены."
+      );
+    }
+  }
+
   let inspectorPosition: InspectorDockPosition = defaults.ui.inspectorPosition;
   if (rawUi.inspectorPosition !== undefined) {
     if (
@@ -1603,6 +1673,8 @@ export function validateAndMigrateSettingsProfileWithReport(
     exportedAt,
     ui: {
       theme,
+      themePreset,
+      customColorOverrides,
       compactToolbar: sanitizeBoolean(
         rawUi.compactToolbar,
         defaults.ui.compactToolbar,
@@ -1772,6 +1844,20 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
       ? rawTheme
       : defaults.ui.theme;
 
+  const rawThemePreset =
+    typeof window !== "undefined"
+      ? window.localStorage.getItem(SETTINGS_STORAGE_KEYS.themePreset)
+      : null;
+  const storedThemePreset: ThemePresetId = isThemePresetId(rawThemePreset)
+    ? rawThemePreset
+    : storedTheme === "light"
+      ? "default-light"
+      : "default-dark";
+
+  const storedCustomColorOverrides = sanitizeCustomColorOverrides(
+    readLocalStorageJson<unknown>(SETTINGS_STORAGE_KEYS.customColorOverrides, {})
+  );
+
   const storedLayout = readLocalStorageJson<Record<string, unknown>>(
     SETTINGS_STORAGE_KEYS.uiLayout,
     {}
@@ -1895,6 +1981,9 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
     exportedAt: new Date().toISOString(),
     ui: {
       theme: live.ui?.theme ?? storedTheme,
+      themePreset: live.ui?.themePreset ?? storedThemePreset,
+      customColorOverrides:
+        live.ui?.customColorOverrides ?? storedCustomColorOverrides,
       compactToolbar:
         live.ui?.compactToolbar ??
         (typeof storedLayout.compactToolbar === "boolean"
@@ -2137,6 +2226,10 @@ export function buildSettingsImportPreview(
     hiddenToolbarGroupsCount,
     compactToolbar: incoming.ui.compactToolbar,
     theme: incoming.ui.theme,
+    themePreset: incoming.ui.themePreset,
+    customColorOverridesCount: Object.keys(
+      incoming.ui.customColorOverrides ?? {}
+    ).length,
     inspectorPosition: incoming.ui.inspectorPosition,
     inspectorSplitDirection: incoming.ui.inspectorSplitDirection,
     proxyPort: incoming.proxy.port,
@@ -2202,6 +2295,15 @@ function atomicWriteProfileToLocalStorage(
 
   const nextEntries: [string, string][] = [
     [SETTINGS_STORAGE_KEYS.theme, profile.ui.theme],
+    [
+      SETTINGS_STORAGE_KEYS.themePreset,
+      profile.ui.themePreset ??
+        (profile.ui.theme === "light" ? "default-light" : "default-dark"),
+    ],
+    [
+      SETTINGS_STORAGE_KEYS.customColorOverrides,
+      JSON.stringify(profile.ui.customColorOverrides ?? {}),
+    ],
     [
       SETTINGS_STORAGE_KEYS.uiLayout,
       JSON.stringify({

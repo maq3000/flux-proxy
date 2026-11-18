@@ -48,6 +48,7 @@ const SAFE_RASTER_IMAGE_MIMES = new Set([
   "image/x-icon",
 ]);
 import { hexToRgba } from "../lib/sessionDiff";
+import { getMonacoThemeName } from "../lib/monaco";
 import {
   analyzeAuth,
   analyzeCaching,
@@ -356,7 +357,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
     }
   }, [detail?.summary.id, loadingReqBody]);
 
-  const monacoTheme = resolvedTheme === "dark" ? "vs-dark" : "light";
+  const monacoTheme = getMonacoThemeName(resolvedTheme);
 
   useEffect(() => {
     if (externalHexTrigger > 0) {

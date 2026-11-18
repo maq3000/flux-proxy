@@ -17,6 +17,7 @@ import {
   X,
 } from "lucide-react";
 import { formatBytes, formatDuration } from "../lib/formatters";
+import { getMonacoThemeName } from "../lib/monaco";
 import {
   buildSessionDiffBundle,
   type DiffNormalizationOptions,
@@ -95,7 +96,7 @@ export const SessionDiffView: React.FC<SessionDiffViewProps> = ({
   const [diffHunkCount, setDiffHunkCount] = useState<number>(0);
   const [copiedSide, setCopiedSide] = useState<"left" | "right" | null>(null);
 
-  const monacoTheme = resolvedTheme === "dark" ? "vs-dark" : "light";
+  const monacoTheme = getMonacoThemeName(resolvedTheme);
 
   const normOpts = useMemo<DiffNormalizationOptions>(
     () => ({
