@@ -84,6 +84,7 @@ interface TopToolbarProps {
   onToggleFollowTail: () => void;
   // Layout & View Customization
   compactToolbar?: boolean;
+  onToggleCompactToolbar?: () => void;
   sidebarCollapsed: boolean;
   onToggleSidebar: () => void;
   inspectorCollapsed: boolean;
@@ -228,6 +229,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   followTail,
   onToggleFollowTail,
   compactToolbar = false,
+  onToggleCompactToolbar,
   sidebarCollapsed,
   onToggleSidebar,
   inspectorCollapsed,
@@ -556,13 +558,15 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                 <>
                   <Pause className="h-3 w-3" />
                   <span className="font-mono text-[11px]">
-                    {status.bindAddr}:{status.port}
+                    {compactToolbar
+                      ? `:${status.port}`
+                      : `${status.bindAddr}:${status.port}`}
                   </span>
                 </>
               ) : (
                 <>
                   <Play className="h-3 w-3" />
-                  <span>Paused</span>
+                  {!compactToolbar && <span>Paused</span>}
                 </>
               )}
             </button>
@@ -575,13 +579,14 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
               className="inline-flex h-7 items-center gap-1 rounded-md border border-hairline bg-elevated px-2 text-xs text-muted transition-colors hover:border-strong hover:text-status5xx-fg"
             >
               <Trash2 className="h-3.5 w-3.5" />
-              <span className="hidden xl:inline">Clear</span>
+              {!compactToolbar && <span className="hidden xl:inline">Clear</span>}
             </button>
 
             <button
               type="button"
               onClick={onToggleFollowTail}
               aria-pressed={followTail}
+              aria-label="Follow Tail"
               title="Автопрокрутка потока к новым запросам (Stream / Follow Tail)"
               className={`inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs transition-colors ${
                 followTail
@@ -590,7 +595,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
               }`}
             >
               <ArrowDownToLine className="h-3.5 w-3.5" />
-              <span>Tail</span>
+              {!compactToolbar && <span>Tail</span>}
             </button>
           </div>
         )}
@@ -723,9 +728,13 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                     : "border-hairline bg-elevated text-muted hover:border-strong hover:text-fg"
                 }`}
               >
-                <span className="text-[11px] text-muted">Keep:</span>
+                {!compactToolbar && (
+                  <span className="text-[11px] text-muted">Keep:</span>
+                )}
                 <span className="font-mono text-[11px] font-semibold text-fg tabular-nums">
-                  {formatRetentionOptionLabel(sessionRetentionLimit)}
+                  {compactToolbar && sessionRetentionLimit === null
+                    ? "All"
+                    : formatRetentionOptionLabel(sessionRetentionLimit)}
                 </span>
                 <ChevronDown className="h-3 w-3 text-muted" aria-hidden="true" />
               </button>
@@ -792,37 +801,51 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                       </span>
                     )}
                   </button>
+                  <hr />
+                  <button
+                    type="button"
+                    role="menuitemcheckbox"
+                    aria-checked={dropNonMatching}
+                    onClick={() => {
+                      closeKeepMenu();
+                      onToggleDropNonMatching();
+                    }}
+                  >
+                    <span>Drop Non-Matching on Capture</span>
+                  </button>
                 </div>
               </div>
             </>
           )}
 
           {/* Drop Non-Matching Checkbox / Badge-Button */}
-          <label
-            htmlFor={dropNonMatchingCheckboxId}
-            title="Не сохранять в память запросы, отсеянные фильтром"
-            className={`inline-flex h-7 cursor-pointer select-none items-center gap-1.5 rounded-md border px-2 text-xs transition-colors ${
-              dropNonMatching
-                ? "border-status4xx-fg/45 bg-status4xx-bg text-status4xx-fg hover:brightness-110"
-                : "border-hairline bg-elevated text-muted hover:border-strong hover:text-fg"
-            }`}
-          >
-            <input
-              id={dropNonMatchingCheckboxId}
-              type="checkbox"
-              checked={dropNonMatching}
-              onChange={onToggleDropNonMatching}
-              className="checkbox-native"
-            />
-            <span className="whitespace-nowrap text-[11px] font-medium">
-              Drop Non-Matching
-            </span>
-            {droppedSessionsCount > 0 && (
-              <span className="rounded-full bg-canvas/80 px-1.5 font-mono text-[10px] font-semibold tabular-nums text-fg">
-                {droppedSessionsCount.toLocaleString()}
+          {!compactToolbar && (
+            <label
+              htmlFor={dropNonMatchingCheckboxId}
+              title="Не сохранять в память запросы, отсеянные фильтром"
+              className={`inline-flex h-7 cursor-pointer select-none items-center gap-1.5 rounded-md border px-2 text-xs transition-colors ${
+                dropNonMatching
+                  ? "border-status4xx-fg/45 bg-status4xx-bg text-status4xx-fg hover:brightness-110"
+                  : "border-hairline bg-elevated text-muted hover:border-strong hover:text-fg"
+              }`}
+            >
+              <input
+                id={dropNonMatchingCheckboxId}
+                type="checkbox"
+                checked={dropNonMatching}
+                onChange={onToggleDropNonMatching}
+                className="checkbox-native"
+              />
+              <span className="whitespace-nowrap text-[11px] font-medium">
+                Drop Non-Matching
               </span>
-            )}
-          </label>
+              {droppedSessionsCount > 0 && (
+                <span className="rounded-full bg-canvas/80 px-1.5 font-mono text-[10px] font-semibold tabular-nums text-fg">
+                  {droppedSessionsCount.toLocaleString()}
+                </span>
+              )}
+            </label>
+          )}
         </div>
 
         {/* Optional Group: OS System Proxy & Selective TLS MITM */}
@@ -833,6 +856,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                 type="button"
                 onClick={onToggleSystemProxy}
                 aria-pressed={status.systemProxyEnabled}
+                aria-label="OS System Proxy"
                 title="Переключить системный прокси ОС"
                 className={`inline-flex h-7 items-center gap-1 rounded-l-md border border-r-0 px-2 text-xs transition-colors ${
                   hasSysProxyWarning
@@ -849,7 +873,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                 ) : (
                   <Terminal className="h-3.5 w-3.5 text-subtle" />
                 )}
-                <span>SysProxy</span>
+                {!compactToolbar && <span>SysProxy</span>}
               </button>
               <button
                 ref={sysChevronRef}
@@ -947,6 +971,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                 type="button"
                 onClick={onToggleTlsInterceptMode}
                 aria-pressed={isTargetedOnly}
+                aria-label="Toggle TLS MITM Mode"
                 title="Переключить режим TLS MITM: Intercept All / Targeted Only"
                 className={`inline-flex h-7 items-center gap-1 rounded-l-md border border-r-0 px-2 text-xs transition-colors ${
                   isTargetedOnly
@@ -959,7 +984,11 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                 ) : (
                   <Shield className="h-3.5 w-3.5 text-accent" />
                 )}
-                <span>{isTargetedOnly ? `Target (${targetHostsCount})` : "MITM All"}</span>
+                {!compactToolbar && (
+                  <span>
+                    {isTargetedOnly ? `Target (${targetHostsCount})` : "MITM All"}
+                  </span>
+                )}
               </button>
               <button
                 ref={mitmChevronRef}
@@ -1073,7 +1102,12 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
         )}
 
         {/* Optional Group: Breakpoints (or alert pill when paused packets exist) */}
-        {(toolbarGroups.breakpoints || pausedBreakpointCount > 0) && (
+        {(toolbarGroups.breakpoints || pausedBreakpointCount > 0) &&
+          (!compactToolbar ||
+            pausedBreakpointCount > 0 ||
+            breakpointConfig.breakBeforeRequest ||
+            breakpointConfig.breakAfterResponse ||
+            breakpointConfig.rules.some((r) => r.enabled)) && (
           <div className="inline-flex h-7 items-center border-l border-hairline pl-1.5">
             {toolbarGroups.breakpoints && (
               <>
@@ -1134,7 +1168,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
       {toolbarGroups.quickFilter ? (
         <div className="flex min-w-[190px] max-w-2xl flex-1 items-center gap-1.5">
           <div
-            className={`relative flex h-7 min-w-0 flex-1 items-center rounded-md border bg-canvas px-2 transition-colors ${
+            className={`relative flex ${compactToolbar ? "h-6" : "h-7"} min-w-0 flex-1 items-center rounded-md border bg-canvas px-2 transition-colors ${
               regexError
                 ? "border-status5xx-fg/70"
                 : "border-hairline focus-within:border-accent/70"
@@ -1199,6 +1233,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
             <button
               type="button"
               onClick={onOpenFilterDrawer}
+              aria-label="Filters & Presets"
               title="Открыть матрицу фильтров и пресеты (Alt+4)"
               className={`inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs transition-colors ${
                 activeFilterCount > 0 || activePresetName
@@ -1207,9 +1242,11 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
               }`}
             >
               <ListFilter className="h-3.5 w-3.5 text-accent" />
-              <span className="hidden max-w-[100px] truncate md:inline">
-                {activePresetName ?? "Filters"}
-              </span>
+              {!compactToolbar && (
+                <span className="hidden max-w-[100px] truncate md:inline">
+                  {activePresetName ?? "Filters"}
+                </span>
+              )}
               {activeFilterCount > 0 && (
                 <span className="rounded-full bg-accent/20 px-1.5 font-mono text-[10px] font-semibold text-accent tabular-nums">
                   {activeFilterCount}
@@ -1235,7 +1272,11 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
 
       {/* Optional Group: Quick Category Filter Pills */}
       {toolbarGroups.categories && (
-        <div className="flex shrink-0 items-center gap-0.5 rounded-md border border-hairline bg-canvas p-0.5">
+        <div
+          className={`flex shrink-0 items-center gap-0.5 rounded-md border border-hairline bg-canvas ${
+            compactToolbar ? "px-0.5 py-0" : "p-0.5"
+          }`}
+        >
           {CATEGORIES.map((cat) => (
             <button
               key={cat.id}
@@ -1260,26 +1301,28 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
 
       {/* Right: Optional Quick Utilities + Mobile Setup + Layout Switches + Column Picker + Overflow ••• */}
       <div className="flex shrink-0 items-center gap-1">
-        <button
-          type="button"
-          onClick={onOpenMobileSetup}
-          title="Connect Mobile Device — iOS & Android Wi-Fi Proxy + QR Code (Ctrl+Shift+M)"
-          aria-label="Connect Mobile Device"
-          className={`inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs transition-colors ${
-            isRemoteAllowed
-              ? "border-status2xx-fg/40 bg-status2xx-bg text-status2xx-fg hover:brightness-110"
-              : "border-hairline bg-elevated text-muted hover:border-strong hover:text-fg"
-          }`}
-        >
-          <Smartphone className="h-3.5 w-3.5" aria-hidden="true" />
-          {isRemoteAllowed && (
-            <span className="hidden font-mono text-[10px] font-semibold xl:inline">
-              LAN
-            </span>
-          )}
-        </button>
+        {!compactToolbar && (
+          <button
+            type="button"
+            onClick={onOpenMobileSetup}
+            title="Connect Mobile Device — iOS & Android Wi-Fi Proxy + QR Code (Ctrl+Shift+M)"
+            aria-label="Connect Mobile Device"
+            className={`inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs transition-colors ${
+              isRemoteAllowed
+                ? "border-status2xx-fg/40 bg-status2xx-bg text-status2xx-fg hover:brightness-110"
+                : "border-hairline bg-elevated text-muted hover:border-strong hover:text-fg"
+            }`}
+          >
+            <Smartphone className="h-3.5 w-3.5" aria-hidden="true" />
+            {isRemoteAllowed && (
+              <span className="hidden font-mono text-[10px] font-semibold xl:inline">
+                LAN
+              </span>
+            )}
+          </button>
+        )}
 
-        {toolbarGroups.utilities && (
+        {!compactToolbar && toolbarGroups.utilities && (
           <div className="flex items-center gap-1 border-r border-hairline pr-1.5">
             <button
               type="button"
@@ -1337,95 +1380,97 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
         {toolbarGroups.layout && (
           <div className="flex items-center gap-1">
             {/* Layout Segmented Control: Sidebar, Bottom Inspector, Right Inspector, Split Composer */}
-            <div
-              role="group"
-              aria-label="Workspace layout controls"
-              className="inline-flex h-7 items-center rounded-md border border-hairline bg-elevated p-0.5"
-            >
-              <button
-                type="button"
-                onClick={onToggleSidebar}
-                aria-pressed={!sidebarCollapsed}
-                aria-label="Toggle navigation sidebar"
-                title={
-                  sidebarCollapsed
-                    ? "Показать боковую панель (Ctrl+B)"
-                    : "Свернуть боковую панель (Ctrl+B)"
-                }
-                className={`inline-flex h-6 w-6 items-center justify-center rounded transition-colors ${
-                  !sidebarCollapsed
-                    ? "bg-selected text-accent"
-                    : "text-muted hover:bg-hover hover:text-fg"
-                }`}
+            {!compactToolbar && (
+              <div
+                role="group"
+                aria-label="Workspace layout controls"
+                className="inline-flex h-7 items-center rounded-md border border-hairline bg-elevated p-0.5"
               >
-                <PanelLeft className="h-3.5 w-3.5" />
-              </button>
-
-              <button
-                type="button"
-                onClick={() => {
-                  if (!inspectorCollapsed && inspectorPosition === "bottom") {
-                    onToggleInspector();
-                  } else {
-                    onSetInspectorPosition("bottom");
+                <button
+                  type="button"
+                  onClick={onToggleSidebar}
+                  aria-pressed={!sidebarCollapsed}
+                  aria-label="Toggle navigation sidebar"
+                  title={
+                    sidebarCollapsed
+                      ? "Показать боковую панель (Ctrl+B)"
+                      : "Свернуть боковую панель (Ctrl+B)"
                   }
-                }}
-                aria-pressed={!inspectorCollapsed && inspectorPosition === "bottom"}
-                aria-label="Dock Session Inspector at bottom or collapse"
-                title={
-                  !inspectorCollapsed && inspectorPosition === "bottom"
-                    ? "Свернуть нижнюю панель Session Inspector"
-                    : "Расположить Session Inspector снизу"
-                }
-                className={`inline-flex h-6 w-6 items-center justify-center rounded transition-colors ${
-                  !inspectorCollapsed && inspectorPosition === "bottom"
-                    ? "bg-selected text-accent"
-                    : "text-muted hover:bg-hover hover:text-fg"
-                }`}
-              >
-                <PanelBottom className="h-3.5 w-3.5" />
-              </button>
+                  className={`inline-flex h-6 w-6 items-center justify-center rounded transition-colors ${
+                    !sidebarCollapsed
+                      ? "bg-selected text-accent"
+                      : "text-muted hover:bg-hover hover:text-fg"
+                  }`}
+                >
+                  <PanelLeft className="h-3.5 w-3.5" />
+                </button>
 
-              <button
-                type="button"
-                onClick={() => {
-                  if (!inspectorCollapsed && inspectorPosition === "right") {
-                    onToggleInspector();
-                  } else {
-                    onSetInspectorPosition("right");
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!inspectorCollapsed && inspectorPosition === "bottom") {
+                      onToggleInspector();
+                    } else {
+                      onSetInspectorPosition("bottom");
+                    }
+                  }}
+                  aria-pressed={!inspectorCollapsed && inspectorPosition === "bottom"}
+                  aria-label="Dock Session Inspector at bottom or collapse"
+                  title={
+                    !inspectorCollapsed && inspectorPosition === "bottom"
+                      ? "Свернуть нижнюю панель Session Inspector"
+                      : "Расположить Session Inspector снизу"
                   }
-                }}
-                aria-pressed={!inspectorCollapsed && inspectorPosition === "right"}
-                aria-label="Dock Session Inspector on right or collapse"
-                title={
-                  !inspectorCollapsed && inspectorPosition === "right"
-                    ? "Свернуть правую панель Session Inspector"
-                    : "Расположить Session Inspector справа"
-                }
-                className={`inline-flex h-6 w-6 items-center justify-center rounded transition-colors ${
-                  !inspectorCollapsed && inspectorPosition === "right"
-                    ? "bg-selected text-accent"
-                    : "text-muted hover:bg-hover hover:text-fg"
-                }`}
-              >
-                <PanelRight className="h-3.5 w-3.5" />
-              </button>
+                  className={`inline-flex h-6 w-6 items-center justify-center rounded transition-colors ${
+                    !inspectorCollapsed && inspectorPosition === "bottom"
+                      ? "bg-selected text-accent"
+                      : "text-muted hover:bg-hover hover:text-fg"
+                  }`}
+                >
+                  <PanelBottom className="h-3.5 w-3.5" />
+                </button>
 
-              <button
-                type="button"
-                onClick={onToggleDockedComposer}
-                aria-pressed={dockedComposer}
-                aria-label="Toggle split Request Composer"
-                title="Открыть / скрыть Split Composer рядом с таблицей"
-                className={`inline-flex h-6 w-6 items-center justify-center rounded transition-colors ${
-                  dockedComposer
-                    ? "bg-selected text-accent"
-                    : "text-muted hover:bg-hover hover:text-fg"
-                }`}
-              >
-                <Columns className="h-3.5 w-3.5" />
-              </button>
-            </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!inspectorCollapsed && inspectorPosition === "right") {
+                      onToggleInspector();
+                    } else {
+                      onSetInspectorPosition("right");
+                    }
+                  }}
+                  aria-pressed={!inspectorCollapsed && inspectorPosition === "right"}
+                  aria-label="Dock Session Inspector on right or collapse"
+                  title={
+                    !inspectorCollapsed && inspectorPosition === "right"
+                      ? "Свернуть правую панель Session Inspector"
+                      : "Расположить Session Inspector справа"
+                  }
+                  className={`inline-flex h-6 w-6 items-center justify-center rounded transition-colors ${
+                    !inspectorCollapsed && inspectorPosition === "right"
+                      ? "bg-selected text-accent"
+                      : "text-muted hover:bg-hover hover:text-fg"
+                  }`}
+                >
+                  <PanelRight className="h-3.5 w-3.5" />
+                </button>
+
+                <button
+                  type="button"
+                  onClick={onToggleDockedComposer}
+                  aria-pressed={dockedComposer}
+                  aria-label="Toggle split Request Composer"
+                  title="Открыть / скрыть Split Composer рядом с таблицей"
+                  className={`inline-flex h-6 w-6 items-center justify-center rounded transition-colors ${
+                    dockedComposer
+                      ? "bg-selected text-accent"
+                      : "text-muted hover:bg-hover hover:text-fg"
+                  }`}
+                >
+                  <Columns className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            )}
 
             {/* Column Picker & Customize Toolbar Popover Button */}
             <button
@@ -1439,6 +1484,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                   true
                 )
               }
+              aria-label="Customize columns and toolbar"
               title="Настроить видимость колонок таблицы и групп тулбара"
               {...({
                 commandfor: columnsPopoverId,
@@ -1447,7 +1493,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
               className="inline-flex h-7 items-center gap-1 rounded-md border border-hairline bg-elevated px-2 text-xs text-muted transition-colors hover:border-strong hover:text-fg"
             >
               <Columns3 className="h-3.5 w-3.5" />
-              <span className="hidden lg:inline">Columns</span>
+              {!compactToolbar && <span className="hidden lg:inline">Columns</span>}
               {visibleColumnsCount < TRAFFIC_COLUMNS.length && (
                 <span className="font-mono text-[10px] text-accent tabular-nums">
                   {visibleColumnsCount}/{TRAFFIC_COLUMNS.length}
@@ -1501,6 +1547,22 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                 </button>
               </div>
               <div className="mt-2 space-y-1">
+                {onToggleCompactToolbar && (
+                  <label className="flex cursor-pointer items-center justify-between gap-2 rounded border-b border-hairline px-1.5 pb-1.5 pt-1 text-[11px] font-medium text-fg hover:bg-hover">
+                    <span className="truncate">
+                      Slim / Compact Toolbar{" "}
+                      <span className="font-mono text-[10px] text-subtle">
+                        (Ctrl+Shift+T)
+                      </span>
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={compactToolbar}
+                      onChange={onToggleCompactToolbar}
+                      className="checkbox-native"
+                    />
+                  </label>
+                )}
                 {TOOLBAR_GROUP_DEFINITIONS.map((grp) => (
                   <label
                     key={grp.id}
@@ -1623,6 +1685,56 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
             </button>
             <button
               type="button"
+              role="menuitemcheckbox"
+              aria-checked={dropNonMatching}
+              onClick={() => {
+                onToggleDropNonMatching();
+                closeOverflow();
+              }}
+            >
+              <span>Drop Non-Matching on Capture</span>
+            </button>
+            <hr />
+            <button
+              type="button"
+              role="menuitemcheckbox"
+              aria-checked={breakpointConfig.breakBeforeRequest}
+              onClick={() => {
+                onToggleBreakBeforeRequest();
+                closeOverflow();
+              }}
+            >
+              <span>Break Before Request</span>
+              <span className="hint" aria-hidden="true">
+                F11
+              </span>
+            </button>
+            <button
+              type="button"
+              role="menuitemcheckbox"
+              aria-checked={breakpointConfig.breakAfterResponse}
+              onClick={() => {
+                onToggleBreakAfterResponse();
+                closeOverflow();
+              }}
+            >
+              <span>Break After Response</span>
+              <span className="hint" aria-hidden="true">
+                Alt+F11
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                closeOverflow();
+                onOpenBreakpointsModal();
+              }}
+            >
+              <span>Breakpoint Rules (bpu / bpafter)…</span>
+            </button>
+            <hr />
+            <button
+              type="button"
               onClick={() => {
                 closeOverflow();
                 onSaveSqlite();
@@ -1640,6 +1752,25 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
               <span>Restore Sessions from SQLite</span>
             </button>
             <hr />
+            {onToggleCompactToolbar && (
+              <>
+                <button
+                  type="button"
+                  role="menuitemcheckbox"
+                  aria-checked={compactToolbar}
+                  onClick={() => {
+                    onToggleCompactToolbar();
+                    closeOverflow();
+                  }}
+                >
+                  <span>Slim / Compact Toolbar</span>
+                  <span className="hint" aria-hidden="true">
+                    Ctrl+Shift+T
+                  </span>
+                </button>
+                <hr />
+              </>
+            )}
             <button
               type="button"
               role="menuitemcheckbox"

@@ -1172,6 +1172,18 @@ export const App: React.FC = () => {
         return;
       }
 
+      // Ctrl+Shift+T / Cmd+Shift+T -> Toggle Slim / Compact Toolbar
+      if (
+        ctrlOrMeta &&
+        !e.altKey &&
+        e.shiftKey &&
+        (keyLower === "t" || e.code === "KeyT")
+      ) {
+        e.preventDefault();
+        toggleCompactToolbar();
+        return;
+      }
+
       // Ctrl+A / Cmd+A -> Select all visible sessions
       if (
         ctrlOrMeta &&
@@ -1381,6 +1393,7 @@ export const App: React.FC = () => {
     selectSessions,
     toggleBreakAfterResponse,
     toggleBreakBeforeRequest,
+    toggleCompactToolbar,
     toggleProxy,
     toggleSidebar,
     unmarkSessions,
@@ -1537,6 +1550,15 @@ export const App: React.FC = () => {
         category: "Inspector",
         label: "Открыть выбранную сессию во вкладке Hex View",
         perform: handleInspectInHex,
+      },
+      {
+        id: "toggle-compact-toolbar",
+        category: "View",
+        label: compactToolbar
+          ? "Выключить Slim / Compact Toolbar"
+          : "Включить Slim / Compact Toolbar",
+        shortcut: "Ctrl+Shift+T",
+        perform: toggleCompactToolbar,
       },
       {
         id: "toggle-sidebar",
@@ -1911,6 +1933,7 @@ export const App: React.FC = () => {
       breakpointConfig.breakAfterResponse,
       breakpointConfig.breakBeforeRequest,
       clearAllSessions,
+      compactToolbar,
       copySessionAsCurl,
       deleteSessions,
       disableAllBreakpoints,
@@ -1959,6 +1982,7 @@ export const App: React.FC = () => {
       toggleAllowRemote,
       toggleBreakAfterResponse,
       toggleBreakBeforeRequest,
+      toggleCompactToolbar,
       toggleDropNonMatching,
       toggleForceNoCache,
       toggleInspector,
@@ -2313,6 +2337,7 @@ export const App: React.FC = () => {
             followTail={followTail}
             onToggleFollowTail={() => setFollowTail((v) => !v)}
             compactToolbar={compactToolbar}
+            onToggleCompactToolbar={toggleCompactToolbar}
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={toggleSidebar}
             inspectorCollapsed={inspectorCollapsed}

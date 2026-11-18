@@ -1369,6 +1369,20 @@ export const MenuBar: React.FC<MenuBarProps> = ({
               >
                 <span>Auto-Scroll Stream (Tail)</span>
               </button>
+              {onToggleCompactToolbar && (
+                <button
+                  type="button"
+                  role="menuitemcheckbox"
+                  aria-checked={compactToolbar}
+                  onKeyDown={checkboxKeyDown}
+                  onClick={(e) => activateCheckbox(e, onToggleCompactToolbar)}
+                >
+                  <span>Slim / Compact Toolbar</span>
+                  <span className="hint" aria-hidden="true">
+                    Ctrl+Shift+T
+                  </span>
+                </button>
+              )}
 
               <hr />
 
@@ -1421,6 +1435,9 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                         }
                       >
                         <span>Compact Toolbar</span>
+                        <span className="hint" aria-hidden="true">
+                          Ctrl+Shift+T
+                        </span>
                       </button>
                       <hr />
                     </>

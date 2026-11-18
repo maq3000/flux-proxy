@@ -28,6 +28,11 @@ const SHORTCUT_GROUPS: {
         keys: "Space / Enter",
         description: "Открыть и переключить фокус на Session Inspector",
       },
+      {
+        keys: "Ctrl+1 … Ctrl+6",
+        description:
+          "Вкладки активной панели Inspector: 1 Headers, 2 JSON/Raw, 3 Cookies/Params, 4 Auth, 5 Raw, 6 Hex",
+      },
       { keys: "Esc", description: "Сбросить множественное выделение / вернуться к таблице" },
     ],
   },
@@ -53,6 +58,10 @@ const SHORTCUT_GROUPS: {
       { keys: "F11 / Alt+F11", description: "Точки останова Break on Request / Response" },
       { keys: "Shift+F11", description: "Снять все точки останова" },
       { keys: "Ctrl+B", description: "Свернуть / развернуть боковую панель (Sidebar)" },
+      {
+        keys: "Ctrl+Shift+T",
+        description: "Компактный режим тулбара (Slim / Compact Toolbar)",
+      },
       { keys: "Ctrl+Shift+M", description: "Connect Mobile Device — iOS / Android Wi-Fi Proxy + QR" },
       { keys: "Ctrl+E", description: "Открыть Text Wizard & JWT Decoder" },
       {

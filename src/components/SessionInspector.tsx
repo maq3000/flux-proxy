@@ -163,6 +163,11 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
 }) => {
   const [reqTab, setReqTab] = useState<InspectorTab>("headers");
   const [respTab, setRespTab] = useState<InspectorTab>("json");
+  const [activePane, setActivePane] = useState<"request" | "response">(
+    "response"
+  );
+  const internalContainerRef = useRef<HTMLDivElement>(null);
+  const resolvedContainerRef = containerRef ?? internalContainerRef;
   const [localSplitDirection, setLocalSplitDirection] = useState<
     "vertical" | "horizontal"
   >(() => (inspectorPosition === "bottom" ? "horizontal" : "vertical"));
@@ -317,6 +322,113 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [externalHexTrigger]);
 
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || !effectiveDetail) return;
+
+      const ctrlOrMeta = e.ctrlKey || e.metaKey;
+      if (!ctrlOrMeta || e.altKey || e.shiftKey) return;
+
+      const digitMatch = /^Digit([1-6])$/.exec(e.code);
+      const keyNum =
+        e.key >= "1" && e.key <= "6"
+          ? Number(e.key)
+          : digitMatch
+            ? Number(digitMatch[1])
+            : null;
+      if (keyNum === null) return;
+
+      if (
+        typeof document !== "undefined" &&
+        document.querySelector("dialog[open]")
+      ) {
+        return;
+      }
+
+      const targetEl = (
+        e.target instanceof HTMLElement ? e.target : document.activeElement
+      ) as HTMLElement | null;
+
+      if (
+        targetEl &&
+        (targetEl.isContentEditable ||
+          targetEl.closest(
+            "input, textarea, select, [contenteditable], .monaco-editor, [popover]"
+          ))
+      ) {
+        return;
+      }
+
+      const inInspector = Boolean(
+        targetEl && resolvedContainerRef.current?.contains(targetEl)
+      );
+      const inTrafficGrid = Boolean(targetEl?.closest('[role="grid"]'));
+      const onRootFallback =
+        !targetEl ||
+        targetEl === document.body ||
+        targetEl === document.documentElement;
+
+      if (!inInspector && !inTrafficGrid && !onRootFallback) {
+        return;
+      }
+
+      const isRequestPane = activePane === "request";
+      let nextTab: InspectorTab;
+      switch (keyNum) {
+        case 1:
+          nextTab = "headers";
+          break;
+        case 2: {
+          if (isRequestPane) {
+            const hasReqJson =
+              tryFormatJson(effectiveDetail.requestBodyText).valid ||
+              (Boolean(effectiveDetail.requestBodyOffloaded) &&
+                effectiveDetail.requestHeaders.some(
+                  (h) =>
+                    h.name.toLowerCase() === "content-type" &&
+                    h.value.toLowerCase().includes("json")
+                ));
+            nextTab = hasReqJson ? "json" : "raw";
+          } else {
+            const hasRespJson =
+              tryFormatJson(effectiveDetail.responseBodyText).valid ||
+              (Boolean(effectiveDetail.bodyOffloaded) &&
+                effectiveDetail.summary.contentType
+                  .toLowerCase()
+                  .includes("json"));
+            nextTab = hasRespJson ? "json" : "raw";
+          }
+          break;
+        }
+        case 3:
+          nextTab =
+            isRequestPane && reqTab === "cookies" ? "params" : "cookies";
+          break;
+        case 4:
+          nextTab = "auth";
+          break;
+        case 5:
+          nextTab = "raw";
+          break;
+        case 6:
+          nextTab = "hex";
+          break;
+        default:
+          return;
+      }
+
+      e.preventDefault();
+      if (isRequestPane) {
+        setReqTab(nextTab);
+      } else {
+        setRespTab(nextTab);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activePane, effectiveDetail, reqTab, resolvedContainerRef]);
+
   const handleContainerKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.defaultPrevented) return;
     const target = e.target as HTMLElement;
@@ -437,7 +549,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
   if (!detail) {
     return (
       <div
-        ref={containerRef}
+        ref={resolvedContainerRef}
         tabIndex={-1}
         onKeyDown={handleContainerKeyDown}
         aria-label="Session Inspector"
@@ -538,7 +650,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
 
   return (
     <div
-      ref={containerRef}
+      ref={resolvedContainerRef}
       tabIndex={-1}
       onKeyDown={handleContainerKeyDown}
       aria-label={`Session Inspector #${summary.id}`}
@@ -825,8 +937,14 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
           order={1}
           defaultSize={44}
           minSize={20}
-          className="flex flex-col overflow-hidden"
+          className="overflow-hidden"
         >
+          <div
+            data-inspector-pane="request"
+            onFocusCapture={() => setActivePane("request")}
+            onPointerDownCapture={() => setActivePane("request")}
+            className="flex h-full flex-col overflow-hidden"
+          >
           <div className="flex h-8 shrink-0 items-center justify-between border-b border-hairline bg-surface px-2">
             <div className="flex items-center gap-0.5 overflow-x-auto">
               <span className="mr-1.5 shrink-0 font-mono text-[10px] font-bold uppercase tracking-wider text-accent">
@@ -1049,6 +1167,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                 <HexViewer base64Data={effectiveDetail.requestBodyBase64} />
               ))}
           </div>
+          </div>
         </Panel>
 
         <PanelResizeHandle
@@ -1067,8 +1186,14 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
           order={2}
           defaultSize={56}
           minSize={20}
-          className="flex flex-col overflow-hidden"
+          className="overflow-hidden"
         >
+          <div
+            data-inspector-pane="response"
+            onFocusCapture={() => setActivePane("response")}
+            onPointerDownCapture={() => setActivePane("response")}
+            className="flex h-full flex-col overflow-hidden"
+          >
           <div className="flex h-8 shrink-0 items-center justify-between border-b border-hairline bg-surface px-2">
             <div className="flex items-center gap-0.5 overflow-x-auto">
               <span
@@ -1367,6 +1492,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
               ))}
               </>
             )}
+          </div>
           </div>
         </Panel>
       </PanelGroup>

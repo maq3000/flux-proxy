@@ -221,6 +221,39 @@ function getTextWidthPx(text: string, font: string): number {
   return sharedMeasureCtx.measureText(text).width;
 }
 
+export function computeAutoFitWidth(
+  col: ColumnDefinition,
+  sessions: SessionSummary[]
+): number {
+  const headerFont =
+    "600 11px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+  const cellFont =
+    "400 12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
+
+  let maxPx = getTextWidthPx(col.label.toUpperCase(), headerFont) + 22;
+
+  const sampleStep = Math.max(1, Math.floor(sessions.length / 250));
+  for (let i = 0; i < sessions.length; i += sampleStep) {
+    const s = sessions[i];
+    const sample = getCellSampleText(s, col.id);
+    if (!sample) continue;
+    const extra =
+      col.id === "url" &&
+      (s.breakpointPaused || s.tlsBypassed || s.isMocked || s.headersMutated)
+        ? 56
+        : col.id === "status"
+          ? 26
+          : 22;
+    const w = getTextWidthPx(sample, cellFont) + extra;
+    if (w > maxPx) maxPx = w;
+  }
+
+  return Math.max(
+    col.minWidth,
+    Math.min(col.maxAutoFitWidth, Math.ceil(maxPx))
+  );
+}
+
 function closePopoverSafe(pop: HTMLElement | null) {
   if (!pop) return;
   if ("popover" in HTMLElement.prototype) {
@@ -447,8 +480,8 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
         headerColPopoverRef.current,
         e.clientX,
         e.clientY,
-        228,
-        440
+        240,
+        500
       );
     },
     [closeContextMenu]
@@ -588,34 +621,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
         suppressNextHeaderClickRef.current = false;
       }, 0);
 
-      const headerFont =
-        "600 11px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-      const cellFont =
-        "400 12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-
-      let maxPx = getTextWidthPx(col.label.toUpperCase(), headerFont) + 22;
-
-      const sampleStep = Math.max(1, Math.floor(sortedSessions.length / 250));
-      for (let i = 0; i < sortedSessions.length; i += sampleStep) {
-        const s = sortedSessions[i];
-        const sample = getCellSampleText(s, col.id);
-        if (!sample) continue;
-        const extra =
-          col.id === "url" &&
-          (s.breakpointPaused || s.tlsBypassed || s.isMocked || s.headersMutated)
-            ? 56
-            : col.id === "status"
-              ? 26
-              : 22;
-        const w = getTextWidthPx(sample, cellFont) + extra;
-        if (w > maxPx) maxPx = w;
-      }
-
-      const clamped = Math.max(
-        col.minWidth,
-        Math.min(col.maxAutoFitWidth, Math.ceil(maxPx))
-      );
-      onColumnWidthChange(col.id, clamped);
+      onColumnWidthChange(col.id, computeAutoFitWidth(col, sortedSessions));
     },
     [onColumnWidthChange, sortedSessions]
   );
@@ -1533,6 +1539,48 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
             </>
           );
         })()}
+        {(() => {
+          const clickedCol = ctxHeaderCol
+            ? (TRAFFIC_COLUMNS.find((c) => c.id === ctxHeaderCol) ?? null)
+            : null;
+          return (
+            <div className="mb-1.5 grid grid-cols-1 gap-0.5">
+              {clickedCol && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onColumnWidthChange(
+                      clickedCol.id,
+                      computeAutoFitWidth(clickedCol, sortedSessions)
+                    );
+                    closeHeaderMenu();
+                  }}
+                  className="flex items-center justify-between rounded px-1.5 py-1 text-left text-xs text-fg hover:bg-hover"
+                >
+                  <span className="truncate">
+                    {`Auto-fit "${clickedCol.label}"`}
+                  </span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  for (const col of activeColumns) {
+                    onColumnWidthChange(
+                      col.id,
+                      computeAutoFitWidth(col, sortedSessions)
+                    );
+                  }
+                  closeHeaderMenu();
+                }}
+                className="flex items-center justify-between rounded px-1.5 py-1 text-left text-xs text-fg hover:bg-hover"
+              >
+                <span className="truncate">Auto-fit All Visible Columns</span>
+              </button>
+            </div>
+          );
+        })()}
+        <hr className="my-1.5 border-hairline" />
         <div className="mb-1.5 flex items-center justify-between px-1">
           <span className="text-[11px] font-semibold text-fg">
             Видимость колонок
@@ -1541,11 +1589,12 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
             type="button"
             onClick={() => {
               onResetColumns();
+              closeHeaderMenu();
             }}
             className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-muted hover:bg-hover hover:text-fg"
           >
             <RotateCcw className="h-2.5 w-2.5" />
-            <span>Сброс</span>
+            <span>Reset</span>
           </button>
         </div>
         <div className="grid grid-cols-1 gap-0.5">
