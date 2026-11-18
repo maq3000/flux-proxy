@@ -27,8 +27,10 @@ import { DEFAULT_SESSION_RETENTION_LIMIT } from "../types/proxy";
 import {
   applyHeaderMutationsInPreview,
   DEFAULT_BACKEND_FILTER_CONFIG,
+  DEFAULT_TLS_BYPASS_RULES,
   evaluateShouldStoreSessionInPreview,
   evaluateTlsConnectInPreview,
+  matchHostRuleList,
 } from "./filterEngine";
 import {
   buildFullRawHttpMessage,
@@ -165,6 +167,7 @@ class BrowserPreviewEngine {
   private filterConfig: ProxyFilterBackendConfig = structuredClone(
     DEFAULT_BACKEND_FILTER_CONFIG
   );
+  private tlsRuleHitCounts = new Map<string, number>();
   private breakpointConfig: BreakpointConfig = structuredClone(
     DEFAULT_BREAKPOINT_CONFIG
   );
@@ -462,6 +465,13 @@ class BrowserPreviewEngine {
     });
   }
 
+  private recordTlsRuleHit(ruleId: string): void {
+    this.tlsRuleHitCounts.set(
+      ruleId,
+      (this.tlsRuleHitCounts.get(ruleId) ?? 0) + 1
+    );
+  }
+
   private applyPipelineToDetail(rawDetail: SessionDetail): SessionDetail {
     // 1. Check Selective TLS / MITM Pass-Through (`interceptAll` Bypass list vs `targetedOnly` Allowlist)
     if (rawDetail.summary.scheme === "https" || rawDetail.summary.scheme === "wss") {
@@ -497,6 +507,7 @@ class BrowserPreviewEngine {
           modeHeaderValue = "Passthrough (Hosts List Whitelist)";
           tlsVersionLabel = "Pure TCP Passthrough (Hosts List Whitelist)";
         } else {
+          this.recordTlsRuleHit(decision.rule.id);
           note = [
             "[TLS / MITM Passthrough Tunnel Active]",
             `Host: ${rawDetail.summary.host}:443`,
@@ -536,6 +547,16 @@ class BrowserPreviewEngine {
           responseBodyText: note,
           tlsVersion: tlsVersionLabel,
         };
+      }
+      if (this.filterConfig.tlsInterceptMode === "targetedOnly") {
+        const matchedTarget = matchHostRuleList(
+          this.filterConfig.tlsTargetRules ?? [],
+          rawDetail.summary.host,
+          443
+        );
+        if (matchedTarget) {
+          this.recordTlsRuleHit(matchedTarget.id);
+        }
       }
     }
 
@@ -1485,6 +1506,23 @@ class BrowserPreviewEngine {
     config: ProxyFilterBackendConfig
   ): ProxyFilterBackendConfig {
     this.filterConfig = structuredClone(config);
+    return structuredClone(this.filterConfig);
+  }
+
+  getTlsRuleHitCounts(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [id, count] of this.tlsRuleHitCounts.entries()) {
+      out[id] = count;
+    }
+    return out;
+  }
+
+  resetTlsBypassRulesToRecommended(): ProxyFilterBackendConfig {
+    this.filterConfig = {
+      ...this.filterConfig,
+      tlsBypassEnabled: true,
+      tlsBypassRules: structuredClone(DEFAULT_TLS_BYPASS_RULES),
+    };
     return structuredClone(this.filterConfig);
   }
 
@@ -2605,6 +2643,28 @@ export const proxyBridge = {
       }
     }
     return previewEngine.updateFilterBackendConfig(config);
+  },
+
+  async getTlsRuleHitCounts(): Promise<Record<string, number>> {
+    if (isTauriRuntime()) {
+      try {
+        return await invoke<Record<string, number>>("get_tls_rule_hit_counts");
+      } catch {
+        return previewEngine.getTlsRuleHitCounts();
+      }
+    }
+    return previewEngine.getTlsRuleHitCounts();
+  },
+
+  async resetTlsBypassRulesToRecommended(): Promise<ProxyFilterBackendConfig> {
+    if (isTauriRuntime()) {
+      const next = await invoke<ProxyFilterBackendConfig>(
+        "reset_tls_bypass_rules_to_recommended"
+      );
+      previewEngine.updateFilterBackendConfig(next);
+      return next;
+    }
+    return previewEngine.resetTlsBypassRulesToRecommended();
   },
 
   async getBreakpointConfig(): Promise<BreakpointConfig> {

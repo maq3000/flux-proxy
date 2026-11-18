@@ -1315,10 +1315,10 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
                             )}
                             {s.tlsBypassed && (
                               <span
-                                title="Чистый TCP-проброс без MITM-расшифровки"
-                                className="shrink-0 rounded bg-elevated px-1 text-[9px] font-semibold text-muted ring-1 ring-inset ring-hairline"
+                                title="TUNNEL — Чистый TCP-проброс без MITM-расшифровки (tokio::io::copy_bidirectional)"
+                                className="shrink-0 rounded bg-teal-500/15 px-1.5 py-0.2 text-[9px] font-bold tracking-wider text-teal-300 ring-1 ring-inset ring-teal-500/35"
                               >
-                                BYPASS
+                                TUNNEL
                               </span>
                             )}
                             {s.isMocked && (

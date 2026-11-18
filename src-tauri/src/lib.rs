@@ -116,6 +116,8 @@ pub fn run() {
             commands::get_filter_backend_config,
             commands::update_filter_backend_config,
             commands::update_proxy_filter_config,
+            commands::get_tls_rule_hit_counts,
+            commands::reset_tls_bypass_rules_to_recommended,
             commands::get_breakpoint_config,
             commands::update_breakpoint_config,
             commands::list_paused_breakpoints,

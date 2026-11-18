@@ -305,6 +305,24 @@ pub async fn update_proxy_filter_config(
 }
 
 #[tauri::command]
+pub async fn get_tls_rule_hit_counts(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, u64>, ProxyError> {
+    Ok(state.controller.context.filters.get_tls_rule_hit_counts())
+}
+
+#[tauri::command]
+pub async fn reset_tls_bypass_rules_to_recommended(
+    state: State<'_, AppState>,
+) -> Result<ProxyFilterBackendConfig, ProxyError> {
+    Ok(state
+        .controller
+        .context
+        .filters
+        .reset_tls_bypass_rules_to_recommended())
+}
+
+#[tauri::command]
 pub async fn get_breakpoint_config(
     state: State<'_, AppState>,
 ) -> Result<BreakpointConfig, ProxyError> {

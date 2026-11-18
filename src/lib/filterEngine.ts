@@ -228,39 +228,52 @@ export const BUILT_IN_FILTER_PRESETS: FilterPreset[] = [
   },
 ];
 
+export const DEFAULT_TLS_BYPASS_RULES: TlsBypassRule[] = [
+  {
+    id: "bypass-pki-ocsp-crl",
+    enabled: true,
+    pattern:
+      "ocsp.*, crl.*, *.digicert.com, *.sectigo.com, *.letsencrypt.org, ocsp.apple.com, *.globalsign.com, *.identrust.com",
+    category: "OCSP / CRL PKI",
+    description: "OCSP / CRL серверы проверки отзыва сертификатов X.509",
+  },
+  {
+    id: "bypass-apple-icloud",
+    enabled: true,
+    pattern:
+      "*.apple.com, *.icloud.com, *.mzstatic.com, *.cdn-apple.com, *.push.apple.com",
+    category: "OS Updaters",
+    description: "Apple / iCloud / App Store / APNs strict Certificate Pinning",
+  },
+  {
+    id: "bypass-windows-update",
+    enabled: true,
+    pattern:
+      "*.windowsupdate.com, *.delivery.mp.microsoft.com, *.update.microsoft.com, *.msftconnecttest.com, *.sfx.ms",
+    category: "OS Updaters",
+    description: "Windows Update, Delivery Optimization & NCSI pinned TLS",
+  },
+  {
+    id: "bypass-messengers",
+    enabled: true,
+    pattern:
+      "*.telegram.org, *.t.me, *.whatsapp.net, *.whatsapp.com, *.signal.org, *.viber.com",
+    category: "Messengers",
+    description: "E2EE Messengers with hardcoded public key pinning",
+  },
+  {
+    id: "bypass-payments-3ds",
+    enabled: true,
+    pattern: "*.stripe.network, *.3dsecure.io, *.braintreegateway.com",
+    category: "Payment Gateways",
+    description: "PCI-DSS / 3DSecure payment frames with strict TLS pinning",
+  },
+];
+
 export const DEFAULT_BACKEND_FILTER_CONFIG: ProxyFilterBackendConfig = {
   tlsInterceptMode: "interceptAll",
   tlsBypassEnabled: true,
-  tlsBypassRules: [
-    {
-      id: "bypass-apple-icloud",
-      enabled: true,
-      pattern: "*.apple.com, *.icloud.com, *.mzstatic.com",
-      category: "OS Updaters",
-      description: "Apple / iCloud / App Store жесткий Certificate Pinning",
-    },
-    {
-      id: "bypass-windows-update",
-      enabled: true,
-      pattern: "*.windowsupdate.com, *.delivery.mp.microsoft.com",
-      category: "OS Updaters",
-      description: "Windows Update & системные службы обновления ОС",
-    },
-    {
-      id: "bypass-messengers",
-      enabled: true,
-      pattern: "*.telegram.org, *.whatsapp.net, *.signal.org",
-      category: "Messengers",
-      description: "Мессенджеры со встроенным пиннингом ключей",
-    },
-    {
-      id: "bypass-payments-3ds",
-      enabled: true,
-      pattern: "*.stripe.network, *.3dsecure.io, *.braintreegateway.com",
-      category: "Payment Gateways",
-      description: "Платежные шлюзы и 3-D Secure виджеты",
-    },
-  ],
+  tlsBypassRules: structuredClone(DEFAULT_TLS_BYPASS_RULES),
   tlsTargetRules: [],
   headerMutationsEnabled: true,
   headerMutations: [
@@ -340,30 +353,104 @@ export const TLS_BYPASS_QUICK_PACKS: {
   rule: Omit<TlsBypassRule, "id">;
 }[] = [
   {
-    label: "+ Платежные шлюзы (Checkout / PayPal / Adyen)",
+    label: "+ Dev Tools & Package Managers",
     rule: {
       enabled: true,
-      pattern: "*.paypal.com, *.adyen.com, *.checkout.com, *.cloudpayments.ru",
+      pattern:
+        "*.npmjs.org, *.yarnpkg.com, *.crates.io, *.pypi.org, *.pythonhosted.org, *.docker.io, *.docker.com, *.githubusercontent.com, *.github.com, *.gitlab.com",
+      category: "Dev Tools & Packages",
+      description:
+        "Пакетные менеджеры, контейнерные реестры и CLI (npm, cargo, pip, docker, git)",
+    },
+  },
+  {
+    label: "+ OCSP / CRL PKI",
+    rule: {
+      enabled: true,
+      pattern:
+        "ocsp.*, crl.*, *.digicert.com, *.sectigo.com, *.letsencrypt.org, ocsp.apple.com, *.globalsign.com, *.identrust.com",
+      category: "OCSP / CRL PKI",
+      description: "Серверы отзыва и статуса сертификатов OCSP / CRL",
+    },
+  },
+  {
+    label: "+ Payment Gateways & 3-DS",
+    rule: {
+      enabled: true,
+      pattern:
+        "*.paypal.com, *.adyen.com, *.checkout.com, *.stripe.network, *.3dsecure.io, *.braintreegateway.com, *.cloudpayments.ru",
       category: "Payment Gateways",
-      description: "Платежные провайдеры с TLS Pinning / mTLS",
+      description: "Платежные шлюзы, 3-D Secure и провайдеры с TLS Pinning / mTLS",
     },
   },
   {
-    label: "+ OCSP / CRL проверки сертификатов",
+    label: "+ DRM & Audio/Video Streaming",
     rule: {
       enabled: true,
-      pattern: "*.digicert.com, *.sectigo.com, *.letsencrypt.org, ocsp.*",
-      category: "OS Updaters",
-      description: "Серверы отзыва сертификатов OCSP/CRL",
+      pattern:
+        "*.scdn.co, *.spotify.com, *.nflxvideo.net, *.netflix.com, *.widevine.com, *.irdeto.com, *.akamaized.net, *.cloudfront.net",
+      category: "DRM & Streaming",
+      description: "Widevine/FairPlay DRM и потоковые аудио/видео сервисы",
     },
   },
   {
-    label: "+ Корпоративные мессенджеры (Slack / Discord / Teams)",
+    label: "+ Gaming & Anti-Cheat",
     rule: {
       enabled: true,
-      pattern: "*.discord.gg, *.slack-msgs.com, *.teams.microsoft.com",
+      pattern:
+        "*.steampowered.com, *.steamcommunity.com, *.steamcontent.com, *.epicgames.com, *.unrealengine.com, *.battle.net, *.blizzard.com, *.riotgames.com, *.easyanticheat.net, *.battleye.com",
+      category: "Gaming & Anti-Cheat",
+      description: "Игровые лаунчеры и античит-системы с жёстким Certificate Pinning",
+    },
+  },
+  {
+    label: "+ РФ FinTech & Госуслуги",
+    rule: {
+      enabled: true,
+      pattern:
+        "*.sberbank.ru, *.sber.ru, *.tbank.ru, *.tinkoff.ru, *.vtb.ru, *.alfabank.ru, *.gosuslugi.ru, *.esia.gosuslugi.ru, *.nspk.ru, *.mirpay.ru, *.nalog.ru",
+      category: "РФ FinTech & Госуслуги",
+      description: "Российские банки, СБП/НСПК, ЕСИА и портал Госуслуг (ГОСТ/mTLS/Pinning)",
+    },
+  },
+  {
+    label: "+ Google & Android FCM",
+    rule: {
+      enabled: true,
+      pattern:
+        "*.googleapis.com, *.gstatic.com, *.gvt1.com, *.gvt2.com, mtalk.google.com, fcm.googleapis.com, *.firebaseio.com, *.google.com",
+      category: "Google & Android FCM",
+      description: "Google Play Services, FCM push-канал и системные сервисы Google",
+    },
+  },
+  {
+    label: "+ Apple Ecosystem & APNs",
+    rule: {
+      enabled: true,
+      pattern:
+        "*.apple.com, *.icloud.com, *.mzstatic.com, *.cdn-apple.com, *.push.apple.com, *.itunes.apple.com, *.me.com",
+      category: "Apple & APNs",
+      description: "Apple ID, iCloud, App Store и Apple Push Notification service",
+    },
+  },
+  {
+    label: "+ Windows Updates & Telemetry",
+    rule: {
+      enabled: true,
+      pattern:
+        "*.windowsupdate.com, *.delivery.mp.microsoft.com, *.update.microsoft.com, *.telemetry.microsoft.com, *.data.microsoft.com, *.msftconnecttest.com, *.live.com, *.office.com",
+      category: "Windows & Telemetry",
+      description: "Центр обновления Windows, NCSI, Microsoft Telemetry и Office 365",
+    },
+  },
+  {
+    label: "+ E2EE & Corporate Messengers",
+    rule: {
+      enabled: true,
+      pattern:
+        "*.telegram.org, *.t.me, *.whatsapp.net, *.whatsapp.com, *.signal.org, *.discord.gg, *.discord.com, *.slack.com, *.slack-msgs.com, *.teams.microsoft.com, *.zoom.us",
       category: "Messengers",
-      description: "Десктопные клиенты с пиннингом WebSocket/TLS",
+      description: "E2EE и корпоративные мессенджеры с пиннингом WebSocket/TLS",
     },
   },
   {
@@ -1828,6 +1915,287 @@ export function matchTlsBypassInPreview(
 ): TlsBypassRule | null {
   if (!config.tlsBypassEnabled) return null;
   return matchHostRuleList(config.tlsBypassRules, host, port);
+}
+
+// ============================================================================
+// Pure Converters: TlsBypassRule[] <-> Bulk Text Editor
+// ============================================================================
+export interface ParseBulkTlsRulesOptions {
+  defaultCategory?: string;
+  defaultDescription?: string;
+  idPrefix?: string;
+}
+
+function splitTlsRulePatternTokens(rawPattern: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let depth = 0;
+  let escaped = false;
+  let inRegexSegment = false;
+
+  for (let i = 0; i < rawPattern.length; i++) {
+    const ch = rawPattern[i];
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      current += ch;
+      escaped = true;
+      continue;
+    }
+    if (!inRegexSegment && /^regex:/i.test(current.trimStart())) {
+      inRegexSegment = true;
+    }
+    if (ch === "{" || ch === "[" || ch === "(") {
+      depth++;
+    } else if (ch === "}" || ch === "]" || ch === ")") {
+      depth = Math.max(0, depth - 1);
+    }
+
+    if ((ch === "," || ch === ";") && depth === 0 && !inRegexSegment) {
+      const piece = current.trim();
+      if (piece) tokens.push(piece);
+      current = "";
+      inRegexSegment = false;
+    } else {
+      current += ch;
+    }
+  }
+
+  const tail = current.trim();
+  if (tail) tokens.push(tail);
+  return tokens;
+}
+
+function canonicalizeTlsRulePattern(rawPattern: string): {
+  normalizedPattern: string;
+  canonicalKey: string;
+  tokens: string[];
+} {
+  const rawTokens = splitTlsRulePatternTokens(rawPattern);
+  const normalizedTokens: string[] = [];
+  for (const rawTok of rawTokens) {
+    const parsed = normalizeHostToken(rawTok);
+    if (!parsed) continue;
+    normalizedTokens.push(parsed.negated ? `!${parsed.token}` : parsed.token);
+  }
+  const normalizedPattern = normalizedTokens.join(", ");
+  return {
+    normalizedPattern,
+    canonicalKey: normalizedPattern,
+    tokens: normalizedTokens,
+  };
+}
+
+function splitPatternAndMetadataComment(lineBody: string): {
+  patternRaw: string;
+  parsedCategory: string | null;
+  parsedDescription: string | null;
+  hasMetadataComment: boolean;
+} {
+  const trimmed = lineBody.trim();
+  if (!trimmed) {
+    return {
+      patternRaw: "",
+      parsedCategory: null,
+      parsedDescription: null,
+      hasMetadataComment: false,
+    };
+  }
+
+  const isRegexLine = /^regex:/i.test(trimmed);
+  const match = isRegexLine
+    ? /\s+(?:#|\/\/)\s*(\[[^\]]+\].*)$/.exec(trimmed)
+    : /\s+(?:#|\/\/)\s*(.*)$/.exec(trimmed);
+
+  if (!match || match.index === undefined) {
+    return {
+      patternRaw: trimmed,
+      parsedCategory: null,
+      parsedDescription: null,
+      hasMetadataComment: false,
+    };
+  }
+
+  const patternRaw = trimmed.slice(0, match.index).trim();
+  const commentBody = match[1].trim();
+  const catMatch = /^\[([^\]]+)\]\s*(.*)$/.exec(commentBody);
+  if (catMatch) {
+    return {
+      patternRaw,
+      parsedCategory: catMatch[1].trim() || null,
+      parsedDescription: catMatch[2].trim(),
+      hasMetadataComment: true,
+    };
+  }
+  return {
+    patternRaw,
+    parsedCategory: null,
+    parsedDescription: commentBody,
+    hasMetadataComment: true,
+  };
+}
+
+export function tlsRulesToBulkText(rules: TlsBypassRule[]): string {
+  return rules
+    .map((rule) => {
+      const pattern = rule.pattern.trim();
+      if (!pattern) return "";
+      const prefix = rule.enabled ? "" : "[disabled] ";
+      const cat = rule.category.trim();
+      const desc = rule.description.trim();
+      if (cat || desc) {
+        const catPart = `[${cat || "Custom"}]`;
+        return desc
+          ? `${prefix}${pattern} # ${catPart} ${desc}`
+          : `${prefix}${pattern} # ${catPart}`;
+      }
+      return `${prefix}${pattern}`;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+export function parseBulkTextToTlsRules(
+  rawText: string,
+  existingRules: TlsBypassRule[] = [],
+  options?: ParseBulkTlsRulesOptions
+): TlsBypassRule[] {
+  const byCanonical = new Map<string, TlsBypassRule[]>();
+  const bySingleToken = new Map<string, TlsBypassRule[]>();
+  const usedExistingIds = new Set<string>();
+
+  for (const rule of existingRules) {
+    const canon = canonicalizeTlsRulePattern(rule.pattern);
+    if (!canon.canonicalKey) continue;
+    const queue = byCanonical.get(canon.canonicalKey) ?? [];
+    queue.push(rule);
+    byCanonical.set(canon.canonicalKey, queue);
+
+    if (canon.tokens.length === 1) {
+      const tokQueue = bySingleToken.get(canon.tokens[0]) ?? [];
+      tokQueue.push(rule);
+      bySingleToken.set(canon.tokens[0], tokQueue);
+    }
+  }
+
+  const takeMatchingExisting = (
+    canonicalKey: string,
+    tokens: string[]
+  ): TlsBypassRule | undefined => {
+    const exactQueue = byCanonical.get(canonicalKey);
+    if (exactQueue) {
+      while (exactQueue.length > 0) {
+        const candidate = exactQueue.shift()!;
+        if (!usedExistingIds.has(candidate.id)) {
+          usedExistingIds.add(candidate.id);
+          return candidate;
+        }
+      }
+    }
+    if (tokens.length === 1) {
+      const singleQueue = bySingleToken.get(tokens[0]);
+      if (singleQueue) {
+        while (singleQueue.length > 0) {
+          const candidate = singleQueue.shift()!;
+          if (!usedExistingIds.has(candidate.id)) {
+            usedExistingIds.add(candidate.id);
+            return candidate;
+          }
+        }
+      }
+    }
+    return undefined;
+  };
+
+  const defaultCategory = options?.defaultCategory ?? "Custom Pinning";
+  const defaultDescription =
+    options?.defaultDescription ?? "Пакетное правило TLS";
+  const idPrefix = options?.idPrefix ?? "tls-bulk";
+
+  const existingAllIds = new Set(existingRules.map((r) => r.id));
+  const emittedIds = new Set<string>();
+  const seenKeys = new Set<string>();
+  const result: TlsBypassRule[] = [];
+  let nextSeq = 1;
+
+  const allocateId = (): string => {
+    while (true) {
+      const candidate = `${idPrefix}-${nextSeq++}`;
+      if (!existingAllIds.has(candidate) && !emittedIds.has(candidate)) {
+        emittedIds.add(candidate);
+        return candidate;
+      }
+    }
+  };
+
+  for (const rawLine of rawText.split(/\r?\n/)) {
+    let line = rawLine.trim();
+    if (!line) continue;
+
+    let explicitEnabled: boolean | null = null;
+    const disabledMatch = /^(?:#|\/\/)?\s*\[(disabled|off)\]\s*/i.exec(line);
+    if (disabledMatch) {
+      explicitEnabled = false;
+      line = line.slice(disabledMatch[0].length).trim();
+    } else {
+      const enabledMatch = /^(?:#|\/\/)?\s*\[(enabled|on)\]\s*/i.exec(line);
+      if (enabledMatch) {
+        explicitEnabled = true;
+        line = line.slice(enabledMatch[0].length).trim();
+      }
+    }
+
+    if (!line || line.startsWith("#") || line.startsWith("//")) {
+      continue;
+    }
+
+    const { patternRaw, parsedCategory, parsedDescription, hasMetadataComment } =
+      splitPatternAndMetadataComment(line);
+    if (!patternRaw) continue;
+
+    const { normalizedPattern, canonicalKey, tokens } =
+      canonicalizeTlsRulePattern(patternRaw);
+    if (!canonicalKey || seenKeys.has(canonicalKey)) continue;
+    seenKeys.add(canonicalKey);
+
+    const matched = takeMatchingExisting(canonicalKey, tokens);
+    const id =
+      matched && !emittedIds.has(matched.id) ? matched.id : allocateId();
+    emittedIds.add(id);
+
+    const enabled =
+      explicitEnabled !== null
+        ? explicitEnabled
+        : hasMetadataComment
+          ? true
+          : matched
+            ? matched.enabled
+            : true;
+
+    const category =
+      parsedCategory ?? matched?.category ?? defaultCategory;
+    const description =
+      parsedDescription !== null && parsedDescription.length > 0
+        ? parsedDescription
+        : hasMetadataComment
+          ? parsedCategory && matched && parsedCategory === matched.category
+            ? matched.description
+            : ""
+          : (matched?.description ?? defaultDescription);
+
+    result.push({
+      id,
+      enabled,
+      pattern: normalizedPattern,
+      category,
+      description,
+    });
+  }
+
+  return result;
 }
 
 function isAltSvcDiscoveryHeader(name: string): boolean {

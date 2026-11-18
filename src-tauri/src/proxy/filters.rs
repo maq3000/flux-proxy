@@ -1,6 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
+use dashmap::DashMap;
 use regex::Regex;
 use tokio::sync::watch;
 
@@ -94,6 +96,7 @@ struct FilterEngineState {
 pub struct ProxyFilterEngine {
     state: RwLock<FilterEngineState>,
     config_version_tx: watch::Sender<u64>,
+    hit_counts: DashMap<String, AtomicU64>,
 }
 
 impl Default for ProxyFilterEngine {
@@ -109,7 +112,33 @@ impl ProxyFilterEngine {
         Self {
             state: RwLock::new(build_filter_engine_state(initial_cfg)),
             config_version_tx,
+            hit_counts: DashMap::new(),
         }
+    }
+
+    fn record_rule_hit(&self, rule_id: &str) {
+        if let Some(counter) = self.hit_counts.get(rule_id) {
+            counter.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.hit_counts
+            .entry(rule_id.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn get_tls_rule_hit_counts(&self) -> HashMap<String, u64> {
+        self.hit_counts
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().load(Ordering::Relaxed)))
+            .collect()
+    }
+
+    pub fn reset_tls_bypass_rules_to_recommended(&self) -> ProxyFilterBackendConfig {
+        let mut cfg = self.get_config();
+        cfg.tls_bypass_enabled = true;
+        cfg.tls_bypass_rules = default_tls_bypass_rules();
+        self.update_config(cfg)
     }
 
     pub fn subscribe_config_updates(&self) -> watch::Receiver<u64> {
@@ -380,6 +409,9 @@ impl ProxyFilterEngine {
         {
             return match host_list_decision {
                 ConnectTunnelDecision::Passthrough(reason) => {
+                    if let PassthroughReason::BypassRule(ref rule) = reason {
+                        self.record_rule_hit(&rule.id);
+                    }
                     ConnectTunnelDecision::Passthrough(reason)
                 }
                 ConnectTunnelDecision::InterceptMitm => {
@@ -387,6 +419,7 @@ impl ProxyFilterEngine {
                         if let Some(rule) =
                             match_host_rule_list(&guard.config.tls_bypass_rules, host, port)
                         {
+                            self.record_rule_hit(&rule.id);
                             return ConnectTunnelDecision::Passthrough(
                                 PassthroughReason::BypassRule(rule),
                             );
@@ -399,8 +432,10 @@ impl ProxyFilterEngine {
                             .iter()
                             .any(|r| r.enabled && !r.pattern.trim().is_empty())
                     {
-                        if match_host_rule_list(&guard.config.tls_target_rules, host, port).is_some()
+                        if let Some(rule) =
+                            match_host_rule_list(&guard.config.tls_target_rules, host, port)
                         {
+                            self.record_rule_hit(&rule.id);
                             return ConnectTunnelDecision::InterceptMitm;
                         }
                         return ConnectTunnelDecision::Passthrough(
@@ -420,13 +455,17 @@ impl ProxyFilterEngine {
                 if let Some(rule) =
                     match_host_rule_list(&guard.config.tls_bypass_rules, host, port)
                 {
+                    self.record_rule_hit(&rule.id);
                     ConnectTunnelDecision::Passthrough(PassthroughReason::BypassRule(rule))
                 } else {
                     ConnectTunnelDecision::InterceptMitm
                 }
             }
             TlsInterceptMode::TargetedOnly => {
-                if match_host_rule_list(&guard.config.tls_target_rules, host, port).is_some() {
+                if let Some(rule) =
+                    match_host_rule_list(&guard.config.tls_target_rules, host, port)
+                {
+                    self.record_rule_hit(&rule.id);
                     ConnectTunnelDecision::InterceptMitm
                 } else {
                     ConnectTunnelDecision::Passthrough(PassthroughReason::NotInTargetAllowlist)
@@ -1109,40 +1148,51 @@ fn evaluate_compiled_host_list_connect(
     }
 }
 
+pub fn default_tls_bypass_rules() -> Vec<TlsBypassRule> {
+    vec![
+        TlsBypassRule {
+            id: "bypass-pki-ocsp-crl".into(),
+            enabled: true,
+            pattern: "ocsp.*, crl.*, *.digicert.com, *.sectigo.com, *.letsencrypt.org, ocsp.apple.com, *.globalsign.com, *.identrust.com".into(),
+            category: "OCSP / CRL PKI".into(),
+            description: "OCSP / CRL серверы проверки отзыва сертификатов X.509".into(),
+        },
+        TlsBypassRule {
+            id: "bypass-apple-icloud".into(),
+            enabled: true,
+            pattern: "*.apple.com, *.icloud.com, *.mzstatic.com, *.cdn-apple.com, *.push.apple.com".into(),
+            category: "OS Updaters".into(),
+            description: "Apple / iCloud / App Store / APNs strict Certificate Pinning".into(),
+        },
+        TlsBypassRule {
+            id: "bypass-windows-update".into(),
+            enabled: true,
+            pattern: "*.windowsupdate.com, *.delivery.mp.microsoft.com, *.update.microsoft.com, *.msftconnecttest.com, *.sfx.ms".into(),
+            category: "OS Updaters".into(),
+            description: "Windows Update, Delivery Optimization & NCSI pinned TLS".into(),
+        },
+        TlsBypassRule {
+            id: "bypass-messengers".into(),
+            enabled: true,
+            pattern: "*.telegram.org, *.t.me, *.whatsapp.net, *.whatsapp.com, *.signal.org, *.viber.com".into(),
+            category: "Messengers".into(),
+            description: "E2EE Messengers with hardcoded public key pinning".into(),
+        },
+        TlsBypassRule {
+            id: "bypass-payments-3ds".into(),
+            enabled: true,
+            pattern: "*.stripe.network, *.3dsecure.io, *.braintreegateway.com".into(),
+            category: "Payment Gateways".into(),
+            description: "PCI-DSS / 3DSecure payment frames with strict TLS pinning".into(),
+        },
+    ]
+}
+
 pub fn default_backend_config() -> ProxyFilterBackendConfig {
     ProxyFilterBackendConfig {
         tls_intercept_mode: TlsInterceptMode::InterceptAll,
         tls_bypass_enabled: true,
-        tls_bypass_rules: vec![
-            TlsBypassRule {
-                id: "bypass-apple-icloud".into(),
-                enabled: true,
-                pattern: "*.apple.com, *.icloud.com, *.mzstatic.com".into(),
-                category: "OS Updaters".into(),
-                description: "Apple / iCloud / App Store strict Certificate Pinning".into(),
-            },
-            TlsBypassRule {
-                id: "bypass-windows-update".into(),
-                enabled: true,
-                pattern: "*.windowsupdate.com, *.delivery.mp.microsoft.com".into(),
-                category: "OS Updaters".into(),
-                description: "Windows Update & Delivery Optimization pinned TLS".into(),
-            },
-            TlsBypassRule {
-                id: "bypass-messengers".into(),
-                enabled: true,
-                pattern: "*.telegram.org, *.whatsapp.net, *.signal.org".into(),
-                category: "Messengers".into(),
-                description: "E2EE Messengers with hardcoded public key pinning".into(),
-            },
-            TlsBypassRule {
-                id: "bypass-payments-3ds".into(),
-                enabled: true,
-                pattern: "*.stripe.network, *.3dsecure.io, *.braintreegateway.com".into(),
-                category: "Payment Gateways".into(),
-                description: "PCI-DSS / 3DSecure payment frames with strict TLS pinning".into(),
-            },
-        ],
+        tls_bypass_rules: default_tls_bypass_rules(),
         tls_target_rules: Vec::new(),
         header_mutations_enabled: true,
         header_mutations: vec![
@@ -2398,5 +2448,127 @@ mod tests {
             engine.evaluate_connect_tunnel("external.example.org", 443),
             ConnectTunnelDecision::Passthrough(PassthroughReason::NotInHostsWhitelist)
         );
+    }
+
+    #[test]
+    fn default_tls_bypass_rules_cover_critical_pki_ocsp_crl_and_messengers() {
+        let rules = default_tls_bypass_rules();
+        let pki_rule = rules
+            .iter()
+            .find(|r| r.id == "bypass-pki-ocsp-crl")
+            .expect("default PKI/OCSP/CRL rule should exist");
+        for token in [
+            "ocsp.*",
+            "crl.*",
+            "*.digicert.com",
+            "*.sectigo.com",
+            "*.letsencrypt.org",
+            "ocsp.apple.com",
+        ] {
+            assert!(
+                pki_rule.pattern.contains(token),
+                "expected PKI rule pattern to contain {token}"
+            );
+        }
+
+        let engine = ProxyFilterEngine::new();
+        for host in [
+            "ocsp.digicert.com",
+            "crl.sectigo.com",
+            "ocsp.int-x3.letsencrypt.org",
+            "ocsp.apple.com",
+            "ocsp.custom-ca.org",
+            "crl.custom-ca.org",
+            "web.whatsapp.com",
+            "signal.org",
+        ] {
+            assert!(
+                matches!(
+                    engine.evaluate_connect_tunnel(host, 443),
+                    ConnectTunnelDecision::Passthrough(PassthroughReason::BypassRule(_))
+                ),
+                "expected default bypass rules to passthrough {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluates_connect_tunnel_and_increments_lock_free_hit_counts_for_bypass_and_target_rules() {
+        let engine = ProxyFilterEngine::new();
+
+        // InterceptAll mode: hit bypass rules and unmatched MITM host
+        assert!(matches!(
+            engine.evaluate_connect_tunnel("ocsp.digicert.com", 443),
+            ConnectTunnelDecision::Passthrough(PassthroughReason::BypassRule(_))
+        ));
+        assert!(matches!(
+            engine.evaluate_connect_tunnel("crl.sectigo.com", 443),
+            ConnectTunnelDecision::Passthrough(PassthroughReason::BypassRule(_))
+        ));
+        assert!(matches!(
+            engine.evaluate_connect_tunnel("web.telegram.org", 443),
+            ConnectTunnelDecision::Passthrough(PassthroughReason::BypassRule(_))
+        ));
+        assert_eq!(
+            engine.evaluate_connect_tunnel("api.unmatched.example", 443),
+            ConnectTunnelDecision::InterceptMitm
+        );
+
+        let counts = engine.get_tls_rule_hit_counts();
+        assert_eq!(counts.get("bypass-pki-ocsp-crl").copied(), Some(2));
+        assert_eq!(counts.get("bypass-messengers").copied(), Some(1));
+        assert_eq!(counts.len(), 2);
+
+        // TargetedOnly mode: hit tls_target_rules
+        let mut cfg = engine.get_config();
+        cfg.tls_intercept_mode = TlsInterceptMode::TargetedOnly;
+        cfg.tls_target_rules = vec![TlsBypassRule {
+            id: "target-payments".into(),
+            enabled: true,
+            pattern: "*.mycompany.com".into(),
+            category: "Target".into(),
+            description: "Inspect corporate API".into(),
+        }];
+        engine.update_config(cfg);
+
+        assert_eq!(
+            engine.evaluate_connect_tunnel("api.mycompany.com", 443),
+            ConnectTunnelDecision::InterceptMitm
+        );
+        assert_eq!(
+            engine.evaluate_connect_tunnel("other.example.net", 443),
+            ConnectTunnelDecision::Passthrough(PassthroughReason::NotInTargetAllowlist)
+        );
+
+        let counts_after = engine.get_tls_rule_hit_counts();
+        assert_eq!(counts_after.get("target-payments").copied(), Some(1));
+        assert_eq!(counts_after.get("bypass-pki-ocsp-crl").copied(), Some(2));
+    }
+
+    #[test]
+    fn reset_tls_bypass_rules_to_recommended_restores_defaults_and_preserves_other_settings() {
+        let engine = ProxyFilterEngine::new();
+        let mut cfg = engine.get_config();
+        cfg.tls_bypass_enabled = false;
+        cfg.tls_bypass_rules.clear();
+        cfg.tls_target_rules = vec![TlsBypassRule {
+            id: "custom-target".into(),
+            enabled: true,
+            pattern: "api.keep-me.dev".into(),
+            category: "Target Service".into(),
+            description: "Preserve custom target rule".into(),
+        }];
+        engine.update_config(cfg);
+
+        let reset_cfg = engine.reset_tls_bypass_rules_to_recommended();
+        assert!(reset_cfg.tls_bypass_enabled);
+        assert_eq!(reset_cfg.tls_bypass_rules, default_tls_bypass_rules());
+        assert_eq!(reset_cfg.tls_target_rules.len(), 1);
+        assert_eq!(reset_cfg.tls_target_rules[0].id, "custom-target");
+
+        let stored = engine.get_config();
+        assert!(stored.tls_bypass_enabled);
+        assert_eq!(stored.tls_bypass_rules, default_tls_bypass_rules());
+        assert_eq!(stored.tls_target_rules.len(), 1);
     }
 }
