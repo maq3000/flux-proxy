@@ -79,7 +79,7 @@ const SAMPLE_GRPC_REQ_B64 = buildGrpcFrameBase64(
     ...encodeProtobufVarintField(2, 14900),
     ...encodeProtobufStringField(3, "USD"),
     0x22,
-    0x10,
+    0x0e,
     ...encodeProtobufStringField(1, "cus_denis_42"),
   ])
 );

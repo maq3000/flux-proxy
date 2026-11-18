@@ -263,6 +263,8 @@ function closePopoverSafe(pop: HTMLElement | null) {
       }
     } catch {
       // ignore
+    } finally {
+      pop.classList.remove(":popover-open");
     }
   } else {
     pop.classList.remove(":popover-open");
@@ -289,6 +291,7 @@ function openFixedContextPopover(
   pop.style.setProperty("--ctx-menu-top", `${Math.round(clampedTop)}px`);
 
   if ("popover" in HTMLElement.prototype) {
+    let openedViaFallback = false;
     try {
       if (pop.matches(":popover-open")) {
         pop.hidePopover();
@@ -296,6 +299,11 @@ function openFixedContextPopover(
       pop.showPopover();
     } catch {
       pop.classList.add(":popover-open");
+      openedViaFallback = true;
+    } finally {
+      if (!openedViaFallback) {
+        pop.classList.remove(":popover-open");
+      }
     }
   } else {
     pop.classList.add(":popover-open");
@@ -559,11 +567,21 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
     };
   }, [ctxSession]);
 
+  const resizeCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      resizeCleanupRef.current?.();
+    };
+  }, []);
+
   // 60 FPS Column Resize via direct CSS variable mutation on mousemove
   const handleResizeMouseDown = useCallback(
     (e: React.MouseEvent<HTMLDivElement>, col: ColumnDefinition) => {
       e.preventDefault();
       e.stopPropagation();
+
+      resizeCleanupRef.current?.();
 
       const startX = e.clientX;
       const startWidth = columnWidths[col.id] ?? col.defaultWidth;
@@ -594,11 +612,16 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
         }
       };
 
-      const onMouseUp = () => {
+      const cleanup = () => {
         window.removeEventListener("mousemove", onMouseMove);
         window.removeEventListener("mouseup", onMouseUp);
         document.body.style.cursor = prevCursor;
         document.body.style.userSelect = prevUserSelect;
+        resizeCleanupRef.current = null;
+      };
+
+      const onMouseUp = () => {
+        cleanup();
         setResizingCol(null);
         onColumnWidthChange(col.id, latestWidth);
         window.setTimeout(() => {
@@ -606,6 +629,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
         }, 0);
       };
 
+      resizeCleanupRef.current = cleanup;
       window.addEventListener("mousemove", onMouseMove);
       window.addEventListener("mouseup", onMouseUp);
     },
@@ -651,6 +675,13 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
     overscan: 20,
   });
 
+  const lastSessionId =
+    sessions.length > 0 ? sessions[sessions.length - 1].id : null;
+  const sortedTailMarker =
+    sortedSessions.length > 0
+      ? `${sortedSessions[0].id}:${sortedSessions[sortedSessions.length - 1].id}:${sortedSessions.length}`
+      : "0";
+
   useEffect(() => {
     if (!followTail || sortedSessions.length === 0) return;
     if (sortColumn === null || (sortColumn === "id" && sortDirection === "asc")) {
@@ -658,7 +689,15 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
     } else if (sortColumn === "id" && sortDirection === "desc") {
       rowVirtualizer.scrollToIndex(0, { align: "start" });
     }
-  }, [followTail, sortedSessions.length, sortColumn, sortDirection, rowVirtualizer]);
+  }, [
+    followTail,
+    lastSessionId,
+    sortedTailMarker,
+    sortColumn,
+    sortDirection,
+    rowVirtualizer,
+    sortedSessions.length,
+  ]);
 
   const getEffectiveTargetIds = useCallback((): number[] => {
     if (selectedIds.length > 0) return selectedIds;

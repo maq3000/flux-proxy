@@ -21,4 +21,35 @@ export default defineConfig({
       ignored: ["**/src-tauri/**"],
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          const normalized = id.replace(/\\/g, "/");
+          if (!normalized.includes("/node_modules/")) return undefined;
+
+          if (
+            normalized.includes("/node_modules/monaco-editor/") ||
+            normalized.includes("/node_modules/@monaco-editor/")
+          ) {
+            return "monaco-editor";
+          }
+          if (
+            normalized.includes("/node_modules/react/") ||
+            normalized.includes("/node_modules/react-dom/") ||
+            normalized.includes("/node_modules/scheduler/")
+          ) {
+            return "react-vendor";
+          }
+          if (
+            normalized.includes("/node_modules/@tauri-apps/") ||
+            normalized.includes("/node_modules/lucide-react/")
+          ) {
+            return "tauri-ui";
+          }
+          return undefined;
+        },
+      },
+    },
+  },
 });

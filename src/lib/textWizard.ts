@@ -205,6 +205,10 @@ export interface JwtInspectionResult {
   error?: string;
 }
 
+function isPlainJsonObject(val: unknown): val is Record<string, unknown> {
+  return typeof val === "object" && val !== null && !Array.isArray(val);
+}
+
 export function inspectJwt(
   rawInput: string,
   nowMs: number = Date.now()
@@ -230,10 +234,13 @@ export function inspectJwt(
   let claimsObj: Record<string, unknown>;
   try {
     const hdrBytes = base64ToBytes(parts[0]);
-    headerObj = JSON.parse(new TextDecoder().decode(hdrBytes)) as Record<
-      string,
-      unknown
-    >;
+    const parsedHeader: unknown = JSON.parse(new TextDecoder().decode(hdrBytes));
+    if (!isPlainJsonObject(parsedHeader)) {
+      return emptyInvalidJwt(
+        "Заголовок JWT (сегмент 1) должен быть JSON-объектом"
+      );
+    }
+    headerObj = parsedHeader;
   } catch (err) {
     return emptyInvalidJwt(
       `Не удалось декодировать JSON заголовка JWT (сегмент 1): ${
@@ -244,10 +251,15 @@ export function inspectJwt(
 
   try {
     const payloadBytes = base64ToBytes(parts[1]);
-    claimsObj = JSON.parse(new TextDecoder().decode(payloadBytes)) as Record<
-      string,
-      unknown
-    >;
+    const parsedClaims: unknown = JSON.parse(
+      new TextDecoder().decode(payloadBytes)
+    );
+    if (!isPlainJsonObject(parsedClaims)) {
+      return emptyInvalidJwt(
+        "Полезная нагрузка JWT claims (сегмент 2) должна быть JSON-объектом"
+      );
+    }
+    claimsObj = parsedClaims;
   } catch (err) {
     return emptyInvalidJwt(
       `Не удалось декодировать JSON claims JWT (сегмент 2): ${

@@ -661,3 +661,25 @@ dialog.drawer-dialog::backdrop {
 .compact-toolbar > div input[type="search"] {
   height: 1.5rem;
 }
+
+/* HexViewer paired hex / ASCII byte hover highlight without React re-renders */
+.hex-row[data-hover-col="0"] [data-byte-col="0"],
+.hex-row[data-hover-col="1"] [data-byte-col="1"],
+.hex-row[data-hover-col="2"] [data-byte-col="2"],
+.hex-row[data-hover-col="3"] [data-byte-col="3"],
+.hex-row[data-hover-col="4"] [data-byte-col="4"],
+.hex-row[data-hover-col="5"] [data-byte-col="5"],
+.hex-row[data-hover-col="6"] [data-byte-col="6"],
+.hex-row[data-hover-col="7"] [data-byte-col="7"],
+.hex-row[data-hover-col="8"] [data-byte-col="8"],
+.hex-row[data-hover-col="9"] [data-byte-col="9"],
+.hex-row[data-hover-col="10"] [data-byte-col="10"],
+.hex-row[data-hover-col="11"] [data-byte-col="11"],
+.hex-row[data-hover-col="12"] [data-byte-col="12"],
+.hex-row[data-hover-col="13"] [data-byte-col="13"],
+.hex-row[data-hover-col="14"] [data-byte-col="14"],
+.hex-row[data-hover-col="15"] [data-byte-col="15"] {
+  background-color: rgb(14 165 233 / 0.28);
+  color: var(--accent-primary);
+  border-radius: 0.25rem;
+}

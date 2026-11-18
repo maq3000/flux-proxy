@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import Editor from "@monaco-editor/react";
-import { Loader2, Plus, Send, Trash2, UploadCloud } from "lucide-react";
+import { AlertTriangle, Loader2, Plus, Send, Trash2, UploadCloud, X } from "lucide-react";
 import { formatBytes, formatDuration, tryFormatJson } from "../lib/formatters";
 import { proxyBridge } from "../lib/tauriBridge";
 import type {
@@ -52,6 +52,7 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
   const [followRedirects, setFollowRedirects] = useState(true);
   const [activeTab, setActiveTab] = useState<"headers" | "body">("body");
   const [sending, setSending] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [lastResponse, setLastResponse] = useState<SessionDetail | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
 
@@ -66,6 +67,7 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
     );
     setBody(draftRequest.body);
     setFollowRedirects(draftRequest.followRedirects);
+    setErrorMessage(null);
   }, [draftRequest]);
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -90,6 +92,7 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
     e.preventDefault();
     if (!url.trim() || sending) return;
     setSending(true);
+    setErrorMessage(null);
     try {
       const detail = await proxyBridge.executeComposedRequest({
         method,
@@ -100,6 +103,12 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
       });
       setLastResponse(detail);
       onSessionCreated(detail);
+    } catch (err) {
+      setErrorMessage(
+        err instanceof Error
+          ? err.message
+          : String(err ?? "Не удалось выполнить запрос")
+      );
     } finally {
       setSending(false);
     }
@@ -192,6 +201,28 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
           <span>Execute</span>
         </button>
       </form>
+
+      {errorMessage && (
+        <div
+          role="alert"
+          className="flex shrink-0 items-start justify-between gap-2 border-b border-status5xx-fg/35 bg-status5xx-bg px-3 py-2 text-xs text-status5xx-fg"
+        >
+          <div className="flex min-w-0 items-start gap-2">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            <span className="break-words font-mono text-[11px] select-text">
+              {errorMessage}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setErrorMessage(null)}
+            aria-label="Скрыть ошибку"
+            className="shrink-0 rounded p-0.5 hover:bg-surface/40"
+          >
+            <X className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+        </div>
+      )}
 
       {/* Request Builder Tabs */}
       <div className="flex h-8 shrink-0 items-center justify-between border-b border-hairline px-3">

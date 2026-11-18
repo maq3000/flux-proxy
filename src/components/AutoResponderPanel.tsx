@@ -1,4 +1,4 @@
-import React, { useId, useState } from "react";
+import React, { useEffect, useId, useState } from "react";
 import Editor from "@monaco-editor/react";
 import { Clock, Plus, Save, Sliders, Trash2 } from "lucide-react";
 import type {
@@ -183,6 +183,19 @@ const RuleDetailForm: React.FC<{
   onDelete: (id: string) => Promise<void>;
 }> = ({ rule, monacoTheme, onSave, onDelete }) => {
   const [draft, setDraft] = useState<AutoResponderRule>(rule);
+
+  useEffect(() => {
+    setDraft(rule);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rule.id]);
+
+  useEffect(() => {
+    setDraft((prev) =>
+      prev.id === rule.id && prev.enabled !== rule.enabled
+        ? { ...prev, enabled: rule.enabled }
+        : prev
+    );
+  }, [rule.id, rule.enabled]);
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden bg-surface">

@@ -205,25 +205,54 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
     sessionId: number;
     payload: LoadedSessionBody;
   } | null>(null);
-  const [loadingRespBody, setLoadingRespBody] = useState(false);
-  const [respBodyError, setRespBodyError] = useState<string | null>(null);
+  const [loadingRespState, setLoadingRespState] = useState<{
+    sessionId: number;
+    token: number;
+  } | null>(null);
+  const [respBodyErrorEntry, setRespBodyErrorEntry] = useState<{
+    sessionId: number;
+    message: string;
+  } | null>(null);
 
   const [loadedReqEntry, setLoadedReqEntry] = useState<{
     sessionId: number;
     payload: LoadedSessionBody;
   } | null>(null);
-  const [loadingReqBody, setLoadingReqBody] = useState(false);
-  const [reqBodyError, setReqBodyError] = useState<string | null>(null);
+  const [loadingReqState, setLoadingReqState] = useState<{
+    sessionId: number;
+    token: number;
+  } | null>(null);
+  const [reqBodyErrorEntry, setReqBodyErrorEntry] = useState<{
+    sessionId: number;
+    message: string;
+  } | null>(null);
 
-  const activeSessionIdRef = useRef<number | null>(detail?.summary.id ?? null);
-  activeSessionIdRef.current = detail?.summary.id ?? null;
+  const currentSessionIdRef = useRef<number | null>(detail?.summary.id ?? null);
+  currentSessionIdRef.current = detail?.summary.id ?? null;
+  const respLoadTokenRef = useRef(0);
+  const reqLoadTokenRef = useRef(0);
 
-  useEffect(() => {
-    setLoadingRespBody(false);
-    setRespBodyError(null);
-    setLoadingReqBody(false);
-    setReqBodyError(null);
-  }, [detail?.summary.id]);
+  const activeDetailId = detail?.summary.id ?? null;
+  const loadingRespBody =
+    activeDetailId !== null &&
+    loadingRespState !== null &&
+    loadingRespState.sessionId === activeDetailId;
+  const respBodyError =
+    activeDetailId !== null &&
+    respBodyErrorEntry !== null &&
+    respBodyErrorEntry.sessionId === activeDetailId
+      ? respBodyErrorEntry.message
+      : null;
+  const loadingReqBody =
+    activeDetailId !== null &&
+    loadingReqState !== null &&
+    loadingReqState.sessionId === activeDetailId;
+  const reqBodyError =
+    activeDetailId !== null &&
+    reqBodyErrorEntry !== null &&
+    reqBodyErrorEntry.sessionId === activeDetailId
+      ? reqBodyErrorEntry.message
+      : null;
 
   const effectiveDetail = useMemo<SessionDetail | null>(() => {
     if (!detail) return null;
@@ -258,50 +287,72 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
   const handleLoadResponseBody = useCallback(async () => {
     const sessionId = detail?.summary.id;
     if (sessionId == null || loadingRespBody) return;
-    setLoadingRespBody(true);
-    setRespBodyError(null);
+    const token = ++respLoadTokenRef.current;
+    setLoadingRespState({ sessionId, token });
+    setRespBodyErrorEntry((prev) =>
+      prev?.sessionId === sessionId ? null : prev
+    );
     try {
       const payload = await proxyBridge.loadSessionBody(sessionId, true);
-      if (activeSessionIdRef.current === sessionId) {
+      if (
+        currentSessionIdRef.current === sessionId &&
+        respLoadTokenRef.current === token
+      ) {
         setLoadedRespEntry({ sessionId, payload });
       }
     } catch (err) {
-      if (activeSessionIdRef.current === sessionId) {
-        setRespBodyError(
-          err instanceof Error
-            ? err.message
-            : String(err ?? "Не удалось загрузить тело ответа из SQLite")
-        );
+      if (
+        currentSessionIdRef.current === sessionId &&
+        respLoadTokenRef.current === token
+      ) {
+        setRespBodyErrorEntry({
+          sessionId,
+          message:
+            err instanceof Error
+              ? err.message
+              : String(err ?? "Не удалось загрузить тело ответа из SQLite"),
+        });
       }
     } finally {
-      if (activeSessionIdRef.current === sessionId) {
-        setLoadingRespBody(false);
-      }
+      setLoadingRespState((prev) =>
+        prev?.sessionId === sessionId && prev?.token === token ? null : prev
+      );
     }
   }, [detail?.summary.id, loadingRespBody]);
 
   const handleLoadRequestBody = useCallback(async () => {
     const sessionId = detail?.summary.id;
     if (sessionId == null || loadingReqBody) return;
-    setLoadingReqBody(true);
-    setReqBodyError(null);
+    const token = ++reqLoadTokenRef.current;
+    setLoadingReqState({ sessionId, token });
+    setReqBodyErrorEntry((prev) =>
+      prev?.sessionId === sessionId ? null : prev
+    );
     try {
       const payload = await proxyBridge.loadSessionBody(sessionId, false);
-      if (activeSessionIdRef.current === sessionId) {
+      if (
+        currentSessionIdRef.current === sessionId &&
+        reqLoadTokenRef.current === token
+      ) {
         setLoadedReqEntry({ sessionId, payload });
       }
     } catch (err) {
-      if (activeSessionIdRef.current === sessionId) {
-        setReqBodyError(
-          err instanceof Error
-            ? err.message
-            : String(err ?? "Не удалось загрузить тело запроса из SQLite")
-        );
+      if (
+        currentSessionIdRef.current === sessionId &&
+        reqLoadTokenRef.current === token
+      ) {
+        setReqBodyErrorEntry({
+          sessionId,
+          message:
+            err instanceof Error
+              ? err.message
+              : String(err ?? "Не удалось загрузить тело запроса из SQLite"),
+        });
       }
     } finally {
-      if (activeSessionIdRef.current === sessionId) {
-        setLoadingReqBody(false);
-      }
+      setLoadingReqState((prev) =>
+        prev?.sessionId === sessionId && prev?.token === token ? null : prev
+      );
     }
   }, [detail?.summary.id, loadingReqBody]);
 
@@ -525,7 +576,11 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
 
     if (isSseSession(detail)) {
       setRespTab("sse");
-    } else if (detail.websocketFrames.length > 0 || detail.summary.scheme === "wss") {
+    } else if (
+      detail.websocketFrames.length > 0 ||
+      detail.summary.scheme === "ws" ||
+      detail.summary.scheme === "wss"
+    ) {
       setRespTab("ws");
     } else if (hasProtobufOrGrpcContentType(detail.responseHeaders)) {
       setRespTab("protobuf");

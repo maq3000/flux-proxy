@@ -320,6 +320,8 @@ export const BreakpointInterceptorModal: React.FC<
   const [draftStatus, setDraftStatus] = useState<number>(200);
   const [draftHeaders, setDraftHeaders] = useState<HeaderPair[]>([]);
   const [draftBody, setDraftBody] = useState("");
+  const [isBinaryBody, setIsBinaryBody] = useState(false);
+  const [bodyModified, setBodyModified] = useState(false);
 
   // New `bpu` rule form
   const [newRulePattern, setNewRulePattern] = useState("");
@@ -336,27 +338,40 @@ export const BreakpointInterceptorModal: React.FC<
     return pausedItems[0];
   }, [pausedItems, activeBpId]);
 
+  const wasOpenRef = useRef(false);
+  const pausedCountRef = useRef(pausedItems.length);
+  pausedCountRef.current = pausedItems.length;
+
   // Open / close native modal `<dialog>` (uses default `closerequest` so outside clicks never drop live breakpoints)
   useEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
 
     if (open) {
-      setTab(
-        initialMode === "intercept" && pausedItems.length === 0
-          ? "rules"
-          : initialMode
-      );
-      if (selectedBreakpointId) {
-        setActiveBpId(selectedBreakpointId);
+      if (!wasOpenRef.current) {
+        setTab(
+          initialMode === "intercept" && pausedCountRef.current === 0
+            ? "rules"
+            : initialMode
+        );
       }
+      wasOpenRef.current = true;
       if (!dialog.open) {
         dialog.showModal();
       }
-    } else if (dialog.open) {
-      dialog.close();
+    } else {
+      wasOpenRef.current = false;
+      if (dialog.open) {
+        dialog.close();
+      }
     }
-  }, [open, initialMode, selectedBreakpointId, pausedItems.length]);
+  }, [open, initialMode]);
+
+  useEffect(() => {
+    if (open && selectedBreakpointId) {
+      setActiveBpId(selectedBreakpointId);
+    }
+  }, [open, selectedBreakpointId]);
 
   // Populate draft editors whenever the active parked item changes
   const loadItemIntoDraft = (item: PausedBreakpointItem) => {
@@ -369,18 +384,36 @@ export const BreakpointInterceptorModal: React.FC<
           .filter((h) => h.name.toLowerCase() !== "content-length")
           .map((h) => ({ ...h }))
       );
-      const rawResp = item.responseBodyText ?? "";
-      const pretty = tryFormatJson(rawResp);
-      setDraftBody(pretty.valid ? pretty.formatted : rawResp);
+      const itemIsBinary = Boolean(
+        item.responseBodyBase64 && item.responseBodyText == null
+      );
+      setIsBinaryBody(itemIsBinary);
+      setBodyModified(false);
+      if (itemIsBinary) {
+        setDraftBody(item.responseBodyBase64);
+      } else {
+        const rawResp = item.responseBodyText ?? "";
+        const pretty = tryFormatJson(rawResp);
+        setDraftBody(pretty.valid ? pretty.formatted : rawResp);
+      }
     } else {
       setDraftHeaders(
         item.requestHeaders
           .filter((h) => h.name.toLowerCase() !== "content-length")
           .map((h) => ({ ...h }))
       );
-      const rawReq = item.requestBodyText ?? "";
-      const pretty = tryFormatJson(rawReq);
-      setDraftBody(pretty.valid ? pretty.formatted : rawReq);
+      const itemIsBinary = Boolean(
+        item.requestBodyBase64 && item.requestBodyText == null
+      );
+      setIsBinaryBody(itemIsBinary);
+      setBodyModified(false);
+      if (itemIsBinary) {
+        setDraftBody(item.requestBodyBase64);
+      } else {
+        const rawReq = item.requestBodyText ?? "";
+        const pretty = tryFormatJson(rawReq);
+        setDraftBody(pretty.valid ? pretty.formatted : rawReq);
+      }
     }
   };
 
@@ -398,6 +431,7 @@ export const BreakpointInterceptorModal: React.FC<
   }, [open, pausedItems.length]);
 
   const detectedLanguage = useMemo(() => {
+    if (isBinaryBody) return "plaintext";
     const ct =
       draftHeaders
         .find((h) => h.name.toLowerCase() === "content-type")
@@ -414,7 +448,7 @@ export const BreakpointInterceptorModal: React.FC<
       return "xml";
     }
     return "plaintext";
-  }, [draftHeaders, draftBody]);
+  }, [draftHeaders, draftBody, isBinaryBody]);
 
   const handleContinueWithEdits = async () => {
     if (!activeItem) return;
@@ -426,7 +460,16 @@ export const BreakpointInterceptorModal: React.FC<
         action: "continue",
         statusCode: Math.max(100, Math.min(599, Number(draftStatus) || 200)),
         responseHeaders: cleanHeaders,
-        responseBodyText: draftBody,
+        ...(isBinaryBody
+          ? {
+              responseBodyBase64: bodyModified
+                ? draftBody.trim()
+                : activeItem.responseBodyBase64,
+              responseBodyText: null,
+            }
+          : {
+              responseBodyText: draftBody,
+            }),
       });
     } else {
       await onResolve({
@@ -435,12 +478,26 @@ export const BreakpointInterceptorModal: React.FC<
         method: draftMethod,
         url: draftUrl.trim() || activeItem.url,
         requestHeaders: cleanHeaders,
-        requestBodyText: draftBody,
+        ...(isBinaryBody
+          ? {
+              requestBodyBase64: bodyModified
+                ? draftBody.trim()
+                : activeItem.requestBodyBase64,
+              requestBodyText: null,
+            }
+          : {
+              requestBodyText: draftBody,
+            }),
       });
     }
 
-    // Auto-close modal if that was the last paused request in queue
-    if (pausedItems.length <= 1) {
+    // Auto-close modal only after verifying the real paused queue is empty
+    const remaining = await proxyBridge
+      .listPausedBreakpoints()
+      .catch(() =>
+        pausedItems.filter((i) => i.breakpointId !== activeItem.breakpointId)
+      );
+    if (remaining.length === 0) {
       dialogRef.current?.close();
     }
   };
@@ -451,7 +508,12 @@ export const BreakpointInterceptorModal: React.FC<
       breakpointId: activeItem.breakpointId,
       action: "abort",
     });
-    if (pausedItems.length <= 1) {
+    const remaining = await proxyBridge
+      .listPausedBreakpoints()
+      .catch(() =>
+        pausedItems.filter((i) => i.breakpointId !== activeItem.breakpointId)
+      );
+    if (remaining.length === 0) {
       dialogRef.current?.close();
     }
   };
@@ -741,6 +803,8 @@ export const BreakpointInterceptorModal: React.FC<
                           type="button"
                           onClick={() => {
                             setDraftStatus(500);
+                            setIsBinaryBody(false);
+                            setBodyModified(true);
                             setDraftBody(
                               JSON.stringify(
                                 {
@@ -777,7 +841,7 @@ export const BreakpointInterceptorModal: React.FC<
                         : "text-muted hover:text-fg"
                     }`}
                   >
-                    Payload Body ({detectedLanguage.toUpperCase()})
+                    Payload Body ({isBinaryBody ? "BASE64 / BINARY" : detectedLanguage.toUpperCase()})
                   </button>
                   <button
                     type="button"
@@ -793,12 +857,15 @@ export const BreakpointInterceptorModal: React.FC<
                 </div>
 
                 <div className="flex items-center gap-2">
-                  {editorSubTab === "body" && (
+                  {editorSubTab === "body" && !isBinaryBody && (
                     <button
                       type="button"
                       onClick={() => {
                         const res = tryFormatJson(draftBody);
-                        if (res.valid) setDraftBody(res.formatted);
+                        if (res.valid) {
+                          setDraftBody(res.formatted);
+                          setBodyModified(true);
+                        }
                       }}
                       className="rounded border border-hairline bg-surface px-2 py-0.5 text-[11px] text-sky-400 hover:bg-hover"
                     >
@@ -824,7 +891,10 @@ export const BreakpointInterceptorModal: React.FC<
                     language={detectedLanguage}
                     theme={monacoTheme}
                     value={draftBody}
-                    onChange={(val) => setDraftBody(val ?? "")}
+                    onChange={(val) => {
+                      setDraftBody(val ?? "");
+                      setBodyModified(true);
+                    }}
                     options={{
                       minimap: { enabled: false },
                       fontSize: 12,
