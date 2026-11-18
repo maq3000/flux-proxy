@@ -1967,7 +1967,7 @@ class BrowserPreviewEngine {
     const har = {
       log: {
         version: "1.2",
-        creator: { name: "FluxProxy", version: "0.2.0" },
+        creator: { name: "FluxProxy", version: "0.3.0" },
         pages: effectiveList.length
           ? [
               {

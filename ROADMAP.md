@@ -47,33 +47,40 @@
     - Zero-buffering стриминг для видео/CDN и ответов `206`, диагностика причин обрывов по цепочке `err.source()`, Video & CDN Quick-Pack и мгновенный сброс активных MITM-туннелей в Passthrough.
 16. **[Этап 28 — Выполнено] Неблокирующий Tokio-рантайм, предкомпиляция Regex и потоковый SSE/WebSocket:**
     - Вынос `resolve_client_process` и операций SQLite в `spawn_blocking`, предкомпиляция `Regex`, устранение квадратичной сложности ($O(N^2)$) в SSE/WebSocket и переиспользование пула `reqwest::Client` в Composer.
+17. **[Этап 24 — Выполнено] Интерактивная сортировка колонок таблицы (ASC/DESC) и массовое выделение (Ctrl+A):**
+    - Циклическая сортировка всех 10 колонок `ColumnId` (`null → asc → desc → null`, компараторы в `src/components/TrafficGrid.tsx`, пункты контекстного меню шапки, адаптация `followTail`) и массовое выделение видимых сессий по `Ctrl+A` / `Cmd+A` (`Edit → Select All Sessions`, `selectSessions` в `useProxySessions.ts`).
+18. **[Этап 23 — Выполнено] Персистентность геометрии сплитов и адаптивной сетки панелей:**
+    - Сохранение пропорций всех 4 `<PanelGroup>` (`flux-layout-bottom-outer-v1`, `flux-layout-bottom-inner-v1`, `flux-layout-right-v1`, `flux-inspector-split-v1`), настройка `inspectorSplitDirection` (`"auto" | "horizontal" | "vertical"`) в `useUiPreferences.ts` и `FluxUserSettingsProfile`, сброс двойным кликом по разделителю и команда `View → Reset Panel Layout to Default`.
+19. **[Этап 5 — Выполнено] Ультра-компактный тулбар, автоподбор колонок и шорткаты инспектора:**
+    - Однострочный Slim-тулбар (`Ctrl+Shift+T` / `Cmd+Shift+T`) с выносом второстепенных кнопок в меню переполнения `•••`, определение колонки через `data-col-id` в контекстном меню шапки `TrafficGrid.tsx` с пунктами `Auto-fit "<Column>"` и `Auto-fit All Visible Columns`, а также быстрые шорткаты вкладок активной панели `SessionInspector` (`Ctrl+1` … `Ctrl+6`).
+20. **[Этап 16 — Выполнено] Очистка и маскирование PII / секретов при экспорте (Sanitized Export):**
+    - Структура `SanitizationOptions` и функция `sanitize_sessions` в `src-tauri/src/storage/export_import.rs` для санитизации `.har`, `.saz`, `.json` и Raw HTTP (`.txt`), модальное окно `src/components/SanitizedExportModal.tsx` (`File → Export Sanitized Sessions…`, `Ctrl+Shift+S`) с пресетами *Safe Sharing*, *Strict Anonymization* и *Custom* и unit-тестами.
+21. **[Этап 17 — Выполнено] Диагностический мастер самопроверки «Proxy Doctor»:**
+    - Модуль `src-tauri/src/proxy/doctor.rs` (`run_proxy_doctor`, `fix_doctor_issue`), лёгкий маршрут `http://flux.proxy/health` (`200 OK` без замусоривания `TrafficStore`), 6 проверок (порт/сокет, доверие Root CA, системный прокси ОС, конфликтующие VPN/TUN-интерфейсы, Windows Firewall, сквозная loopback-проверка) и модальное окно `src/components/ProxyDoctorModal.tsx` (`Help → Run Proxy Doctor…`, `Ctrl+Shift+D`).
+22. **[Этап 29 — Выполнено] Единый источник конфигурации запуска, устранение гонок useProxySessions и честные ошибки Bridge:**
+    - Единый источник стартового порта (`proxy_port.pref` в `app_data_dir`) в `lib.rs` и `sysproxy.rs` без двойного старта `:8888`, автооткат порта при `AddrInUse` в `setProxyPort`, устранение утечки подписки в React StrictMode и гонок фильтров/деталей в `useProxySessions.ts`, поддержка `requestBodyBase64`/offloaded тел в `replaySessions`, транзакционный `applySettingsProfile` с поддержкой `breakpoints` (`BreakpointConfig`), отказ от маскировки ошибок IPC в `tauriBridge.ts` и нативная команда `generate_stress_sessions`.
+23. **[Этап 30 — Выполнено] Исправление багов UI-компонентов, виртуализация HexViewer и настройка manualChunks:**
+    - Виртуализация `src/components/HexViewer.tsx` через `@tanstack/react-virtual` (без перерисовки всей таблицы на hover), настройка `manualChunks` в `vite.config.ts` (`monaco-editor`, `react-vendor`, `ui-vendor`), исправление багов в `BreakpointModal.tsx`, `ComposerPanel.tsx`, `AutoResponderPanel.tsx`, `SessionInspector.tsx` (`ws`/`wss`, токены загрузки тел), `TrafficGrid.tsx` (cleanup слушателей, `finally` для popover, `followTail` по хвостовому ID), `textWizard.ts` (JWT `null`-защита) и `mockTraffic.ts`.
 
 ---
 
 ## 📋 Матрица приоритетов и порядок выполнения
 
-> *Номера этапов (`5–30`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз. Завершенные этапы Спринта 1 (Этапы 14, 15, 20, 21, 25–28) выполнены в релизе `v0.2.0` и перенесены в раздел реализованных этапов выше.*
+> *Номера этапов (`6–22`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз. Завершенные этапы Спринта 1 (Этапы 14, 15, 20, 21, 25–28) выполнены в релизе `v0.2.0`, а этапы Спринта 2 (Этапы 5, 16, 17, 23, 24, 29, 30) выполнены в релизе `v0.3.0` и перенесены в раздел реализованных этапов выше.*
 
 | # | Этап | Приоритет | Спринт | Зависимости | Ключевая ценность |
 | :-: | :--- | :--- | :--- | :--- | :--- |
-| 1 | **[Этап 24](#этап-24-интерактивная-сортировка-колонок-таблицы-ascdesc-и-массовое-выделение-ctrla)** | **P0 (High)** | Спринт 2 | — | Быстрый поиск аномалий по `Status` / `Time` / `Size` / `ID` и массовое выделение `Ctrl+A` |
-| 2 | **[Этап 23](#этап-23-персистентность-геометрии-сплитов-и-адаптивной-сетки-панелей)** | **P0 (High)** | Спринт 2 | — | Сохранение пропорций всех `<PanelGroup>` и ориентации сплита инспектора между перезапусками |
-| 3 | **[Этап 5](#этап-5-ультра-компактный-тулбар-автоподбор-колонок-и-шорткаты-инспектора)** | **P0 (High)** | Спринт 2 | — | Однострочный Slim-тулбар (`Ctrl+Shift+T`), автоподбор колонок из меню шапки и быстрые вкладки `Ctrl+1..6` |
-| 4 | **[Этап 16](#этап-16-очистка-и-маскирование-pii--секретов-при-экспорте-sanitized-export)** | **P0 (High)** | Спринт 2 | — | Безопасная передача `.har`/`.saz`/`.json`/`.txt` без утечки токенов, cookie, паролей и платежных данных |
-| 5 | **[Этап 17](#этап-17-диагностический-мастер-самопроверки-proxy-doctor)** | **P0 (High)** | Спринт 2 | Этап 15 ✅ | 1-клик диагностика и автоисправление конфликтов порта, файрвола, системного прокси, Root CA и VPN |
-| 6 | **[Этап 29](#этап-29-единый-источник-конфигурации-запуска-гонки-useproxysessions-и-честные-ошибки-bridge)** | **P0 (High)** | Спринт 2 | Этап 15 ✅, Этап 27 ✅ | Устранение двойного старта `:8888`, атомарная смена порта и профилей настроек, слияние гонок фильтров и отказ от маскировки ошибок IPC |
-| 7 | **[Этап 30](#этап-30-исправление-багов-ui-компонентов-виртуализация-hexviewer-и-настройка-manualchunks)** | **P1 (High)** | Спринт 2 | Этап 26 ✅ | Исправление багов `BreakpointModal`/`ComposerPanel`/`AutoResponderPanel`/`SessionInspector`/`TrafficGrid`/`TextWizard`, виртуализация `HexViewer` и дробление JS-бандла |
-| 8 | **[Этап 22](#этап-22-продвинутая-кастомизация-темы-пресеты-и-детальная-палитра-цветов)** | **P1 (High)** | Спринт 3 | — | 8 тем-пресетов (Dracula, Tokyo Night, Nord, Fiddler Classic и др.) и live-редактор CSS-токенов + Monaco |
-| 9 | **[Этап 6](#этап-6-selective-mitm--bypass-20-bulk-editor-10-quick-packs-и-hit-counter)** | **P1 (High)** | Спринт 3 | Этап 25 ✅ | Пакетный редактор TLS-правил, расширение `TLS_BYPASS_QUICK_PACKS` до 10+ наборов, счетчик срабатываний и бейдж `TUNNEL` |
-| 10 | **[Этап 18](#этап-18-клиентские-сертификаты-mtls--client-certificates-store)** | **P1 (High)** | Спринт 3 | Этап 25 ✅ | Хранилище PKCS#12/PEM-сертификатов с привязкой к маскам доменов и кэшируемыми mTLS-клиентами |
-| 11 | **[Этап 7](#этап-7-кастомные-скрипты-на-python-python-scripting-engine)** | **P1 (Medium)** | Спринт 3 | Этап 14 ✅ | Автоматизация перехвата `on_request` / `on_response` через долгоживущий IPC-процесс Python + Monaco Editor |
-| 12 | **[Этап 8](#этап-8-composer-20-умный-paste-curl-и-генератор-клиентского-кода-на-5-языках)** | **P1 (Medium)** | Спринт 3 | — | Парсер команд `cURL` из буфера обмена и генерация сниппетов (JS, Python, Go, Rust, cURL) |
-| 13 | **[Этап 19](#этап-19-автоматическая-генерация-спецификаций-openapi-30--swagger)** | **P1 (Medium)** | Спринт 3 | Этап 16 | Генерация YAML/JSON OpenAPI 3.0 спецификации по выделенным сессиям с выводом JSON Schema |
-| 14 | **[Этап 9](#этап-9-тестирование-фронтенда-vitest-и-cicd-github-actions)** | **P1 (Medium)** | Спринт 3 | Этап 8, 19, 22, 29, 30 | Покрытие движков `src/lib/*.ts` и хуков тестами Vitest и кроссплатформенный CI (включая `clippy -D warnings`) |
-| 15 | **[Этап 10](#этап-10-сетевая-инфраструктура-hosts-remapping-и-bandwidth-throttling)** | **P2 (Feature)** | Спринт 4 | Этап 15 ✅, 25 ✅ | Виртуальный DNS (`resolve` / `CONNECT`) без правки системного `hosts` и эмуляция медленных сетей |
-| 16 | **[Этап 11](#этап-11-архитектурная-декомпозиция-монолитов-и-внедрение-zustand)** | **P2 (Feature)** | Спринт 4 | — | Разделение крупных Rust/React-модулей, внедрение `zustand` и `React.lazy()` Code Splitting |
-| 17 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 4 | — | Виртуализированная каскадная диаграмма таймингов и сводный Markdown-отчет (P95, статусы, MIME) |
-| 18 | **[Этап 13](#этап-13-расширенные-протоколы-upstream-proxy-chaining-и-ws-инъекция)** | **P2 (Feature)** | Спринт 4 | Этап 18, 25 ✅ | Каскадирование трафика через внешний HTTP/HTTPS/SOCKS5-прокси и отправка фреймов в открытые WS |
+| 1 | **[Этап 22](#этап-22-продвинутая-кастомизация-темы-пресеты-и-детальная-палитра-цветов)** | **P1 (High)** | Спринт 3 | — | 8 тем-пресетов (Dracula, Tokyo Night, Nord, Fiddler Classic и др.) и live-редактор CSS-токенов + Monaco |
+| 2 | **[Этап 6](#этап-6-selective-mitm--bypass-20-bulk-editor-10-quick-packs-и-hit-counter)** | **P1 (High)** | Спринт 3 | Этап 25 ✅ | Пакетный редактор TLS-правил, расширение `TLS_BYPASS_QUICK_PACKS` до 10+ наборов, счетчик срабатываний и бейдж `TUNNEL` |
+| 3 | **[Этап 18](#этап-18-клиентские-сертификаты-mtls--client-certificates-store)** | **P1 (High)** | Спринт 3 | Этап 25 ✅ | Хранилище PKCS#12/PEM-сертификатов с привязкой к маскам доменов и кэшируемыми mTLS-клиентами |
+| 4 | **[Этап 7](#этап-7-кастомные-скрипты-на-python-python-scripting-engine)** | **P1 (Medium)** | Спринт 3 | Этап 14 ✅ | Автоматизация перехвата `on_request` / `on_response` через долгоживущий IPC-процесс Python + Monaco Editor |
+| 5 | **[Этап 8](#этап-8-composer-20-умный-paste-curl-и-генератор-клиентского-кода-на-5-языках)** | **P1 (Medium)** | Спринт 3 | — | Парсер команд `cURL` из буфера обмена и генерация сниппетов (JS, Python, Go, Rust, cURL) |
+| 6 | **[Этап 19](#этап-19-автоматическая-генерация-спецификаций-openapi-30--swagger)** | **P1 (Medium)** | Спринт 3 | Этап 16 ✅ | Генерация YAML/JSON OpenAPI 3.0 спецификации по выделенным сессиям с выводом JSON Schema |
+| 7 | **[Этап 9](#этап-9-тестирование-фронтенда-vitest-и-cicd-github-actions)** | **P1 (Medium)** | Спринт 3 | Этап 8, 19, 22, 29 ✅, 30 ✅ | Покрытие движков `src/lib/*.ts` и хуков тестами Vitest и кроссплатформенный CI (включая `clippy -D warnings`) |
+| 8 | **[Этап 10](#этап-10-сетевая-инфраструктура-hosts-remapping-и-bandwidth-throttling)** | **P2 (Feature)** | Спринт 4 | Этап 15 ✅, 25 ✅ | Виртуальный DNS (`resolve` / `CONNECT`) без правки системного `hosts` и эмуляция медленных сетей |
+| 9 | **[Этап 11](#этап-11-архитектурная-декомпозиция-монолитов-и-внедрение-zustand)** | **P2 (Feature)** | Спринт 4 | — | Разделение крупных Rust/React-модулей, внедрение `zustand` и `React.lazy()` Code Splitting |
+| 10 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 4 | — | Виртуализированная каскадная диаграмма таймингов и сводный Markdown-отчет (P95, статусы, MIME) |
+| 11 | **[Этап 13](#этап-13-расширенные-протоколы-upstream-proxy-chaining-и-ws-инъекция)** | **P2 (Feature)** | Спринт 4 | Этап 18, 25 ✅ | Каскадирование трафика через внешний HTTP/HTTPS/SOCKS5-прокси и отправка фреймов в открытые WS |
 
 ---
 
@@ -98,342 +105,6 @@
    git add .
    git commit -m "feat(phase-N): <краткое описание выполненного этапа>"
    ```
-
----
-
-## 🟠 Спринт 2 — P0 (High): Эргономика таблицы, безопасность экспорта и диагностика
-
----
-
-## Этап 24: Интерактивная сортировка колонок таблицы (ASC/DESC) и массовое выделение (Ctrl+A)
-**Приоритет: P0 (High) | Спринт 2 | Зависимости: нет**
-
-### Цель и контекст
-В `TrafficGrid.tsx` сессии отображаются только в хронологическом порядке (FIFO), что затрудняет поиск самых долгих, тяжелых или ошибочных запросов среди тысяч строк. Также отсутствует перехват `Ctrl+A` / `Cmd+A` для выбора всех отфильтрованных строк без системного выделения текста DOM.
-
-> **Важные уточнения по кодовой базе:**
-> - Реальный тип `ColumnId` в `src/types/proxy.ts` содержит ровно 10 колонок: `'id' | 'status' | 'method' | 'protocol' | 'host' | 'url' | 'process' | 'size' | 'time' | 'comment'` (полей `durationMs`, `bodySize`, `timestamp`, `path`, `clientIp` в `ColumnId` нет).
-> - В `TrafficGrid.tsx` уже есть `onSelectSessionRange(id: number)` для `Shift+Click`, но нет callback-а для пакетной установки массива ID — нужно добавить `onSelectAllSessions(ids: number[])` из `useProxySessions.ts`.
-> - При активной сортировке (`sortColumn !== null`) автоскролл `followTail` в `TrafficGrid.tsx` (`scrollToIndex(sessions.length - 1)`) должен учитывать направление (например, для `id desc` не прыгать в конец таблицы к самой старой сессии).
-
-### Критерии приемки (DoD)
-- Клик по заголовку колонки (вне зоны `col-resize`) циклически переключает сортировку: `null → 'asc' → 'desc' → null` с индикатором `▲` / `▼` в шапке `TrafficGrid.tsx`.
-- Поддержана сортировка всех 10 колонок `ColumnId` (числовая для `id`, `status`, `size` → `bodySize`, `time` → `durationMs`; строковая с `localeCompare` для `method`, `protocol`, `host`, `url` → `path`, `process` → `processName || clientIp`, `comment`) с мемоизацией `useMemo`.
-- В контекстное меню шапки добавлены действия «Sort Ascending», «Sort Descending», «Clear Sort».
-- `Ctrl+A` / `Cmd+A` (когда фокус не в `input`/`textarea`/`select`/`contenteditable`/Monaco и не открыт `<dialog>`) выбирает все текущие отображаемые сессии, `Delete` удаляет выделение, `Escape` сбрасывает к активной сессии.
-- Добавлен пункт `Edit → Select All Sessions` (`Ctrl+A`) в `MenuBar.tsx` и запись в `ShortcutsModal.tsx`.
-
-### 📝 Промпт для Antigravity (Этап 24)
-
-```markdown
-Роль: Senior Frontend Performance Engineer (React 18 + TypeScript) & UX Designer.
-Проект: FluxProxy (Tauri v2 + React 18).
-
-Задача: Реализовать интерактивную сортировку всех колонок таблицы `TrafficGrid` (ASC/DESC/Default) и массовое выделение всех видимых сессий по `Ctrl+A` / `Cmd+A`.
-
-1. Сортировка колонок (`src/components/TrafficGrid.tsx`, `src/types/proxy.ts`):
-   - Добавить типы `SortDirection = "asc" | "desc"` и состояние `sortColumn: ColumnId | null`, `sortDirection: SortDirection`.
-   - По клику на `<div role="columnheader">` (игнорируя клики на resize-handle) циклически переключать `null -> 'asc' -> 'desc' -> null`, отображая компактные `▲` / `▼`.
-   - Реализовать компаратор по всем реальным `ColumnId`:
-     * числовые: `id`, `status`, `size` (`s.bodySize`), `time` (`s.durationMs`);
-     * строковые (`localeCompare` с `numeric: false, sensitivity: "base"`): `method`, `protocol`, `host`, `url` (`s.path || s.url`), `process` (`s.processName || s.clientIp || ""`), `comment` (`s.comment || ""`).
-   - Мемоизировать `sortedSessions = useMemo(...)` и корректно скорректировать `followTail` (при активной нестандартной сортировке не прокручивать в конец, если новые строки сверху, например для `id desc` прокручивать к индексу `0`).
-   - В поповер контекстного меню шапки (`headerColPopoverRef`) добавить пункты сортировки выбранной колонки и сброса сортировки.
-
-2. Массовое выделение `Ctrl+A` (`src/hooks/useProxySessions.ts`, `src/components/TrafficGrid.tsx`, `src/App.tsx`, `src/components/MenuBar.tsx`, `src/components/ShortcutsModal.tsx`):
-   - В `useProxySessions.ts` добавить `selectSessions(ids: number[])` (обновляет `selectedIds`, сохраняя `selectedId` в пределах выборки) и передать в `TrafficGrid` как `onSelectAllSessions`.
-   - В `TrafficGrid.tsx` и глобальном обработчике `App.tsx` перехватывать `(e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && key === 'a'`:
-     * срабатывать только когда нет открытого `<dialog open>` и фокус вне `input`, `textarea`, `select`, `[contenteditable]`, `.monaco-editor`;
-     * вызывать `e.preventDefault()` и выделять `sortedSessions.map(s => s.id)`.
-   - Добавить пункт `Select All Sessions` (`Ctrl+A`) в `MenuBar.tsx` (`Edit`) и обновить `ShortcutsModal.tsx`.
-
-Проверка: `npm run typecheck`, `npm run build`.
-```
-
----
-
-## Этап 23: Персистентность геометрии сплитов и адаптивной сетки панелей
-**Приоритет: P0 (High) | Спринт 2 | Зависимости: нет**
-
-### Цель и контекст
-В `src/App.tsx` и `src/components/SessionInspector.tsx` используются 4 группы `<PanelGroup>` из `react-resizable-panels`, ни одна из которых не имеет `autoSaveId`, а `splitDirection` хранится в локальном состоянии `SessionInspector`. При перезапуске приложения, переключении позиции инспектора (`bottom`/`right`) или открытии док-панели Composer пропорции сбрасываются.
-
-> **Важный технический нюанс:** В `App.tsx` для режима `bottom` используются ДВЕ вложенные группы `<PanelGroup>` (внешняя горизонтальная для док-панели Composer и внутренняя вертикальная для «таблица / инспектор»), а в `SessionInspector.tsx` у `<Panel>` вообще отсутствуют пропсы `id` (без стабильных `id` и `autoSaveId` библиотека `react-resizable-panels` теряет размеры при условном рендере панелей). Кроме того, сохранение `inspectorSplitDirection` в режиме `"auto" | "horizontal" | "vertical"` предотвратит неудобную ориентацию при переключении `bottom ↔ right`.
-
-### Критерии приемки (DoD)
-- Все 4 `<PanelGroup>` снабжены согласованными `autoSaveId` и стабильными `id` у дочерних `<Panel>`:
-  - `flux-layout-bottom-outer-v1` (внешний горизонтальный сплит в режиме `bottom` в `App.tsx`);
-  - `flux-layout-bottom-inner-v1` (внутренний вертикальный сплит «таблица / инспектор» в `App.tsx`);
-  - `flux-layout-right-v1` (горизонтальный сплит «таблица / инспектор / composer» в режиме `right` в `App.tsx`);
-  - `flux-inspector-split-v1` (внутренний сплит Request / Response в `SessionInspector.tsx` с `id="inspector-req-pane"` и `id="inspector-resp-pane"`).
-- Состояние `inspectorSplitDirection: "auto" | "horizontal" | "vertical"` вынесено в `useUiPreferences.ts` и `FluxUserSettingsProfile` (`src/types/settings.ts`, `settingsManager.ts`).
-- Двойной клик по `<PanelResizeHandle>` сбрасывает текущую группу к сбалансированным пропорциям (50/50 или дефолту), а пункт `View → Reset Split Layout` (и команда в `CommandPalette.tsx`) сбрасывает сохраненные размеры и возвращает `inspectorSplitDirection: "auto"`.
-
-### 📝 Промпт для Antigravity (Этап 23)
-
-```markdown
-Роль: Senior Frontend UX Engineer (React 18 + react-resizable-panels).
-Проект: FluxProxy (Tauri v2 + React 18).
-
-Задача: Обеспечить сохранение и восстановление геометрии всех сплит-панелей в `App.tsx` и `SessionInspector.tsx`, а также ориентации внутреннего сплиттера инспектора.
-
-1. Персистентность `react-resizable-panels` (`src/App.tsx`, `src/components/SessionInspector.tsx`):
-   - В `App.tsx` добавить `autoSaveId` (с безопасным `localStorage`-адаптером или встроенным механизмом `react-resizable-panels` v2) на все 3 `<PanelGroup>`:
-     * `autoSaveId="flux-layout-bottom-outer-v1"`,
-     * `autoSaveId="flux-layout-bottom-inner-v1"`,
-     * `autoSaveId="flux-layout-right-v1"`.
-   - В `SessionInspector.tsx` добавить `autoSaveId="flux-inspector-split-v1"` на `<PanelGroup>` и задать стабильные `id="inspector-req-pane"` (`order={1}`) и `id="inspector-resp-pane"` (`order={2}`) обоим `<Panel>`.
-   - Добавить обработчик `onDoubleClick` на разделители `<PanelResizeHandle>` (используя `ImperativePanelGroupHandle` / `setLayout`) для быстрого сброса текущей группы панелей.
-
-2. Ориентация сплита и профиль настроек (`src/hooks/useUiPreferences.ts`, `src/types/settings.ts`, `src/lib/settingsManager.ts`, `src/types/proxy.ts`):
-   - Добавить `InspectorSplitDirection = "auto" | "horizontal" | "vertical"` в `useUiPreferences.ts` и `FluxUserUiSettings` (при `"auto"` вычисляется от `inspectorPosition`: `bottom -> "horizontal"`, `right -> "vertical"`).
-   - Передать `splitDirection` и `onToggleSplitDirection` в `SessionInspector.tsx`.
-   - Поддержать сохранение/экспорт/импорт `inspectorSplitDirection` (и при желании карты сохраненных размеров панелей) в `settingsManager.ts` и `SettingsModal.tsx`.
-
-3. Команда сброса (`src/components/MenuBar.tsx`, `src/components/CommandPalette.tsx`, `src/App.tsx`):
-   - В `MenuBar.tsx` (`View`) и `CommandPalette.tsx` добавить `Reset Panel Layout to Default`, очищающий ключи `autoSaveId` (префикс `react-resizable-panels:flux-`) и сбрасывающий `inspectorSplitDirection` в `"auto"`.
-
-Проверка: `npm run typecheck`, `npm run build`.
-```
-
----
-
-## Этап 5: Ультра-компактный тулбар, автоподбор колонок и шорткаты инспектора
-**Приоритет: P0 (High) | Спринт 2 | Зависимости: нет**
-
-### Цель и контекст
-Состояние `compactToolbar` и базовый поповер видимости колонок (`headerColPopoverRef` в `TrafficGrid.tsx`) уже существуют, но:
-1. В компактном режиме на 13-дюймовых экранах тулбар всё ещё требует прокрутки вместо лаконичной однострочной Slim-компоновки с выносом второстепенных групп в меню `•••` и шортката `Ctrl+Shift+T`.
-2. Контекстное меню шапки `TrafficGrid.tsx` привязано к всей строке заголовка и не определяет колонку под курсором, а также не содержит `Auto-fit This Column` и `Auto-fit All Visible Columns`.
-3. В `SessionInspector.tsx` две независимые панели вкладок (`REQUEST_TABS` и `RESPONSE_TABS`), и отсутствуют клавиатурные шорткаты `Ctrl+1` … `Ctrl+6`.
-
-### Критерии приемки (DoD)
-- Глобальный шорткат `Ctrl+Shift+T` / `Cmd+Shift+T` переключает `compactToolbar`; Slim-режим гарантирует однострочную компоновку ключевых контролов без горизонтального скролла.
-- Правый клик по конкретному `<div role="columnheader">` в `TrafficGrid.tsx` определяет `ColumnId` через `data-col-id` и показывает в поповере действия `Auto-fit "<Column>"`, `Auto-fit All Visible Columns` и `Reset Columns & Widths`.
-- В `SessionInspector.tsx` отслеживается активная подпанель (`activePane: "request" | "response"`, по умолчанию `"response"`), и `Ctrl+1` … `Ctrl+6` переключают вкладки активной панели (вне текстовых полей и Monaco Editor).
-- Новые шорткаты отражены в `MenuBar.tsx`, `ShortcutsModal.tsx` и `CommandPalette.tsx`.
-
-### 📝 Промпт для Antigravity (Этап 5)
-
-```markdown
-Роль: Senior UX / Frontend Engineer (React 18 + TypeScript + Tailwind CSS).
-Проект: FluxProxy (Tauri v2 + React 18).
-
-Задача: Завершить Slim-режим тулбара, расширить контекстное меню шапки колонок таблицы и добавить шорткаты вкладок инспектора.
-
-1. Slim Toolbar и `Ctrl+Shift+T` (`src/components/TopToolbar.tsx`, `src/App.tsx`, `src/components/MenuBar.tsx`, `src/components/ShortcutsModal.tsx`):
-   - В `App.tsx` добавить глобальный шорткат `(e.ctrlKey || e.metaKey) && e.shiftKey && !e.altKey && key === 't'` для переключения `compactToolbar`.
-   - В `TopToolbar.tsx` при `compactToolbar === true` убирать вторичные подписи и убирать редкие кнопки в уже существующее меню переполнения `•••`, чтобы Capture, Clear, Tail, Keep, поиск и быстрые категории умещались в 1 строку на 1280px.
-   - Указать подсказку `Ctrl+Shift+T` в `MenuBar.tsx` (`View`) и `ShortcutsModal.tsx`.
-
-2. Контекстное меню шапки `TrafficGrid.tsx`:
-   - Добавить `data-col-id={col.id}` на каждый `<div role="columnheader">`.
-   - В `handleHeaderContextMenu` определять колонку через `(e.target as HTMLElement).closest<HTMLElement>("[data-col-id]")?.dataset.colId`.
-   - Вынести логику измерения авто-ширины из `handleResizeDoubleClick` в общий helper `computeAutoFitWidth(col, sessions)` и добавить в `headerColPopoverRef`:
-     * `Auto-fit "<Column>"` (если клик был по колонке),
-     * `Auto-fit All Visible Columns`,
-     * существующий `Reset`.
-
-3. Шорткаты вкладок `SessionInspector.tsx` (`Ctrl+1` … `Ctrl+6`):
-   - В `SessionInspector.tsx` отслеживать `activePane: "request" | "response"` (обновляется по `onFocusCapture`/`onPointerDownCapture` внутри левой/верхней или правой/нижней панели, по умолчанию `"response"`).
-   - По `Ctrl+1..6` (если фокус внутри инспектора или таблицы, но вне `input`/`textarea`/`.monaco-editor`) переключать вкладку активной панели:
-     `1` -> `headers`, `2` -> `json` (или `raw`, если для текущей сессии/панели JSON пуст/неприменим), `3` -> `cookies` (или `params` в Request, если выбрана 3-я), `4` -> `auth`, `5` -> `raw`, `6` -> `hex`.
-   - Добавить описание `Ctrl+1..6` в `ShortcutsModal.tsx`.
-
-Проверка: `npm run typecheck`, `npm run build`.
-```
-
----
-
-## Этап 16: Очистка и маскирование PII / секретов при экспорте (Sanitized Export)
-**Приоритет: P0 (High) | Спринт 2 | Зависимости: нет**
-
-### Цель и контекст
-При экспорте `.har`, `.saz`, `.json` или Raw HTTP (`.txt`) для коллег и баг-трекеров в архивы попадают боевые токены (`Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`), пароли/секреты в JSON/form-телах, токены в query-параметрах и локальные IP/имена процессов. Необходим безопасный режим экспорта с настраиваемой санитизацией без поломки структуры архива.
-
-### Критерии приемки (DoD)
-- В `src-tauri/src/models.rs` и `src-tauri/src/storage/export_import.rs` реализована структура `SanitizationOptions` и функция санитизации копий `SessionDetail` перед сериализацией в HAR 1.2, SAZ, JSON и Raw HTTP.
-- Команда `export_sessions_file` (`commands.rs`) принимает опциональный параметр `sanitization: Option<SanitizationOptions>` с сохранением обратной совместимости для обычного `Ctrl+S`.
-- Модальное окно `src/components/SanitizedExportModal.tsx` (меню `File → Export Sanitized Sessions...` / `Ctrl+Shift+S`, Command Palette, контекстное меню таблицы) с пресетами *Safe Sharing*, *Strict Anonymization* и *Custom*.
-- Маскируются заголовки, рекурсивные ключи в JSON и `application/x-www-form-urlencoded`, query-параметры URL, а также опционально `clientAddr`, `clientIp` и `processName`.
-- Покрыто unit-тестами `sanitizes_har_and_saz_exports_without_corrupting_structure` в `export_import.rs`.
-
-### 📝 Промпт для Antigravity (Этап 16)
-
-```markdown
-Роль: Senior Security & Full-Stack Engineer (Rust + TypeScript + React).
-Проект: FluxProxy (Tauri v2 + Rust + React 18).
-
-Задача: Реализовать подсистему санитизации и маскирования чувствительных данных (PII & Secrets Redaction) при экспорте сессий в HAR 1.2, SAZ, JSON и Raw HTTP.
-
-1. Бэкенд (`src-tauri/src/models.rs`, `src-tauri/src/storage/export_import.rs`, `src-tauri/src/commands.rs`):
-   - Добавить `SanitizationOptions` (`#[serde(rename_all = "camelCase")]`):
-     * `redact_auth_headers: bool`,
-     * `custom_redacted_headers: Vec<String>`,
-     * `mask_json_keys: Vec<String>` (дефолты: `password`, `passwd`, `secret`, `token`, `access_token`, `refresh_token`, `api_key`, `cvv`, `pan`, `card_number`, `pin`),
-     * `strip_query_params: Vec<String>` (дефолты: `token`, `auth`, `api_key`, `key`, `signature`, `sig`, `code`),
-     * `anonymize_client_info: bool`,
-     * `replacement_text: String` (по умолчанию `"[REDACTED]"`).
-   - Реализовать чистую функцию `sanitize_sessions(sessions: &[SessionDetail], opts: &SanitizationOptions) -> Vec<SessionDetail>`:
-     * Замена значений секретных заголовков (включая `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Auth-Token`) на `replacement_text`.
-     * Рекурсивный обход JSON-тел (`serde_json::Value`) и маскирование `application/x-www-form-urlencoded` пар по case-insensitive совпадению ключей, с пересчетом `request_body_text`/`response_body_text` и `base64`.
-     * Замена значений указанных query-параметров в `summary.url` и `summary.path`.
-     * При `anonymize_client_info`: замена `client_addr` (`0.0.0.0:0`), `client_ip` (`0.0.0.0`) и `process_name` (`"redacted-process"`).
-   - Расширить `export_sessions_file` в `commands.rs` опциональным полем `sanitization: Option<SanitizationOptions>` и добавить unit-тест `sanitizes_har_and_saz_exports_without_corrupting_structure` в `export_import.rs`.
-
-2. Frontend UI (`src/components/SanitizedExportModal.tsx`, `src/types/proxy.ts`, `src/types/settings.ts`, `src/lib/settingsManager.ts`, `src/lib/tauriBridge.ts`, `src/lib/mockTraffic.ts`, `src/components/MenuBar.tsx`, `src/App.tsx`):
-   - Создать `SanitizedExportModal.tsx` с выбором формата (`har` / `saz` / `json` / `raw`), пресетами (*Safe Sharing*, *Strict Anonymization*, *Custom*) и сохранением настроек санитизации.
-   - Интегрировать в `File → Export Sanitized Sessions…` (`Ctrl+Shift+S`), `CommandPalette.tsx` и `ShortcutsModal.tsx`, а также в Browser Preview (`tauriBridge.ts`, `mockTraffic.ts`).
-
-Проверка: `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run typecheck`, `npm run build`.
-```
-
----
-
-## Этап 17: Диагностический мастер самопроверки «Proxy Doctor»
-**Приоритет: P0 (High) | Спринт 2 | Зависимости: Этап 15 (Bind Configuration)**
-
-### Цель и контекст
-Когда трафик не проходит через прокси, причина обычно внешняя: занятый порт, блокировка файрволом, вмешательство VPN, сброс системного прокси ОС или недоверенный Root CA. Пользователю нужен единый мастер диагностики и 1-клик исправления типовых сбоев.
-
-> **Важные уточнения по кодовой базе:**
-> - В `handle_builtin_portal_request` (`src-tauri/src/proxy/server.rs:2881`) сейчас **нет** маршрута `/health` (`select_portal_asset` возвращает HTML-страницу лендинга и записывает сессию в `TrafficStore`). Нужно явно добавить легкий эндпоинт `/health` на `http://flux.proxy/health`, возвращающий `200 OK` без замусоривания таблицы трафика (или с флагом игнорирования health-check).
-> - Проверки порта и системного прокси должны опираться на актуальные `bound_ips` и `bind_mode` из Этапа 15, а не на жесткий `127.0.0.1:8888`.
-
-### Критерии приемки (DoD)
-- Создан отдельный Rust-модуль `src-tauri/src/proxy/doctor.rs` (без перегрузки `server.rs`), экспортирующий команды `run_proxy_doctor()` и `fix_doctor_issue(issue_id)`.
-- Проверяются: (1) доступность/состояние сокета и конфликт порта, (2) доверие ОС к Root CA (`ca.rs`), (3) соответствие системного прокси ОС (`sysproxy.rs`) активным `bound_ips:port`, (4) наличие потенциально конфликтующих VPN/туннельных интерфейсов (`network.rs`), (5) правила/доступность Windows Firewall (или диагностика прав), (6) сквозной loopback-запрос через прокси на `http://flux.proxy/health`.
-- В `handle_builtin_portal_request` (`server.rs`) добавлен маршрут `/health` (`200 OK`), не создающий лишнего шума в `TrafficStore`.
-- Модальное окно `src/components/ProxyDoctorModal.tsx` (`Help → Run Proxy Doctor…` / `Ctrl+Shift+D`, кнопка при ошибке в статус-баре и в `CommandPalette.tsx`) с кнопкой 1-клик автоисправления («Repair»).
-- Покрыто unit-тестами в `doctor.rs`.
-
-### 📝 Промпт для Antigravity (Этап 17)
-
-```markdown
-Роль: Senior Systems Engineer & Diagnostics Specialist (Rust + React 18).
-Проект: FluxProxy (Tauri v2 + Rust + React 18).
-
-Задача: Реализовать встроенный диагностический мастер «Proxy Doctor» для выявления и 1-клик устранения проблем с портом, Root CA, системным прокси ОС, VPN и loopback-маршрутизацией.
-
-1. Бэкенд (`src-tauri/src/proxy/doctor.rs`, `src-tauri/src/proxy/mod.rs`, `src-tauri/src/proxy/server.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/lib.rs`):
-   - В `server.rs` (`handle_builtin_portal_request`):
-     * Добавить быстрый ответ для пути `/health` (`200 OK`, `application/json`, `{"status":"ok"}`) без записи шумной сессии в `TrafficStore`.
-   - Создать `src-tauri/src/proxy/doctor.rs`:
-     * Модель `DoctorCheckResult`: `id`, `title`, `status: "ok" | "warning" | "error"`, `summary`, `details`, `can_auto_fix: bool`, `fix_label: Option<String>`.
-     * Проверки:
-       1. `port_binding`: статус `ProxyEngineController` (учитывая `bound_ips` и `port` из Этапа 15; при остановленном состоянии — пробный `TcpListener::bind`).
-       2. `root_ca_trust`: статус `ca.info_with_trust_status()`.
-       3. `system_proxy_sync`: сопоставление `sysproxy.status_for_listener(...)` с ожидаемым адресом и `auto_system_proxy`.
-       4. `vpn_interface_check`: обнаружение активных TUN/VPN/CGNAT маршрутов, способных перехватывать системный прокси.
-       5. `firewall_check`: проверка доступности локального/LAN входа (на Windows — безопасная проверка без требования UAC там, где возможно, с понятной рекомендацией при блокировке).
-       6. `loopback_e2e`: отправка `GET http://flux.proxy/health` через локальный сокет прокси с проверкой ответа `200`.
-     * Автоисправление `fix_doctor_issue(issue_id)` (перезапуск listener / установка Root CA / восстановление `set_system_proxy(true)`).
-   - Зарегистрировать команды `run_proxy_doctor` и `fix_doctor_issue` в `commands.rs` и `lib.rs`.
-   - Добавить unit-тесты в `doctor.rs`.
-
-2. Frontend UI (`src/components/ProxyDoctorModal.tsx`, `src/lib/tauriBridge.ts`, `src/lib/mockTraffic.ts`, `src/components/MenuBar.tsx`, `src/App.tsx`, `src/components/CommandPalette.tsx`, `src/components/ShortcutsModal.tsx`):
-   - Создать `ProxyDoctorModal.tsx` с запуском сканирования, статусами проверок, понятными пояснениями и кнопками «Fix» / «Fix All Fixable».
-   - Добавить `Help → Run Proxy Doctor…` (`Ctrl+Shift+D`) и кликабельный триггер в статус-баре `App.tsx` при наличии ошибки системного прокси/движка.
-
-Проверка: `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run typecheck`, `npm run build`.
-```
-
----
-
-## Этап 29: Единый источник конфигурации запуска, гонки useProxySessions и честные ошибки Bridge
-**Приоритет: P0 (High) | Спринт 2 | Зависимости: Этап 15, Этап 27**
-
-### Цель и контекст
-Аудит связки фронтенда (`src/hooks/useProxySessions.ts`, `src/lib/settingsManager.ts`, `src/lib/tauriBridge.ts`) и запуска бэкенда (`src-tauri/src/lib.rs`) выявил структурный split-state и гонки:
-1. При старте Rust безусловно запускает прокси на захардкоженном `:8888` (`src-tauri/src/lib.rs:63`), а `bootstrap` на фронтенде останавливает его и переподнимает на `initialPort` (`useProxySessions.ts:597-600`). Более того, `if (!mounted) return` проверяется **до** `await proxyBridge.subscribeSessionBatches(...)`, из-за чего в React StrictMode подписка утекает.
-2. `setProxyPort` записывает новый порт в `localStorage` до фактического биндинга, останавливает работающий прокси без отката при падении `startProxy` и вызывает `setPreviewPort` даже при остановленном прокси.
-3. Два пересекающихся debounced-эффекта фильтров (`useProxySessions.ts:880-896` и `928-945`) читают `backendFilterConfigRef.current` и перетирают изменения друг друга; загрузка `selectedDetail` не имеет `.catch()` и не сбрасывает устаревшую карточку; `replaySessions` передаёт `detail.requestBodyText ?? ""`, теряя бинарные (`requestBodyBase64`) и выгруженные тела.
-4. `applySettingsProfile` (`settingsManager.ts:1815-1889`) сохраняет профиль в `localStorage` и диспатчит `SETTINGS_APPLIED_EVENT` **до** выполнения IPC-вызовов без rollback при ошибке и без сохранения `BreakpointConfig`.
-5. `tauriBridge.ts` маскирует сбои IPC: `deleteSessions` при ошибке возвращает `ids.length`, `getAutoResponderEnabled`/`setAutoResponderEnabled` глотают исключения, а `generateStressTestSessions` в нативном режиме работает только через `previewEngine`.
-
-### Критерии приемки (DoD)
-- Rust читает сохранённый стартовый порт/параметры биндинга из `.pref` в `app_data_dir` (единая точка правды запуска) и стартует сразу на нужном порту без принудительного рестарта из `bootstrap`; фронтенд обновляет преференс через IPC при смене порта.
-- В `useProxySessions.ts` проверка `mounted` выполняется и **после** `await subscribeSessionBatches` с немедленным `unlisten()`; `setProxyPort` сначала пытается переключить порт в Rust/откатить старый при ошибке, и лишь затем фиксирует UI-состояние/`localStorage`.
-- Синхронизация фильтров сведена в единый сериализованный debounced-поток; `loadSessionDetail` обрабатывает ошибки, защищён от race-condition и сбрасывает устаревший `selectedDetail`; `replaySessions` поддерживает бинарные/base64 и offloaded-тела запроса.
-- `applySettingsProfile` применяет изменения к бэкенду транзакционно (фиксирует `localStorage` и `SETTINGS_APPLIED_EVENT` только после успешного IPC, либо откатывает/отдаёт список ошибок); `FluxUserSettingsProfile` опционально сохраняет `breakpoints` (`BreakpointConfig`).
-- `tauriBridge.ts` не подделывает успешные ответы при ошибках IPC и честно разводит `generateStressTestSessions` (поддержка Tauri или явная индикация Preview-режима).
-
-### 📝 Промпт для Antigravity (Этап 29)
-
-```markdown
-Роль: Senior Fullstack Tauri / React State Architect.
-Проект: FluxProxy (Tauri v2 + Rust + React 18).
-
-Задача: Устранить двойной старт прокси `:8888`, гонки `useProxySessions.ts` и `settingsManager.ts`, а также скрытие ошибок в `tauriBridge.ts`.
-
-1. Единая стартовая конфигурация (`src-tauri/src/lib.rs`, `src-tauri/src/commands.rs`, `src/hooks/useProxySessions.ts`):
-   - Сохранять порт/режим запуска в `app_data_dir` (`.pref` по аналогии с `sysproxy.rs` / Этап 15), чтобы `lib.rs` при старте сразу поднимал прокси на сохранённом порту без перезапуска `:8888 -> initialPort`.
-   - В `useProxySessions.ts`:
-     * После `const unlisten = await proxyBridge.subscribeSessionBatches(...)` проверять `if (!mounted) { unlisten(); return; }`.
-     * Переписать `setProxyPort`: сохранить `previousPort`/`wasRunning`; при ошибке `startProxy` на новом порту автоматически возвращать предыдущий порт и не писать нерабочий порт в `localStorage`.
-     * Объединить два debounced-эффекта синхронизации фильтров (`880-896` и `928-945`) в один эффект с единым актуальным снимком конфига.
-     * В эффекте `selectedId`: сбрасывать устаревший `selectedDetail`, проверять актуальность `selectedId` после `await` и добавлять `.catch(...)`.
-     * В `replaySessions`: при наличии `requestBodyBase64` (или `bodyOffloaded`) догружать тело через `loadSessionBody` и передавать raw-байты/base64 в `replay`.
-
-2. Честный Bridge и профили настроек (`src/lib/tauriBridge.ts`, `src/lib/settingsManager.ts`, `src/types/settings.ts`):
-   - В `tauriBridge.ts`: убрать `catch { return ids.length }` в `deleteSessions` и тихое проглатывание ошибок в `getAutoResponderEnabled`/`setAutoResponderEnabled` — пробрасывать ошибку в вызывающий код/toast. В `generateStressTestSessions` либо добавить нативную Tauri-команду генерации в `TrafficStore` (только для dev/stress диагностики), либо явно сообщать о режиме Preview вместо тихого no-op в нативном окне.
-   - В `src/types/settings.ts` и `src/lib/settingsManager.ts`: добавить опциональное поле `breakpoints?: BreakpointConfig` (с нормализацией для профилей `schemaVersion: 1`); в `applySettingsProfile` вызывать IPC-обновления **до** записи в `localStorage` и события `SETTINGS_APPLIED_EVENT` с отчётом/откатом при сбое.
-
-Проверка: `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run typecheck`, `npm run build`.
-```
-
----
-
-## Этап 30: Исправление багов UI-компонентов, виртуализация HexViewer и настройка manualChunks
-**Приоритет: P1 (High) | Спринт 2 | Зависимости: Этап 26**
-
-### Цель и контекст
-Детальная ревизия компонентов UI и конфигурации сборки выявила конкретные дефекты UX, утечки слушателей DOM и просадки производительности:
-1. **`BreakpointModal.tsx`:** зависимость эффекта от `pausedItems.length` сбрасывает текущий режим и выбор при поступлении нового паузированного запроса; при Resume всегда отправляется текстовый `draftBody` (ломая бинарные тела); закрытие модалки опирается на устаревшее `pausedItems.length <= 1`.
-2. **`ComposerPanel.tsx`:** `handleExecute` использует `try ... finally` без `catch`, из-за чего ошибка выполнения уходит в `unhandledrejection` без индикации в интерфейсе.
-3. **`AutoResponderPanel.tsx`:** `RuleDetailForm` инициализирует `useState(rule)` однократно, поэтому переключение чекбокса правила в левом списке не синхронизирует `draft` и откатывается кнопкой Apply.
-4. **`SessionInspector.tsx`:** автопереключение на вкладку `"ws"` проверяет `scheme === "wss"`, но пропускает `ws`; при быстром переключении `A → B → A` флаги `loadingRespBody` / `loadingReqBody` сбрасываются до завершения первого асинхронного запроса.
-5. **`TrafficGrid.tsx`:** слушатели `mousemove`/`mouseup` и inline-стили `document.body` при ресайзе колонок утекают при unmount компонента во время перетаскивания; `followTail` завязан на `sessions.length` и перестаёт автоскроллить при заполнении FIFO-лимита; при исключении `showPopover()` добавленный класс `":popover-open"` не снимается.
-6. **`HexViewer.tsx`, `textWizard.ts`, `mockTraffic.ts` и `vite.config.ts`:**
-   - `HexViewer.tsx` рендерит до `16_384` байт в DOM без виртуализации, а `hoveredOffset` в React state перерисовывает всю таблицу при движении курсора;
-   - `textWizard.ts` падает с `TypeError` на `headerObj.alg`, если заголовок/payload JWT является валидным JSON `null`;
-   - в `mockTraffic.ts` (`SAMPLE_GRPC_REQ_B64`) длина protobuf submessage для поля `#4` (`cus_denis_42`) записана как `0x10` (16 байт) вместо фактических `0x0e` (14 байт);
-   - `vite.config.ts` не настраивает `manualChunks`, из-за чего основной JS-чанк превышает `5 MB`.
-
-### Критерии приемки (DoD)
-- В `BreakpointModal.tsx` состояние формы синхронизировано по `selectedId`, бинарные тела при Resume сохраняются без искажения текстом, а закрытие проверяет реальное отсутствие оставшихся элементов.
-- В `ComposerPanel.tsx` добавлен `catch` с понятным отображением ошибки запроса; в `AutoResponderPanel.tsx` `RuleDetailForm` корректно синхронизируется с изменениями `rule.enabled` из левого списка.
-- В `SessionInspector.tsx` вкладка `WS` автовыбирается и для `ws`, и для `wss`; загрузка тел отслеживается через идентификатор/счётчик активного запроса без залипания индикаторов `loading*`.
-- В `TrafficGrid.tsx` реализован гарантированный cleanup listeners/body styles при unmount, `try/finally` вокруг `showPopover()` / снятия `:popover-open` и автоскролл `followTail` по изменению ID хвостовой сессии (или счётчику апдейтов), а не по `sessions.length`.
-- `HexViewer.tsx` виртуализован по строкам (например, `@tanstack/react-virtual`) и не перерисовывает всю таблицу на hover каждого байта.
-- В `textWizard.ts` JWT-декодер проверяет `typeof obj === "object" && obj !== null && !Array.isArray(obj)`; в `mockTraffic.ts` исправлен `SAMPLE_GRPC_REQ_B64`; в `vite.config.ts` настроено разбиение на чанки (`manualChunks` для `monaco-editor`, `@tauri-apps`, React vendor).
-
-### 📝 Промпт для Antigravity (Этап 30)
-
-```markdown
-Роль: Senior React UI & Performance Engineer.
-Проект: FluxProxy (React 18 + TypeScript + Vite 6 + Tailwind).
-
-Задача: Исправить дефекты интерактивных компонентов UI, виртуализовать `HexViewer` и настроить `manualChunks` в Vite.
-
-1. Компонентные баги (`BreakpointModal.tsx`, `ComposerPanel.tsx`, `AutoResponderPanel.tsx`, `SessionInspector.tsx`, `TrafficGrid.tsx`):
-   - `src/components/BreakpointModal.tsx`: убрать сброс черновика/вкладки при росте `pausedItems.length`; при Resume учитывать `isBinary` / base64 без отправки повреждённого `draftBody`; закрывать модалку только после проверки реальной пустой очереди.
-   - `src/components/ComposerPanel.tsx`: добавить `catch (err)` в `handleExecute` и выводить сообщение об ошибке в UI.
-   - `src/components/AutoResponderPanel.tsx`: синхронизировать `draft` с внешними изменениями активного `rule` (в частности `rule.enabled` из левого списка, при смене `rule.id` или тоггле).
-   - `src/components/SessionInspector.tsx`: включить `scheme === "ws"` в условие автовыбора вкладки `"ws"`; привязать загрузку тела (`loadingReqBody` / `loadingRespBody`) к `currentSessionIdRef`/токену запроса, чтобы быстрое переключение `A -> B -> A` не сбрасывало состояние текущего запроса.
-   - `src/components/TrafficGrid.tsx`:
-     * Вынести очистку `mousemove`/`mouseup` и сброс `document.body.style.cursor`/`userSelect` в `useEffect` cleanup.
-     * В управлении popover снимать `":popover-open"` в `finally` при ошибке `showPopover()`.
-     * Заменить зависимость `followTail` с `sessions.length` на `lastSessionId` / монотонный маркер новых сессий, чтобы автопрокрутка продолжала работать после достижения FIFO-лимита RAM.
-
-2. Виртуализация HexViewer, JWT/gRPC-фиксы и Vite Chunking (`HexViewer.tsx`, `textWizard.ts`, `mockTraffic.ts`, `vite.config.ts`):
-   - `src/components/HexViewer.tsx`: виртуализовать 16-байтовые строки через `@tanstack/react-virtual` и перенести подсветку пары hex/ASCII на CSS/локальный атрибут без полного ре-рендера дерева на `hoveredOffset`.
-   - `src/lib/textWizard.ts`: добавить проверку не-null plain-object после `JSON.parse` в декодере JWT перед чтением `headerObj.alg` и claims.
-   - `src/lib/mockTraffic.ts`: исправить длину поля `#4` (`cus_denis_42`) в `SAMPLE_GRPC_REQ_B64` с `0x10` на `0x0e`.
-   - `vite.config.ts`: добавить `build.rollupOptions.output.manualChunks` с выделением `monaco-editor`, `react`/`react-dom` и `@tauri-apps`/`lucide-react` в отдельные чанки.
-
-Проверка: `npm run typecheck`, `npm run build` (проверить снижение размера `dist/assets/index-*.js`), `cargo test --manifest-path src-tauri/Cargo.toml`.
-```
 
 ---
 

@@ -15,7 +15,7 @@
 
 Мгновенный запуск, умный контроль памяти, аппаратное ускорение интерфейса и стабильные 60 FPS при работе с десятками тысяч перехваченных запросов.
 
-> 📥 **Скачать готовую сборку для Windows:** [**FluxProxy Setup v0.2.0 (.exe)**](https://github.com/maq3000/flux-proxy/releases/download/v0.2.0/FluxProxy_0.2.0_x64-setup.exe) или [**MSI-пакет (.msi)**](https://github.com/maq3000/flux-proxy/releases/download/v0.2.0/FluxProxy_0.2.0_x64_en-US.msi). Подробнее см. раздел [Скачать готовые сборки](#-скачать-готовые-сборки-releases).
+> 📥 **Скачать готовую сборку для Windows:** [**FluxProxy Setup v0.3.0 (.exe)**](https://github.com/maq3000/flux-proxy/releases/download/v0.3.0/FluxProxy_0.3.0_x64-setup.exe) или [**MSI-пакет (.msi)**](https://github.com/maq3000/flux-proxy/releases/download/v0.3.0/FluxProxy_0.3.0_x64_en-US.msi). Подробнее см. раздел [Скачать готовые сборки](#-скачать-готовые-сборки-releases).
 >
 > 📖 **Ищете понятную инструкцию по работе с программой?** Откройте [**Руководство пользователя (USER_GUIDE.md)**](USER_GUIDE.md) — пошаговое описание всех возможностей простым языком: от первого запуска и настройки телефона до подмены ответов и сравнения запросов.
 >
@@ -48,12 +48,12 @@
 
 ## 📥 Скачать готовые сборки (Releases)
 
-Для запуска FluxProxy на **Windows** вам не требуется компилировать проект из исходных кодов — вы можете скачать готовые официальные установщики из [**GitHub Releases v0.2.0**](https://github.com/maq3000/flux-proxy/releases/tag/v0.2.0):
+Для запуска FluxProxy на **Windows** вам не требуется компилировать проект из исходных кодов — вы можете скачать готовые официальные установщики из [**GitHub Releases v0.3.0**](https://github.com/maq3000/flux-proxy/releases/tag/v0.3.0):
 
 | Дистрибутив | Версия | Архитектура | Описание | Ссылка на загрузку | Контрольная сумма (SHA-256) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Windows Setup (`.exe`)** | `v0.2.0` | x64 | **Рекомендуемый** автономный инсталлятор (NSIS). Автоматическое создание ярлыков на рабочем столе и в меню «Пуск», встроенный деинсталлятор. | [📥 **FluxProxy_0.2.0_x64-setup.exe** (9.1 МБ)](https://github.com/maq3000/flux-proxy/releases/download/v0.2.0/FluxProxy_0.2.0_x64-setup.exe) | `4b57c09e3ed0c9ad06e404f4c36ade9d93b3431e5ad977d29e34058e98758176` |
-| **Windows Package (`.msi`)** | `v0.2.0` | x64 | Пакет Windows Installer (MSI). Оптимизирован для тихой установки (`msiexec /i ... /qn`) и автоматизированного развертывания через Active Directory (GPO). | [📥 **FluxProxy_0.2.0_x64_en-US.msi** (11.7 МБ)](https://github.com/maq3000/flux-proxy/releases/download/v0.2.0/FluxProxy_0.2.0_x64_en-US.msi) | `5853d51f015a050a27ffa8fe8bd939f5643c4f10a3a02ca71ffc1cf8532f6fc1` |
+| **Windows Setup (`.exe`)** | `v0.3.0` | x64 | **Рекомендуемый** автономный инсталлятор (NSIS). Автоматическое создание ярлыков на рабочем столе и в меню «Пуск», встроенный деинсталлятор. | [📥 **FluxProxy_0.3.0_x64-setup.exe** (9.1 МБ)](https://github.com/maq3000/flux-proxy/releases/download/v0.3.0/FluxProxy_0.3.0_x64-setup.exe) | `d717be130f6f8233e5d4c180c27552445329b57a70036c7bdfe7f5548b17f69a` |
+| **Windows Package (`.msi`)** | `v0.3.0` | x64 | Пакет Windows Installer (MSI). Оптимизирован для тихой установки (`msiexec /i ... /qn`) и автоматизированного развертывания через Active Directory (GPO). | [📥 **FluxProxy_0.3.0_x64_en-US.msi** (11.8 МБ)](https://github.com/maq3000/flux-proxy/releases/download/v0.3.0/FluxProxy_0.3.0_x64_en-US.msi) | `f1b5129e3ce269ee4db1ab9a58b0573f2ac3a2d19b2a6d9ab2f20f67f905fa3a` |
 
 > 📦 **Все релизы проекта:** [github.com/maq3000/flux-proxy/releases](https://github.com/maq3000/flux-proxy/releases)  
 > 🐧 🍏 **macOS и Linux:** На текущем этапе сборка выполняется из исходного кода с помощью команды `npx @tauri-apps/cli build` (см. раздел [Быстрый старт](#-быстрый-старт)). Готовые дистрибутивы `.dmg` и `.AppImage` будут доступны в следующих релизах.
@@ -74,12 +74,16 @@
 
 ### 🛠 Инструменты анализа и модификации
 - **Протокольные анализаторы в Session Inspector**:
-  - Заголовки, Query-параметры, Cookies с флагами безопасности, предпросмотр изображений и Hex Viewer.
+  - Заголовки, Query-параметры, Cookies с флагами безопасности, предпросмотр изображений, виртуализированный **Hex Viewer** (`@tanstack/react-virtual`) и быстрое переключение вкладок активной панели клавишами **`Ctrl+1` … `Ctrl+6`**.
   - **JSON / XML Viewer** на базе **Monaco Editor** с подсветкой синтаксиса, поиском и форматированием.
   - **SSE & LLM Stream Inspector**: разбор потоков `text/event-stream` и сборка чанков ответов нейросетей (OpenAI, Anthropic, Gemini) в единый связный текст в один клик.
   - **gRPC & Protobuf Wire Decoder**: декодирование бинарных Protobuf-сообщений и проекция в JSON без `.proto`-файлов.
   - **Auth & Caching Inspectors**: аудит безопасности Basic/Bearer/JWT токенов и анализ HTTP-кэширования по RFC 9111.
   - **Multipart Form Inspector**: разбор `multipart/form-data` с мини-превью загружаемых изображений.
+- **Эргономика таблицы и адаптивный интерфейс**:
+  - Интерактивная сортировка всех 10 колонок таблицы (`ASC` / `DESC`), массовое выделение видимых сессий (`Ctrl+A`), автоподбор ширины колонок из контекстного меню шапки (**Auto-fit**), однострочный **Slim Toolbar (`Ctrl+Shift+T`)** и персистентность геометрии всех сплит-панелей и ориентации Инспектора между перезапусками.
+- **Диагностический мастер «Proxy Doctor» (`Ctrl+Shift+D`)**:
+  - Проверка сокета и конфликта порта, доверия Root CA, синхронизации системного прокси ОС, конфликтующих VPN/TUN-интерфейсов, брандмауэра Windows и сквозного пробника `http://flux.proxy/health` с 1-клик автоисправлением (**Fix All Fixable**).
 - **Live Breakpoints (Точки останова, `F11` / `Alt+F11`)**:
   - Пауза до отправки запроса (*Before Request*) или после ответа сервера (*After Response*), условные ловушки по URL (`bpu` / `bpafter`), редактирование заголовков, статусов и тел на лету.
 - **AutoResponder & Header Mutations**:
@@ -97,12 +101,13 @@
   - Управление размером `sessions.sqlite`: индикатор `SQLite: X.X MB` в статус-баре, ручной `VACUUM` + `wal_checkpoint(TRUNCATE)` и опция *Clear DB on App Exit* в настройках.
   - Режим **Drop Non-Matching on Capture** — отбрасывание фонового шума на этапе захвата без расхода оперативной памяти.
   - Ленивая подгрузка тяжелых тел (> 2 МБ) с диска только при открытии в инспекторе.
-- **Полная совместимость форматов (`Ctrl+S` / `Ctrl+O`)**:
+- **Полная совместимость форматов и Sanitized Export (`Ctrl+S` / `Ctrl+Shift+S` / `Ctrl+O`)**:
   - Экспорт и импорт индустриального стандарта **HAR 1.2 (`.har`)**, архивов **Fiddler Classic (`.saz`)**, **JSON**, сырых HTTP-сообщений (`.txt`) с защитой парсеров от ZIP-бомб и переполнения (включая UTF-16BE), а также выгрузка отдельных тел запросов и ответов в файлы.
+  - **Sanitized Export (`Ctrl+Shift+S`)**: безопасная передача архивов `.har`, `.saz`, `.json` и `.txt` с настраиваемым маскированием секретных заголовков (`Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`), рекурсивных ключей в JSON и `form-urlencoded`, query-параметров и опциональной анонимизацией IP/имени процесса клиента (пресеты *Safe Sharing*, *Strict Anonymization*, *Custom*).
   - Поддержка **Drag-and-Drop** файлов `.har`, `.saz` и `.json` прямо в окно программы.
-- **Централизованные настройки и профили (`Preferences`, `Ctrl+,`)**:
-  - Единое окно управления интерфейсом, портом прокси, колонками, фильтрами и правилами.
-  - Версионированный экспорт и импорт профиля настроек (`fluxproxy-settings-v1.json`) с превью изменений перед применением.
+- **Централизованные настройки, профили и единый старт (`Preferences`, `Ctrl+,`)**:
+  - Единое окно управления интерфейсом, портом прокси (с сохранением стартового порта в `proxy_port.pref` без двойного запуска), колонками, фильтрами и правилами.
+  - Версионированный экспорт и импорт профиля настроек (`fluxproxy-settings-v1.json`) с превью изменений перед применением, сохранением конфигурации точек останова (`breakpoints`), правил санитизации и ориентации сплит-панелей, а также транзакционным применением с откатом при сбое.
 
 ---
 
@@ -154,8 +159,9 @@
 │
 ├── src/                                 # Исходный код Frontend UI (React + TypeScript)
 │   ├── components/                      # Компоненты интерфейса
-│   │   ├── TrafficGrid.tsx              # Виртуализированная таблица запросов и контекстные меню
-│   │   ├── SessionInspector.tsx         # Инспектор запросов/ответов с ленивой подгрузкой тел
+│   │   ├── TrafficGrid.tsx              # Виртуализированная таблица с сортировкой колонок и контекстным меню
+│   │   ├── SessionInspector.tsx         # Инспектор запросов/ответов с ленивой подгрузкой тел и шорткатами Ctrl+1..6
+│   │   ├── HexViewer.tsx                # Виртуализированный шестнадцатеричный инспектор байтов
 │   │   ├── InspectorProtocolPanels.tsx  # Панели SSE/LLM, gRPC/Protobuf, Auth, Cache, Multipart
 │   │   ├── FilterDrawer.tsx             # Матрица фильтров, пороги шума, Selective TLS, мутации
 │   │   ├── HostFiltersTab.tsx           # Пакетный фильтр хостов (Whitelist / Blacklist)
@@ -163,12 +169,14 @@
 │   │   ├── AutoResponderPanel.tsx       # Правила подмены ответов и эмуляции задержек
 │   │   ├── BreakpointModal.tsx          # Перехватчик запросов и ответов на лету
 │   │   ├── SessionDiffView.tsx          # Визуальное сравнение двух сессий
+│   │   ├── SanitizedExportModal.tsx     # Экспорт сессий с очисткой PII и секретов (Ctrl+Shift+S)
+│   │   ├── ProxyDoctorModal.tsx         # Диагностический мастер самопроверки и автоисправления (Ctrl+Shift+D)
 │   │   ├── SettingsModal.tsx            # Централизованные настройки и профили (Ctrl+,)
-│   │   ├── TextWizardModal.tsx          # Декодер JWT, Base64, URL, Hex, Gzip/Brotli
+│   │   ├── TextWizardModal.tsx          # Декодер JWT, Base64, URL, Hex, Gzip/Brotli/Zstd
 │   │   ├── MobileSetupModal.tsx         # Мастер подключения iOS/Android по Wi-Fi с QR-кодом
 │   │   ├── CertificateModal.tsx         # Установка, проверка и удаление Root CA
 │   │   ├── CommandPalette.tsx           # Командная палитра и QuickExec (Ctrl+K)
-│   │   ├── TopToolbar.tsx               # Панель управления, поиска, лимита Keep и пресетов
+│   │   ├── TopToolbar.tsx               # Панель управления, Slim Toolbar, поиска, лимита Keep и пресетов
 │   │   └── MenuBar.tsx                  # Главное меню приложения
 │   ├── hooks/                           # Хуки управления сессиями, темой и раскладкой UI
 │   ├── lib/                             # Движок фильтров, парсеры протоколов, менеджер настроек, IPC-мост
@@ -180,9 +188,10 @@
     └── src/
         ├── main.rs / lib.rs             # Точка входа приложения и регистрация IPC-команд
         ├── commands.rs                  # Команды Tauri для взаимодействия с UI
-        ├── models.rs                    # Модели данных сессий, фильтров, кодеков и статистики
+        ├── models.rs                    # Модели данных сессий, фильтров, санитизации, кодеков и статистики
         ├── proxy/                       # Асинхронное ядро MITM-прокси
-        │   ├── server.rs                # HTTP/1.1, HTTP/2, HTTPS, WS прокси и встроенный портал flux.proxy
+        │   ├── server.rs                # HTTP/1.1, HTTP/2, HTTPS, WS прокси и портал flux.proxy (/health)
+        │   ├── doctor.rs                # Самодиагностика порта, Root CA, SysProxy, VPN, Firewall и /health
         │   ├── ca.rs                    # Генерация Root CA, сертификатов доменов и управление хранилищем ОС
         │   ├── filters.rs               # Selective TLS, стриппинг Alt-Svc, мутации заголовков, capture-drop
         │   ├── breakpoints.rs           # Менеджер живых точек останова
@@ -194,7 +203,7 @@
         └── storage/                     # Хранение и обмен данными
             ├── mod.rs                   # Потокобезопасный Ring Buffer и оффлоадинг тяжелых тел
             ├── sqlite.rs                # Архивация и чтение сессий из SQLite (WAL)
-            └── export_import.rs         # Экспорт/импорт HAR 1.2, Fiddler SAZ (.saz), JSON и Raw
+            └── export_import.rs         # Экспорт/импорт и санитизация HAR 1.2, Fiddler SAZ, JSON и Raw HTTP
 ```
 
 ---
@@ -290,6 +299,7 @@ FluxProxy умеет перехватывать трафик со смартфо
 | `Ctrl+,` / `Cmd+,` | Открыть окно настроек и профилей (**Preferences**) |
 | `F12` | Включить / приостановить захват трафика (**Capture**) |
 | `Ctrl+S` / `Cmd+S` | Сохранить все сессии в архив (`.har`, `.saz`, `.json`) |
+| `Ctrl+Shift+S` | Безопасный экспорт с маскированием токенов и PII (**Export Sanitized Sessions…**) |
 | `Ctrl+O` / `Cmd+O` | Открыть / импортировать архив сессий (`.har`, `.saz`, `.json`) |
 | `Ctrl+F` / `Cmd+F` | Фокус на поле быстрого поиска и фильтрации |
 | `F11` / `Alt+F11` | Перехват на лету: **Break Before Request** / **Break After Response** |
@@ -298,8 +308,12 @@ FluxProxy умеет перехватывать трафик со смартфо
 | `Ctrl+D` / `Cmd+D` | Открыть визуальное сравнение двух сессий (**Session Diff**) |
 | `Ctrl+E` / `Cmd+E` | Открыть **Text Wizard & JWT Decoder** |
 | `Ctrl+Shift+M` | Мастер подключения мобильных устройств (**Mobile Setup**) |
+| `Ctrl+Shift+D` | Запустить диагностический мастер самопроверки (**Proxy Doctor**) |
+| `Ctrl+Shift+T` | Переключить однострочный компактный тулбар (**Slim / Compact Toolbar**) |
+| `Ctrl+A` / `Cmd+A` | Выделить все видимые сессии в таблице |
 | `M` / `U` | Добавить комментарий и цветовую метку (`M`) / снять метку (`U`) |
 | `Space` / `Enter` | Открыть **Session Inspector** и переключить фокус между таблицей и инспектором |
+| `Ctrl+1` … `Ctrl+6` | Переключение вкладок активной панели **Session Inspector** (*Headers*, *JSON/Raw*, *Cookies/Params*, *Auth*, *Raw*, *Hex*) |
 | `Delete` / `Backspace` | Удалить выбранные сессии из таблицы |
 | `Ctrl+X` / `Cmd+X` | Полностью очистить список сессий (**Clear All**) |
 | `Ctrl+C` / `Cmd+C` | Скопировать URL выбранных сессий |
@@ -347,9 +361,11 @@ curl -x http://127.0.0.1:8888 https://httpbin.org/get -k
 - ✅ Прозрачная распаковка сжатия **Zstandard (`zstd`, RFC 8878)** на лету (прокси-ядро, Composer, Text Wizard).
 - ✅ **Привязка к конкретному IP / сетевому интерфейсу** (Wi-Fi/Ethernet/WSL/VPN) и режим **Dual Listener** (loopback + выбранный адаптер).
 - ✅ Управление хранилищем SQLite (`VACUUM` + `wal_checkpoint(TRUNCATE)`, *Clear DB on App Exit*), неблокирующий Tokio-рантайм (`spawn_blocking`), предкомпиляция Regex и $O(1)$ SSE/WebSocket-стриминг.
+- ✅ Сортировка всех колонок таблицы (`ASC`/`DESC`), `Ctrl+A`, автоподбор ширины колонок (`Auto-fit`), персистентность геометрии сплитов, однострочный **Slim Toolbar (`Ctrl+Shift+T`)**, шорткаты вкладок `Ctrl+1..6`, виртуализация `HexViewer` и `manualChunks` в Vite.
+- ✅ Очистка и маскирование PII/секретов при экспорте (**Sanitized Export**, `Ctrl+Shift+S`) для `.har`, `.saz`, `.json` и Raw HTTP.
+- ✅ Диагностический мастер самопроверки и 1-клик починки **«Proxy Doctor» (`Ctrl+Shift+D`)**, единая точка старта порта (`proxy_port.pref`) и транзакционное применение профилей настроек с поддержкой `breakpoints`.
 
 ### Ближайшие этапы разработки:
-- 🔜 **P0 (High)** — Сортировка колонок таблицы (`ASC`/`DESC`) и `Ctrl+A`, сохранение геометрии сплитов, компактный тулбар (`Ctrl+Shift+T`) и шорткаты вкладок `Ctrl+1..6`, очистка PII/секретов при экспорте (**Sanitized Export**), мастер самопроверки **«Proxy Doctor»**, унификация запуска и виртуализация `HexViewer`.
 - 🔜 **P1** — Продвинутые темы-пресеты и палитра, **Selective MITM 2.0**, клиентские сертификаты (**mTLS**), **Python Scripting Engine**, **Composer 2.0** («Paste cURL» и кодогенератор), генератор **OpenAPI 3.0 / Swagger** и тесты **Vitest & CI/CD**.
 - 🔜 **P2** — **HOSTS Remapping** (виртуальный DNS), **Bandwidth Throttling** (эмуляция 3G/LTE), архитектурная декомпозиция + **Zustand**, **Waterfall Timeline**, статистика трафика, **Upstream Proxy** и ручная отправка WebSocket-сообщений.
 
