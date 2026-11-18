@@ -2200,7 +2200,8 @@ export function useProxySessions() {
   );
 
   const selectSessionRange = useCallback(
-    (targetId: number) => {
+    (targetId: number, orderedSessions?: SessionSummary[]) => {
+      const pool = orderedSessions ?? filteredSessions;
       const anchor =
         selectionAnchorIdRef.current ?? selectedIds[0] ?? selectedId;
       if (anchor === null) {
@@ -2215,8 +2216,8 @@ export function useProxySessions() {
         setSelectedIds([targetId]);
         return;
       }
-      const anchorIdx = filteredSessions.findIndex((s) => s.id === anchor);
-      const targetIdx = filteredSessions.findIndex((s) => s.id === targetId);
+      const anchorIdx = pool.findIndex((s) => s.id === anchor);
+      const targetIdx = pool.findIndex((s) => s.id === targetId);
       if (anchorIdx === -1 || targetIdx === -1) {
         setSelectedIdState(targetId);
         setSelectedIds([anchor, targetId]);
@@ -2225,12 +2226,32 @@ export function useProxySessions() {
       const step = anchorIdx <= targetIdx ? 1 : -1;
       const rangeIds: number[] = [];
       for (let i = anchorIdx; step > 0 ? i <= targetIdx : i >= targetIdx; i += step) {
-        rangeIds.push(filteredSessions[i].id);
+        rangeIds.push(pool[i].id);
       }
       setSelectedIdState(targetId);
       setSelectedIds(rangeIds);
     },
     [filteredSessions, selectedId, selectedIds]
+  );
+
+  const selectSessions = useCallback(
+    (ids: number[]) => {
+      if (ids.length === 0) {
+        selectionAnchorIdRef.current = null;
+        setSelectedIdState(null);
+        setSelectedIds([]);
+        return;
+      }
+      const uniqueIds = Array.from(new Set(ids));
+      const nextPrimary =
+        selectedId !== null && uniqueIds.includes(selectedId)
+          ? selectedId
+          : uniqueIds[0];
+      selectionAnchorIdRef.current = nextPrimary;
+      setSelectedIdState(nextPrimary);
+      setSelectedIds(uniqueIds);
+    },
+    [selectedId]
   );
 
   const compareWithSession = useCallback(
@@ -2959,6 +2980,7 @@ export function useProxySessions() {
     selectedIds,
     toggleSessionSelection,
     selectSessionRange,
+    selectSessions,
     compareWithSession,
     setComparePairIds,
     swapCompareSessions,

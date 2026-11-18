@@ -428,6 +428,8 @@ export type ColumnId =
   | "time"
   | "comment";
 
+export type SortDirection = "asc" | "desc";
+
 export type ToolbarGroupId =
   | "capture"
   | "proxyMode"

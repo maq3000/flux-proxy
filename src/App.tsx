@@ -96,6 +96,7 @@ export const App: React.FC = () => {
     selectedIds,
     toggleSessionSelection,
     selectSessionRange,
+    selectSessions,
     compareWithSession,
     setComparePairIds,
     swapCompareSessions,
@@ -191,6 +192,21 @@ export const App: React.FC = () => {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const trafficGridRef = useRef<HTMLDivElement>(null);
   const inspectorContainerRef = useRef<HTMLDivElement>(null);
+  const sortedSessionsRef = useRef<SessionSummary[]>(filteredSessions);
+
+  const handleSelectAllSessions = useCallback(
+    (explicitIds?: number[]) => {
+      const ids =
+        explicitIds ??
+        (sortedSessionsRef.current.length === filteredSessions.length
+          ? sortedSessionsRef.current.map((s) => s.id)
+          : filteredSessions.map((s) => s.id));
+      if (ids.length === 0) return;
+      setActiveSection("traffic");
+      selectSessions(ids);
+    },
+    [filteredSessions, selectSessions]
+  );
 
   const [activeSection, setActiveSection] =
     useState<ActiveNavSection>("traffic");
@@ -974,6 +990,7 @@ export const App: React.FC = () => {
         return true;
       }
       if (target.isContentEditable) return true;
+      if (target.closest("[contenteditable]")) return true;
       if (target.closest(".monaco-editor")) return true;
       return false;
     };
@@ -1088,6 +1105,28 @@ export const App: React.FC = () => {
       ) {
         e.preventDefault();
         setMobileModalOpen((prev) => !prev);
+        return;
+      }
+
+      // Ctrl+A / Cmd+A -> Select all visible sessions
+      if (
+        ctrlOrMeta &&
+        !e.altKey &&
+        !e.shiftKey &&
+        (keyLower === "a" || e.code === "KeyA") &&
+        !isEditableTarget(e.target) &&
+        !hasOpenModal()
+      ) {
+        if (activeSection === "traffic") {
+          e.preventDefault();
+          const ids =
+            sortedSessionsRef.current.length === filteredSessions.length
+              ? sortedSessionsRef.current.map((s) => s.id)
+              : filteredSessions.map((s) => s.id);
+          if (ids.length > 0) {
+            selectSessions(ids);
+          }
+        }
         return;
       }
 
@@ -1269,11 +1308,13 @@ export const App: React.FC = () => {
     disableAllBreakpoints,
     effectiveSelectedIds,
     exportAllSessionsAs,
+    filteredSessions,
     handleFocusSearch,
     importArchiveDialog,
     openAnnotationFor,
     openDiffWithPairSmart,
     replaySessions,
+    selectSessions,
     toggleBreakAfterResponse,
     toggleBreakBeforeRequest,
     toggleProxy,
@@ -1345,6 +1386,13 @@ export const App: React.FC = () => {
 
   const commands: PaletteCommand[] = useMemo(
     () => [
+      {
+        id: "select-all-sessions",
+        category: "Traffic",
+        label: "Select All Visible Sessions in Traffic Grid",
+        shortcut: "Ctrl+A",
+        perform: () => handleSelectAllSessions(),
+      },
       {
         id: "replay-selected",
         category: "Traffic",
@@ -1799,6 +1847,7 @@ export const App: React.FC = () => {
       handleInspectInHex,
       handleOpenCustomRetentionLimit,
       handleResetAllSettings,
+      handleSelectAllSessions,
       importArchiveDialog,
       inspectorCollapsed,
       isForceNoCacheActive,
@@ -1880,6 +1929,10 @@ export const App: React.FC = () => {
       }}
       onToggleSelectSession={toggleSessionSelection}
       onSelectSessionRange={selectSessionRange}
+      onSelectAllSessions={selectSessions}
+      onSortedSessionsChange={(list) => {
+        sortedSessionsRef.current = list;
+      }}
       onFocusInspector={handleFocusInspector}
       onDeleteSessions={(ids) => void deleteSessions(ids)}
       onReplaySessions={(ids) => void replaySessions(ids)}
@@ -2007,6 +2060,7 @@ export const App: React.FC = () => {
         onExportSettingsProfile={() => void handleExportSettingsProfile()}
         onImportSettingsProfile={() => void handleImportSettingsProfileDialog()}
         onOpenPreferences={() => openPreferencesAt("general")}
+        onSelectAllSessions={() => handleSelectAllSessions()}
         onCopyUrl={() => copyUrlsForIds(effectiveSelectedIds)}
         onCopyCurl={() => {
           if (selectedId !== null) void copySessionAsCurl(selectedId);

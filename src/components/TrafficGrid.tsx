@@ -38,6 +38,7 @@ import type {
   ColumnId,
   NoiseThresholdsConfig,
   SessionSummary,
+  SortDirection,
 } from "../types/proxy";
 
 interface TrafficGridProps {
@@ -52,7 +53,9 @@ interface TrafficGridProps {
   onResetColumns: () => void;
   onSelectSession: (id: number) => void;
   onToggleSelectSession: (id: number) => void;
-  onSelectSessionRange: (id: number) => void;
+  onSelectSessionRange: (id: number, orderedSessions?: SessionSummary[]) => void;
+  onSelectAllSessions?: (ids: number[]) => void;
+  onSortedSessionsChange?: (sessions: SessionSummary[]) => void;
   onFocusInspector: () => void;
   onDeleteSessions: (ids: number[]) => void;
   onReplaySessions: (ids: number[]) => void;
@@ -84,6 +87,63 @@ interface TrafficGridProps {
 
 const ROW_HEIGHT = 28;
 const HEADER_HEIGHT = 28;
+const STRING_SORT_LOCALE_OPTS: Intl.CollatorOptions = {
+  numeric: false,
+  sensitivity: "base",
+};
+
+function compareSessions(
+  a: SessionSummary,
+  b: SessionSummary,
+  colId: ColumnId
+): number {
+  switch (colId) {
+    case "id":
+      return a.id - b.id;
+    case "status":
+      return a.status - b.status;
+    case "size":
+      return a.bodySize - b.bodySize;
+    case "time":
+      return a.durationMs - b.durationMs;
+    case "method":
+      return (a.method || "").localeCompare(
+        b.method || "",
+        undefined,
+        STRING_SORT_LOCALE_OPTS
+      );
+    case "protocol":
+      return (a.protocol || "").localeCompare(
+        b.protocol || "",
+        undefined,
+        STRING_SORT_LOCALE_OPTS
+      );
+    case "host":
+      return (a.host || "").localeCompare(
+        b.host || "",
+        undefined,
+        STRING_SORT_LOCALE_OPTS
+      );
+    case "url":
+      return (a.path || a.url || "").localeCompare(
+        b.path || b.url || "",
+        undefined,
+        STRING_SORT_LOCALE_OPTS
+      );
+    case "process":
+      return (a.processName || a.clientIp || "").localeCompare(
+        b.processName || b.clientIp || "",
+        undefined,
+        STRING_SORT_LOCALE_OPTS
+      );
+    case "comment":
+      return (a.comment || "").localeCompare(
+        b.comment || "",
+        undefined,
+        STRING_SORT_LOCALE_OPTS
+      );
+  }
+}
 
 function isRemoteClientIp(ip?: string | null): ip is string {
   if (!ip) return false;
@@ -236,6 +296,8 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
   onSelectSession,
   onToggleSelectSession,
   onSelectSessionRange,
+  onSelectAllSessions,
+  onSortedSessionsChange,
   onFocusInspector,
   onDeleteSessions,
   onReplaySessions,
@@ -269,6 +331,44 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
 
   const [ctxSession, setCtxSession] = useState<SessionSummary | null>(null);
   const [resizingCol, setResizingCol] = useState<ColumnId | null>(null);
+  const [sortColumn, setSortColumn] = useState<ColumnId | null>(null);
+  const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
+  const [ctxHeaderCol, setCtxHeaderCol] = useState<ColumnId | null>(null);
+  const [sortAnnouncement, setSortAnnouncement] = useState<string>("");
+  const suppressNextHeaderClickRef = useRef<boolean>(false);
+  const hasMountedSortRef = useRef<boolean>(false);
+
+  const sortedSessions = useMemo(() => {
+    if (!sortColumn) return sessions;
+    const factor = sortDirection === "asc" ? 1 : -1;
+    const copy = sessions.slice();
+    copy.sort((a, b) => {
+      const cmp = compareSessions(a, b, sortColumn);
+      if (cmp !== 0) return cmp * factor;
+      return (a.id - b.id) * factor;
+    });
+    return copy;
+  }, [sessions, sortColumn, sortDirection]);
+
+  useEffect(() => {
+    onSortedSessionsChange?.(sortedSessions);
+  }, [sortedSessions, onSortedSessionsChange]);
+
+  useEffect(() => {
+    if (!hasMountedSortRef.current) {
+      hasMountedSortRef.current = true;
+      return;
+    }
+    if (!sortColumn) {
+      setSortAnnouncement("Сортировка сброшена (порядок по умолчанию)");
+      return;
+    }
+    const colLabel =
+      TRAFFIC_COLUMNS.find((c) => c.id === sortColumn)?.label ?? sortColumn;
+    setSortAnnouncement(
+      `Сортировка: ${colLabel}, ${sortDirection === "asc" ? "по возрастанию" : "по убыванию"}`
+    );
+  }, [sortColumn, sortDirection]);
 
   const effectivePassthroughHandler =
     onAlwaysPassthroughHost ?? onAddHostToTlsBypass;
@@ -339,15 +439,41 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
     (e: React.MouseEvent<HTMLDivElement>) => {
       e.preventDefault();
       closeContextMenu();
+      const colEl = (e.target as HTMLElement | null)?.closest<HTMLElement>(
+        "[data-col-id]"
+      );
+      setCtxHeaderCol((colEl?.dataset.colId as ColumnId | undefined) ?? null);
       openFixedContextPopover(
         headerColPopoverRef.current,
         e.clientX,
         e.clientY,
         228,
-        340
+        440
       );
     },
     [closeContextMenu]
+  );
+
+  const handleHeaderClick = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>, colId: ColumnId) => {
+      if (suppressNextHeaderClickRef.current) {
+        suppressNextHeaderClickRef.current = false;
+        return;
+      }
+      if ((e.target as HTMLElement | null)?.closest('[role="separator"]')) {
+        return;
+      }
+      if (sortColumn !== colId) {
+        setSortColumn(colId);
+        setSortDirection("asc");
+      } else if (sortDirection === "asc") {
+        setSortDirection("desc");
+      } else {
+        setSortColumn(null);
+        setSortDirection("asc");
+      }
+    },
+    [sortColumn, sortDirection]
   );
 
   // Progressive enhancement fallback for browsers where native `focusgroup` is not yet supported
@@ -412,6 +538,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
       let latestWidth = startWidth;
 
       setResizingCol(col.id);
+      suppressNextHeaderClickRef.current = true;
       const prevCursor = document.body.style.cursor;
       const prevUserSelect = document.body.style.userSelect;
       document.body.style.cursor = "col-resize";
@@ -441,6 +568,9 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
         document.body.style.userSelect = prevUserSelect;
         setResizingCol(null);
         onColumnWidthChange(col.id, latestWidth);
+        window.setTimeout(() => {
+          suppressNextHeaderClickRef.current = false;
+        }, 0);
       };
 
       window.addEventListener("mousemove", onMouseMove);
@@ -453,6 +583,10 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
     (e: React.MouseEvent<HTMLDivElement>, col: ColumnDefinition) => {
       e.preventDefault();
       e.stopPropagation();
+      suppressNextHeaderClickRef.current = true;
+      window.setTimeout(() => {
+        suppressNextHeaderClickRef.current = false;
+      }, 0);
 
       const headerFont =
         "600 11px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
@@ -461,9 +595,9 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
 
       let maxPx = getTextWidthPx(col.label.toUpperCase(), headerFont) + 22;
 
-      const sampleStep = Math.max(1, Math.floor(sessions.length / 250));
-      for (let i = 0; i < sessions.length; i += sampleStep) {
-        const s = sessions[i];
+      const sampleStep = Math.max(1, Math.floor(sortedSessions.length / 250));
+      for (let i = 0; i < sortedSessions.length; i += sampleStep) {
+        const s = sortedSessions[i];
         const sample = getCellSampleText(s, col.id);
         if (!sample) continue;
         const extra =
@@ -483,7 +617,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
       );
       onColumnWidthChange(col.id, clamped);
     },
-    [onColumnWidthChange, sessions]
+    [onColumnWidthChange, sortedSessions]
   );
 
   const ctxHostClean = useMemo(
@@ -504,7 +638,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
   }, [ctxSession, selectedIds, selectedSet]);
 
   const rowVirtualizer = useVirtualizer({
-    count: sessions.length,
+    count: sortedSessions.length,
     getScrollElement: () => scrollParentRef.current,
     estimateSize: () => ROW_HEIGHT,
     scrollPaddingStart: HEADER_HEIGHT,
@@ -512,10 +646,13 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
   });
 
   useEffect(() => {
-    if (followTail && sessions.length > 0) {
-      rowVirtualizer.scrollToIndex(sessions.length - 1, { align: "end" });
+    if (!followTail || sortedSessions.length === 0) return;
+    if (sortColumn === null || (sortColumn === "id" && sortDirection === "asc")) {
+      rowVirtualizer.scrollToIndex(sortedSessions.length - 1, { align: "end" });
+    } else if (sortColumn === "id" && sortDirection === "desc") {
+      rowVirtualizer.scrollToIndex(0, { align: "start" });
     }
-  }, [followTail, sessions.length, rowVirtualizer]);
+  }, [followTail, sortedSessions.length, sortColumn, sortDirection, rowVirtualizer]);
 
   const getEffectiveTargetIds = useCallback((): number[] => {
     if (selectedIds.length > 0) return selectedIds;
@@ -527,8 +664,31 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
     const targetEl = e.target as HTMLElement | null;
     if (
       targetEl &&
-      targetEl.closest("input, textarea, select, [contenteditable='true']")
+      (targetEl.isContentEditable ||
+        targetEl.closest(
+          "input, textarea, select, [contenteditable], .monaco-editor"
+        ))
     ) {
+      return;
+    }
+
+    // Ctrl+A / Cmd+A -> Select all visible sessions
+    if (
+      (e.ctrlKey || e.metaKey) &&
+      !e.altKey &&
+      !e.shiftKey &&
+      (e.key.toLowerCase() === "a" || e.code === "KeyA")
+    ) {
+      if (
+        typeof document !== "undefined" &&
+        document.querySelector("dialog[open]")
+      ) {
+        return;
+      }
+      e.preventDefault();
+      if (sortedSessions.length > 0) {
+        onSelectAllSessions?.(sortedSessions.map((s) => s.id));
+      }
       return;
     }
 
@@ -550,7 +710,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
       if (targetEl && targetEl.closest("button") && targetEl !== e.currentTarget) {
         return;
       }
-      if (sessions.length > 0) {
+      if (sortedSessions.length > 0) {
         e.preventDefault();
         onFocusInspector();
       }
@@ -566,10 +726,10 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
       e.key === "Home" ||
       e.key === "End"
     ) {
-      if (sessions.length === 0) return;
+      if (sortedSessions.length === 0) return;
       e.preventDefault();
 
-      const currentIdx = sessions.findIndex((s) => s.id === selectedId);
+      const currentIdx = sortedSessions.findIndex((s) => s.id === selectedId);
       const viewportHeight =
         (scrollParentRef.current?.clientHeight ?? 360) - HEADER_HEIGHT;
       const pageStep = Math.max(1, Math.floor(viewportHeight / ROW_HEIGHT) - 1);
@@ -580,19 +740,19 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
           nextIdx =
             currentIdx < 0
               ? 0
-              : Math.min(sessions.length - 1, currentIdx + 1);
+              : Math.min(sortedSessions.length - 1, currentIdx + 1);
           break;
         case "ArrowUp":
           nextIdx =
             currentIdx < 0
-              ? sessions.length - 1
+              ? sortedSessions.length - 1
               : Math.max(0, currentIdx - 1);
           break;
         case "PageDown":
           nextIdx =
             currentIdx < 0
-              ? Math.min(sessions.length - 1, pageStep)
-              : Math.min(sessions.length - 1, currentIdx + pageStep);
+              ? Math.min(sortedSessions.length - 1, pageStep)
+              : Math.min(sortedSessions.length - 1, currentIdx + pageStep);
           break;
         case "PageUp":
           nextIdx =
@@ -602,22 +762,32 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
           nextIdx = 0;
           break;
         case "End":
-          nextIdx = sessions.length - 1;
+          nextIdx = sortedSessions.length - 1;
           break;
       }
 
-      if (
-        followTail &&
-        (e.key === "ArrowUp" || e.key === "PageUp" || e.key === "Home") &&
-        nextIdx < sessions.length - 1
-      ) {
-        onDisableFollowTail?.();
+      if (followTail) {
+        if (
+          sortColumn === "id" &&
+          sortDirection === "desc" &&
+          (e.key === "ArrowDown" || e.key === "PageDown" || e.key === "End") &&
+          nextIdx > 0
+        ) {
+          onDisableFollowTail?.();
+        } else if (
+          (sortColumn === null ||
+            (sortColumn === "id" && sortDirection === "asc")) &&
+          (e.key === "ArrowUp" || e.key === "PageUp" || e.key === "Home") &&
+          nextIdx < sortedSessions.length - 1
+        ) {
+          onDisableFollowTail?.();
+        }
       }
 
-      const nextSession = sessions[nextIdx];
+      const nextSession = sortedSessions[nextIdx];
       if (nextSession) {
         if (e.shiftKey) {
-          onSelectSessionRange(nextSession.id);
+          onSelectSessionRange(nextSession.id, sortedSessions);
         } else {
           onSelectSession(nextSession.id);
         }
@@ -709,6 +879,9 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
       }
       className="pane-contain flex h-full w-full flex-col bg-canvas focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-accent/50"
     >
+      <p role="status" className="sr-only">
+        {sortAnnouncement}
+      </p>
       {/* Contextual Multi-Select & Session Diff Banner */}
       {selectedIds.length >= 2 && (
         <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-hairline bg-elevated px-2.5 py-1 text-xs">
@@ -783,7 +956,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
         <div
           role="row"
           onContextMenu={handleHeaderContextMenu}
-          title="Потяните границу колонки для изменения ширины • Двойной клик для автоподбора • Правый клик для настройки колонок"
+          title="Клик по заголовку для сортировки • Потяните границу колонки для ширины • Двойной клик для автоподбора • Правый клик для настройки"
           style={{
             gridTemplateColumns: "var(--traffic-grid-template)",
             minWidth: "max(100%, var(--traffic-min-width))",
@@ -793,20 +966,42 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
         >
           {activeColumns.map((col) => {
             const isBeingResized = resizingCol === col.id;
+            const isSorted = sortColumn === col.id;
             return (
               <div
                 key={col.id}
                 role="columnheader"
-                className={`relative flex h-full min-w-0 items-center px-2 ${
+                data-col-id={col.id}
+                aria-sort={
+                  isSorted
+                    ? sortDirection === "asc"
+                      ? "ascending"
+                      : "descending"
+                    : undefined
+                }
+                onClick={(e) => handleHeaderClick(e, col.id)}
+                className={`relative flex h-full min-w-0 cursor-pointer items-center px-2 transition-colors hover:bg-hover/60 hover:text-fg ${
                   col.align === "right" ? "justify-end" : "justify-start"
-                }`}
+                } ${isSorted ? "text-fg" : ""}`}
               >
                 <span className="truncate">{col.label}</span>
+                {isSorted && (
+                  <span
+                    aria-hidden="true"
+                    className="ml-1 shrink-0 text-[9px] leading-none text-accent"
+                  >
+                    {sortDirection === "asc" ? "▲" : "▼"}
+                  </span>
+                )}
                 {/* Interactive Resize Handle */}
                 <div
                   role="separator"
                   aria-orientation="vertical"
                   aria-label={`Resize ${col.label} column`}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }}
                   onMouseDown={(e) => handleResizeMouseDown(e, col)}
                   onDoubleClick={(e) => handleResizeDoubleClick(e, col)}
                   className="group/handle absolute -right-1 top-0 z-20 flex h-full w-2.5 cursor-col-resize items-center justify-center"
@@ -827,7 +1022,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
         </div>
 
         {/* Virtualized Rows */}
-        {sessions.length === 0 ? (
+        {sortedSessions.length === 0 ? (
           <div className="flex h-[calc(100%-28px)] min-h-[160px] flex-col items-center justify-center gap-1.5 px-4 text-center text-xs text-muted">
             <span>Нет подходящих сессий для текущих фильтров.</span>
             <span className="text-[11px] text-subtle">
@@ -843,7 +1038,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
             }}
           >
             {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-              const s = sessions[virtualRow.index];
+              const s = sortedSessions[virtualRow.index];
               const isPrimarySelected = s.id === selectedId;
               const isInMultiSelection = selectedSet.has(s.id);
               const isDiffA = s.id === diffLeftId;
@@ -931,7 +1126,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
                     if (e.ctrlKey || e.metaKey) {
                       onToggleSelectSession(s.id);
                     } else if (e.shiftKey) {
-                      onSelectSessionRange(s.id);
+                      onSelectSessionRange(s.id, sortedSessions);
                     } else {
                       onSelectSession(s.id);
                     }
@@ -1261,12 +1456,83 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
         )}
       </div>
 
-      {/* Column Header Right-Click Column Picker Popover (plain checkbox disclosure, not role="menu") */}
+      {/* Column Header Right-Click Column Picker & Sort Popover (plain disclosure, not role="menu") */}
       <div
         ref={headerColPopoverRef}
         {...({ popover: "auto" } as Record<string, string>)}
-        className="session-context-menu z-50 hidden w-56 rounded-lg border border-strong bg-surface p-2 text-fg shadow-popover"
+        className="session-context-menu z-50 hidden w-60 rounded-lg border border-strong bg-surface p-2 text-fg shadow-popover"
       >
+        {(() => {
+          const targetCol =
+            TRAFFIC_COLUMNS.find(
+              (c) => c.id === (ctxHeaderCol ?? sortColumn)
+            ) ?? TRAFFIC_COLUMNS[0];
+          const isAsc =
+            sortColumn === targetCol.id && sortDirection === "asc";
+          const isDesc =
+            sortColumn === targetCol.id && sortDirection === "desc";
+          return (
+            <>
+              <div className="mb-1 flex items-center justify-between px-1">
+                <span className="truncate text-[11px] font-semibold text-fg">
+                  Сортировка: {targetCol.label}
+                </span>
+                <button
+                  type="button"
+                  disabled={sortColumn === null}
+                  onClick={() => {
+                    setSortColumn(null);
+                    setSortDirection("asc");
+                    closeHeaderMenu();
+                  }}
+                  className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-muted hover:bg-hover hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  <RotateCcw className="h-2.5 w-2.5" />
+                  <span>Сбросить</span>
+                </button>
+              </div>
+              <div className="mb-1.5 grid grid-cols-1 gap-0.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSortColumn(targetCol.id);
+                    setSortDirection("asc");
+                    closeHeaderMenu();
+                  }}
+                  className={`flex items-center justify-between rounded px-1.5 py-1 text-left text-xs hover:bg-hover ${
+                    isAsc ? "bg-selected font-semibold text-accent" : "text-fg"
+                  }`}
+                >
+                  <span>▲ По возрастанию (ASC)</span>
+                  {isAsc && (
+                    <span className="text-[10px]" aria-hidden="true">
+                      ✓
+                    </span>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSortColumn(targetCol.id);
+                    setSortDirection("desc");
+                    closeHeaderMenu();
+                  }}
+                  className={`flex items-center justify-between rounded px-1.5 py-1 text-left text-xs hover:bg-hover ${
+                    isDesc ? "bg-selected font-semibold text-accent" : "text-fg"
+                  }`}
+                >
+                  <span>▼ По убыванию (DESC)</span>
+                  {isDesc && (
+                    <span className="text-[10px]" aria-hidden="true">
+                      ✓
+                    </span>
+                  )}
+                </button>
+              </div>
+              <hr className="my-1.5 border-hairline" />
+            </>
+          );
+        })()}
         <div className="mb-1.5 flex items-center justify-between px-1">
           <span className="text-[11px] font-semibold text-fg">
             Видимость колонок

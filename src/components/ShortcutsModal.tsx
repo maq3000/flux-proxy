@@ -18,6 +18,10 @@ const SHORTCUT_GROUPS: {
         keys: "Shift + ↑ / ↓",
         description: "Множественное выделение диапазона строк",
       },
+      {
+        keys: "Ctrl+A / Cmd+A",
+        description: "Выделить все видимые сессии в таблице",
+      },
       { keys: "PageUp / PageDown", description: "Прокрутка на экран вверх / вниз" },
       { keys: "Home / End", description: "Переход к первой / последней сессии" },
       {

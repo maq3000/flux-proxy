@@ -45,6 +45,7 @@ interface MenuBarProps {
   onImportSettingsProfile: () => void;
   onOpenPreferences: () => void;
   // Edit
+  onSelectAllSessions?: () => void;
   onCopyUrl: () => void;
   onCopyCurl: () => void;
   onCopyRequestHeaders: () => void;
@@ -280,6 +281,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onExportSettingsProfile,
   onImportSettingsProfile,
   onOpenPreferences,
+  onSelectAllSessions,
   onCopyUrl,
   onCopyCurl,
   onCopyRequestHeaders,
@@ -1068,6 +1070,21 @@ export const MenuBar: React.FC<MenuBarProps> = ({
               {...({ focusgroup: "menu nomemory" } as Record<string, string>)}
               aria-labelledby={menuIds.edit.trigger}
             >
+              {onSelectAllSessions && (
+                <>
+                  <button
+                    type="button"
+                    disabled={filteredCount === 0}
+                    onClick={(e) => activateCommand(e, onSelectAllSessions)}
+                  >
+                    <span>Select All Sessions</span>
+                    <span className="hint" aria-hidden="true">
+                      Ctrl+A
+                    </span>
+                  </button>
+                  <hr />
+                </>
+              )}
               <button
                 type="button"
                 disabled={!hasSelection}
