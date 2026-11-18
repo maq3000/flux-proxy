@@ -46,6 +46,7 @@ import type {
   ProxyFilterBackendConfig,
   ProxyStatus,
   QuickFilterCategory,
+  SanitizationOptions,
   SessionDetail,
   SessionSummary,
   StorageStats,
@@ -2544,13 +2545,15 @@ export function useProxySessions() {
   const exportSessionsWithDialog = useCallback(
     async (
       targetSessionIds: number[],
-      forcedFormat?: "har" | "saz" | "json" | "raw"
-    ) => {
+      forcedFormat?: "har" | "saz" | "json" | "raw",
+      sanitization?: SanitizationOptions | null
+    ): Promise<boolean> => {
       try {
         const stamp = new Date()
           .toISOString()
           .replace(/[:.]/g, "-")
           .slice(0, 19);
+        const suffix = sanitization ? "_sanitized" : "";
 
         let filters: FileDialogFilter[];
         let defaultName: string;
@@ -2562,10 +2565,10 @@ export function useProxySessions() {
           ];
           defaultName =
             targetSessionIds.length === 1
-              ? `session_${targetSessionIds[0]}.har`
+              ? `session_${targetSessionIds[0]}${suffix}.har`
               : targetSessionIds.length > 1
-                ? `fluxproxy_selected_${targetSessionIds.length}.har`
-                : `fluxproxy_capture_${stamp}.har`;
+                ? `fluxproxy_selected_${targetSessionIds.length}${suffix}.har`
+                : `fluxproxy_capture_${stamp}${suffix}.har`;
         } else if (forcedFormat === "saz") {
           filters = [
             { name: "Fiddler Session Archive (*.saz)", extensions: ["saz"] },
@@ -2573,10 +2576,10 @@ export function useProxySessions() {
           ];
           defaultName =
             targetSessionIds.length === 1
-              ? `session_${targetSessionIds[0]}.saz`
+              ? `session_${targetSessionIds[0]}${suffix}.saz`
               : targetSessionIds.length > 1
-                ? `fluxproxy_selected_${targetSessionIds.length}.saz`
-                : `fluxproxy_capture_${stamp}.saz`;
+                ? `fluxproxy_selected_${targetSessionIds.length}${suffix}.saz`
+                : `fluxproxy_capture_${stamp}${suffix}.saz`;
         } else if (forcedFormat === "raw") {
           filters = [
             { name: "Raw HTTP Message (*.txt)", extensions: ["txt"] },
@@ -2584,14 +2587,14 @@ export function useProxySessions() {
           ];
           defaultName =
             targetSessionIds.length === 1
-              ? `session_${targetSessionIds[0]}_raw.txt`
-              : `sessions_raw_${targetSessionIds.length}.txt`;
+              ? `session_${targetSessionIds[0]}_raw${suffix}.txt`
+              : `sessions_raw_${targetSessionIds.length || "all"}${suffix}.txt`;
         } else if (forcedFormat === "json") {
           filters = [
             { name: "JSON Sessions Archive (*.json)", extensions: ["json"] },
             { name: "All Files (*.*)", extensions: ["*"] },
           ];
-          defaultName = `fluxproxy_capture_${stamp}.json`;
+          defaultName = `fluxproxy_capture_${stamp}${suffix}.json`;
         } else {
           filters = [
             { name: "HTTP Archive 1.2 (*.har)", extensions: ["har"] },
@@ -2601,19 +2604,20 @@ export function useProxySessions() {
           ];
           defaultName =
             targetSessionIds.length > 0
-              ? `fluxproxy_selected_${targetSessionIds.length}.har`
-              : `fluxproxy_capture_${stamp}.har`;
+              ? `fluxproxy_selected_${targetSessionIds.length}${suffix}.har`
+              : `fluxproxy_capture_${stamp}${suffix}.har`;
         }
 
+        const titlePrefix = sanitization ? "Export Sanitized" : "Save";
         const chosenPath = await proxyBridge.pickSaveFileDialog({
           title:
             targetSessionIds.length > 0
-              ? `Save Selected Sessions (${targetSessionIds.length})`
-              : "Save All Sessions As",
+              ? `${titlePrefix} Selected Sessions (${targetSessionIds.length})`
+              : `${titlePrefix} All Sessions As`,
           defaultName,
           filters,
         });
-        if (!chosenPath) return;
+        if (!chosenPath) return false;
 
         const lowerPath = chosenPath.toLowerCase();
         const resolvedFormat =
@@ -2629,16 +2633,21 @@ export function useProxySessions() {
         const savedCount = await proxyBridge.exportSessionsFile(
           targetSessionIds,
           resolvedFormat,
-          chosenPath
+          chosenPath,
+          sanitization
         );
         const baseName = chosenPath.split(/[\\/]/).pop() ?? chosenPath;
         showToast(
-          `💾 Сохранено сессий: ${savedCount.toLocaleString()} → ${baseName}`
+          sanitization
+            ? `🛡️ Санитизированный экспорт: ${savedCount.toLocaleString()} → ${baseName}`
+            : `💾 Сохранено сессий: ${savedCount.toLocaleString()} → ${baseName}`
         );
+        return true;
       } catch (err) {
         showToast(
           `⚠️ Ошибка экспорта: ${err instanceof Error ? err.message : String(err)}`
         );
+        return false;
       }
     },
     [showToast]
@@ -2675,6 +2684,21 @@ export function useProxySessions() {
       await exportSessionsWithDialog(ids, forcedFormat);
     },
     [exportSessionsWithDialog, selectedId, selectedIds, showToast]
+  );
+
+  const exportSanitizedSessions = useCallback(
+    async (
+      targetSessionIds: number[],
+      format: "har" | "saz" | "json" | "raw",
+      sanitization: SanitizationOptions
+    ): Promise<boolean> => {
+      if (sessions.length === 0) {
+        showToast("⚠️ Нет захваченных сессий для экспорта");
+        return false;
+      }
+      return exportSessionsWithDialog(targetSessionIds, format, sanitization);
+    },
+    [exportSessionsWithDialog, sessions.length, showToast]
   );
 
   const importArchiveFromPath = useCallback(
@@ -3095,6 +3119,7 @@ export function useProxySessions() {
     loadFromSqlite,
     exportAllSessionsAs,
     exportSelectedSessionsAs,
+    exportSanitizedSessions,
     importArchiveDialog,
     importArchiveFromPath,
     importArchiveFromDroppedFile,

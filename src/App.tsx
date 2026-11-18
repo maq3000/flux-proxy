@@ -20,6 +20,7 @@ import { ComposerPanel } from "./components/ComposerPanel";
 import { FilterDrawer } from "./components/FilterDrawer";
 import { MenuBar } from "./components/MenuBar";
 import { MobileSetupModal } from "./components/MobileSetupModal";
+import { SanitizedExportModal } from "./components/SanitizedExportModal";
 import { SessionAnnotationModal } from "./components/SessionAnnotationModal";
 import {
   SessionDiffModal,
@@ -53,6 +54,7 @@ import {
   buildSettingsImportPreview,
   exportCurrentSettingsProfile,
   isLikelyFluxSettingsProfile,
+  loadPersistedSanitizationOptions,
   parseAndValidateSettingsJsonText,
   registerLiveSettingsSnapshotGetter,
   resetAllSettingsToDefault,
@@ -198,6 +200,7 @@ export const App: React.FC = () => {
     loadFromSqlite,
     exportAllSessionsAs,
     exportSelectedSessionsAs,
+    exportSanitizedSessions,
     importArchiveDialog,
     importArchiveFromPath,
     importArchiveFromDroppedFile,
@@ -244,6 +247,8 @@ export const App: React.FC = () => {
   } | null>(null);
   const [certModalOpen, setCertModalOpen] = useState(false);
   const [mobileModalOpen, setMobileModalOpen] = useState(false);
+  const [sanitizedExportModalOpen, setSanitizedExportModalOpen] =
+    useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsModalOpen, setShortcutsModalOpen] = useState(false);
   const [hexTriggerSeq, setHexTriggerSeq] = useState(0);
@@ -762,6 +767,7 @@ export const App: React.FC = () => {
       sessionRetentionLimit,
       dropNonMatching,
       clearDbOnExit,
+      sanitizationOptions: loadPersistedSanitizationOptions(),
     },
     autoResponder: {
       enabled: autoResponderEnabled,
@@ -792,6 +798,14 @@ export const App: React.FC = () => {
     setFilterDrawerTab(tab);
     setFilterDrawerOpen(true);
   }, []);
+
+  const openSanitizedExportModal = useCallback(() => {
+    if (sessions.length === 0) {
+      showToast("⚠️ Нет захваченных сессий для экспорта");
+      return;
+    }
+    setSanitizedExportModalOpen(true);
+  }, [sessions.length, showToast]);
 
   const openTextWizardAt = useCallback(
     (tab: TextWizardTab = "jwt", input?: string) => {
@@ -1115,6 +1129,22 @@ export const App: React.FC = () => {
         return;
       }
 
+      // Ctrl+Shift+S / Cmd+Shift+S -> Export Sanitized Sessions...
+      if (
+        ctrlOrMeta &&
+        !e.altKey &&
+        e.shiftKey &&
+        (keyLower === "s" || e.code === "KeyS")
+      ) {
+        e.preventDefault();
+        if (sanitizedExportModalOpen) {
+          setSanitizedExportModalOpen(false);
+        } else if (!hasOpenModal()) {
+          openSanitizedExportModal();
+        }
+        return;
+      }
+
       // Ctrl+S / Cmd+S -> Save All Sessions As... (.har, .saz, .json)
       if (
         ctrlOrMeta &&
@@ -1389,7 +1419,9 @@ export const App: React.FC = () => {
     importArchiveDialog,
     openAnnotationFor,
     openDiffWithPairSmart,
+    openSanitizedExportModal,
     replaySessions,
+    sanitizedExportModalOpen,
     selectSessions,
     toggleBreakAfterResponse,
     toggleBreakBeforeRequest,
@@ -1824,6 +1856,27 @@ export const App: React.FC = () => {
         perform: () => void exportSelectedSessionsAs(),
       },
       {
+        id: "export-sanitized-sessions",
+        category: "Security",
+        label:
+          "Export Sanitized Sessions… (PII & Secrets Redaction for HAR / SAZ / JSON / Raw)",
+        shortcut: "Ctrl+Shift+S",
+        keywords: [
+          "sanitize",
+          "redact",
+          "pii",
+          "secrets",
+          "mask",
+          "anonymize",
+          "har",
+          "saz",
+          "export",
+          "санитизация",
+          "маскирование",
+        ],
+        perform: openSanitizedExportModal,
+      },
+      {
         id: "import-archive",
         category: "Storage",
         label: "Open / Import Archive... (.har, .saz, .json)",
@@ -1959,6 +2012,7 @@ export const App: React.FC = () => {
       openDiffWithPairSmart,
       openFilterDrawerAt,
       openPreferencesAt,
+      openSanitizedExportModal,
       openTextWizardAt,
       pausedBreakpoints.length,
       replaySessions,
@@ -2158,6 +2212,7 @@ export const App: React.FC = () => {
         onToggleAutoSystemProxy={() => void toggleAutoSystemProxy()}
         onSaveAllSessionsAs={() => void exportAllSessionsAs()}
         onSaveSelectedSessionsAs={() => void exportSelectedSessionsAs()}
+        onOpenSanitizedExport={openSanitizedExportModal}
         onImportArchive={() => void importArchiveDialog()}
         onSaveSqlite={() => void saveToSqlite()}
         onLoadSqlite={() => void loadFromSqlite()}
@@ -2965,6 +3020,14 @@ export const App: React.FC = () => {
         onNotify={showToast}
       />
 
+      <SanitizedExportModal
+        open={sanitizedExportModalOpen}
+        totalCount={sessions.length}
+        selectedIds={effectiveSelectedIds}
+        onClose={() => setSanitizedExportModalOpen(false)}
+        onExport={exportSanitizedSessions}
+      />
+
       <CommandPalette
         open={paletteOpen}
         onClose={() => setPaletteOpen(false)}
@@ -2973,6 +3036,7 @@ export const App: React.FC = () => {
           void applyQuickExecBpu(stage, pattern)
         }
         onQuickOpenJwt={(token) => openTextWizardAt("jwt", token)}
+        onQuickOpenSanitizedExport={openSanitizedExportModal}
       />
 
       <dialog

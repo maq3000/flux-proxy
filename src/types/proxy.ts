@@ -450,3 +450,66 @@ export interface UiLayoutPreferences {
   inspectorPosition: InspectorDockPosition;
   inspectorSplitDirection: InspectorSplitDirection;
 }
+
+// ============================================================================
+// PII & Secrets Redaction / Sanitized Session Export
+// ============================================================================
+export type ExportArchiveFormat = "har" | "saz" | "json" | "raw";
+
+export type SanitizationPresetId =
+  | "safeSharing"
+  | "strictAnonymization"
+  | "custom";
+
+export interface SanitizationOptions {
+  redactAuthHeaders: boolean;
+  customRedactedHeaders: string[];
+  maskJsonKeys: string[];
+  stripQueryParams: string[];
+  anonymizeClientInfo: boolean;
+  replacementText: string;
+}
+
+export const BUILTIN_REDACTED_AUTH_HEADERS: readonly string[] = [
+  "Authorization",
+  "Proxy-Authorization",
+  "Cookie",
+  "Set-Cookie",
+  "X-Api-Key",
+  "X-Auth-Token",
+] as const;
+
+export const DEFAULT_MASK_JSON_KEYS: readonly string[] = [
+  "password",
+  "passwd",
+  "secret",
+  "token",
+  "access_token",
+  "refresh_token",
+  "api_key",
+  "cvv",
+  "pan",
+  "card_number",
+  "pin",
+] as const;
+
+export const DEFAULT_STRIP_QUERY_PARAMS: readonly string[] = [
+  "token",
+  "auth",
+  "api_key",
+  "key",
+  "signature",
+  "sig",
+  "code",
+] as const;
+
+export const DEFAULT_SANITIZATION_REPLACEMENT = "[REDACTED]";
+
+export const DEFAULT_SANITIZATION_OPTIONS: SanitizationOptions = {
+  redactAuthHeaders: true,
+  customRedactedHeaders: [],
+  maskJsonKeys: [...DEFAULT_MASK_JSON_KEYS],
+  stripQueryParams: [...DEFAULT_STRIP_QUERY_PARAMS],
+  anonymizeClientInfo: false,
+  replacementText: DEFAULT_SANITIZATION_REPLACEMENT,
+};

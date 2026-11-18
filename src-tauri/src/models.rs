@@ -449,6 +449,66 @@ pub struct ProxyStatus {
     pub bound_ips: Vec<String>,
 }
 
+fn default_mask_json_keys() -> Vec<String> {
+    [
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "access_token",
+        "refresh_token",
+        "api_key",
+        "cvv",
+        "pan",
+        "card_number",
+        "pin",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn default_strip_query_params() -> Vec<String> {
+    ["token", "auth", "api_key", "key", "signature", "sig", "code"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn default_replacement_text() -> String {
+    "[REDACTED]".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SanitizationOptions {
+    #[serde(default = "default_true")]
+    pub redact_auth_headers: bool,
+    #[serde(default)]
+    pub custom_redacted_headers: Vec<String>,
+    #[serde(default = "default_mask_json_keys")]
+    pub mask_json_keys: Vec<String>,
+    #[serde(default = "default_strip_query_params")]
+    pub strip_query_params: Vec<String>,
+    #[serde(default)]
+    pub anonymize_client_info: bool,
+    #[serde(default = "default_replacement_text")]
+    pub replacement_text: String,
+}
+
+impl Default for SanitizationOptions {
+    fn default() -> Self {
+        Self {
+            redact_auth_headers: true,
+            custom_redacted_headers: Vec::new(),
+            mask_json_keys: default_mask_json_keys(),
+            strip_query_params: default_strip_query_params(),
+            anonymize_client_info: false,
+            replacement_text: default_replacement_text(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
     #[error("I/O error: {0}")]

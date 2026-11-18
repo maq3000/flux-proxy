@@ -16,6 +16,7 @@ interface CommandPaletteProps {
   commands: PaletteCommand[];
   onQuickExecBpu?: (stage: "request" | "response", pattern: string) => void;
   onQuickOpenJwt?: (token: string) => void;
+  onQuickOpenSanitizedExport?: () => void;
 }
 
 export const CommandPalette: React.FC<CommandPaletteProps> = ({
@@ -24,6 +25,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   commands,
   onQuickExecBpu,
   onQuickOpenJwt,
+  onQuickOpenSanitizedExport,
 }) => {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -85,6 +87,20 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       });
     }
 
+    if (
+      onQuickOpenSanitizedExport &&
+      (q.startsWith("sanitize") || q.startsWith("redact"))
+    ) {
+      dynamicQuickExec.push({
+        id: "quickexec-sanitized-export",
+        category: "Security",
+        label:
+          "Export Sanitized Sessions… (PII & Secrets Redaction for HAR / SAZ / JSON / Raw)",
+        shortcut: "Ctrl+Shift+S",
+        perform: () => onQuickOpenSanitizedExport(),
+      });
+    }
+
     const matchedStatic = commands.filter(
       (c) =>
         c.id.toLowerCase().includes(q) ||
@@ -94,7 +110,13 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     );
 
     return [...dynamicQuickExec, ...matchedStatic];
-  }, [commands, query, onQuickExecBpu, onQuickOpenJwt]);
+  }, [
+    commands,
+    query,
+    onQuickExecBpu,
+    onQuickOpenJwt,
+    onQuickOpenSanitizedExport,
+  ]);
 
   useEffect(() => {
     const dialog = dialogRef.current;

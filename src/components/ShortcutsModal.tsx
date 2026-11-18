@@ -41,6 +41,11 @@ const SHORTCUT_GROUPS: {
     items: [
       { keys: "R / Ctrl+R", description: "Replay — повторить запрос в upstream" },
       { keys: "Ctrl+S / Cmd+S", description: "Сохранить все сессии в архив (.har, .saz, .json)" },
+      {
+        keys: "Ctrl+Shift+S",
+        description:
+          "Экспорт сессий с санитизацией секретов и PII (Export Sanitized Sessions…)",
+      },
       { keys: "Ctrl+O / Cmd+O", description: "Открыть / импортировать архив (.har, .saz, .json)" },
       { keys: "M", description: "Добавить / изменить комментарий и маркер сессии" },
       { keys: "U", description: "Снять цветовую метку (Unmark)" },

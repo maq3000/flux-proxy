@@ -10,6 +10,7 @@ import type {
   InspectorDockPosition,
   InspectorSplitDirection,
   NoiseThresholdsConfig,
+  SanitizationOptions,
   TlsBypassRule,
   TlsInterceptMode,
   ToolbarGroupId,
@@ -67,6 +68,8 @@ export interface FluxUserProxySettings {
   dropNonMatching?: boolean;
   /** Автоматически очищать и сжимать (VACUUM) SQLite-архив при выходе из приложения */
   clearDbOnExit?: boolean;
+  /** Настройки санитизации и маскирования секретов/PII при экспорте сессий */
+  sanitizationOptions?: SanitizationOptions;
 }
 
 export interface FluxUserAutoResponderSettings {

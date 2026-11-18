@@ -36,6 +36,7 @@ interface MenuBarProps {
   onToggleAutoSystemProxy: () => void;
   onSaveAllSessionsAs: () => void;
   onSaveSelectedSessionsAs: () => void;
+  onOpenSanitizedExport: () => void;
   onImportArchive: () => void;
   onSaveSqlite: () => void;
   onLoadSqlite: () => void;
@@ -274,6 +275,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onToggleAutoSystemProxy,
   onSaveAllSessionsAs,
   onSaveSelectedSessionsAs,
+  onOpenSanitizedExport,
   onImportArchive,
   onSaveSqlite,
   onLoadSqlite,
@@ -992,6 +994,16 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 <span>
                   Save Selected Sessions...
                   {selectedCount > 1 ? ` (${selectedCount})` : ""}
+                </span>
+              </button>
+              <button
+                type="button"
+                disabled={totalCount === 0}
+                onClick={(e) => activateCommand(e, onOpenSanitizedExport)}
+              >
+                <span>Export Sanitized Sessions…</span>
+                <span className="hint" aria-hidden="true">
+                  Ctrl+Shift+S
                 </span>
               </button>
               <button

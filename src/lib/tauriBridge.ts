@@ -17,6 +17,7 @@ import type {
   PausedBreakpointItem,
   ProxyFilterBackendConfig,
   ProxyStatus,
+  SanitizationOptions,
   SessionDetail,
   SessionSummary,
   StorageStats,
@@ -32,6 +33,7 @@ import {
   buildFullRawHttpMessage,
   decodeBase64ToBytes,
   encodeTextToBase64,
+  parseQueryParams,
 } from "./formatters";
 import {
   buildInFlightSnapshot,
@@ -42,6 +44,7 @@ import {
   PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
   PREVIEW_SQLITE_ARCHIVE_STORAGE_KEY,
   PREVIEW_SQLITE_COUNT_STORAGE_KEY,
+  sanitizeSessionsInPreview,
 } from "./mockTraffic";
 import { browserPreviewCodecTransform } from "./textWizard";
 
@@ -1869,7 +1872,8 @@ class BrowserPreviewEngine {
   exportPreviewSessions(
     sessionIds: number[],
     format: string,
-    filePath: string
+    filePath: string,
+    sanitization?: SanitizationOptions | null
   ): number {
     const targetIds =
       sessionIds.length > 0
@@ -1899,9 +1903,13 @@ class BrowserPreviewEngine {
       list.push(hydrated);
     }
 
+    const effectiveList = sanitization
+      ? sanitizeSessionsInPreview(list, sanitization)
+      : list;
+
     const fmt = format.replace(/^\./, "").toLowerCase();
     if (fmt === "raw" || fmt === "txt") {
-      const text = list
+      const text = effectiveList
         .map((d) => buildFullRawHttpMessage(d))
         .join(
           "\r\n------------------------------------------------------------------\r\n\r\n"
@@ -1911,17 +1919,17 @@ class BrowserPreviewEngine {
         filePath,
         "text/plain;charset=utf-8"
       );
-      return list.length;
+      return effectiveList.length;
     }
 
     if (fmt === "json") {
-      const json = JSON.stringify(list, null, 2);
+      const json = JSON.stringify(effectiveList, null, 2);
       triggerBrowserDownload(
         new TextEncoder().encode(json),
         filePath,
         "application/json"
       );
-      return list.length;
+      return effectiveList.length;
     }
 
     // Default HAR 1.2 serialization in Browser Preview
@@ -1929,17 +1937,17 @@ class BrowserPreviewEngine {
       log: {
         version: "1.2",
         creator: { name: "FluxProxy", version: "0.2.0" },
-        pages: list.length
+        pages: effectiveList.length
           ? [
               {
-                startedDateTime: list[0].summary.timestamp,
+                startedDateTime: effectiveList[0].summary.timestamp,
                 id: "page_1",
                 title: "FluxProxy Capture",
                 pageTimings: { onContentLoad: -1, onLoad: -1 },
               },
             ]
           : [],
-        entries: list.map((d) => ({
+        entries: effectiveList.map((d) => ({
           pageref: "page_1",
           startedDateTime: d.summary.timestamp,
           time: d.summary.durationMs,
@@ -1951,7 +1959,7 @@ class BrowserPreviewEngine {
               : "HTTP/1.1",
             cookies: [],
             headers: d.requestHeaders,
-            queryString: [],
+            queryString: parseQueryParams(d.summary.url),
             ...(d.requestBodyText
               ? {
                   postData: {
@@ -2005,6 +2013,8 @@ class BrowserPreviewEngine {
             markedColor: d.summary.markedColor,
             processName: d.summary.processName,
             processPid: d.summary.processPid,
+            clientIp: d.summary.clientIp ?? null,
+            clientAddr: d.clientAddr,
           },
         })),
       },
@@ -2016,7 +2026,7 @@ class BrowserPreviewEngine {
       outName,
       "application/json"
     );
-    return list.length;
+    return effectiveList.length;
   }
 
   importPreviewText(text: string): SessionSummary[] {
@@ -2734,16 +2744,23 @@ export const proxyBridge = {
   async exportSessionsFile(
     sessionIds: number[],
     format: string,
-    filePath: string
+    filePath: string,
+    sanitization?: SanitizationOptions | null
   ): Promise<number> {
     if (isTauriRuntime()) {
       return invoke<number>("export_sessions_file", {
         sessionIds,
         format,
         filePath,
+        sanitization: sanitization ?? null,
       });
     }
-    return previewEngine.exportPreviewSessions(sessionIds, format, filePath);
+    return previewEngine.exportPreviewSessions(
+      sessionIds,
+      format,
+      filePath,
+      sanitization
+    );
   },
 
   async importSessionsFile(filePath: string): Promise<SessionSummary[]> {

@@ -8,14 +8,14 @@ use crate::models::{
     AutoResponderRule, BindHostMode, BreakpointAction, BreakpointConfig, BreakpointResolution,
     CaCertificateInfo, CodecOperation, CodecTransformResult, ComposedRequest, LoadedSessionBody,
     NetworkInterfaceInfo, PausedBreakpointItem, ProxyError, ProxyFilterBackendConfig, ProxyStatus,
-    SessionDetail, SessionSummary, StorageStats,
+    SanitizationOptions, SessionDetail, SessionSummary, StorageStats,
 };
 use crate::proxy::codec::execute_codec_transform;
 use crate::proxy::network::list_network_interfaces_with_options;
 use crate::proxy::server::ProxyEngineController;
 use crate::storage::export_import::{
     export_sessions_to_path, import_sessions_from_bytes, import_sessions_from_path,
-    write_raw_bytes_to_file,
+    sanitize_sessions, write_raw_bytes_to_file,
 };
 
 pub struct AppState {
@@ -560,6 +560,7 @@ pub async fn export_sessions_file(
     session_ids: Vec<u64>,
     format: String,
     file_path: String,
+    sanitization: Option<SanitizationOptions>,
     state: State<'_, AppState>,
 ) -> Result<usize, ProxyError> {
     let validated_path =
@@ -590,7 +591,11 @@ pub async fn export_sessions_file(
     let store = state.controller.context.store.clone();
     tokio::task::spawn_blocking(move || {
         let sessions = store.collect_sessions_for_export(&session_ids)?;
-        export_sessions_to_path(&sessions, &format, &validated_path)
+        let effective_sessions = match sanitization.as_ref() {
+            Some(opts) => sanitize_sessions(&sessions, opts),
+            None => sessions,
+        };
+        export_sessions_to_path(&effective_sessions, &format, &validated_path)
     })
     .await
     .map_err(|e| ProxyError::Custom(format!("Export task join error: {e}")))?

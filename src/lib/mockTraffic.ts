@@ -1,10 +1,12 @@
-import type {
-  AutoResponderRule,
-  HeaderPair,
-  SessionDetail,
-  SseEventRecord,
+import {
+  BUILTIN_REDACTED_AUTH_HEADERS,
+  type AutoResponderRule,
+  type HeaderPair,
+  type SanitizationOptions,
+  type SessionDetail,
+  type SseEventRecord,
 } from "../types/proxy";
-import { encodeTextToBase64 } from "./formatters";
+import { decodeBase64ToBytes, encodeTextToBase64 } from "./formatters";
 import { bytesToBase64, createSampleJwtToken } from "./textWizard";
 
 const SAMPLE_SVG_BADGE = `<svg xmlns="http://www.w3.org/2000/svg" width="360" height="160" viewBox="0 0 360 160">
@@ -819,3 +821,393 @@ export const PREVIEW_SQLITE_COUNT_STORAGE_KEY =
   "fluxproxy-sqlite-preview-count";
 export const PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY =
   "fluxproxy.clearDbOnExit.v1";
+export const PREVIEW_SANITIZATION_OPTIONS_STORAGE_KEY =
+  "fluxproxy.sanitizationOptions.v1";
+
+const BUILTIN_REDACTED_AUTH_HEADERS_SET = new Set(
+  BUILTIN_REDACTED_AUTH_HEADERS.map((h) => h.toLowerCase())
+);
+
+function normalizeSanitizationTokensPreview(items: string[]): Set<string> {
+  const out = new Set<string>();
+  for (const item of items) {
+    const clean = item.trim().toLowerCase();
+    if (clean) out.add(clean);
+  }
+  return out;
+}
+
+function safeDecodeUrlComponentPreview(input: string): string {
+  try {
+    return decodeURIComponent(input.replace(/\+/g, " "));
+  } catch {
+    return input;
+  }
+}
+
+function sanitizeUrlComponentReplacementPreview(replacement: string): string {
+  return replacement
+    .replace(/[\r\n\0]/g, "")
+    .replace(/%/g, "%25")
+    .replace(/&/g, "%26")
+    .replace(/=/g, "%3D")
+    .replace(/#/g, "%23")
+    .replace(/\+/g, "%2B");
+}
+
+function redactHeadersPreview(
+  headers: HeaderPair[],
+  redactAuthHeaders: boolean,
+  customHeadersLower: Set<string>,
+  replacement: string
+): HeaderPair[] {
+  return headers.map((h) => {
+    const lowerName = h.name.trim().toLowerCase();
+    const isBuiltin =
+      redactAuthHeaders && BUILTIN_REDACTED_AUTH_HEADERS_SET.has(lowerName);
+    const isCustom = customHeadersLower.has(lowerName);
+    if (isBuiltin || isCustom) {
+      return { ...h, value: replacement };
+    }
+    return { ...h };
+  });
+}
+
+function sanitizeJsonValueInPlacePreview(
+  value: unknown,
+  maskKeysLower: Set<string>,
+  replacement: string
+): boolean {
+  if (Array.isArray(value)) {
+    let modified = false;
+    for (let i = 0; i < value.length; i++) {
+      if (sanitizeJsonValueInPlacePreview(value[i], maskKeysLower, replacement)) {
+        modified = true;
+      }
+    }
+    return modified;
+  }
+  if (value !== null && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    let modified = false;
+    for (const key of Object.keys(obj)) {
+      if (maskKeysLower.has(key.trim().toLowerCase())) {
+        obj[key] = replacement;
+        modified = true;
+      } else if (
+        sanitizeJsonValueInPlacePreview(obj[key], maskKeysLower, replacement)
+      ) {
+        modified = true;
+      }
+    }
+    return modified;
+  }
+  return false;
+}
+
+function sanitizeJsonTextPreview(
+  text: string,
+  maskKeysLower: Set<string>,
+  replacement: string
+): string | null {
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!sanitizeJsonValueInPlacePreview(parsed, maskKeysLower, replacement)) {
+      return null;
+    }
+    return text.includes("\n")
+      ? JSON.stringify(parsed, null, 2)
+      : JSON.stringify(parsed);
+  } catch {
+    return null;
+  }
+}
+
+function isLikelyUrlencodedFormPreview(text: string): boolean {
+  const trimmed = text.trim();
+  if (
+    !trimmed ||
+    trimmed.startsWith("{") ||
+    trimmed.startsWith("[") ||
+    trimmed.startsWith("<") ||
+    trimmed.includes("\n") ||
+    trimmed.includes("\r") ||
+    !trimmed.includes("=")
+  ) {
+    return false;
+  }
+  return trimmed.split("&").every((seg) => {
+    if (!seg) return true;
+    const eq = seg.indexOf("=");
+    if (eq === -1) return !/\s/.test(seg);
+    const k = seg.slice(0, eq);
+    const v = seg.slice(eq + 1);
+    return k.trim().length > 0 && !/\s/.test(k) && !/\s/.test(v);
+  });
+}
+
+function sanitizeUrlencodedTextPreview(
+  text: string,
+  maskKeysLower: Set<string>,
+  replacement: string
+): string | null {
+  if (!text) return null;
+  const safeRep = sanitizeUrlComponentReplacementPreview(replacement);
+  let modified = false;
+  const rebuilt = text.split("&").map((seg) => {
+    const eq = seg.indexOf("=");
+    if (eq !== -1) {
+      const rawK = seg.slice(0, eq);
+      const decodedK = safeDecodeUrlComponentPreview(rawK).trim().toLowerCase();
+      if (maskKeysLower.has(decodedK)) {
+        modified = true;
+        return `${rawK}=${safeRep}`;
+      }
+    }
+    return seg;
+  });
+  return modified ? rebuilt.join("&") : null;
+}
+
+function resolveUtf8BodyTextPreview(
+  bodyText: string | null | undefined,
+  bodyBase64: string | null | undefined
+): string | null {
+  if (typeof bodyText === "string") {
+    return bodyText;
+  }
+  if (!bodyBase64) return null;
+  try {
+    const bytes = decodeBase64ToBytes(bodyBase64);
+    if (bytes.length === 0) return null;
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeBodyPayloadPreview(
+  text: string,
+  contentTypeHint: string | undefined,
+  maskKeysLower: Set<string>,
+  replacement: string
+): string | null {
+  if (maskKeysLower.size === 0 || !text.trim()) return null;
+  const trimmed = text.trimStart();
+  const ctLower = (contentTypeHint ?? "").toLowerCase();
+  const isJsonHint =
+    ctLower.includes("json") || trimmed.startsWith("{") || trimmed.startsWith("[");
+  if (isJsonHint) {
+    const updated = sanitizeJsonTextPreview(text, maskKeysLower, replacement);
+    if (updated !== null) return updated;
+  }
+  if (
+    ctLower.includes("application/x-www-form-urlencoded") ||
+    isLikelyUrlencodedFormPreview(text)
+  ) {
+    return sanitizeUrlencodedTextPreview(text, maskKeysLower, replacement);
+  }
+  return null;
+}
+
+function updateContentLengthHeaderPreview(
+  headers: HeaderPair[],
+  byteLen: number
+): HeaderPair[] {
+  const lenStr = String(byteLen);
+  return headers.map((h) =>
+    h.name.trim().toLowerCase() === "content-length"
+      ? { ...h, value: lenStr }
+      : h
+  );
+}
+
+function sanitizeQueryStringInUrlOrPathPreview(
+  input: string,
+  stripParamsLower: Set<string>,
+  replacement: string
+): string {
+  if (stripParamsLower.size === 0 || !input.includes("?")) {
+    return input;
+  }
+  const hashIdx = input.indexOf("#");
+  const baseAndQuery = hashIdx === -1 ? input : input.slice(0, hashIdx);
+  const fragment = hashIdx === -1 ? null : input.slice(hashIdx + 1);
+  const qIdx = baseAndQuery.indexOf("?");
+  if (qIdx === -1) return input;
+  const base = baseAndQuery.slice(0, qIdx);
+  const query = baseAndQuery.slice(qIdx + 1);
+  if (!query) return input;
+
+  const safeRep = sanitizeUrlComponentReplacementPreview(replacement);
+  let modified = false;
+  const rebuilt = query.split("&").map((seg) => {
+    if (!seg) return "";
+    const eq = seg.indexOf("=");
+    if (eq !== -1) {
+      const rawK = seg.slice(0, eq);
+      const decodedK = safeDecodeUrlComponentPreview(rawK).trim().toLowerCase();
+      if (stripParamsLower.has(decodedK)) {
+        modified = true;
+        return `${rawK}=${safeRep}`;
+      }
+    }
+    return seg;
+  });
+
+  if (!modified) return input;
+  const joined = `${base}?${rebuilt.join("&")}`;
+  return fragment !== null ? `${joined}#${fragment}` : joined;
+}
+
+export function sanitizeSessionsInPreview(
+  sessions: SessionDetail[],
+  opts: SanitizationOptions
+): SessionDetail[] {
+  const replacement = opts.replacementText.trim()
+    ? opts.replacementText
+    : "[REDACTED]";
+  const customHeadersLower = normalizeSanitizationTokensPreview(
+    opts.customRedactedHeaders
+  );
+  const maskKeysLower = normalizeSanitizationTokensPreview(opts.maskJsonKeys);
+  const stripParamsLower = normalizeSanitizationTokensPreview(
+    opts.stripQueryParams
+  );
+  const encoder = new TextEncoder();
+
+  return sessions.map((orig) => {
+    const detail = structuredClone(orig);
+
+    // 1. Redact headers
+    if (opts.redactAuthHeaders || customHeadersLower.size > 0) {
+      detail.requestHeaders = redactHeadersPreview(
+        detail.requestHeaders,
+        opts.redactAuthHeaders,
+        customHeadersLower,
+        replacement
+      );
+      detail.responseHeaders = redactHeadersPreview(
+        detail.responseHeaders,
+        opts.redactAuthHeaders,
+        customHeadersLower,
+        replacement
+      );
+    }
+
+    // 2. Mask JSON / form-urlencoded bodies
+    if (maskKeysLower.size > 0) {
+      const reqText = resolveUtf8BodyTextPreview(
+        detail.requestBodyText,
+        detail.requestBodyBase64
+      );
+      if (reqText !== null) {
+        const reqCt = detail.requestHeaders.find(
+          (h) => h.name.trim().toLowerCase() === "content-type"
+        )?.value;
+        const sanitizedReq = sanitizeBodyPayloadPreview(
+          reqText,
+          reqCt,
+          maskKeysLower,
+          replacement
+        );
+        if (sanitizedReq !== null) {
+          const byteLen = encoder.encode(sanitizedReq).length;
+          detail.requestBodyText = sanitizedReq;
+          detail.requestBodyBase64 = encodeTextToBase64(sanitizedReq);
+          detail.requestHeaders = updateContentLengthHeaderPreview(
+            detail.requestHeaders,
+            byteLen
+          );
+        }
+      }
+
+      const respText = resolveUtf8BodyTextPreview(
+        detail.responseBodyText,
+        detail.responseBodyBase64
+      );
+      if (respText !== null) {
+        const respCt =
+          detail.summary.contentType ||
+          detail.responseHeaders.find(
+            (h) => h.name.trim().toLowerCase() === "content-type"
+          )?.value;
+        const sanitizedResp = sanitizeBodyPayloadPreview(
+          respText,
+          respCt,
+          maskKeysLower,
+          replacement
+        );
+        if (sanitizedResp !== null) {
+          const byteLen = encoder.encode(sanitizedResp).length;
+          detail.responseBodyText = sanitizedResp;
+          detail.responseBodyBase64 = encodeTextToBase64(sanitizedResp);
+          detail.summary.bodySize = byteLen;
+          detail.responseHeaders = updateContentLengthHeaderPreview(
+            detail.responseHeaders,
+            byteLen
+          );
+        }
+      }
+
+      if (Array.isArray(detail.sseEvents) && detail.sseEvents.length > 0) {
+        detail.sseEvents = detail.sseEvents.map((ev) => {
+          const updated = sanitizeJsonTextPreview(
+            ev.data,
+            maskKeysLower,
+            replacement
+          );
+          if (updated === null) return ev;
+          return {
+            ...ev,
+            data: updated,
+            byteLength: encoder.encode(updated).length,
+          };
+        });
+      }
+
+      if (
+        Array.isArray(detail.websocketFrames) &&
+        detail.websocketFrames.length > 0
+      ) {
+        detail.websocketFrames = detail.websocketFrames.map((frame) => {
+          const updated = sanitizeJsonTextPreview(
+            frame.payloadPreview,
+            maskKeysLower,
+            replacement
+          );
+          if (updated === null) return frame;
+          return {
+            ...frame,
+            payloadPreview: updated,
+            byteLength: encoder.encode(updated).length,
+          };
+        });
+      }
+    }
+
+    // 3. Strip query parameters in `summary.url` and `summary.path`
+    if (stripParamsLower.size > 0) {
+      detail.summary.url = sanitizeQueryStringInUrlOrPathPreview(
+        detail.summary.url,
+        stripParamsLower,
+        replacement
+      );
+      detail.summary.path = sanitizeQueryStringInUrlOrPathPreview(
+        detail.summary.path,
+        stripParamsLower,
+        replacement
+      );
+    }
+
+    // 4. Anonymize client info
+    if (opts.anonymizeClientInfo) {
+      detail.clientAddr = "0.0.0.0:0";
+      detail.summary.clientIp = "0.0.0.0";
+      detail.summary.processName = "redacted-process";
+      detail.summary.processPid = null;
+    }
+
+    return detail;
+  });
+}

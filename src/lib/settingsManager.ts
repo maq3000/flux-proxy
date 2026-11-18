@@ -24,9 +24,16 @@ import {
   DEFAULT_AUTORESPONDER_RULES,
   DEFAULT_CLEAR_DB_ON_EXIT,
   PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
+  PREVIEW_SANITIZATION_OPTIONS_STORAGE_KEY,
 } from "./mockTraffic";
 import { proxyBridge } from "./tauriBridge";
-import { DEFAULT_SESSION_RETENTION_LIMIT } from "../types/proxy";
+import {
+  DEFAULT_MASK_JSON_KEYS,
+  DEFAULT_SANITIZATION_OPTIONS,
+  DEFAULT_SANITIZATION_REPLACEMENT,
+  DEFAULT_SESSION_RETENTION_LIMIT,
+  DEFAULT_STRIP_QUERY_PARAMS,
+} from "../types/proxy";
 import type {
   AutoResponderRule,
   BindHostMode,
@@ -49,6 +56,7 @@ import type {
   ProxyStatus,
   RuleActionType,
   RuleMatchTarget,
+  SanitizationOptions,
   TlsBypassRule,
   TlsInterceptMode,
   ToolbarGroupId,
@@ -85,6 +93,7 @@ export const SETTINGS_STORAGE_KEYS = {
   sessionRetentionLimit: "fluxproxy.sessionRetentionLimit.v1",
   dropNonMatching: "fluxproxy.dropNonMatching.v1",
   clearDbOnExit: PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
+  sanitizationOptions: PREVIEW_SANITIZATION_OPTIONS_STORAGE_KEY,
 } as const;
 
 const VALID_THEMES = new Set<ThemePreference>(["dark", "light", "system"]);
@@ -169,6 +178,7 @@ const RECOGNIZED_PROFILE_TOP_KEYS = new Set<string>([
   "tlsInterceptMode",
   "autoResponderRules",
   "clearDbOnExit",
+  "sanitizationOptions",
 ]);
 
 type LiveSettingsSnapshotGetter = () => Partial<FluxUserSettingsProfile>;
@@ -254,6 +264,7 @@ export function createDefaultSettingsProfile(): FluxUserSettingsProfile {
       sessionRetentionLimit: DEFAULT_SESSION_RETENTION_LIMIT,
       dropNonMatching: false,
       clearDbOnExit: DEFAULT_CLEAR_DB_ON_EXIT,
+      sanitizationOptions: structuredClone(DEFAULT_SANITIZATION_OPTIONS),
     },
     autoResponder: {
       enabled: true,
@@ -373,6 +384,12 @@ const SCHEMA_MIGRATIONS: Record<number, SchemaMigrationFn> = {
       } else if (ui.clearDbOnExit !== undefined) {
         proxy.clearDbOnExit = ui.clearDbOnExit;
       }
+    }
+    if (
+      proxy.sanitizationOptions === undefined &&
+      isPlainObject(draft.sanitizationOptions)
+    ) {
+      proxy.sanitizationOptions = draft.sanitizationOptions;
     }
 
     const autoResponder: Record<string, unknown> = { ...existingAutoResp };
@@ -867,6 +884,107 @@ function sanitizeAutoResponderRules(
     });
   });
   return out;
+}
+
+function sanitizeStringTokenArray(
+  raw: unknown,
+  fallback: readonly string[],
+  fieldPath: string,
+  warnings: string[]
+): string[] {
+  if (raw === undefined) return [...fallback];
+  if (!Array.isArray(raw)) {
+    warnings.push(`Поле «${fieldPath}» повреждено — применены значения по умолчанию.`);
+    return [...fallback];
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string") continue;
+    const clean = item.trim();
+    if (!clean) continue;
+    const lower = clean.toLowerCase();
+    if (!seen.has(lower)) {
+      seen.add(lower);
+      out.push(clean);
+    }
+  }
+  return out;
+}
+
+export function sanitizeSanitizationOptions(
+  raw: unknown,
+  warnings: string[] = []
+): SanitizationOptions {
+  if (raw === undefined) {
+    return structuredClone(DEFAULT_SANITIZATION_OPTIONS);
+  }
+  if (!isPlainObject(raw)) {
+    warnings.push(
+      "Секция «proxy.sanitizationOptions» повреждена — восстановлены настройки санитизации по умолчанию."
+    );
+    return structuredClone(DEFAULT_SANITIZATION_OPTIONS);
+  }
+  const replacementText =
+    typeof raw.replacementText === "string" && raw.replacementText.trim()
+      ? raw.replacementText
+      : DEFAULT_SANITIZATION_REPLACEMENT;
+  return {
+    redactAuthHeaders: sanitizeBoolean(
+      raw.redactAuthHeaders,
+      DEFAULT_SANITIZATION_OPTIONS.redactAuthHeaders,
+      "proxy.sanitizationOptions.redactAuthHeaders",
+      warnings
+    ),
+    customRedactedHeaders: sanitizeStringTokenArray(
+      raw.customRedactedHeaders,
+      DEFAULT_SANITIZATION_OPTIONS.customRedactedHeaders,
+      "proxy.sanitizationOptions.customRedactedHeaders",
+      warnings
+    ),
+    maskJsonKeys: sanitizeStringTokenArray(
+      raw.maskJsonKeys,
+      DEFAULT_MASK_JSON_KEYS,
+      "proxy.sanitizationOptions.maskJsonKeys",
+      warnings
+    ),
+    stripQueryParams: sanitizeStringTokenArray(
+      raw.stripQueryParams,
+      DEFAULT_STRIP_QUERY_PARAMS,
+      "proxy.sanitizationOptions.stripQueryParams",
+      warnings
+    ),
+    anonymizeClientInfo: sanitizeBoolean(
+      raw.anonymizeClientInfo,
+      DEFAULT_SANITIZATION_OPTIONS.anonymizeClientInfo,
+      "proxy.sanitizationOptions.anonymizeClientInfo",
+      warnings
+    ),
+    replacementText,
+  };
+}
+
+export function loadPersistedSanitizationOptions(): SanitizationOptions {
+  const raw = readLocalStorageJson<unknown>(
+    SETTINGS_STORAGE_KEYS.sanitizationOptions,
+    undefined
+  );
+  return sanitizeSanitizationOptions(raw);
+}
+
+export function savePersistedSanitizationOptions(
+  opts: SanitizationOptions
+): void {
+  if (typeof window === "undefined") return;
+  try {
+    const clean = sanitizeSanitizationOptions(opts);
+    window.localStorage.setItem(
+      SETTINGS_STORAGE_KEYS.sanitizationOptions,
+      JSON.stringify(clean)
+    );
+  } catch {
+    // ignore storage quota errors
+  }
 }
 
 /**
@@ -1479,6 +1597,10 @@ export function validateAndMigrateSettingsProfileWithReport(
         "proxy.clearDbOnExit",
         warnings
       ),
+      sanitizationOptions: sanitizeSanitizationOptions(
+        rawProxy.sanitizationOptions,
+        warnings
+      ),
     },
     autoResponder: {
       enabled: sanitizeBoolean(
@@ -1600,6 +1722,7 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
     SETTINGS_STORAGE_KEYS.clearDbOnExit,
     Boolean(defaults.proxy.clearDbOnExit ?? DEFAULT_CLEAR_DB_ON_EXIT)
   );
+  const storedSanitizationOptions = loadPersistedSanitizationOptions();
   const storedAutoResponder = readLocalStorageJson<{
     enabled?: boolean;
     rules?: AutoResponderRule[];
@@ -1757,6 +1880,9 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
         live.proxy?.clearDbOnExit ??
         live.ui?.clearDbOnExit ??
         storedClearDbOnExit,
+      sanitizationOptions: structuredClone(
+        live.proxy?.sanitizationOptions ?? storedSanitizationOptions
+      ),
     },
     autoResponder: {
       enabled:
@@ -2030,6 +2156,12 @@ function atomicWriteProfileToLocalStorage(
     [
       SETTINGS_STORAGE_KEYS.clearDbOnExit,
       JSON.stringify(Boolean(profile.proxy.clearDbOnExit ?? false)),
+    ],
+    [
+      SETTINGS_STORAGE_KEYS.sanitizationOptions,
+      JSON.stringify(
+        profile.proxy.sanitizationOptions ?? DEFAULT_SANITIZATION_OPTIONS
+      ),
     ],
   ];
 

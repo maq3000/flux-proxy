@@ -11,7 +11,8 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::models::{
-    HeaderPair, ProxyError, SessionDetail, SessionSummary, SseEventRecord, WebSocketFrameRecord,
+    HeaderPair, ProxyError, SanitizationOptions, SessionDetail, SessionSummary, SseEventRecord,
+    WebSocketFrameRecord,
 };
 
 /// Maximum allowed archive/JSON import file size on disk or in memory (256 MiB).
@@ -952,6 +953,379 @@ pub fn decode_detail_body_bytes(detail: &SessionDetail, is_response: bool) -> Ve
     }
 
     Vec::new()
+}
+
+// ============================================================================
+// PII & Secrets Sanitization Engine (HAR / SAZ / JSON / Raw HTTP)
+// ============================================================================
+
+const BUILTIN_REDACTED_AUTH_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "x-auth-token",
+];
+
+fn normalize_sanitization_tokens(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn sanitize_url_component_replacement(replacement: &str) -> String {
+    let mut out = String::with_capacity(replacement.len());
+    for ch in replacement.chars() {
+        match ch {
+            '\r' | '\n' | '\0' => {}
+            '%' => out.push_str("%25"),
+            '&' => out.push_str("%26"),
+            '=' => out.push_str("%3D"),
+            '#' => out.push_str("%23"),
+            '+' => out.push_str("%2B"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn redact_headers_in_place(
+    headers: &mut [HeaderPair],
+    redact_auth_headers: bool,
+    custom_headers_lower: &[String],
+    replacement: &str,
+) {
+    for h in headers.iter_mut() {
+        let lower_name = h.name.trim().to_ascii_lowercase();
+        let is_builtin = redact_auth_headers
+            && BUILTIN_REDACTED_AUTH_HEADERS
+                .iter()
+                .any(|&builtin| builtin == lower_name);
+        let is_custom = custom_headers_lower.iter().any(|c| c == &lower_name);
+        if is_builtin || is_custom {
+            h.value = replacement.to_string();
+        }
+    }
+}
+
+fn sanitize_json_value_in_place(
+    value: &mut serde_json::Value,
+    mask_keys_lower: &[String],
+    replacement: &str,
+) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut modified = false;
+            for (k, v) in map.iter_mut() {
+                let k_lower = k.trim().to_ascii_lowercase();
+                if mask_keys_lower.iter().any(|mk| mk == &k_lower) {
+                    *v = serde_json::Value::String(replacement.to_string());
+                    modified = true;
+                } else if sanitize_json_value_in_place(v, mask_keys_lower, replacement) {
+                    modified = true;
+                }
+            }
+            modified
+        }
+        serde_json::Value::Array(arr) => {
+            let mut modified = false;
+            for item in arr.iter_mut() {
+                if sanitize_json_value_in_place(item, mask_keys_lower, replacement) {
+                    modified = true;
+                }
+            }
+            modified
+        }
+        _ => false,
+    }
+}
+
+fn sanitize_json_text(
+    text: &str,
+    mask_keys_lower: &[String],
+    replacement: &str,
+) -> Option<String> {
+    let mut parsed: serde_json::Value = serde_json::from_str(text).ok()?;
+    if !sanitize_json_value_in_place(&mut parsed, mask_keys_lower, replacement) {
+        return None;
+    }
+    if text.contains('\n') {
+        serde_json::to_string_pretty(&parsed).ok()
+    } else {
+        serde_json::to_string(&parsed).ok()
+    }
+}
+
+fn is_likely_urlencoded_form(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('{')
+        || trimmed.starts_with('[')
+        || trimmed.starts_with('<')
+        || trimmed.contains('\n')
+        || trimmed.contains('\r')
+        || !trimmed.contains('=')
+    {
+        return false;
+    }
+    trimmed.split('&').all(|seg| {
+        if seg.is_empty() {
+            return true;
+        }
+        match seg.split_once('=') {
+            Some((k, v)) => {
+                !k.trim().is_empty()
+                    && !k.chars().any(char::is_whitespace)
+                    && !v.chars().any(char::is_whitespace)
+            }
+            None => !seg.chars().any(char::is_whitespace),
+        }
+    })
+}
+
+fn sanitize_urlencoded_text(
+    text: &str,
+    mask_keys_lower: &[String],
+    replacement: &str,
+) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    let safe_rep = sanitize_url_component_replacement(replacement);
+    let mut modified = false;
+    let mut parts: Vec<String> = Vec::new();
+    for seg in text.split('&') {
+        if let Some((raw_k, _raw_v)) = seg.split_once('=') {
+            let decoded_k = url_decode_component(raw_k).trim().to_ascii_lowercase();
+            if mask_keys_lower.iter().any(|mk| mk == &decoded_k) {
+                parts.push(format!("{raw_k}={safe_rep}"));
+                modified = true;
+                continue;
+            }
+        }
+        parts.push(seg.to_string());
+    }
+    if modified {
+        Some(parts.join("&"))
+    } else {
+        None
+    }
+}
+
+fn sanitize_body_payload(
+    text: &str,
+    content_type_hint: Option<&str>,
+    mask_keys_lower: &[String],
+    replacement: &str,
+) -> Option<String> {
+    if mask_keys_lower.is_empty() || text.trim().is_empty() {
+        return None;
+    }
+    let trimmed = text.trim_start();
+    let ct_lower = content_type_hint.unwrap_or("").to_ascii_lowercase();
+    let is_json_hint =
+        ct_lower.contains("json") || trimmed.starts_with('{') || trimmed.starts_with('[');
+
+    if is_json_hint {
+        if let Some(updated) = sanitize_json_text(text, mask_keys_lower, replacement) {
+            return Some(updated);
+        }
+    }
+
+    let is_form_hint = ct_lower.contains("application/x-www-form-urlencoded")
+        || is_likely_urlencoded_form(text);
+    if is_form_hint {
+        return sanitize_urlencoded_text(text, mask_keys_lower, replacement);
+    }
+
+    None
+}
+
+fn update_content_length_header(headers: &mut [HeaderPair], byte_len: usize) {
+    let len_str = byte_len.to_string();
+    for h in headers.iter_mut() {
+        if h.name.trim().eq_ignore_ascii_case("content-length") {
+            h.value = len_str.clone();
+        }
+    }
+}
+
+fn sanitize_query_string_in_url_or_path(
+    input: &str,
+    strip_params_lower: &[String],
+    replacement: &str,
+) -> String {
+    if strip_params_lower.is_empty() || !input.contains('?') {
+        return input.to_string();
+    }
+    let (base_and_query, fragment) = match input.split_once('#') {
+        Some((b, f)) => (b, Some(f)),
+        None => (input, None),
+    };
+    let Some((base, query)) = base_and_query.split_once('?') else {
+        return input.to_string();
+    };
+    if query.is_empty() {
+        return input.to_string();
+    }
+
+    let safe_rep = sanitize_url_component_replacement(replacement);
+    let mut modified = false;
+    let mut rebuilt = Vec::new();
+
+    for seg in query.split('&') {
+        if seg.is_empty() {
+            rebuilt.push(String::new());
+            continue;
+        }
+        if let Some((raw_k, _raw_v)) = seg.split_once('=') {
+            let decoded_k = url_decode_component(raw_k).trim().to_ascii_lowercase();
+            if strip_params_lower.iter().any(|p| p == &decoded_k) {
+                rebuilt.push(format!("{raw_k}={safe_rep}"));
+                modified = true;
+                continue;
+            }
+        }
+        rebuilt.push(seg.to_string());
+    }
+
+    if !modified {
+        return input.to_string();
+    }
+
+    let joined = format!("{base}?{}", rebuilt.join("&"));
+    match fragment {
+        Some(f) => format!("{joined}#{f}"),
+        None => joined,
+    }
+}
+
+/// Pure transformation that clones `sessions` and masks sensitive headers, JSON/form bodies,
+/// query parameters, and client/process metadata according to `SanitizationOptions`.
+pub fn sanitize_sessions(
+    sessions: &[SessionDetail],
+    opts: &SanitizationOptions,
+) -> Vec<SessionDetail> {
+    let replacement = if opts.replacement_text.trim().is_empty() {
+        "[REDACTED]"
+    } else {
+        opts.replacement_text.as_str()
+    };
+    let custom_headers_lower = normalize_sanitization_tokens(&opts.custom_redacted_headers);
+    let mask_keys_lower = normalize_sanitization_tokens(&opts.mask_json_keys);
+    let strip_params_lower = normalize_sanitization_tokens(&opts.strip_query_params);
+
+    sessions
+        .iter()
+        .map(|orig| {
+            let mut detail = orig.clone();
+
+            // 1. Redact sensitive request & response headers
+            if opts.redact_auth_headers || !custom_headers_lower.is_empty() {
+                redact_headers_in_place(
+                    &mut detail.request_headers,
+                    opts.redact_auth_headers,
+                    &custom_headers_lower,
+                    replacement,
+                );
+                redact_headers_in_place(
+                    &mut detail.response_headers,
+                    opts.redact_auth_headers,
+                    &custom_headers_lower,
+                    replacement,
+                );
+            }
+
+            // 2. Mask sensitive keys in request & response JSON / form-urlencoded bodies
+            if !mask_keys_lower.is_empty() {
+                let req_bytes = decode_detail_body_bytes(&detail, false);
+                if let Ok(req_text) = std::str::from_utf8(&req_bytes) {
+                    let req_ct = find_header_value(&detail.request_headers, "content-type")
+                        .map(str::to_string);
+                    if let Some(sanitized_req) = sanitize_body_payload(
+                        req_text,
+                        req_ct.as_deref(),
+                        &mask_keys_lower,
+                        replacement,
+                    ) {
+                        let new_len = sanitized_req.len();
+                        detail.request_body_base64 =
+                            base64::engine::general_purpose::STANDARD.encode(sanitized_req.as_bytes());
+                        detail.request_body_text = Some(sanitized_req);
+                        update_content_length_header(&mut detail.request_headers, new_len);
+                    }
+                }
+
+                let resp_bytes = decode_detail_body_bytes(&detail, true);
+                if let Ok(resp_text) = std::str::from_utf8(&resp_bytes) {
+                    let resp_ct = if !detail.summary.content_type.trim().is_empty() {
+                        Some(detail.summary.content_type.clone())
+                    } else {
+                        find_header_value(&detail.response_headers, "content-type")
+                            .map(str::to_string)
+                    };
+                    if let Some(sanitized_resp) = sanitize_body_payload(
+                        resp_text,
+                        resp_ct.as_deref(),
+                        &mask_keys_lower,
+                        replacement,
+                    ) {
+                        let new_len = sanitized_resp.len();
+                        detail.response_body_base64 =
+                            base64::engine::general_purpose::STANDARD.encode(sanitized_resp.as_bytes());
+                        detail.response_body_text = Some(sanitized_resp);
+                        detail.summary.body_size = new_len;
+                        update_content_length_header(&mut detail.response_headers, new_len);
+                    }
+                }
+
+                for ev in detail.sse_events.iter_mut() {
+                    if let Some(sanitized_data) =
+                        sanitize_json_text(&ev.data, &mask_keys_lower, replacement)
+                    {
+                        ev.byte_length = sanitized_data.len();
+                        ev.data = sanitized_data;
+                    }
+                }
+
+                for frame in detail.websocket_frames.iter_mut() {
+                    if let Some(sanitized_payload) =
+                        sanitize_json_text(&frame.payload_preview, &mask_keys_lower, replacement)
+                    {
+                        frame.byte_length = sanitized_payload.len();
+                        frame.payload_preview = sanitized_payload;
+                    }
+                }
+            }
+
+            // 3. Redact sensitive query parameters in `summary.url` and `summary.path`
+            if !strip_params_lower.is_empty() {
+                detail.summary.url = sanitize_query_string_in_url_or_path(
+                    &detail.summary.url,
+                    &strip_params_lower,
+                    replacement,
+                );
+                detail.summary.path = sanitize_query_string_in_url_or_path(
+                    &detail.summary.path,
+                    &strip_params_lower,
+                    replacement,
+                );
+            }
+
+            // 4. Anonymize client address, IP, and local process info
+            if opts.anonymize_client_info {
+                detail.client_addr = "0.0.0.0:0".to_string();
+                detail.summary.client_ip = Some("0.0.0.0".to_string());
+                detail.summary.process_name = Some("redacted-process".to_string());
+                detail.summary.process_pid = None;
+            }
+
+            detail
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -3504,5 +3878,176 @@ mod tests {
         assert_eq!(imported[0].sse_events.len(), 1);
         assert_eq!(imported[0].sse_events[0].id.as_deref(), Some("evt-1"));
         assert_eq!(imported[0].sse_events[0].event, "token");
+    }
+
+    #[test]
+    fn sanitizes_har_and_saz_exports_without_corrupting_structure() {
+        let mut sessions = sample_sessions();
+
+        // Session 0: JSON request/response + Auth headers + sensitive query params + client PII
+        let json_req = br#"{"user":"alice","Password":"secret-json-pass","nested":[{"access_token":"tok-nested-999","cvv":"882"}]}"#;
+        let json_resp = br#"{"ok":true,"token":"resp-jwt-secret-123","refresh_token":"ref-secret-456","profile":{"api_key":"live-key-789"}}"#;
+        sessions[0].summary.path = "/v1/login?token=url-secret-tok&lang=ru&sig=hmac-secret-sig".into();
+        sessions[0].summary.url =
+            "https://auth.fluxproxy.dev/v1/login?token=url-secret-tok&lang=ru&sig=hmac-secret-sig"
+                .into();
+        sessions[0].summary.client_ip = Some("192.168.10.44".into());
+        sessions[0].client_addr = "192.168.10.44:59123".into();
+        sessions[0].summary.process_name = Some("secret-app.exe".into());
+        sessions[0].summary.process_pid = Some(4242);
+        sessions[0].request_headers = vec![
+            HeaderPair { name: "Host".into(), value: "auth.fluxproxy.dev".into() },
+            HeaderPair { name: "Content-Type".into(), value: "application/json".into() },
+            HeaderPair { name: "Authorization".into(), value: "Bearer header-jwt-secret".into() },
+            HeaderPair { name: "Proxy-Authorization".into(), value: "Basic cHJveHk6c2VjcmV0".into() },
+            HeaderPair { name: "Cookie".into(), value: "sid=cookie-secret-val; theme=dark".into() },
+            HeaderPair { name: "X-Api-Key".into(), value: "x-api-key-secret".into() },
+            HeaderPair { name: "X-Auth-Token".into(), value: "x-auth-tok-secret".into() },
+            HeaderPair { name: "X-Custom-Session".into(), value: "custom-hdr-secret".into() },
+        ];
+        sessions[0].response_headers = vec![
+            HeaderPair { name: "Content-Type".into(), value: "application/json; charset=utf-8".into() },
+            HeaderPair { name: "Set-Cookie".into(), value: "session=set-cookie-secret; HttpOnly; Secure".into() },
+        ];
+        sessions[0].request_body_base64 =
+            base64::engine::general_purpose::STANDARD.encode(json_req);
+        sessions[0].request_body_text = Some(String::from_utf8(json_req.to_vec()).unwrap());
+        sessions[0].response_body_base64 =
+            base64::engine::general_purpose::STANDARD.encode(json_resp);
+        sessions[0].response_body_text = Some(String::from_utf8(json_resp.to_vec()).unwrap());
+        sessions[0].summary.body_size = json_resp.len();
+
+        // Session 1: Form-urlencoded request + binary PNG response (must stay intact)
+        let form_req = b"grant_type=refresh_token&client_id=flux-web&refresh_token=form-refresh-secret&Password=form-pass-secret";
+        sessions[1].summary.method = "POST".into();
+        sessions[1].summary.path = "/oauth/token?api_key=query-api-key-secret&mode=refresh".into();
+        sessions[1].summary.url =
+            "https://cdn.fluxproxy.dev/oauth/token?api_key=query-api-key-secret&mode=refresh"
+                .into();
+        sessions[1].request_headers = vec![
+            HeaderPair { name: "Host".into(), value: "cdn.fluxproxy.dev".into() },
+            HeaderPair {
+                name: "Content-Type".into(),
+                value: "application/x-www-form-urlencoded".into(),
+            },
+        ];
+        sessions[1].request_body_base64 =
+            base64::engine::general_purpose::STANDARD.encode(form_req);
+        sessions[1].request_body_text = Some(String::from_utf8(form_req.to_vec()).unwrap());
+
+        let original_png = decode_detail_body_bytes(&sessions[1], true);
+
+        let opts = SanitizationOptions {
+            custom_redacted_headers: vec!["x-custom-session".into()],
+            anonymize_client_info: true,
+            ..SanitizationOptions::default()
+        };
+
+        let sanitized = sanitize_sessions(&sessions, &opts);
+        assert_eq!(sanitized.len(), 2);
+
+        // Verify JSON & Raw HTTP exports contain no raw secrets
+        let json_dump = serialize_json_archive(&sanitized).expect("serialize JSON");
+        let raw_dump = String::from_utf8_lossy(&serialize_full_raw_http(&sanitized)).into_owned();
+        let har_json = serialize_har_1_2(&sanitized).expect("serialize HAR 1.2");
+
+        let secrets = [
+            "secret-json-pass",
+            "tok-nested-999",
+            "882",
+            "resp-jwt-secret-123",
+            "ref-secret-456",
+            "live-key-789",
+            "url-secret-tok",
+            "hmac-secret-sig",
+            "header-jwt-secret",
+            "cHJveHk6c2VjcmV0",
+            "cookie-secret-val",
+            "x-api-key-secret",
+            "x-auth-tok-secret",
+            "custom-hdr-secret",
+            "set-cookie-secret",
+            "form-refresh-secret",
+            "form-pass-secret",
+            "query-api-key-secret",
+            "192.168.10.44",
+            "secret-app.exe",
+        ];
+
+        for secret in secrets {
+            assert!(!har_json.contains(secret), "HAR leaked secret: {secret}");
+            assert!(!json_dump.contains(secret), "JSON leaked secret: {secret}");
+            assert!(!raw_dump.contains(secret), "Raw HTTP leaked secret: {secret}");
+        }
+
+        // Verify HAR 1.2 deserializes cleanly and retains structure
+        let har_val: serde_json::Value = serde_json::from_str(&har_json).expect("valid HAR JSON");
+        assert_eq!(har_val["log"]["version"], "1.2");
+        assert_eq!(har_val["log"]["entries"][0]["request"]["queryString"][0]["value"], "[REDACTED]");
+        assert_eq!(har_val["log"]["entries"][0]["request"]["queryString"][1]["name"], "lang");
+        assert_eq!(har_val["log"]["entries"][0]["request"]["queryString"][1]["value"], "ru");
+
+        let har_roundtrip = deserialize_har_1_2(&har_json).expect("deserialize sanitized HAR");
+        assert_eq!(har_roundtrip.len(), 2);
+        assert_eq!(har_roundtrip[0].client_addr, "0.0.0.0:0");
+        assert_eq!(har_roundtrip[0].summary.client_ip.as_deref(), Some("0.0.0.0"));
+        assert_eq!(
+            har_roundtrip[0].summary.process_name.as_deref(),
+            Some("redacted-process")
+        );
+        assert_eq!(har_roundtrip[0].summary.process_pid, None);
+        assert_eq!(
+            decode_detail_body_bytes(&har_roundtrip[1], true),
+            original_png
+        );
+
+        let form_body = har_roundtrip[1].request_body_text.as_deref().unwrap();
+        assert!(form_body.contains("grant_type=refresh_token"));
+        assert!(form_body.contains("refresh_token=[REDACTED]"));
+        assert!(form_body.contains("Password=[REDACTED]"));
+
+        // Verify SAZ archive builds cleanly, strips secrets from ZIP entries, and roundtrips
+        let mut saz_cursor = Cursor::new(Vec::new());
+        let written_count = write_saz_to_writer(&mut saz_cursor, &sanitized).expect("write SAZ");
+        assert_eq!(written_count, 2);
+
+        saz_cursor.set_position(0);
+        {
+            let mut archive = ZipArchive::new(&mut saz_cursor).expect("open SAZ zip");
+            for i in 0..archive.len() {
+                let mut entry = archive.by_index(i).unwrap();
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf).unwrap();
+                let text = String::from_utf8_lossy(&buf);
+                for secret in secrets {
+                    assert!(
+                        !text.contains(secret),
+                        "SAZ entry '{}' leaked secret: {secret}",
+                        entry.name()
+                    );
+                }
+            }
+        }
+
+        saz_cursor.set_position(0);
+        let saz_roundtrip = read_saz_from_reader(saz_cursor).expect("read sanitized SAZ");
+        assert_eq!(saz_roundtrip.len(), 2);
+        assert_eq!(saz_roundtrip[0].client_addr, "0.0.0.0:0");
+        assert_eq!(saz_roundtrip[0].summary.client_ip.as_deref(), Some("0.0.0.0"));
+        assert_eq!(
+            saz_roundtrip[0].summary.process_name.as_deref(),
+            Some("redacted-process")
+        );
+        assert_eq!(saz_roundtrip[0].summary.process_pid, None);
+        assert_eq!(
+            decode_detail_body_bytes(&saz_roundtrip[1], true),
+            original_png
+        );
+        let saz_req_json: serde_json::Value =
+            serde_json::from_str(saz_roundtrip[0].request_body_text.as_deref().unwrap()).unwrap();
+        assert_eq!(saz_req_json["user"], "alice");
+        assert_eq!(saz_req_json["Password"], "[REDACTED]");
+        assert_eq!(saz_req_json["nested"][0]["access_token"], "[REDACTED]");
+        assert_eq!(saz_req_json["nested"][0]["cvv"], "[REDACTED]");
     }
 }
