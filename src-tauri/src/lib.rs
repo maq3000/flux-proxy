@@ -90,6 +90,8 @@ pub fn run() {
             commands::get_network_interfaces,
             commands::set_system_proxy,
             commands::set_auto_system_proxy,
+            commands::run_proxy_doctor,
+            commands::fix_doctor_issue,
             commands::get_sessions,
             commands::get_session_detail,
             commands::clear_sessions,

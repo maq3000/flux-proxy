@@ -17,6 +17,7 @@ interface CommandPaletteProps {
   onQuickExecBpu?: (stage: "request" | "response", pattern: string) => void;
   onQuickOpenJwt?: (token: string) => void;
   onQuickOpenSanitizedExport?: () => void;
+  onQuickOpenProxyDoctor?: () => void;
 }
 
 export const CommandPalette: React.FC<CommandPaletteProps> = ({
@@ -26,6 +27,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   onQuickExecBpu,
   onQuickOpenJwt,
   onQuickOpenSanitizedExport,
+  onQuickOpenProxyDoctor,
 }) => {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -101,6 +103,20 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       });
     }
 
+    if (
+      onQuickOpenProxyDoctor &&
+      (q === "doctor" || q.startsWith("doctor ") || q === "health")
+    ) {
+      dynamicQuickExec.push({
+        id: "quickexec-proxy-doctor",
+        category: "Diagnostics",
+        label:
+          "Run Proxy Doctor… (Диагностика порта, Root CA, SysProxy, VPN и loopback)",
+        shortcut: "Ctrl+Shift+D",
+        perform: () => onQuickOpenProxyDoctor(),
+      });
+    }
+
     const matchedStatic = commands.filter(
       (c) =>
         c.id.toLowerCase().includes(q) ||
@@ -116,6 +132,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     onQuickExecBpu,
     onQuickOpenJwt,
     onQuickOpenSanitizedExport,
+    onQuickOpenProxyDoctor,
   ]);
 
   useEffect(() => {

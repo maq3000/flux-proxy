@@ -6,9 +6,10 @@ use tauri::State;
 
 use crate::models::{
     AutoResponderRule, BindHostMode, BreakpointAction, BreakpointConfig, BreakpointResolution,
-    CaCertificateInfo, CodecOperation, CodecTransformResult, ComposedRequest, LoadedSessionBody,
-    NetworkInterfaceInfo, PausedBreakpointItem, ProxyError, ProxyFilterBackendConfig, ProxyStatus,
-    SanitizationOptions, SessionDetail, SessionSummary, StorageStats,
+    CaCertificateInfo, CodecOperation, CodecTransformResult, ComposedRequest, DoctorCheckResult,
+    LoadedSessionBody, NetworkInterfaceInfo, PausedBreakpointItem, ProxyError,
+    ProxyFilterBackendConfig, ProxyStatus, SanitizationOptions, SessionDetail, SessionSummary,
+    StorageStats,
 };
 use crate::proxy::codec::execute_codec_transform;
 use crate::proxy::network::list_network_interfaces_with_options;
@@ -105,6 +106,21 @@ pub async fn set_auto_system_proxy(
     state: State<'_, AppState>,
 ) -> Result<ProxyStatus, ProxyError> {
     state.controller.set_auto_system_proxy(auto).await
+}
+
+#[tauri::command]
+pub async fn run_proxy_doctor(
+    state: State<'_, AppState>,
+) -> Result<Vec<DoctorCheckResult>, ProxyError> {
+    Ok(crate::proxy::doctor::run_proxy_doctor(&state.controller).await)
+}
+
+#[tauri::command]
+pub async fn fix_doctor_issue(
+    issue_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<DoctorCheckResult>, ProxyError> {
+    crate::proxy::doctor::fix_doctor_issue(&state.controller, &issue_id).await
 }
 
 #[tauri::command]

@@ -485,7 +485,7 @@ struct ControllerRuntimeState {
     allow_remote: bool,
 }
 
-fn format_bind_sock_addr(ip: &str, port: u16) -> String {
+pub(crate) fn format_bind_sock_addr(ip: &str, port: u16) -> String {
     if ip.contains(':') && !ip.starts_with('[') {
         format!("[{ip}]:{port}")
     } else {
@@ -4365,6 +4365,14 @@ fn handle_builtin_portal_request(
         return Response::builder()
             .status(StatusCode::NO_CONTENT)
             .body(boxed_full(Bytes::new()))
+            .unwrap();
+    }
+    if raw_path.trim_end_matches('/').eq_ignore_ascii_case("/health") {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .header("Cache-Control", "no-store, no-cache, must-revalidate")
+            .body(boxed_full(Bytes::from_static(br#"{"status":"ok"}"#)))
             .unwrap();
     }
 

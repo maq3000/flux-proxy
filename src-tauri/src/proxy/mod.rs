@@ -1,6 +1,7 @@
 pub mod breakpoints;
 pub mod ca;
 pub mod codec;
+pub mod doctor;
 pub mod filters;
 pub mod network;
 pub mod process;

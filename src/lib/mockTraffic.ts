@@ -1,7 +1,9 @@
 import {
   BUILTIN_REDACTED_AUTH_HEADERS,
   type AutoResponderRule,
+  type DoctorCheckResult,
   type HeaderPair,
+  type ProxyStatus,
   type SanitizationOptions,
   type SessionDetail,
   type SseEventRecord,
@@ -1210,4 +1212,124 @@ export function sanitizeSessionsInPreview(
 
     return detail;
   });
+}
+
+export function buildPreviewDoctorChecks(params: {
+  status: ProxyStatus;
+  caTrusted: boolean;
+}): DoctorCheckResult[] {
+  const { status, caTrusted } = params;
+  const boundList =
+    status.boundIps && status.boundIps.length > 0
+      ? status.boundIps
+      : [status.bindAddr];
+  const endpoints = boundList.map((ip) => `${ip}:${status.port}`).join(" + ");
+  const expectedSysproxyHost =
+    status.bindMode === "specific" &&
+    status.specificBindIp &&
+    status.alsoBindLoopback === false
+      ? status.specificBindIp
+      : "127.0.0.1";
+  const expectedSysproxyEndpoint = `${expectedSysproxyHost}:${status.port}`;
+  const lanExposed = Boolean(
+    status.allowRemote ||
+      status.bindMode === "all" ||
+      (status.bindMode === "specific" &&
+        status.specificBindIp &&
+        status.specificBindIp !== "127.0.0.1" &&
+        status.specificBindIp !== "::1")
+  );
+
+  return [
+    {
+      id: "port_binding",
+      title: "Привязка порта и сокетов прокси",
+      status: status.running ? "ok" : "warning",
+      summary: status.running
+        ? `Прокси-листенер активен на ${endpoints}`
+        : `Прокси остановлен, но порт ${status.port} свободен (${endpoints})`,
+      details: status.running
+        ? `Browser Preview: движок активен на [${boundList.join(", ")}], порт ${status.port}.`
+        : "Пробная проверка сокета прошла успешно. Запустите прокси-листенер в 1 клик.",
+      canAutoFix: !status.running,
+      fixLabel: status.running ? null : "Запустить листенер прокси",
+    },
+    {
+      id: "root_ca_trust",
+      title: "Доверие к HTTPS Root CA",
+      status: caTrusted ? "ok" : "error",
+      summary: caTrusted
+        ? "FluxProxy Root CA установлен в доверенном хранилище ОС"
+        : "Root CA не установлен в доверенные корневые центры ОС",
+      details: caTrusted
+        ? "Subject: CN=FluxProxy Local Debugging Root CA, O=FluxProxy Web Debugger\nSHA-256: 8F:4B:1C:92:A7:03:E1:55..."
+        : "Без установки Root CA в хранилище ОС браузеры отклоняют HTTPS MITM-соединения.",
+      canAutoFix: !caTrusted,
+      fixLabel: caTrusted ? null : "Установить Root CA в ОС",
+    },
+    {
+      id: "system_proxy_sync",
+      title: "Синхронизация системного прокси ОС",
+      status: status.systemProxyError
+        ? "error"
+        : status.running && status.systemProxyEnabled
+          ? "ok"
+          : !status.running && status.systemProxyEnabled
+            ? "error"
+            : "warning",
+      summary: status.systemProxyError
+        ? `Системный прокси не синхронизирован с ${expectedSysproxyEndpoint}`
+        : status.running && status.systemProxyEnabled
+          ? `Системный прокси ОС активен и указывает на ${expectedSysproxyEndpoint}`
+          : "Системный прокси ОС отключён (режим Port Only)",
+      details: status.systemProxyError
+        ? `${status.systemProxyError}. Нажмите «Восстановить системный прокси» для переподключения.`
+        : `Ожидаемый адрес системного прокси: ${expectedSysproxyEndpoint} (autoSystemProxy: ${
+            status.autoSystemProxy ? "вкл" : "выкл"
+          }).`,
+      canAutoFix: !(status.running && status.systemProxyEnabled && !status.systemProxyError),
+      fixLabel:
+        status.running && status.systemProxyEnabled && !status.systemProxyError
+          ? null
+          : status.systemProxyError
+            ? "Восстановить системный прокси"
+            : "Включить системный прокси ОС",
+    },
+    {
+      id: "vpn_interface_check",
+      title: "Конфликты VPN / TUN / CGNAT маршрутизации",
+      status: "warning",
+      summary: "Preview: обнаружен виртуальный интерфейс Tailscale (100.101.102.4, CGNAT/VPN)",
+      details:
+        "VPN-клиенты в режиме TUN могут перехватывать системный прокси или сбрасывать WinINet ProxyServer. В нативном Tauri-режиме проверяются реальные адаптеры ОС.",
+      canAutoFix: false,
+      fixLabel: null,
+    },
+    {
+      id: "firewall_check",
+      title: "Брандмауэр и доступность порта",
+      status: lanExposed ? "warning" : "ok",
+      summary: lanExposed
+        ? `LAN-режим активен (порт ${status.port}); проверьте входящее правило брандмауэра`
+        : `Loopback-режим (127.0.0.1:${status.port}) защищён от внешней блокировки`,
+      details: lanExposed
+        ? `При необходимости выполните: netsh advfirewall firewall add rule name="FluxProxy" dir=in action=allow protocol=TCP localport=${status.port}`
+        : "Локальный трафик 127.0.0.1 не блокируется внешним брандмауэром.",
+      canAutoFix: false,
+      fixLabel: null,
+    },
+    {
+      id: "loopback_e2e",
+      title: "End-to-End loopback-маршрутизация (/health)",
+      status: status.running ? "ok" : "error",
+      summary: status.running
+        ? "GET http://flux.proxy/health → HTTP 200 (1 мс)"
+        : `Прокси остановлен — сокет ${expectedSysproxyEndpoint} не прослушивается`,
+      details: status.running
+        ? 'Ответ {"status":"ok"} подтверждён (симуляция Browser Preview; без записи в TrafficStore).'
+        : "Запустите прокси-листенер, чтобы проверить прохождение трафика через локальный сокет.",
+      canAutoFix: !status.running,
+      fixLabel: status.running ? null : "Запустить листенер прокси",
+    },
+  ];
 }

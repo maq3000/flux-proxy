@@ -68,6 +68,7 @@ const SHORTCUT_GROUPS: {
         description: "Компактный режим тулбара (Slim / Compact Toolbar)",
       },
       { keys: "Ctrl+Shift+M", description: "Connect Mobile Device — iOS / Android Wi-Fi Proxy + QR" },
+      { keys: "Ctrl+Shift+D", description: "Запустить диагностический мастер Proxy Doctor" },
       { keys: "Ctrl+E", description: "Открыть Text Wizard & JWT Decoder" },
       {
         keys: "Ctrl+, / Cmd+,",

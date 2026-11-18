@@ -12,6 +12,7 @@ import type {
   CodecOperation,
   CodecTransformResult,
   ComposedRequest,
+  DoctorCheckResult,
   LoadedSessionBody,
   NetworkInterfaceInfo,
   PausedBreakpointItem,
@@ -37,6 +38,7 @@ import {
 } from "./formatters";
 import {
   buildInFlightSnapshot,
+  buildPreviewDoctorChecks,
   buildSimulatedSession,
   DEFAULT_AUTORESPONDER_RULES,
   DEFAULT_CLEAR_DB_ON_EXIT,
@@ -2267,6 +2269,40 @@ export const proxyBridge = {
       return invoke<ProxyStatus>("set_auto_system_proxy", { auto });
     }
     return previewEngine.setAutoSystemProxy(auto);
+  },
+
+  async runProxyDoctor(): Promise<DoctorCheckResult[]> {
+    if (isTauriRuntime()) {
+      return invoke<DoctorCheckResult[]>("run_proxy_doctor");
+    }
+    return buildPreviewDoctorChecks({
+      status: previewEngine.getStatus(),
+      caTrusted: previewCaTrusted,
+    });
+  },
+
+  async fixDoctorIssue(issueId: string): Promise<DoctorCheckResult[]> {
+    if (isTauriRuntime()) {
+      return invoke<DoctorCheckResult[]>("fix_doctor_issue", { issueId });
+    }
+    if (issueId === "port_binding" || issueId === "loopback_e2e" || issueId === "all") {
+      if (!previewEngine.getStatus().running) {
+        previewEngine.setRunning(true);
+      }
+    }
+    if (issueId === "system_proxy_sync" || issueId === "all") {
+      if (!previewEngine.getStatus().running) {
+        previewEngine.setRunning(true);
+      }
+      previewEngine.setSystemProxy(true);
+    }
+    if (issueId === "root_ca_trust" || issueId === "all") {
+      previewCaTrusted = true;
+    }
+    return buildPreviewDoctorChecks({
+      status: previewEngine.getStatus(),
+      caTrusted: previewCaTrusted,
+    });
   },
 
   setPreviewPort(port: number): ProxyStatus {

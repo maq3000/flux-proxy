@@ -408,6 +408,20 @@ pub struct CodecTransformResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DoctorCheckResult {
+    pub id: String,
+    pub title: String,
+    pub status: String, // "ok" | "warning" | "error"
+    pub summary: String,
+    pub details: String,
+    #[serde(alias = "can_auto_fix")]
+    pub can_auto_fix: bool,
+    #[serde(alias = "fix_label")]
+    pub fix_label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NetworkInterfaceInfo {
     pub name: String,
     pub ip: String,

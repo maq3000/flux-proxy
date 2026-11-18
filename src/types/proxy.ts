@@ -274,6 +274,18 @@ export interface CaCertificateInfo {
   isTrusted?: boolean;
 }
 
+export type DoctorCheckStatus = "ok" | "warning" | "error";
+
+export interface DoctorCheckResult {
+  id: string;
+  title: string;
+  status: DoctorCheckStatus;
+  summary: string;
+  details: string;
+  canAutoFix: boolean;
+  fixLabel?: string | null;
+}
+
 export interface NetworkInterfaceInfo {
   name: string;
   ip: string;

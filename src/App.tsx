@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Database, Trash2, Upload, X } from "lucide-react";
+import { Database, Stethoscope, Trash2, Upload, X } from "lucide-react";
 import {
   Panel,
   PanelGroup,
@@ -20,6 +20,7 @@ import { ComposerPanel } from "./components/ComposerPanel";
 import { FilterDrawer } from "./components/FilterDrawer";
 import { MenuBar } from "./components/MenuBar";
 import { MobileSetupModal } from "./components/MobileSetupModal";
+import { ProxyDoctorModal } from "./components/ProxyDoctorModal";
 import { SanitizedExportModal } from "./components/SanitizedExportModal";
 import { SessionAnnotationModal } from "./components/SessionAnnotationModal";
 import {
@@ -247,6 +248,7 @@ export const App: React.FC = () => {
   } | null>(null);
   const [certModalOpen, setCertModalOpen] = useState(false);
   const [mobileModalOpen, setMobileModalOpen] = useState(false);
+  const [proxyDoctorModalOpen, setProxyDoctorModalOpen] = useState(false);
   const [sanitizedExportModalOpen, setSanitizedExportModalOpen] =
     useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -1202,6 +1204,18 @@ export const App: React.FC = () => {
         return;
       }
 
+      // Ctrl+Shift+D / Cmd+Shift+D -> Run Proxy Doctor
+      if (
+        ctrlOrMeta &&
+        !e.altKey &&
+        e.shiftKey &&
+        (keyLower === "d" || e.code === "KeyD")
+      ) {
+        e.preventDefault();
+        setProxyDoctorModalOpen((prev) => !prev);
+        return;
+      }
+
       // Ctrl+Shift+T / Cmd+Shift+T -> Toggle Slim / Compact Toolbar
       if (
         ctrlOrMeta &&
@@ -1648,6 +1662,26 @@ export const App: React.FC = () => {
         label: "Показать справку по горячим клавишам (Keyboard Shortcuts)",
         shortcut: "?",
         perform: () => setShortcutsModalOpen(true),
+      },
+      {
+        id: "run-proxy-doctor",
+        category: "Diagnostics",
+        label:
+          "Run Proxy Doctor… (Диагностика порта, Root CA, SysProxy, VPN, Firewall и loopback)",
+        shortcut: "Ctrl+Shift+D",
+        keywords: [
+          "doctor",
+          "diagnose",
+          "health",
+          "vpn",
+          "firewall",
+          "ca",
+          "sysproxy",
+          "loopback",
+          "диагностика",
+          "проблемы",
+        ],
+        perform: () => setProxyDoctorModalOpen(true),
       },
       {
         id: "open-text-wizard",
@@ -2318,6 +2352,7 @@ export const App: React.FC = () => {
         onGenerateStress10k={generateStress10k}
         onOpenCommandPalette={() => setPaletteOpen(true)}
         onOpenShortcutsModal={() => setShortcutsModalOpen(true)}
+        onOpenProxyDoctor={() => setProxyDoctorModalOpen(true)}
         onCopyCliEnv={copyCliProxyEnv}
         onResetAllUiPreferences={resetAllUiPreferences}
       />
@@ -2679,6 +2714,24 @@ export const App: React.FC = () => {
                   ? "Port Only"
                   : "Proxy Off"}
           </button>
+          {(status.systemProxyError || !status.running) && (
+            <>
+              <span className="text-subtle">•</span>
+              <button
+                type="button"
+                onClick={() => setProxyDoctorModalOpen(true)}
+                title={
+                  status.systemProxyError
+                    ? `Ошибка системного прокси: ${status.systemProxyError} — нажмите для диагностики Proxy Doctor (Ctrl+Shift+D)`
+                    : "Прокси-движок остановлен — нажмите для диагностики Proxy Doctor (Ctrl+Shift+D)"
+                }
+                className="inline-flex shrink-0 items-center gap-1 rounded border border-rose-500/40 bg-rose-500/12 px-1.5 py-0.5 font-sans text-[10px] font-semibold text-status5xx-fg transition-colors hover:bg-rose-500/20"
+              >
+                <Stethoscope aria-hidden="true" className="h-3 w-3" />
+                <span>Fix with Proxy Doctor</span>
+              </button>
+            </>
+          )}
           <span className="hidden text-subtle md:inline">•</span>
           {(() => {
             const boundIpsList =
@@ -3020,6 +3073,12 @@ export const App: React.FC = () => {
         onNotify={showToast}
       />
 
+      <ProxyDoctorModal
+        open={proxyDoctorModalOpen}
+        onClose={() => setProxyDoctorModalOpen(false)}
+        onNotify={showToast}
+      />
+
       <SanitizedExportModal
         open={sanitizedExportModalOpen}
         totalCount={sessions.length}
@@ -3037,6 +3096,7 @@ export const App: React.FC = () => {
         }
         onQuickOpenJwt={(token) => openTextWizardAt("jwt", token)}
         onQuickOpenSanitizedExport={openSanitizedExportModal}
+        onQuickOpenProxyDoctor={() => setProxyDoctorModalOpen(true)}
       />
 
       <dialog

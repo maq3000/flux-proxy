@@ -112,6 +112,7 @@ interface MenuBarProps {
   // Help
   onOpenCommandPalette: () => void;
   onOpenShortcutsModal: () => void;
+  onOpenProxyDoctor: () => void;
   onCopyCliEnv: () => void;
   onResetAllUiPreferences: () => void;
 }
@@ -346,6 +347,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onGenerateStress10k,
   onOpenCommandPalette,
   onOpenShortcutsModal,
+  onOpenProxyDoctor,
   onCopyCliEnv,
   onResetAllUiPreferences,
 }) => {
@@ -1875,6 +1877,16 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 <span>Keyboard Shortcuts…</span>
                 <span className="hint" aria-hidden="true">
                   ?
+                </span>
+              </button>
+              <hr />
+              <button
+                type="button"
+                onClick={(e) => activateCommand(e, onOpenProxyDoctor)}
+              >
+                <span>Run Proxy Doctor…</span>
+                <span className="hint" aria-hidden="true">
+                  Ctrl+Shift+D
                 </span>
               </button>
               <hr />
