@@ -834,6 +834,7 @@ impl ProxyEngineController {
 
         let breakpoints = Arc::new(BreakpointEngine::new(Some(bp_tx)));
 
+        let initial_port = sysproxy.load_proxy_port_pref();
         let context = Arc::new(SharedProxyContext {
             ca,
             rules,
@@ -844,7 +845,7 @@ impl ProxyEngineController {
             upstream_redirect_client,
             event_tx,
             removed_tx,
-            active_port: AtomicU16::new(8888),
+            active_port: AtomicU16::new(initial_port),
             app_handle,
             stats_dirty,
         });
@@ -875,7 +876,7 @@ impl ProxyEngineController {
             sysproxy,
             op_lock: Mutex::new(()),
             runtime_state: std::sync::Mutex::new(ControllerRuntimeState {
-                bind_addr: (initial_bind_host, 8888),
+                bind_addr: (initial_bind_host, initial_port),
                 bind_mode: initial_mode,
                 specific_bind_ip: initial_specific_ip,
                 also_bind_loopback: bind_pref.also_bind_loopback,
@@ -890,6 +891,10 @@ impl ProxyEngineController {
 
     pub fn preferred_bind_host(&self) -> String {
         self.lock_runtime().bind_addr.0.clone()
+    }
+
+    pub fn preferred_port(&self) -> u16 {
+        self.lock_runtime().bind_addr.1
     }
 
     fn lock_runtime(&self) -> std::sync::MutexGuard<'_, ControllerRuntimeState> {
@@ -1081,6 +1086,10 @@ impl ProxyEngineController {
                     return Err(err);
                 }
             };
+
+        if port > 0 {
+            self.sysproxy.save_proxy_port_pref(actual_port);
+        }
 
         let (tx, handles) = self.spawn_listeners_for_bind(listeners, actual_port);
 
@@ -1284,6 +1293,128 @@ impl ProxyEngineController {
             .await
     }
 
+    /// Updates the proxy listener port. When the proxy is stopped, persists the new port
+    /// preference immediately; when running, atomically rebinds active listeners with rollback
+    /// to the previous port on failure.
+    pub async fn set_port(&self, port: u16) -> Result<ProxyStatus, ProxyError> {
+        if port == 0 {
+            return Err(ProxyError::Custom(
+                "Порт прокси должен быть целым числом от 1 до 65535".to_string(),
+            ));
+        }
+
+        let _op = self.op_lock.lock().await;
+        let (
+            was_running,
+            prev_port,
+            auto_system_proxy,
+            eff_mode,
+            norm_specific_ip,
+            also_bind_loopback,
+            bound_ips,
+            old_tx,
+            old_handles,
+        ) = {
+            let mut guard = self.lock_runtime();
+            let running = guard.shutdown_tx.is_some();
+            let current_port = guard.bind_addr.1;
+            if current_port == port {
+                let _ = running;
+                drop(guard);
+                self.sysproxy.save_proxy_port_pref(port);
+                return Ok(self.build_status());
+            }
+            if !running {
+                guard.bind_addr.1 = port;
+                drop(guard);
+                self.context.active_port.store(port, Ordering::Relaxed);
+                self.sysproxy.save_proxy_port_pref(port);
+                let status = self.build_status();
+                self.emit_status_changed(&status);
+                return Ok(status);
+            }
+            (
+                running,
+                current_port,
+                guard.auto_system_proxy,
+                guard.bind_mode,
+                guard.specific_bind_ip.clone(),
+                guard.also_bind_loopback,
+                guard.bound_ips.clone(),
+                guard.shutdown_tx.take(),
+                std::mem::take(&mut guard.listener_handles),
+            )
+        };
+
+        let _ = was_running;
+        shutdown_listeners(old_tx, old_handles).await;
+
+        match bind_listeners_with_cleanup(&bound_ips, port, 8).await {
+            Ok((listeners, actual_port)) => {
+                let (tx, handles) = self.spawn_listeners_for_bind(listeners, actual_port);
+                {
+                    let mut guard = self.lock_runtime();
+                    guard.bind_addr.1 = actual_port;
+                    guard.shutdown_tx = Some(tx);
+                    guard.listener_handles = handles;
+                }
+                self.sysproxy.save_proxy_port_pref(actual_port);
+
+                let sysproxy_enabled_before = self.sysproxy.is_desired_enabled();
+                if auto_system_proxy || sysproxy_enabled_before {
+                    let sysproxy_host = resolve_sysproxy_host_for_bind(
+                        eff_mode,
+                        norm_specific_ip.as_deref(),
+                        also_bind_loopback,
+                    );
+                    if let Err(err) = self.sysproxy.enable(&sysproxy_host, actual_port) {
+                        tracing::warn!(
+                            "Failed to update OS system proxy target to {sysproxy_host}:{actual_port}: {err}"
+                        );
+                    }
+                }
+
+                let status = self.build_status();
+                self.emit_status_changed(&status);
+                Ok(status)
+            }
+            Err(err) => {
+                if let Ok((fallback_listeners, fallback_port)) =
+                    bind_listeners_with_cleanup(&bound_ips, prev_port, 3).await
+                {
+                    let (tx, handles) =
+                        self.spawn_listeners_for_bind(fallback_listeners, fallback_port);
+                    {
+                        let mut guard = self.lock_runtime();
+                        guard.bind_addr.1 = fallback_port;
+                        guard.shutdown_tx = Some(tx);
+                        guard.listener_handles = handles;
+                    }
+                    let sysproxy_enabled_before = self.sysproxy.is_desired_enabled();
+                    if auto_system_proxy || sysproxy_enabled_before {
+                        let sysproxy_host = resolve_sysproxy_host_for_bind(
+                            eff_mode,
+                            norm_specific_ip.as_deref(),
+                            also_bind_loopback,
+                        );
+                        let _ = self.sysproxy.enable(&sysproxy_host, fallback_port);
+                    }
+                } else {
+                    {
+                        let mut guard = self.lock_runtime();
+                        guard.bind_addr.1 = prev_port;
+                    }
+                    self.context.active_port.store(prev_port, Ordering::Relaxed);
+                    self.sysproxy.rollback_if_dirty();
+                }
+
+                let rollback_status = self.build_status();
+                self.emit_status_changed(&rollback_status);
+                Err(err)
+            }
+        }
+    }
+
     pub async fn stop(&self) -> ProxyStatus {
         let _op = self.op_lock.lock().await;
         self.context
@@ -1391,7 +1522,17 @@ impl ProxyEngineController {
         let mut method_str = composed.method;
         let mut full_url = composed.url;
         let mut req_headers = composed.headers;
-        let mut req_bytes = composed.body.into_bytes();
+        let mut req_bytes = match composed
+            .body_base64
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(b64) => base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| ProxyError::Custom(format!("Invalid request bodyBase64: {e}")))?,
+            None => composed.body.into_bytes(),
+        };
         let mut bp_modified = false;
 
         let parsed_initial = reqwest::Url::parse(&full_url)
@@ -6948,5 +7089,87 @@ mod tests {
             Err(RequestBodyReadError::PayloadTooLarge(limit)) => assert_eq!(limit, 8),
             other => panic!("expected PayloadTooLarge(8) on streamed body, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn set_port_updates_stopped_and_running_with_rollback_on_addr_in_use() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-setport-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("setport.sqlite")).unwrap());
+        let os_backend = RecordingOsProxyBackend::new();
+        let sysproxy = Arc::new(SystemProxyManager::with_backend(
+            &tmp_dir,
+            os_backend.clone(),
+        ));
+
+        let controller = ProxyEngineController::new_for_test(
+            ca,
+            rules,
+            filters,
+            store,
+            sysproxy.clone(),
+        )
+        .unwrap();
+
+        let p1_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p1 = p1_probe.local_addr().unwrap().port();
+        drop(p1_probe);
+
+        // 1. Update port while stopped -> persists pref and updates preferred_port
+        let stopped_status = controller.set_port(p1).await.expect("set_port while stopped");
+        assert!(!stopped_status.running);
+        assert_eq!(stopped_status.port, p1);
+        assert_eq!(controller.preferred_port(), p1);
+        assert_eq!(sysproxy.load_proxy_port_pref(), p1);
+
+        // 2. Start using preferred_port
+        let started = controller
+            .start_with_config(controller.preferred_port())
+            .await
+            .expect("start on preferred_port");
+        assert!(started.running);
+        assert_eq!(started.port, p1);
+
+        // 3. Rebind to another free port p2 while running
+        let p2_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p2 = p2_probe.local_addr().unwrap().port();
+        drop(p2_probe);
+
+        let moved = controller.set_port(p2).await.expect("set_port to p2 while running");
+        assert!(moved.running);
+        assert_eq!(moved.port, p2);
+        assert_eq!(sysproxy.load_proxy_port_pref(), p2);
+        TcpStream::connect(format!("127.0.0.1:{p2}"))
+            .await
+            .expect("connect to new port p2");
+
+        // 4. Attempt switching to an already occupied port -> must fail AND roll back listener to p2
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+        let err = controller
+            .set_port(occupied_port)
+            .await
+            .expect_err("occupied port should fail");
+        assert!(err.to_string().contains("AddrInUse"));
+
+        let after_rollback = controller.status().await;
+        assert!(after_rollback.running);
+        assert_eq!(after_rollback.port, p2);
+        assert_eq!(sysproxy.load_proxy_port_pref(), p2);
+        TcpStream::connect(format!("127.0.0.1:{p2}"))
+            .await
+            .expect("listener restored on p2 after rollback");
+
+        controller.stop().await;
+        drop(occupied);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

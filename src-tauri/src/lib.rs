@@ -59,12 +59,15 @@ pub fn run() {
                 .expect("Failed to create ProxyEngineController"),
             );
 
-            // Auto-start proxy listener using saved bind configuration (Loopback, AllInterfaces, or Specific + Dual Listener)
+            // Auto-start proxy listener using saved port & bind configuration (Loopback, AllInterfaces, or Specific + Dual Listener)
             let startup_controller = controller.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(err) = startup_controller.start_with_config(8888).await {
+                let startup_port = startup_controller.preferred_port();
+                if let Err(err) = startup_controller.start_with_config(startup_port).await {
                     let bind_host = startup_controller.preferred_bind_host();
-                    tracing::warn!("Could not auto-bind {bind_host}:8888 on startup: {err}");
+                    tracing::warn!(
+                        "Could not auto-bind {bind_host}:{startup_port} on startup: {err}"
+                    );
                 }
             });
 
@@ -85,6 +88,7 @@ pub fn run() {
             commands::get_proxy_status,
             commands::start_proxy,
             commands::stop_proxy,
+            commands::set_proxy_port,
             commands::set_allow_remote,
             commands::set_bind_configuration,
             commands::get_network_interfaces,
@@ -133,6 +137,7 @@ pub fn run() {
             commands::import_settings_file,
             commands::pick_save_file_dialog,
             commands::pick_open_file_dialog,
+            commands::generate_stress_sessions,
         ])
         .build(tauri::generate_context!())
         .expect("error while building FluxProxy Tauri application");

@@ -2,6 +2,7 @@ import type { ThemePreference } from "../hooks/useTheme";
 import type {
   AutoResponderRule,
   BindHostMode,
+  BreakpointConfig,
   ColumnId,
   FilterConditionRule,
   FilterPreset,
@@ -70,6 +71,8 @@ export interface FluxUserProxySettings {
   clearDbOnExit?: boolean;
   /** Настройки санитизации и маскирования секретов/PII при экспорте сессий */
   sanitizationOptions?: SanitizationOptions;
+  /** Optional breakpoints alias accepted during profile import/migration; canonically stored at top-level `breakpoints` */
+  breakpoints?: BreakpointConfig;
 }
 
 export interface FluxUserAutoResponderSettings {
@@ -84,6 +87,7 @@ export interface FluxUserSettingsProfile {
   filters: FluxUserFilterSettings;
   proxy: FluxUserProxySettings;
   autoResponder: FluxUserAutoResponderSettings;
+  breakpoints?: BreakpointConfig;
 }
 
 export type SettingsModalTab =

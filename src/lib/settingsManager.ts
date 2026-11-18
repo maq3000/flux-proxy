@@ -26,7 +26,7 @@ import {
   PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
   PREVIEW_SANITIZATION_OPTIONS_STORAGE_KEY,
 } from "./mockTraffic";
-import { proxyBridge } from "./tauriBridge";
+import { DEFAULT_BREAKPOINT_CONFIG, proxyBridge } from "./tauriBridge";
 import {
   DEFAULT_MASK_JSON_KEYS,
   DEFAULT_SANITIZATION_OPTIONS,
@@ -37,6 +37,9 @@ import {
 import type {
   AutoResponderRule,
   BindHostMode,
+  BreakpointConfig,
+  BreakpointRule,
+  BreakpointStage,
   ColumnId,
   FilterConditionRule,
   FilterField,
@@ -90,6 +93,7 @@ export const SETTINGS_STORAGE_KEYS = {
   alsoBindLoopback: "fluxproxy.alsoBindLoopback.v1",
   proxyPort: "fluxproxy.proxyPort.v1",
   autoResponder: "fluxproxy.autoResponder.v1",
+  breakpointConfig: "fluxproxy.breakpointConfig.v1",
   sessionRetentionLimit: "fluxproxy.sessionRetentionLimit.v1",
   dropNonMatching: "fluxproxy.dropNonMatching.v1",
   clearDbOnExit: PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
@@ -157,6 +161,11 @@ const VALID_RULE_ACTIONS = new Set<RuleActionType>([
   "overrideStatus",
   "delayOnly",
 ]);
+const VALID_BREAKPOINT_STAGES = new Set<BreakpointStage>([
+  "request",
+  "response",
+  "both",
+]);
 
 const RECOGNIZED_PROFILE_TOP_KEYS = new Set<string>([
   "schemaVersion",
@@ -165,6 +174,8 @@ const RECOGNIZED_PROFILE_TOP_KEYS = new Set<string>([
   "filters",
   "proxy",
   "autoResponder",
+  "breakpoints",
+  "breakpointConfig",
   // Legacy v0 keys supported by migration chain
   "version",
   "theme",
@@ -270,6 +281,7 @@ export function createDefaultSettingsProfile(): FluxUserSettingsProfile {
       enabled: true,
       rules: structuredClone(DEFAULT_AUTORESPONDER_RULES),
     },
+    breakpoints: structuredClone(DEFAULT_BREAKPOINT_CONFIG),
   };
 }
 
@@ -400,6 +412,13 @@ const SCHEMA_MIGRATIONS: Record<number, SchemaMigrationFn> = {
       autoResponder.rules = draft.autoResponderRules;
     }
 
+    const breakpoints =
+      draft.breakpoints !== undefined
+        ? draft.breakpoints
+        : draft.breakpointConfig !== undefined
+          ? draft.breakpointConfig
+          : existingProxy.breakpoints;
+
     warnings.push("Профиль мигрирован со старой схемы (v0 → v1).");
 
     return {
@@ -412,6 +431,7 @@ const SCHEMA_MIGRATIONS: Record<number, SchemaMigrationFn> = {
       filters,
       proxy,
       autoResponder,
+      ...(breakpoints !== undefined ? { breakpoints } : {}),
     };
   },
 };
@@ -886,6 +906,100 @@ function sanitizeAutoResponderRules(
   return out;
 }
 
+function sanitizeBreakpointConfig(
+  raw: unknown,
+  warnings: string[]
+): BreakpointConfig {
+  const def = DEFAULT_BREAKPOINT_CONFIG;
+  if (raw === undefined) {
+    return structuredClone(def);
+  }
+  if (!isPlainObject(raw)) {
+    warnings.push(
+      "Секция «breakpoints» повреждена — восстановлены настройки точек останова по умолчанию."
+    );
+    return structuredClone(def);
+  }
+
+  let rules: BreakpointRule[] = [];
+  if (raw.rules !== undefined) {
+    if (!Array.isArray(raw.rules)) {
+      warnings.push(
+        "Список «breakpoints.rules» повреждён — правила точек останова сброшены."
+      );
+    } else {
+      raw.rules.forEach((item, idx) => {
+        if (!isPlainObject(item) || typeof item.urlPattern !== "string") {
+          warnings.push(
+            `Правило точки останова «breakpoints.rules[${idx}]» пропущено (повреждён формат).`
+          );
+          return;
+        }
+        const cleanPattern = item.urlPattern.trim();
+        if (!cleanPattern) return;
+
+        let stage: BreakpointStage = "request";
+        if (item.stage !== undefined) {
+          if (
+            typeof item.stage === "string" &&
+            VALID_BREAKPOINT_STAGES.has(item.stage as BreakpointStage)
+          ) {
+            stage = item.stage as BreakpointStage;
+          } else {
+            warnings.push(
+              `Недопустимый этап «breakpoints.rules[${idx}].stage» — установлен request.`
+            );
+          }
+        }
+
+        const methodFilter =
+          typeof item.methodFilter === "string" && item.methodFilter.trim()
+            ? item.methodFilter.trim().toUpperCase()
+            : null;
+
+        rules.push({
+          id:
+            typeof item.id === "string" && item.id.trim()
+              ? item.id.trim()
+              : `bp-imported-${idx + 1}`,
+          enabled: typeof item.enabled === "boolean" ? item.enabled : true,
+          name:
+            typeof item.name === "string" && item.name.trim()
+              ? item.name.trim()
+              : `${stage === "response" ? "bpafter" : "bpu"} ${cleanPattern}`,
+          stage,
+          urlPattern: cleanPattern,
+          methodFilter,
+        });
+      });
+    }
+  }
+
+  return {
+    breakBeforeRequest: sanitizeBoolean(
+      raw.breakBeforeRequest,
+      def.breakBeforeRequest,
+      "breakpoints.breakBeforeRequest",
+      warnings
+    ),
+    breakAfterResponse: sanitizeBoolean(
+      raw.breakAfterResponse,
+      def.breakAfterResponse,
+      "breakpoints.breakAfterResponse",
+      warnings
+    ),
+    timeoutSecs: sanitizePositiveInt(
+      raw.timeoutSecs,
+      def.timeoutSecs,
+      5,
+      600,
+      "breakpoints.timeoutSecs",
+      warnings
+    ),
+    rules,
+  };
+}
+
 function sanitizeStringTokenArray(
   raw: unknown,
   fallback: readonly string[],
@@ -1001,7 +1115,8 @@ export function isLikelyFluxSettingsProfile(raw: unknown): boolean {
     (isPlainObject(raw.ui) &&
       (isPlainObject(raw.filters) ||
         isPlainObject(raw.proxy) ||
-        isPlainObject(raw.autoResponder)))
+        isPlainObject(raw.autoResponder) ||
+        isPlainObject(raw.breakpoints)))
   );
 }
 
@@ -1615,6 +1730,12 @@ export function validateAndMigrateSettingsProfileWithReport(
         warnings
       ),
     },
+    breakpoints: sanitizeBreakpointConfig(
+      workingDraft.breakpoints !== undefined
+        ? workingDraft.breakpoints
+        : rawProxy.breakpoints,
+      warnings
+    ),
   };
 
   return {
@@ -1730,6 +1851,10 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
     enabled: defaults.autoResponder.enabled,
     rules: defaults.autoResponder.rules,
   });
+  const storedBreakpoints = readLocalStorageJson<Partial<BreakpointConfig>>(
+    SETTINGS_STORAGE_KEYS.breakpointConfig,
+    structuredClone(DEFAULT_BREAKPOINT_CONFIG)
+  );
 
   const live = liveSnapshotGetter ? liveSnapshotGetter() : {};
 
@@ -1895,6 +2020,11 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
           defaults.autoResponder.rules
       ),
     },
+    breakpoints: structuredClone({
+      ...DEFAULT_BREAKPOINT_CONFIG,
+      ...storedBreakpoints,
+      ...(live.breakpoints ?? {}),
+    }),
   };
 
   return validateAndMigrateSettingsProfile(mergedCandidate);
@@ -2142,6 +2272,12 @@ function atomicWriteProfileToLocalStorage(
       }),
     ],
     [
+      SETTINGS_STORAGE_KEYS.breakpointConfig,
+      JSON.stringify(
+        profile.breakpoints ?? structuredClone(DEFAULT_BREAKPOINT_CONFIG)
+      ),
+    ],
+    [
       SETTINGS_STORAGE_KEYS.sessionRetentionLimit,
       JSON.stringify(
         profile.proxy.sessionRetentionLimit !== undefined
@@ -2196,30 +2332,287 @@ function atomicWriteProfileToLocalStorage(
 }
 
 /**
- * Atomically persists a validated `FluxUserSettingsProfile` to `localStorage`,
- * synchronizes all active React hooks via `SETTINGS_APPLIED_EVENT`, and pushes
- * updated proxy filter, TLS, header mutation, listener, and AutoResponder rules
- * into Rust (`update_proxy_filter_config`).
+ * Validates a `FluxUserSettingsProfile`, applies all backend IPC updates transactionally
+ * (rolling back any partial backend changes on failure BEFORE touching `localStorage`
+ * or dispatching `SETTINGS_APPLIED_EVENT`), atomically writes `localStorage`, and broadcasts
+ * synchronized React hook state.
  */
 export async function applySettingsProfile(
   profile: FluxUserSettingsProfile
 ): Promise<FluxUserSettingsProfile> {
   const normalized = validateAndMigrateSettingsProfile(profile);
   const backendConfig = buildBackendFilterConfigFromProfile(normalized);
+  const nextBreakpoints: BreakpointConfig = structuredClone(
+    normalized.breakpoints ?? DEFAULT_BREAKPOINT_CONFIG
+  );
+  const normalizedWithBreakpoints: FluxUserSettingsProfile = {
+    ...normalized,
+    breakpoints: nextBreakpoints,
+  };
 
-  // 1. Atomic localStorage write
-  atomicWriteProfileToLocalStorage(normalized, backendConfig);
+  const retentionLimit =
+    normalizedWithBreakpoints.proxy.sessionRetentionLimit !== undefined
+      ? normalizedWithBreakpoints.proxy.sessionRetentionLimit
+      : DEFAULT_SESSION_RETENTION_LIMIT;
+  const dropNonMatching = Boolean(
+    normalizedWithBreakpoints.proxy.dropNonMatching ?? false
+  );
+  const clearDbOnExit = Boolean(
+    normalizedWithBreakpoints.proxy.clearDbOnExit ?? false
+  );
 
-  // 2. Immediate synchronous React state broadcast across all hooks
+  // 1. Capture current backend state snapshot for transactional rollback
+  const [
+    prevStatus,
+    prevFilterCfg,
+    prevBpCfg,
+    prevAutoRespEnabled,
+    prevAutoRespRules,
+    prevStats,
+    prevClearOnExit,
+  ] = await Promise.all([
+    proxyBridge.getStatus(),
+    proxyBridge.getFilterBackendConfig(),
+    proxyBridge.getBreakpointConfig(),
+    proxyBridge.getAutoResponderEnabled(),
+    proxyBridge.listRules(),
+    proxyBridge.getMemoryStorageStats(),
+    proxyBridge.getClearDbOnExit(),
+  ]);
+
+  let latestStatus: ProxyStatus = prevStatus;
+  let autoSysProxyChanged = false;
+  let sysProxyChanged = false;
+  let bindChanged = false;
+  let portChanged = false;
+
+  try {
+    // 2. Apply all IPC updates BEFORE persisting to localStorage or broadcasting SETTINGS_APPLIED_EVENT
+    await Promise.all([
+      proxyBridge.updateProxyFilterConfig(backendConfig),
+      proxyBridge.updateBreakpointConfig(nextBreakpoints),
+      proxyBridge.setAutoResponderConfig(
+        normalizedWithBreakpoints.autoResponder.enabled,
+        normalizedWithBreakpoints.autoResponder.rules
+      ),
+      proxyBridge.setSessionRetentionLimit(retentionLimit),
+      proxyBridge.setDropNonMatching(dropNonMatching),
+      proxyBridge.setClearDbOnExit(clearDbOnExit),
+    ]);
+
+    if (
+      latestStatus.autoSystemProxy !==
+      normalizedWithBreakpoints.proxy.autoSystemProxy
+    ) {
+      latestStatus = await proxyBridge.setAutoSystemProxy(
+        normalizedWithBreakpoints.proxy.autoSystemProxy
+      );
+      autoSysProxyChanged = true;
+      if (
+        !normalizedWithBreakpoints.proxy.autoSystemProxy &&
+        latestStatus.systemProxyEnabled
+      ) {
+        latestStatus = await proxyBridge.setSystemProxy(false);
+        sysProxyChanged = true;
+      }
+    }
+
+    const currentMode: BindHostMode =
+      latestStatus.bindMode ??
+      (latestStatus.allowRemote || latestStatus.bindAddr === "0.0.0.0"
+        ? "all"
+        : "loopback");
+    const currentSpecificIp = latestStatus.specificBindIp ?? null;
+    const currentAlsoLoopback = latestStatus.alsoBindLoopback ?? true;
+
+    const targetMode: BindHostMode =
+      normalizedWithBreakpoints.proxy.bindMode ??
+      (normalizedWithBreakpoints.proxy.allowRemote ? "all" : "loopback");
+    const targetSpecificIp =
+      normalizedWithBreakpoints.proxy.specificBindIp ?? null;
+    const targetAlsoLoopback =
+      normalizedWithBreakpoints.proxy.alsoBindLoopback ?? true;
+
+    if (
+      currentMode !== targetMode ||
+      (targetMode === "specific" && currentSpecificIp !== targetSpecificIp) ||
+      currentAlsoLoopback !== targetAlsoLoopback
+    ) {
+      latestStatus = await proxyBridge.setBindConfiguration(
+        targetMode,
+        targetSpecificIp,
+        targetAlsoLoopback
+      );
+      bindChanged = true;
+    }
+
+    if (latestStatus.port !== normalizedWithBreakpoints.proxy.port) {
+      portChanged = true;
+      if (latestStatus.running) {
+        await proxyBridge.stopProxy();
+        latestStatus = await proxyBridge.startProxy(
+          undefined,
+          normalizedWithBreakpoints.proxy.port
+        );
+      } else {
+        latestStatus = await proxyBridge.setPreviewPort(
+          normalizedWithBreakpoints.proxy.port
+        );
+        latestStatus = {
+          ...latestStatus,
+          port: normalizedWithBreakpoints.proxy.port,
+        };
+      }
+    }
+
+    // 3. Atomic localStorage write ONLY after all IPC operations succeed
+    atomicWriteProfileToLocalStorage(normalizedWithBreakpoints, backendConfig);
+  } catch (applyErr) {
+    const rollbackErrors: string[] = [];
+
+    const configRollback = await Promise.allSettled([
+      proxyBridge.updateProxyFilterConfig(prevFilterCfg),
+      proxyBridge.updateBreakpointConfig(prevBpCfg),
+      proxyBridge.setAutoResponderConfig(
+        prevAutoRespEnabled,
+        prevAutoRespRules
+      ),
+      proxyBridge.setSessionRetentionLimit(prevStats.sessionRetentionLimit),
+      proxyBridge.setDropNonMatching(prevStats.dropNonMatching),
+      proxyBridge.setClearDbOnExit(prevClearOnExit),
+    ]);
+    const configLabels = [
+      "фильтры прокси",
+      "точки останова",
+      "AutoResponder",
+      "лимит хранения сессий",
+      "dropNonMatching",
+      "clearDbOnExit",
+    ];
+    configRollback.forEach((res, idx) => {
+      if (res.status === "rejected") {
+        rollbackErrors.push(
+          `${configLabels[idx]}: ${
+            res.reason instanceof Error
+              ? res.reason.message
+              : String(res.reason)
+          }`
+        );
+      }
+    });
+
+    if (bindChanged) {
+      const prevMode: BindHostMode =
+        prevStatus.bindMode ??
+        (prevStatus.allowRemote || prevStatus.bindAddr === "0.0.0.0"
+          ? "all"
+          : "loopback");
+      try {
+        await proxyBridge.setBindConfiguration(
+          prevMode,
+          prevStatus.specificBindIp ?? null,
+          prevStatus.alsoBindLoopback ?? true
+        );
+      } catch (rbErr) {
+        rollbackErrors.push(
+          `интерфейс прослушивания: ${
+            rbErr instanceof Error ? rbErr.message : String(rbErr)
+          }`
+        );
+      }
+    }
+
+    if (portChanged) {
+      try {
+        if (prevStatus.running) {
+          const afterErrStatus = await proxyBridge
+            .getStatus()
+            .catch(() => null);
+          if (
+            afterErrStatus?.running &&
+            afterErrStatus.port !== prevStatus.port
+          ) {
+            await proxyBridge.stopProxy();
+          }
+          if (
+            !afterErrStatus?.running ||
+            afterErrStatus.port !== prevStatus.port
+          ) {
+            await proxyBridge.startProxy(undefined, prevStatus.port);
+          }
+        } else {
+          await proxyBridge.setPreviewPort(prevStatus.port);
+        }
+      } catch (rbErr) {
+        rollbackErrors.push(
+          `порт :${prevStatus.port}: ${
+            rbErr instanceof Error ? rbErr.message : String(rbErr)
+          }`
+        );
+      }
+    }
+
+    if (autoSysProxyChanged) {
+      try {
+        await proxyBridge.setAutoSystemProxy(prevStatus.autoSystemProxy);
+      } catch (rbErr) {
+        rollbackErrors.push(
+          `autoSystemProxy: ${
+            rbErr instanceof Error ? rbErr.message : String(rbErr)
+          }`
+        );
+      }
+    }
+
+    if (
+      sysProxyChanged ||
+      (autoSysProxyChanged && prevStatus.systemProxyEnabled)
+    ) {
+      try {
+        await proxyBridge.setSystemProxy(prevStatus.systemProxyEnabled);
+      } catch (rbErr) {
+        rollbackErrors.push(
+          `systemProxy: ${
+            rbErr instanceof Error ? rbErr.message : String(rbErr)
+          }`
+        );
+      }
+    }
+
+    try {
+      const rolledBackStatus = await proxyBridge.getStatus();
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent<ProxyStatus>(PROXY_STATUS_SYNCED_EVENT, {
+            detail: rolledBackStatus,
+          })
+        );
+      }
+    } catch {
+      // best-effort status sync
+    }
+
+    const primaryMessage =
+      applyErr instanceof Error ? applyErr.message : String(applyErr);
+    const rollbackSummary =
+      rollbackErrors.length === 0
+        ? "выполнен полный откат параметров бэкенда"
+        : `при откате возникли ошибки (${rollbackErrors.join("; ")})`;
+    throw new Error(
+      `Сбой применения настроек (${primaryMessage}); ${rollbackSummary}.`
+    );
+  }
+
+  // 4. Broadcast React hook state & panel layout reset ONLY after IPC + localStorage succeed
   if (typeof window !== "undefined") {
     window.dispatchEvent(
       new CustomEvent<FluxUserSettingsProfile>(SETTINGS_APPLIED_EVENT, {
-        detail: normalized,
+        detail: normalizedWithBreakpoints,
       })
     );
     if (
-      normalized.ui.panelLayouts !== undefined &&
-      Object.keys(normalized.ui.panelLayouts).length === 0
+      normalizedWithBreakpoints.ui.panelLayouts !== undefined &&
+      Object.keys(normalizedWithBreakpoints.ui.panelLayouts).length === 0
     ) {
       clearPersistedPanelLayouts();
       window.dispatchEvent(new CustomEvent(FLUX_PANEL_LAYOUT_RESET_EVENT));
@@ -2227,81 +2620,6 @@ export async function applySettingsProfile(
         clearPersistedPanelLayouts();
       }, 150);
     }
-  }
-
-  // 3. Synchronize proxy filter rules, AutoResponder, retention & listener config to Rust / Preview Engine
-  const retentionLimit =
-    normalized.proxy.sessionRetentionLimit !== undefined
-      ? normalized.proxy.sessionRetentionLimit
-      : DEFAULT_SESSION_RETENTION_LIMIT;
-  const dropNonMatching = Boolean(normalized.proxy.dropNonMatching ?? false);
-  const clearDbOnExit = Boolean(normalized.proxy.clearDbOnExit ?? false);
-
-  await Promise.all([
-    proxyBridge.updateProxyFilterConfig(backendConfig),
-    proxyBridge.setAutoResponderConfig(
-      normalized.autoResponder.enabled,
-      normalized.autoResponder.rules
-    ),
-    proxyBridge.setSessionRetentionLimit(retentionLimit),
-    proxyBridge.setDropNonMatching(dropNonMatching),
-    proxyBridge.setClearDbOnExit(clearDbOnExit),
-  ]);
-
-  let latestStatus: ProxyStatus = await proxyBridge.getStatus();
-
-  if (latestStatus.autoSystemProxy !== normalized.proxy.autoSystemProxy) {
-    latestStatus = await proxyBridge.setAutoSystemProxy(
-      normalized.proxy.autoSystemProxy
-    );
-    if (!normalized.proxy.autoSystemProxy && latestStatus.systemProxyEnabled) {
-      latestStatus = await proxyBridge.setSystemProxy(false);
-    }
-  }
-
-  const currentMode: BindHostMode =
-    latestStatus.bindMode ??
-    (latestStatus.allowRemote || latestStatus.bindAddr === "0.0.0.0"
-      ? "all"
-      : "loopback");
-  const currentSpecificIp = latestStatus.specificBindIp ?? null;
-  const currentAlsoLoopback = latestStatus.alsoBindLoopback ?? true;
-
-  const targetMode: BindHostMode =
-    normalized.proxy.bindMode ??
-    (normalized.proxy.allowRemote ? "all" : "loopback");
-  const targetSpecificIp = normalized.proxy.specificBindIp ?? null;
-  const targetAlsoLoopback = normalized.proxy.alsoBindLoopback ?? true;
-
-  if (
-    currentMode !== targetMode ||
-    (targetMode === "specific" && currentSpecificIp !== targetSpecificIp) ||
-    currentAlsoLoopback !== targetAlsoLoopback
-  ) {
-    latestStatus = await proxyBridge.setBindConfiguration(
-      targetMode,
-      targetSpecificIp,
-      targetAlsoLoopback
-    );
-  }
-
-  if (latestStatus.port !== normalized.proxy.port) {
-    if (latestStatus.running) {
-      await proxyBridge.stopProxy();
-      latestStatus = await proxyBridge.startProxy(
-        undefined,
-        normalized.proxy.port
-      );
-    } else {
-      latestStatus = proxyBridge.setPreviewPort(normalized.proxy.port);
-      latestStatus = {
-        ...latestStatus,
-        port: normalized.proxy.port,
-      };
-    }
-  }
-
-  if (typeof window !== "undefined") {
     window.dispatchEvent(
       new CustomEvent<ProxyStatus>(PROXY_STATUS_SYNCED_EVENT, {
         detail: latestStatus,
@@ -2309,7 +2627,7 @@ export async function applySettingsProfile(
     );
   }
 
-  return normalized;
+  return normalizedWithBreakpoints;
 }
 
 /**

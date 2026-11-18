@@ -293,6 +293,8 @@ pub struct ComposedRequest {
     pub url: String,
     pub headers: Vec<HeaderPair>,
     pub body: String,
+    #[serde(default)]
+    pub body_base64: Option<String>,
     pub follow_redirects: bool,
 }
 

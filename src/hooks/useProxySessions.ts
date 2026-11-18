@@ -22,6 +22,7 @@ import {
 import {
   DEFAULT_BREAKPOINT_CONFIG,
   type FileDialogFilter,
+  isTauriRuntime,
   proxyBridge,
 } from "../lib/tauriBridge";
 import { DEFAULT_SESSION_RETENTION_LIMIT } from "../types/proxy";
@@ -177,11 +178,11 @@ function persistBindConfigToLocalStorage(statusObj: ProxyStatus): void {
   }
 }
 
-function loadPersistedProxyPort(): number {
-  if (typeof window === "undefined") return 8888;
+function loadPersistedProxyPort(): number | null {
+  if (typeof window === "undefined") return null;
   try {
     const raw = window.localStorage.getItem(LS_PROXY_PORT_KEY);
-    if (!raw) return 8888;
+    if (!raw) return null;
     const parsed = JSON.parse(raw) as unknown;
     if (
       typeof parsed === "number" &&
@@ -191,9 +192,9 @@ function loadPersistedProxyPort(): number {
     ) {
       return parsed;
     }
-    return 8888;
+    return null;
   } catch {
-    return 8888;
+    return null;
   }
 }
 
@@ -318,7 +319,7 @@ export function useProxySessions() {
   const [status, setStatus] = useState<ProxyStatus>({
     running: true,
     bindAddr: initialBindAddr,
-    port: initialPort,
+    port: initialPort ?? 8888,
     activeSessions: 0,
     systemProxyEnabled: initialAutoSysProxy ?? true,
     autoSystemProxy: initialAutoSysProxy ?? true,
@@ -640,6 +641,16 @@ export function useProxySessions() {
       };
       statusRef.current = nextStatusOptimistic;
       setStatus(nextStatusOptimistic);
+
+      if (detail.breakpoints) {
+        const nextBp: BreakpointConfig = {
+          ...DEFAULT_BREAKPOINT_CONFIG,
+          ...detail.breakpoints,
+          rules: structuredClone(detail.breakpoints.rules ?? []),
+        };
+        breakpointConfigRef.current = nextBp;
+        setBreakpointConfig(nextBp);
+      }
     };
 
     const handleProxyStatusSynced = (event: Event) => {
@@ -876,16 +887,44 @@ export function useProxySessions() {
           );
         }
       }
-      if (effectiveStatus.port !== initialPort) {
+      if (initialPort !== null && effectiveStatus.port !== initialPort) {
+        const backendPort = effectiveStatus.port;
         if (effectiveStatus.running) {
-          await proxyBridge.stopProxy();
-          effectiveStatus = await proxyBridge.startProxy(
-            undefined,
-            initialPort
-          );
+          try {
+            await proxyBridge.stopProxy();
+            effectiveStatus = await proxyBridge.startProxy(
+              undefined,
+              initialPort
+            );
+          } catch (err) {
+            try {
+              effectiveStatus = await proxyBridge.startProxy(
+                undefined,
+                backendPort
+              );
+            } catch {
+              // keep best-known status if fallback restart also fails
+            }
+            if (mounted) {
+              showToast(
+                `⚠️ Не удалось занять стартовый порт ${initialPort}, оставлен ${effectiveStatus.port}: ${
+                  err instanceof Error ? err.message : String(err)
+                }`
+              );
+            }
+          }
         } else {
-          effectiveStatus = proxyBridge.setPreviewPort(initialPort);
-          effectiveStatus = { ...effectiveStatus, port: initialPort };
+          try {
+            effectiveStatus = await proxyBridge.setPreviewPort(initialPort);
+          } catch (err) {
+            if (mounted) {
+              showToast(
+                `⚠️ Не удалось установить стартовый порт ${initialPort}: ${
+                  err instanceof Error ? err.message : String(err)
+                }`
+              );
+            }
+          }
         }
       }
       try {
@@ -922,17 +961,24 @@ export function useProxySessions() {
         setSelectedId(cappedInitial[0].id);
       }
 
-      unlistenFn = await proxyBridge.subscribeSessionBatches((batch) => {
-        if (!mounted) return;
-        pendingQueueRef.current.push(...batch);
-        if (rafHandleRef.current === null) {
-          rafHandleRef.current = window.requestAnimationFrame(
-            flushPendingSessions
-          );
+      const unlistenBatches = await proxyBridge.subscribeSessionBatches(
+        (batch) => {
+          if (!mounted) return;
+          pendingQueueRef.current.push(...batch);
+          if (rafHandleRef.current === null) {
+            rafHandleRef.current = window.requestAnimationFrame(
+              flushPendingSessions
+            );
+          }
         }
-      });
+      );
+      if (!mounted) {
+        unlistenBatches();
+        return;
+      }
+      unlistenFn = unlistenBatches;
 
-      unlistenRemovedFn = await proxyBridge.subscribeSessionsRemoved(
+      const unlistenRemoved = await proxyBridge.subscribeSessionsRemoved(
         (removedIds) => {
           if (!mounted || removedIds.length === 0) return;
           const removedSet = new Set(removedIds);
@@ -960,25 +1006,47 @@ export function useProxySessions() {
           );
         }
       );
+      if (!mounted) {
+        unlistenRemoved();
+        return;
+      }
+      unlistenRemovedFn = unlistenRemoved;
 
-      unlistenBpFn = await proxyBridge.subscribeBreakpointsChanged((items) => {
-        if (!mounted) return;
-        setPausedBreakpoints(items);
-      });
+      const unlistenBp = await proxyBridge.subscribeBreakpointsChanged(
+        (items) => {
+          if (!mounted) return;
+          setPausedBreakpoints(items);
+        }
+      );
+      if (!mounted) {
+        unlistenBp();
+        return;
+      }
+      unlistenBpFn = unlistenBp;
 
-      unlistenStatusFn = await proxyBridge.subscribeStatusChanged(
+      const unlistenStatus = await proxyBridge.subscribeStatusChanged(
         (nextStatus) => {
           if (!mounted) return;
           applyProxyStatusUpdate(nextStatus);
         }
       );
+      if (!mounted) {
+        unlistenStatus();
+        return;
+      }
+      unlistenStatusFn = unlistenStatus;
 
-      unlistenStatsFn = await proxyBridge.subscribeStorageStatsChanged(
+      const unlistenStats = await proxyBridge.subscribeStorageStatsChanged(
         (nextStats) => {
           if (!mounted) return;
           applyStorageStats(nextStats);
         }
       );
+      if (!mounted) {
+        unlistenStats();
+        return;
+      }
+      unlistenStatsFn = unlistenStats;
     }
 
     void bootstrap();
@@ -1053,20 +1121,39 @@ export function useProxySessions() {
     return `${found.status}:${found.bodySize}:${found.durationMs}:${found.contentType}:${found.error ?? ""}:${found.breakpointPaused ?? ""}:${found.breakpointModified ? "1" : "0"}:${found.comment ?? ""}:${found.markedColor ?? ""}`;
   }, [selectedId, sessions]);
 
+  const selectedIdRef = useRef<number | null>(selectedId);
+  selectedIdRef.current = selectedId;
+
   // Fetch full SessionDetail on-demand when selected row changes or updates in-place
   useEffect(() => {
     let active = true;
-    if (selectedId === null) {
+    const targetId = selectedId;
+    if (targetId === null) {
       setSelectedDetail(null);
       return;
     }
-    void proxyBridge.getSessionDetail(selectedId).then((detail) => {
-      if (active) setSelectedDetail(detail);
-    });
+    setSelectedDetail((prev) =>
+      prev && prev.summary.id === targetId ? prev : null
+    );
+    void proxyBridge
+      .getSessionDetail(targetId)
+      .then((detail) => {
+        if (!active || selectedIdRef.current !== targetId) return;
+        setSelectedDetail(detail);
+      })
+      .catch((err) => {
+        if (!active || selectedIdRef.current !== targetId) return;
+        setSelectedDetail(null);
+        showToast(
+          `⚠️ Ошибка загрузки деталей сессии #${targetId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      });
     return () => {
       active = false;
     };
-  }, [selectedId, sessions.length, selectedSummarySignature]);
+  }, [selectedId, sessions.length, selectedSummarySignature, showToast]);
 
   const diffLeftId = selectedIds.length >= 2 ? selectedIds[0] : null;
   const diffRightId = selectedIds.length >= 2 ? selectedIds[1] : null;
@@ -1090,21 +1177,41 @@ export function useProxySessions() {
       setDiffRightDetail(null);
       return;
     }
+    const targetLeft = diffLeftId;
+    const targetRight = diffRightId;
+    setDiffLeftDetail((prev) =>
+      prev && prev.summary.id === targetLeft ? prev : null
+    );
+    setDiffRightDetail((prev) =>
+      prev && prev.summary.id === targetRight ? prev : null
+    );
     void Promise.all([
-      proxyBridge.getSessionDetail(diffLeftId),
-      proxyBridge.getSessionDetail(diffRightId),
-    ]).then(([left, right]) => {
-      if (!active) return;
-      setDiffLeftDetail(left);
-      setDiffRightDetail(right);
-    });
+      proxyBridge.getSessionDetail(targetLeft),
+      proxyBridge.getSessionDetail(targetRight),
+    ])
+      .then(([left, right]) => {
+        if (!active) return;
+        setDiffLeftDetail(left);
+        setDiffRightDetail(right);
+      })
+      .catch((err) => {
+        if (!active) return;
+        setDiffLeftDetail(null);
+        setDiffRightDetail(null);
+        showToast(
+          `⚠️ Ошибка загрузки сессий для сравнения: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      });
     return () => {
       active = false;
     };
-  }, [diffLeftId, diffRightId, diffPairSignature]);
+  }, [diffLeftId, diffRightId, diffPairSignature, showToast]);
 
   const updateBackendFilterConfig = useCallback(
     async (next: ProxyFilterBackendConfig) => {
+      backendFilterConfigRef.current = next;
       setBackendFilterConfig(next);
       try {
         window.localStorage.setItem(
@@ -1115,6 +1222,7 @@ export function useProxySessions() {
         // ignore
       }
       const saved = await proxyBridge.updateFilterBackendConfig(next);
+      backendFilterConfigRef.current = saved;
       setBackendFilterConfig(saved);
     },
     []
@@ -1140,7 +1248,7 @@ export function useProxySessions() {
     [hostListFilter]
   );
 
-  // Sync Bulk Hosts List to Rust ProxyFilterEngine when TLS Passthrough sync is active (debounced on text input)
+  // Unified sync of Bulk Hosts List (TLS Passthrough) + Capture Filters (Hosts List, Thresholds, Matrix, Quick Category & Search Query) to Rust ProxyFilterEngine
   const lastSyncedHostListFlagsRef = useRef({
     enabled: hostListFilter.enabled,
     mode: hostListFilter.mode,
@@ -1148,14 +1256,19 @@ export function useProxySessions() {
   });
 
   useEffect(() => {
-    const desiredSync = buildHostListSyncPayload(
+    const desiredHostListSync = buildHostListSyncPayload(
       hostListFilter,
       compiledHostList.activeCount
     );
-    const currentSync = backendFilterConfigRef.current.hostListSync;
+    const desiredCaptureHl = buildCaptureHostListPayload(
+      hostListFilter,
+      compiledHostList.activeCount
+    );
+    const desiredThresholds = buildNoiseThresholdsSyncPayload(thresholds);
+    const curr = backendFilterConfigRef.current;
 
     const prevFlags = lastSyncedHostListFlagsRef.current;
-    const structuralChange =
+    const structuralHostListChange =
       prevFlags.enabled !== hostListFilter.enabled ||
       prevFlags.mode !== hostListFilter.mode ||
       prevFlags.applyToTlsPassthrough !== hostListFilter.applyToTlsPassthrough;
@@ -1166,46 +1279,14 @@ export function useProxySessions() {
       applyToTlsPassthrough: hostListFilter.applyToTlsPassthrough,
     };
 
-    if (!desiredSync.enabled && !currentSync?.enabled) {
-      return;
-    }
-
-    if (
-      currentSync &&
-      currentSync.enabled === desiredSync.enabled &&
-      currentSync.mode === desiredSync.mode &&
-      currentSync.rawText === desiredSync.rawText
-    ) {
-      return;
-    }
-
-    const pushSync = () => {
-      void updateBackendFilterConfig({
-        ...backendFilterConfigRef.current,
-        hostListSync: desiredSync,
-      });
-    };
-
-    if (structuralChange || !desiredSync.enabled) {
-      pushSync();
-      return;
-    }
-
-    const timerId = window.setTimeout(pushSync, 250);
-    return () => {
-      window.clearTimeout(timerId);
-    };
-  }, [hostListFilter, compiledHostList.activeCount, updateBackendFilterConfig]);
-
-  // Sync active Capture Filters (Hosts List, Thresholds, Matrix, Quick Category & Search Query) to Rust for `evaluate_should_store_session`
-  useEffect(() => {
-    const desiredCaptureHl = buildCaptureHostListPayload(
-      hostListFilter,
-      compiledHostList.activeCount
-    );
-    const desiredThresholds = buildNoiseThresholdsSyncPayload(thresholds);
-    const curr = backendFilterConfigRef.current;
-
+    const sameHostListSync =
+      (!desiredHostListSync.enabled && !curr.hostListSync?.enabled) ||
+      Boolean(
+        curr.hostListSync &&
+          curr.hostListSync.enabled === desiredHostListSync.enabled &&
+          curr.hostListSync.mode === desiredHostListSync.mode &&
+          curr.hostListSync.rawText === desiredHostListSync.rawText
+      );
     const sameCaptureHl =
       curr.captureHostList?.enabled === desiredCaptureHl.enabled &&
       curr.captureHostList?.mode === desiredCaptureHl.mode &&
@@ -1223,13 +1304,20 @@ export function useProxySessions() {
       Boolean(curr.useRegexQuery) === useRegex &&
       Boolean(curr.dropNonMatchingOnCapture) === dropNonMatching;
 
-    if (sameCaptureHl && sameThresholds && sameMatrix && sameQuick) {
+    if (
+      sameHostListSync &&
+      sameCaptureHl &&
+      sameThresholds &&
+      sameMatrix &&
+      sameQuick
+    ) {
       return;
     }
 
-    const pushCaptureFilters = () => {
+    const pushUnifiedFilterConfig = () => {
       void updateBackendFilterConfig({
         ...backendFilterConfigRef.current,
+        hostListSync: desiredHostListSync,
         dropNonMatchingOnCapture: dropNonMatching,
         captureHostList: desiredCaptureHl,
         noiseThresholds: desiredThresholds,
@@ -1238,10 +1326,24 @@ export function useProxySessions() {
         quickCategory,
         filterQuery,
         useRegexQuery: useRegex,
+      }).catch((err) => {
+        showToast(
+          `⚠️ Ошибка синхронизации фильтров с движком: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
       });
     };
 
-    const timerId = window.setTimeout(pushCaptureFilters, 150);
+    if (
+      !sameHostListSync &&
+      (structuralHostListChange || !desiredHostListSync.enabled)
+    ) {
+      pushUnifiedFilterConfig();
+      return;
+    }
+
+    const timerId = window.setTimeout(pushUnifiedFilterConfig, 150);
     return () => {
       window.clearTimeout(timerId);
     };
@@ -1256,6 +1358,7 @@ export function useProxySessions() {
     filterQuery,
     useRegex,
     updateBackendFilterConfig,
+    showToast,
   ]);
 
   const setSessionRetentionLimit = useCallback(
@@ -2061,30 +2164,42 @@ export function useProxySessions() {
         return;
       }
 
-      try {
-        window.localStorage.setItem(
-          LS_PROXY_PORT_KEY,
-          JSON.stringify(nextPort)
-        );
-      } catch {
-        // ignore storage quota errors
-      }
-
       const curr = statusRef.current;
-      if (curr.port === nextPort) {
+      const previousPort = curr.port;
+      const wasRunning = curr.running;
+
+      if (previousPort === nextPort) {
+        try {
+          window.localStorage.setItem(
+            LS_PROXY_PORT_KEY,
+            JSON.stringify(nextPort)
+          );
+        } catch {
+          // ignore storage quota errors
+        }
         showToast(`Порт прокси уже установлен на ${nextPort}`);
         return;
       }
 
       try {
         let nextStatus: ProxyStatus;
-        if (curr.running) {
+        if (wasRunning) {
           await proxyBridge.stopProxy();
           nextStatus = await proxyBridge.startProxy(undefined, nextPort);
         } else {
-          nextStatus = proxyBridge.setPreviewPort(nextPort);
+          nextStatus = await proxyBridge.setPreviewPort(nextPort);
           nextStatus = { ...nextStatus, port: nextPort };
         }
+
+        try {
+          window.localStorage.setItem(
+            LS_PROXY_PORT_KEY,
+            JSON.stringify(nextStatus.port)
+          );
+        } catch {
+          // ignore storage quota errors
+        }
+
         statusRef.current = nextStatus;
         setStatus(nextStatus);
         showToast(
@@ -2093,11 +2208,55 @@ export function useProxySessions() {
             : `🔌 Порт прокси изменён на ${nextStatus.port} (вступит в силу при захвате)`
         );
       } catch (err) {
-        showToast(
-          `⚠️ Не удалось занять порт ${nextPort}: ${
-            err instanceof Error ? err.message : String(err)
-          }`
-        );
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (wasRunning) {
+          try {
+            const recoveredStatus = await proxyBridge.startProxy(
+              undefined,
+              previousPort
+            );
+            statusRef.current = recoveredStatus;
+            setStatus(recoveredStatus);
+            try {
+              window.localStorage.setItem(
+                LS_PROXY_PORT_KEY,
+                JSON.stringify(recoveredStatus.port)
+              );
+            } catch {
+              // ignore storage quota errors
+            }
+            showToast(
+              `⚠️ Не удалось занять порт ${nextPort} (${errMsg}). Прокси восстановлен на :${recoveredStatus.port}`
+            );
+            return;
+          } catch (rollbackErr) {
+            const rbMsg =
+              rollbackErr instanceof Error
+                ? rollbackErr.message
+                : String(rollbackErr);
+            const fallbackStatus: ProxyStatus = {
+              ...statusRef.current,
+              running: false,
+              port: previousPort,
+            };
+            statusRef.current = fallbackStatus;
+            setStatus(fallbackStatus);
+            showToast(
+              `⚠️ Не удалось занять порт ${nextPort} (${errMsg}), откат на :${previousPort} не удался: ${rbMsg}`
+            );
+            return;
+          }
+        }
+
+        try {
+          window.localStorage.setItem(
+            LS_PROXY_PORT_KEY,
+            JSON.stringify(previousPort)
+          );
+        } catch {
+          // ignore storage quota errors
+        }
+        showToast(`⚠️ Не удалось занять порт ${nextPort}: ${errMsg}`);
       }
     },
     [showToast]
@@ -2408,26 +2567,34 @@ export function useProxySessions() {
         nextSelected = selectedId;
       }
 
-      pendingQueueRef.current = pendingQueueRef.current.filter(
-        (s) => !removeSet.has(s.id)
-      );
-      await proxyBridge.deleteSessions(ids);
-      setSessions((prev) => prev.filter((s) => !removeSet.has(s.id)));
-      selectionAnchorIdRef.current = nextSelected;
-      setSelectedIdState(nextSelected);
-      setSelectedIds(nextSelected !== null ? [nextSelected] : []);
-      if (nextSelected === null) {
-        setSelectedDetail(null);
-      }
-      setDiffLeftDetail(null);
-      setDiffRightDetail(null);
-      void refreshStorageStats();
+      try {
+        await proxyBridge.deleteSessions(ids);
+        pendingQueueRef.current = pendingQueueRef.current.filter(
+          (s) => !removeSet.has(s.id)
+        );
+        setSessions((prev) => prev.filter((s) => !removeSet.has(s.id)));
+        selectionAnchorIdRef.current = nextSelected;
+        setSelectedIdState(nextSelected);
+        setSelectedIds(nextSelected !== null ? [nextSelected] : []);
+        if (nextSelected === null) {
+          setSelectedDetail(null);
+        }
+        setDiffLeftDetail(null);
+        setDiffRightDetail(null);
+        void refreshStorageStats();
 
-      showToast(
-        ids.length === 1
-          ? `Сессия #${ids[0]} удалена`
-          : `Удалено сессий: ${ids.length}`
-      );
+        showToast(
+          ids.length === 1
+            ? `Сессия #${ids[0]} удалена`
+            : `Удалено сессий: ${ids.length}`
+        );
+      } catch (err) {
+        showToast(
+          `⚠️ Не удалось удалить сессии: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
     },
     [filteredSessions, refreshStorageStats, selectedId, showToast]
   );
@@ -2441,37 +2608,63 @@ export function useProxySessions() {
       let replayedCount = 0;
       let lastDetail: SessionDetail | null = null;
 
-      for (const id of ids) {
-        const detail = await proxyBridge.getSessionDetail(id);
-        if (!detail) continue;
-        if (
-          detail.summary.tlsBypassed ||
-          detail.summary.method.toUpperCase() === "CONNECT"
-        ) {
-          continue;
+      try {
+        for (const id of ids) {
+          const detail = await proxyBridge.getSessionDetail(id);
+          if (!detail) continue;
+          if (
+            detail.summary.tlsBypassed ||
+            detail.summary.method.toUpperCase() === "CONNECT"
+          ) {
+            continue;
+          }
+
+          let requestBodyBase64 = detail.requestBodyBase64 ?? "";
+          let requestBodyText = detail.requestBodyText ?? "";
+          if (
+            (detail.requestBodyOffloaded ||
+              (detail.bodyOffloaded &&
+                !requestBodyBase64 &&
+                !requestBodyText)) &&
+            !requestBodyBase64
+          ) {
+            const loaded = await proxyBridge.loadSessionBody(id, false);
+            requestBodyBase64 = loaded.bodyBase64 ?? "";
+            requestBodyText = loaded.bodyText ?? "";
+          }
+
+          lastDetail = await proxyBridge.executeComposedRequest({
+            method: detail.summary.method,
+            url: detail.summary.url,
+            headers: detail.requestHeaders.filter(
+              (h) => h.name.toLowerCase() !== "content-length"
+            ),
+            body: requestBodyText,
+            ...(requestBodyBase64 ? { bodyBase64: requestBodyBase64 } : {}),
+            followRedirects: true,
+          });
+          replayedCount += 1;
         }
-        lastDetail = await proxyBridge.executeComposedRequest({
-          method: detail.summary.method,
-          url: detail.summary.url,
-          headers: detail.requestHeaders.filter(
-            (h) => h.name.toLowerCase() !== "content-length"
-          ),
-          body: detail.requestBodyText ?? "",
-          followRedirects: true,
-        });
-        replayedCount += 1;
-      }
 
-      if (replayedCount === 0) {
-        showToast("Выбранные туннели CONNECT / Passthrough нельзя повторить как HTTP-запрос");
-        return;
-      }
+        if (replayedCount === 0) {
+          showToast(
+            "Выбранные туннели CONNECT / Passthrough нельзя повторить как HTTP-запрос"
+          );
+          return;
+        }
 
-      if (lastDetail) {
+        if (lastDetail) {
+          showToast(
+            replayedCount === 1
+              ? `↻ Replay #${lastDetail.summary.id}: ${lastDetail.summary.method} ${lastDetail.summary.host}${lastDetail.summary.path} (${lastDetail.summary.status})`
+              : `↻ Выполнено повторных запросов: ${replayedCount}`
+          );
+        }
+      } catch (err) {
         showToast(
-          replayedCount === 1
-            ? `↻ Replay #${lastDetail.summary.id}: ${lastDetail.summary.method} ${lastDetail.summary.host}${lastDetail.summary.path} (${lastDetail.summary.status})`
-            : `↻ Выполнено повторных запросов: ${replayedCount}`
+          `⚠️ Ошибка повторной отправки (Replay): ${
+            err instanceof Error ? err.message : String(err)
+          }`
         );
       }
     },
@@ -2836,10 +3029,25 @@ export function useProxySessions() {
     [selectedDetail, sessions, showToast]
   );
 
-  const generateStress10k = useCallback(() => {
-    proxyBridge.generateStressTestSessions(10_000);
-    void refreshStorageStats();
-    showToast("Generated +10,000 sessions — test virtualized 60fps scrolling!");
+  const generateStress10k = useCallback(async () => {
+    try {
+      const generatedCount = await proxyBridge.generateStressTestSessions(
+        10_000
+      );
+      await refreshStorageStats();
+      const modeLabel = isTauriRuntime()
+        ? "Tauri Rust TrafficStore"
+        : "Preview Simulator";
+      showToast(
+        `⚡ [${modeLabel}] Сгенерировано ${generatedCount.toLocaleString()} сессий — проверьте плавность 60fps скролла`
+      );
+    } catch (err) {
+      showToast(
+        `⚠️ Ошибка генерации стресс-сессий: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
   }, [refreshStorageStats, showToast]);
 
   const updateBreakpointConfig = useCallback(

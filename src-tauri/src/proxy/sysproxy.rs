@@ -9,6 +9,7 @@ use crate::models::{BindHostMode, ProxyError};
 
 pub const BACKUP_FILE_NAME: &str = "system-proxy-backup.json";
 pub const PREFS_FILE_NAME: &str = "system-proxy-prefs.json";
+pub const PROXY_PORT_PREF_FILE_NAME: &str = "proxy_port.pref";
 pub const LEGACY_ALLOW_REMOTE_FILE_NAME: &str = "allow_remote.pref";
 pub const DEFAULT_WINDOWS_PROXY_OVERRIDE: &str = "localhost;127.*;10.*;192.168.*;<local>";
 
@@ -103,6 +104,8 @@ struct PersistedSystemProxyPrefs {
     pub specific_bind_ip: Option<String>,
     #[serde(default)]
     pub also_bind_loopback: Option<bool>,
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 fn default_auto_system_proxy() -> bool {
@@ -117,6 +120,7 @@ impl Default for PersistedSystemProxyPrefs {
             bind_mode: None,
             specific_bind_ip: None,
             also_bind_loopback: None,
+            port: None,
         }
     }
 }
@@ -206,7 +210,7 @@ impl SystemProxyManager {
             );
         }
 
-        Self {
+        let mgr = Self {
             backup_path,
             prefs_path,
             backend,
@@ -216,7 +220,13 @@ impl SystemProxyManager {
                 backup: recovered_backup,
                 last_error: None,
             }),
+        };
+        let initial_port = mgr.load_proxy_port_pref();
+        {
+            let mut guard = mgr.lock_inner();
+            guard.active_target.1 = initial_port;
         }
+        mgr
     }
 
     pub fn backup_file_path(&self) -> &Path {
@@ -362,6 +372,61 @@ impl SystemProxyManager {
         self.save_prefs(&prefs);
     }
 
+    fn read_proxy_port_pref_file(&self) -> Option<u16> {
+        let port_pref_path = self
+            .prefs_path
+            .parent()
+            .map(|dir| dir.join(PROXY_PORT_PREF_FILE_NAME))?;
+        let raw = fs::read_to_string(port_pref_path).ok()?;
+        let trimmed = raw.trim();
+        if let Ok(port) = trimmed.parse::<u16>() {
+            if port >= 1 {
+                return Some(port);
+            }
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(p) = val
+                .as_u64()
+                .or_else(|| val.get("port").and_then(|v| v.as_u64()))
+            {
+                if (1..=65535).contains(&p) {
+                    return Some(p as u16);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn load_proxy_port_pref(&self) -> u16 {
+        let prefs = self.load_prefs();
+        if let Some(port) = prefs.port {
+            if port >= 1 {
+                return port;
+            }
+        }
+        self.read_proxy_port_pref_file().unwrap_or(8888)
+    }
+
+    pub fn save_proxy_port_pref(&self, port: u16) {
+        if port == 0 {
+            return;
+        }
+        let mut prefs = self.load_prefs();
+        prefs.port = Some(port);
+        self.save_prefs(&prefs);
+
+        if let Some(port_pref_path) = self
+            .prefs_path
+            .parent()
+            .map(|dir| dir.join(PROXY_PORT_PREF_FILE_NAME))
+        {
+            if let Some(parent) = port_pref_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = fs::write(port_pref_path, format!("{port}\n"));
+        }
+    }
+
     /// Enables the OS system proxy pointing to `normalize_sysproxy_host(host):port`.
     /// Crash-recovery guarantee:
     /// 1. If `system-proxy-backup.json` already exists on disk (or in memory), it is NEVER overwritten.
@@ -502,9 +567,13 @@ impl SystemProxyManager {
                         }
                     }
                 } else if let Ok(current_os) = self.backend.capture_snapshot() {
-                    if snapshot_points_to_self(&current_os, "127.0.0.1", 8888) {
-                        let sanitized =
-                            sanitize_self_referential_snapshot(current_os, "127.0.0.1", 8888);
+                    let fallback_port = self.load_proxy_port_pref();
+                    if snapshot_points_to_self(&current_os, "127.0.0.1", fallback_port) {
+                        let sanitized = sanitize_self_referential_snapshot(
+                            current_os,
+                            "127.0.0.1",
+                            fallback_port,
+                        );
                         if let Err(err) = self.backend.restore_snapshot(&sanitized) {
                             tracing::error!(
                                 "Failed lock-free synchronous system proxy sanitization: {err}"
@@ -2165,6 +2234,42 @@ mod tests {
             ),
             "192.168.1.45"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proxy_port_prefs_persist_and_fallback_from_pref_file() {
+        let dir = make_temp_test_dir("proxy-port-prefs");
+        let backend = MockWindowsOsBackend::new(WindowsProxySnapshot::default());
+        let mgr = SystemProxyManager::with_backend(&dir, backend.clone());
+
+        // Default port is 8888
+        assert_eq!(mgr.load_proxy_port_pref(), 8888);
+
+        // Standalone proxy_port.pref is used when system-proxy-prefs.json has no port
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(PROXY_PORT_PREF_FILE_NAME), "9090\n").unwrap();
+        assert_eq!(mgr.load_proxy_port_pref(), 9090);
+
+        // Ephemeral port 0 must never be persisted
+        mgr.save_proxy_port_pref(0);
+        assert_eq!(mgr.load_proxy_port_pref(), 9090);
+
+        // Saving a valid port updates both system-proxy-prefs.json and proxy_port.pref
+        mgr.save_proxy_port_pref(8899);
+        assert_eq!(mgr.load_proxy_port_pref(), 8899);
+        assert_eq!(
+            fs::read_to_string(dir.join(PROXY_PORT_PREF_FILE_NAME))
+                .unwrap()
+                .trim(),
+            "8899"
+        );
+
+        // New manager instance initializes active_target with saved port
+        let reloaded = SystemProxyManager::with_backend(&dir, backend);
+        assert_eq!(reloaded.load_proxy_port_pref(), 8899);
+        assert_eq!(reloaded.lock_inner().active_target.1, 8899);
 
         let _ = fs::remove_dir_all(&dir);
     }

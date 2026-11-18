@@ -10,9 +10,10 @@ use base64::Engine as _;
 use dashmap::DashMap;
 
 use crate::models::{
-    LoadedSessionBody, ProxyError, SessionDetail, SessionSummary, SseEventRecord, StorageStats,
-    WebSocketFrameRecord,
+    HeaderPair, LoadedSessionBody, ProxyError, SessionDetail, SessionSummary, SseEventRecord,
+    StorageStats, WebSocketFrameRecord,
 };
+use crate::proxy::filters::ProxyFilterEngine;
 use crate::storage::sqlite::SqliteArchive;
 
 /// Default maximum number of sessions kept in RAM before FIFO eviction to SQLite.
@@ -839,6 +840,150 @@ impl TrafficStore {
         }
         summaries
     }
+
+    /// Populates synthetic HTTP/HTTPS diagnostic sessions directly into the store
+    /// (respecting active capture filters and retention limits) for virtualized grid stress testing.
+    pub fn generate_stress_sessions(
+        &self,
+        count: usize,
+        filters: &ProxyFilterEngine,
+        event_tx: &tokio::sync::mpsc::UnboundedSender<SessionSummary>,
+    ) -> usize {
+        if count == 0 {
+            return 0;
+        }
+        let target_count = count.min(100_000);
+        let hosts = [
+            "api.github.com",
+            "auth.internal.corp",
+            "cdn.cloudflare.com",
+            "analytics.telemetry.io",
+            "payments.stripe.com",
+            "graphql.shop.local",
+        ];
+        let methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"];
+        let paths = [
+            "/v1/users/profile",
+            "/oauth2/token",
+            "/graphql",
+            "/assets/app.bundle.js",
+            "/v2/checkout/sessions",
+            "/healthz",
+        ];
+        let statuses: [u16; 7] = [200, 200, 200, 201, 204, 304, 502];
+        let mut generated = 0usize;
+
+        for i in 0..target_count {
+            let id = self.allocate_id();
+            let host = hosts[i % hosts.len()];
+            let method = methods[i % methods.len()];
+            let path = paths[(i / 2) % paths.len()];
+            let status = statuses[i % statuses.len()];
+            let is_static = path.ends_with(".js");
+            let content_type = if is_static {
+                "application/javascript; charset=utf-8"
+            } else if status == 204 {
+                ""
+            } else {
+                "application/json; charset=utf-8"
+            };
+            let resp_text = if status == 204 || status == 304 {
+                String::new()
+            } else {
+                format!("{{\"stressId\":{id},\"host\":\"{host}\",\"status\":{status}}}")
+            };
+            let body_size = resp_text.len();
+            let url = format!("https://{host}{path}?seq={i}");
+            let summary = SessionSummary {
+                id,
+                status,
+                protocol: "HTTPS/2".to_string(),
+                scheme: "https".to_string(),
+                method: method.to_string(),
+                host: host.to_string(),
+                path: format!("{path}?seq={i}"),
+                url,
+                content_type: content_type.to_string(),
+                body_size,
+                duration_ms: ((i % 240) + 8) as u64,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                is_mocked: false,
+                matched_rule_id: None,
+                error: if status >= 500 {
+                    Some("Simulated stress upstream 502".to_string())
+                } else {
+                    None
+                },
+                process_name: Some("stress-bench.exe".to_string()),
+                process_pid: Some(4242),
+                tls_bypassed: false,
+                headers_mutated: false,
+                breakpoint_paused: None,
+                breakpoint_modified: false,
+                comment: None,
+                marked_color: None,
+                client_ip: Some("127.0.0.1".to_string()),
+            };
+
+            if !filters.evaluate_should_store_session(&summary) {
+                self.increment_dropped_sessions();
+                continue;
+            }
+
+            let resp_b64 = if resp_text.is_empty() {
+                String::new()
+            } else {
+                base64::engine::general_purpose::STANDARD.encode(resp_text.as_bytes())
+            };
+            let detail = SessionDetail {
+                summary: summary.clone(),
+                request_headers: vec![
+                    HeaderPair {
+                        name: "Host".to_string(),
+                        value: host.to_string(),
+                    },
+                    HeaderPair {
+                        name: "User-Agent".to_string(),
+                        value: "FluxProxy-StressBench/1.0".to_string(),
+                    },
+                ],
+                response_headers: vec![HeaderPair {
+                    name: "Content-Type".to_string(),
+                    value: if content_type.is_empty() {
+                        "text/plain".to_string()
+                    } else {
+                        content_type.to_string()
+                    },
+                }],
+                request_body_base64: String::new(),
+                response_body_base64: resp_b64,
+                request_body_text: None,
+                response_body_text: if resp_text.is_empty() {
+                    None
+                } else {
+                    Some(resp_text)
+                },
+                tls_version: Some("TLS 1.3".to_string()),
+                client_addr: "127.0.0.1:0".to_string(),
+                websocket_frames: Vec::new(),
+                sse_events: Vec::new(),
+                body_offloaded: false,
+                request_body_offloaded: false,
+            };
+
+            self.sessions.insert(id, Arc::new(detail));
+            let _ = event_tx.send(summary);
+            generated += 1;
+        }
+
+        if let Some(limit) = self.retention_limit() {
+            if self.sessions.len() > limit {
+                self.enforce_retention_limit();
+            }
+        }
+
+        generated
+    }
 }
 
 fn apply_sse_to_detail(
@@ -1383,6 +1528,29 @@ mod tests {
         assert!(store.ws_streams.get(&ws_id).is_none());
         let finalized_ws = store.get(ws_id).expect("get finalized WS");
         assert_eq!(finalized_ws.websocket_frames.len(), 1);
+
+        drop(store);
+        cleanup_temp_db(&db_path);
+    }
+
+    #[test]
+    fn generate_stress_sessions_respects_retention_limit_and_emits_events() {
+        let db_path = unique_temp_db("stress_gen");
+        let store = TrafficStore::new(db_path.clone()).expect("init TrafficStore");
+        store.set_retention_limit(Some(25)).expect("set limit 25");
+
+        let filters = ProxyFilterEngine::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let generated = store.generate_stress_sessions(60, &filters, &tx);
+        assert_eq!(generated, 60);
+        assert_eq!(store.len(), 25);
+
+        let mut received = 0usize;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, 60);
 
         drop(store);
         cleanup_temp_db(&db_path);

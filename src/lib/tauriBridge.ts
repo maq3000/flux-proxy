@@ -1130,10 +1130,11 @@ class BrowserPreviewEngine {
   }
 
   setPort(port: number): ProxyStatus {
-    if (Number.isInteger(port) && port >= 1 && port <= 65535) {
-      this.port = port;
-      this.emitStatusChanged();
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error("Порт прокси должен быть целым числом от 1 до 65535");
     }
+    this.port = port;
+    this.emitStatusChanged();
     return this.getStatus();
   }
 
@@ -1492,7 +1493,23 @@ class BrowserPreviewEngine {
     const id = this.nextId++;
     let effectiveMethod = req.method;
     let effectiveUrl = req.url;
-    let effectiveBody = req.body;
+    const initialBodyBytes =
+      req.bodyBase64 && req.bodyBase64.trim().length > 0
+        ? decodeBase64ToBytes(req.bodyBase64)
+        : req.body
+          ? new TextEncoder().encode(req.body)
+          : new Uint8Array(0);
+    let effectiveBodyBytes: Uint8Array | null =
+      initialBodyBytes.length > 0 ? initialBodyBytes : null;
+    let effectiveBodyBase64 =
+      initialBodyBytes.length > 0
+        ? encodeUint8ArrayToBase64(initialBodyBytes)
+        : "";
+    let effectiveBody =
+      req.body ||
+      (initialBodyBytes.length > 0
+        ? new TextDecoder().decode(initialBodyBytes)
+        : "");
     let bpModified = false;
 
     const reqMut = applyHeaderMutationsInPreview(
@@ -1521,7 +1538,7 @@ class BrowserPreviewEngine {
         host: parsedUrl.host,
         path: `${parsedUrl.pathname}${parsedUrl.search}`,
         requestHeaders: effectiveReqHeaders,
-        requestBodyBase64: effectiveBody ? encodeTextToBase64(effectiveBody) : "",
+        requestBodyBase64: effectiveBodyBase64,
         requestBodyText: effectiveBody || null,
         responseStatus: null,
         responseHeaders: [],
@@ -1556,7 +1573,7 @@ class BrowserPreviewEngine {
           },
           requestHeaders: effectiveReqHeaders,
           responseHeaders: [{ name: "Content-Type", value: "application/json" }],
-          requestBodyBase64: effectiveBody ? encodeTextToBase64(effectiveBody) : "",
+          requestBodyBase64: effectiveBodyBase64,
           responseBodyBase64: encodeTextToBase64(abortedText),
           requestBodyText: effectiveBody || null,
           responseBodyText: abortedText,
@@ -1588,6 +1605,21 @@ class BrowserPreviewEngine {
       }
       if (typeof verdict.requestBodyText === "string") {
         effectiveBody = verdict.requestBodyText;
+        effectiveBodyBytes = effectiveBody
+          ? new TextEncoder().encode(effectiveBody)
+          : null;
+        effectiveBodyBase64 = effectiveBody
+          ? encodeTextToBase64(effectiveBody)
+          : "";
+        bpModified = true;
+      } else if (typeof verdict.requestBodyBase64 === "string") {
+        effectiveBodyBase64 = verdict.requestBodyBase64;
+        effectiveBodyBytes = effectiveBodyBase64
+          ? decodeBase64ToBytes(effectiveBodyBase64)
+          : null;
+        effectiveBody = effectiveBodyBytes
+          ? new TextDecoder().decode(effectiveBodyBytes)
+          : "";
         bpModified = true;
       }
     }
@@ -1640,7 +1672,7 @@ class BrowserPreviewEngine {
         },
         requestHeaders: effectiveReqHeaders,
         responseHeaders: respMut.headers,
-        requestBodyBase64: effectiveBody ? encodeTextToBase64(effectiveBody) : "",
+        requestBodyBase64: effectiveBodyBase64,
         responseBodyBase64: encodeTextToBase64(matched.responseBody),
         requestBodyText: effectiveBody || null,
         responseBodyText: matched.responseBody,
@@ -1675,7 +1707,7 @@ class BrowserPreviewEngine {
         },
         requestHeaders: effectiveReqHeaders,
         responseHeaders: [],
-        requestBodyBase64: effectiveBody ? encodeTextToBase64(effectiveBody) : "",
+        requestBodyBase64: effectiveBodyBase64,
         responseBodyBase64: "",
         requestBodyText: effectiveBody || null,
         responseBodyText: null,
@@ -1696,8 +1728,9 @@ class BrowserPreviewEngine {
           body:
             effectiveMethod !== "GET" &&
             effectiveMethod !== "HEAD" &&
-            effectiveBody
-              ? effectiveBody
+            effectiveBodyBytes &&
+            effectiveBodyBytes.length > 0
+              ? new Uint8Array(effectiveBodyBytes)
               : undefined,
         });
         const text = await resp.text();
@@ -1745,9 +1778,7 @@ class BrowserPreviewEngine {
           },
           requestHeaders: effectiveReqHeaders,
           responseHeaders: respMut.headers,
-          requestBodyBase64: effectiveBody
-            ? encodeTextToBase64(effectiveBody)
-            : "",
+          requestBodyBase64: effectiveBodyBase64,
           responseBodyBase64: encodeTextToBase64(text),
           requestBodyText: effectiveBody || null,
           responseBodyText: text,
@@ -1764,7 +1795,7 @@ class BrowserPreviewEngine {
               method: effectiveMethod,
               url: effectiveUrl,
               headersCount: effectiveReqHeaders.length,
-              bodyLength: effectiveBody.length,
+              bodyLength: effectiveBodyBytes ? effectiveBodyBytes.length : 0,
             },
           },
           null,
@@ -1806,9 +1837,7 @@ class BrowserPreviewEngine {
           },
           requestHeaders: effectiveReqHeaders,
           responseHeaders: respMut.headers,
-          requestBodyBase64: effectiveBody
-            ? encodeTextToBase64(effectiveBody)
-            : "",
+          requestBodyBase64: effectiveBodyBase64,
           responseBodyBase64: encodeTextToBase64(fallbackBody),
           requestBodyText: effectiveBody || null,
           responseBodyText: fallbackBody,
@@ -2305,7 +2334,10 @@ export const proxyBridge = {
     });
   },
 
-  setPreviewPort(port: number): ProxyStatus {
+  async setPreviewPort(port: number): Promise<ProxyStatus> {
+    if (isTauriRuntime()) {
+      return invoke<ProxyStatus>("set_proxy_port", { port });
+    }
     return previewEngine.setPort(port);
   },
 
@@ -2391,11 +2423,7 @@ export const proxyBridge = {
   async deleteSessions(ids: number[]): Promise<number> {
     if (ids.length === 0) return 0;
     if (isTauriRuntime()) {
-      try {
-        return await invoke<number>("delete_sessions", { ids });
-      } catch {
-        return ids.length;
-      }
+      return invoke<number>("delete_sessions", { ids });
     }
     return previewEngine.deleteMany(ids);
   },
@@ -2470,25 +2498,20 @@ export const proxyBridge = {
 
   async getAutoResponderEnabled(): Promise<boolean> {
     if (isTauriRuntime()) {
-      try {
-        return await invoke<boolean>("get_autoresponder_enabled");
-      } catch {
-        return previewEngine.isAutoResponderEnabled();
-      }
+      return invoke<boolean>("get_autoresponder_enabled");
     }
     return previewEngine.isAutoResponderEnabled();
   },
 
   async setAutoResponderEnabled(enabled: boolean): Promise<boolean> {
-    previewEngine.setAutoResponderEnabled(enabled);
     if (isTauriRuntime()) {
-      try {
-        return await invoke<boolean>("set_autoresponder_enabled", { enabled });
-      } catch {
-        return enabled;
-      }
+      const applied = await invoke<boolean>("set_autoresponder_enabled", {
+        enabled,
+      });
+      previewEngine.setAutoResponderEnabled(applied);
+      return applied;
     }
-    return enabled;
+    return previewEngine.setAutoResponderEnabled(enabled);
   },
 
   async setAutoResponderConfig(
@@ -2906,8 +2929,11 @@ export const proxyBridge = {
     });
   },
 
-  generateStressTestSessions(count = 10_000): SessionSummary[] {
-    return previewEngine.generateBulkStressSessions(count);
+  async generateStressTestSessions(count = 10_000): Promise<number> {
+    if (isTauriRuntime()) {
+      return invoke<number>("generate_stress_sessions", { count });
+    }
+    return previewEngine.generateBulkStressSessions(count).length;
   },
 
   triggerSimulatedTrafficHit(): void {

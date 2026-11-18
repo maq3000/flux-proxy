@@ -651,14 +651,22 @@ export const App: React.FC = () => {
 
   const handleSetAutoResponderEnabled = useCallback(
     async (nextEnabled: boolean) => {
-      const applied = await proxyBridge.setAutoResponderEnabled(nextEnabled);
-      setAutoResponderEnabled(applied);
-      persistAutoResponderStorage(applied, rules);
-      showToast(
-        applied
-          ? "▶ AutoResponder включён"
-          : "⏸ AutoResponder отключён глобально"
-      );
+      try {
+        const applied = await proxyBridge.setAutoResponderEnabled(nextEnabled);
+        setAutoResponderEnabled(applied);
+        persistAutoResponderStorage(applied, rules);
+        showToast(
+          applied
+            ? "▶ AutoResponder включён"
+            : "⏸ AutoResponder отключён глобально"
+        );
+      } catch (err) {
+        showToast(
+          `⚠️ Не удалось переключить AutoResponder: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
     },
     [persistAutoResponderStorage, rules, showToast]
   );
@@ -693,14 +701,23 @@ export const App: React.FC = () => {
         // fallback to backend defaults
       }
 
-      const [initialEnabled, initialRules] = await Promise.all([
-        proxyBridge.getAutoResponderEnabled(),
-        proxyBridge.listRules(),
-      ]);
-      if (!active) return;
-      setAutoResponderEnabled(initialEnabled);
-      setRules(initialRules);
-      persistAutoResponderStorage(initialEnabled, initialRules);
+      try {
+        const [initialEnabled, initialRules] = await Promise.all([
+          proxyBridge.getAutoResponderEnabled(),
+          proxyBridge.listRules(),
+        ]);
+        if (!active) return;
+        setAutoResponderEnabled(initialEnabled);
+        setRules(initialRules);
+        persistAutoResponderStorage(initialEnabled, initialRules);
+      } catch (err) {
+        if (!active) return;
+        showToast(
+          `⚠️ Не удалось загрузить состояние AutoResponder: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
     };
 
     void initAutoResponder();
@@ -717,7 +734,7 @@ export const App: React.FC = () => {
       active = false;
       window.removeEventListener(SETTINGS_APPLIED_EVENT, onSettingsApplied);
     };
-  }, [persistAutoResponderStorage]);
+  }, [persistAutoResponderStorage, showToast]);
 
   // Register live snapshot getter so `exportCurrentSettingsProfile()` captures live React state
   const liveSnapshotRef = useRef<() => Partial<FluxUserSettingsProfile>>(
@@ -775,6 +792,7 @@ export const App: React.FC = () => {
       enabled: autoResponderEnabled,
       rules,
     },
+    breakpoints: breakpointConfig,
   });
 
   useEffect(() => {

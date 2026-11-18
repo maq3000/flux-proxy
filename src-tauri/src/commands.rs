@@ -44,11 +44,19 @@ pub async fn start_proxy(
     port: Option<u16>,
     state: State<'_, AppState>,
 ) -> Result<ProxyStatus, ProxyError> {
-    let bind_port = port.unwrap_or(8888);
+    let bind_port = port.unwrap_or_else(|| state.controller.preferred_port());
     match host.map(|h| h.trim().to_string()).filter(|h| !h.is_empty()) {
         Some(explicit_host) => state.controller.start(explicit_host, bind_port).await,
         None => state.controller.start_with_config(bind_port).await,
     }
+}
+
+#[tauri::command]
+pub async fn set_proxy_port(
+    port: u16,
+    state: State<'_, AppState>,
+) -> Result<ProxyStatus, ProxyError> {
+    state.controller.set_port(port).await
 }
 
 #[tauri::command]
@@ -706,6 +714,23 @@ pub async fn import_settings_file(file_path: String) -> Result<String, ProxyErro
     })
     .await
     .map_err(|e| ProxyError::Custom(format!("Import settings task join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn generate_stress_sessions(
+    count: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<usize, ProxyError> {
+    let target = count.unwrap_or(10_000);
+    let store = state.controller.context.store.clone();
+    let filters = state.controller.context.filters.clone();
+    let event_tx = state.controller.context.event_tx.clone();
+    let generated = run_blocking("Generate stress sessions", move || {
+        store.generate_stress_sessions(target, &filters, &event_tx)
+    })
+    .await?;
+    state.controller.context.emit_storage_stats_changed();
+    Ok(generated)
 }
 
 #[cfg(test)]

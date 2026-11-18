@@ -262,6 +262,7 @@ export interface ComposedRequest {
   url: string;
   headers: HeaderPair[];
   body: string;
+  bodyBase64?: string | null;
   followRedirects: boolean;
 }
 
