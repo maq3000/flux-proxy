@@ -1,6 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Database, Trash2, Upload, X } from "lucide-react";
-import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
+import {
+  Panel,
+  PanelGroup,
+  PanelResizeHandle,
+  type ImperativePanelGroupHandle,
+} from "react-resizable-panels";
 import { AutoResponderPanel } from "./components/AutoResponderPanel";
 import {
   BreakpointBanner,
@@ -35,7 +40,13 @@ import { TopToolbar } from "./components/TopToolbar";
 import { TrafficGrid } from "./components/TrafficGrid";
 import { useProxySessions } from "./hooks/useProxySessions";
 import { useTheme } from "./hooks/useTheme";
-import { useUiPreferences } from "./hooks/useUiPreferences";
+import {
+  FLUX_PANEL_AUTOSAVE_IDS,
+  FLUX_PANEL_LAYOUT_RESET_EVENT,
+  SAFE_PANEL_STORAGE,
+  readPersistedPanelLayouts,
+  useUiPreferences,
+} from "./hooks/useUiPreferences";
 import { buildCurlCommand, buildHeadersBlock } from "./lib/formatters";
 import {
   applySettingsProfile,
@@ -72,10 +83,15 @@ export const App: React.FC = () => {
     setSidebarCollapsed,
     inspectorCollapsed,
     inspectorPosition,
+    inspectorSplitDirection,
+    resolvedInspectorSplitDirection,
     toggleSidebar,
     setInspectorCollapsed,
     toggleInspector,
     setInspectorPosition,
+    setInspectorSplitDirection,
+    toggleInspectorSplitDirection,
+    resetPanelLayouts,
     toolbarGroups,
     toggleToolbarGroup,
     setToolbarGroupVisible,
@@ -193,6 +209,9 @@ export const App: React.FC = () => {
   const trafficGridRef = useRef<HTMLDivElement>(null);
   const inspectorContainerRef = useRef<HTMLDivElement>(null);
   const sortedSessionsRef = useRef<SessionSummary[]>(filteredSessions);
+  const bottomOuterGroupRef = useRef<ImperativePanelGroupHandle>(null);
+  const bottomInnerGroupRef = useRef<ImperativePanelGroupHandle>(null);
+  const rightGroupRef = useRef<ImperativePanelGroupHandle>(null);
 
   const handleSelectAllSessions = useCallback(
     (explicitIds?: number[]) => {
@@ -349,6 +368,49 @@ export const App: React.FC = () => {
     },
     [showToast]
   );
+
+  const handleResetBottomOuterGroup = useCallback(() => {
+    bottomOuterGroupRef.current?.setLayout(dockedComposer ? [74, 26] : [100]);
+  }, [dockedComposer]);
+
+  const handleResetBottomInnerGroup = useCallback(() => {
+    bottomInnerGroupRef.current?.setLayout(
+      inspectorCollapsed ? [100] : [54, 46]
+    );
+  }, [inspectorCollapsed]);
+
+  const handleResetRightGroup = useCallback(() => {
+    rightGroupRef.current?.setLayout(
+      !inspectorCollapsed
+        ? dockedComposer
+          ? [44, 32, 24]
+          : [56, 44]
+        : dockedComposer
+          ? [74, 26]
+          : [100]
+    );
+  }, [dockedComposer, inspectorCollapsed]);
+
+  const handleResetPanelLayout = useCallback(() => {
+    resetPanelLayouts();
+    showToast("📐 Размеры сплит-панелей сброшены к значениям по умолчанию");
+  }, [resetPanelLayouts, showToast]);
+
+  useEffect(() => {
+    const onResetPanels = () => {
+      handleResetBottomOuterGroup();
+      handleResetBottomInnerGroup();
+      handleResetRightGroup();
+    };
+    window.addEventListener(FLUX_PANEL_LAYOUT_RESET_EVENT, onResetPanels);
+    return () => {
+      window.removeEventListener(FLUX_PANEL_LAYOUT_RESET_EVENT, onResetPanels);
+    };
+  }, [
+    handleResetBottomInnerGroup,
+    handleResetBottomOuterGroup,
+    handleResetRightGroup,
+  ]);
 
   useEffect(() => {
     let mounted = true;
@@ -661,10 +723,12 @@ export const App: React.FC = () => {
       sidebarCollapsed,
       inspectorCollapsed,
       inspectorPosition,
+      inspectorSplitDirection,
       followTail,
       columnWidths,
       visibleColumns,
       toolbarGroups,
+      panelLayouts: readPersistedPanelLayouts(),
     },
     filters: {
       activePresetId,
@@ -1511,6 +1575,20 @@ export const App: React.FC = () => {
         perform: resetColumns,
       },
       {
+        id: "reset-panel-layout",
+        category: "View",
+        label: "Reset Panel Layout to Default",
+        keywords: [
+          "split",
+          "panels",
+          "geometry",
+          "autosave",
+          "сбросить панели",
+          "размеры",
+        ],
+        perform: handleResetPanelLayout,
+      },
+      {
         id: "open-shortcuts-modal",
         category: "Help",
         label: "Показать справку по горячим клавишам (Keyboard Shortcuts)",
@@ -1847,6 +1925,7 @@ export const App: React.FC = () => {
       handleInspectInHex,
       handleOpenCustomRetentionLimit,
       handleResetAllSettings,
+      handleResetPanelLayout,
       handleSelectAllSessions,
       importArchiveDialog,
       inspectorCollapsed,
@@ -1989,6 +2068,9 @@ export const App: React.FC = () => {
         onReturnFocusToGrid={focusTrafficGrid}
         inspectorPosition={inspectorPosition}
         onChangeInspectorPosition={setInspectorPosition}
+        splitDirection={resolvedInspectorSplitDirection}
+        inspectorSplitDirection={inspectorSplitDirection}
+        onToggleSplitDirection={toggleInspectorSplitDirection}
         onCollapseInspector={() => {
           setInspectorCollapsed(true);
           focusTrafficGrid();
@@ -2129,6 +2211,7 @@ export const App: React.FC = () => {
         visibleColumns={visibleColumns}
         onToggleColumnVisibility={toggleColumnVisibility}
         onResetColumns={resetColumns}
+        onResetPanelLayout={handleResetPanelLayout}
         themePreference={preference}
         onSetTheme={setTheme}
         onReplaySelected={() => {
@@ -2295,7 +2378,10 @@ export const App: React.FC = () => {
           <main className="flex-1 overflow-hidden">
             {activeSection === "traffic" && inspectorPosition === "bottom" && (
               <PanelGroup
+                ref={bottomOuterGroupRef}
                 key="traffic-layout-bottom"
+                autoSaveId={FLUX_PANEL_AUTOSAVE_IDS.bottomOuter}
+                storage={SAFE_PANEL_STORAGE}
                 direction="horizontal"
                 className="h-full w-full"
               >
@@ -2305,7 +2391,13 @@ export const App: React.FC = () => {
                   defaultSize={dockedComposer ? 74 : 100}
                   minSize={35}
                 >
-                  <PanelGroup direction="vertical" className="h-full w-full">
+                  <PanelGroup
+                    ref={bottomInnerGroupRef}
+                    autoSaveId={FLUX_PANEL_AUTOSAVE_IDS.bottomInner}
+                    storage={SAFE_PANEL_STORAGE}
+                    direction="vertical"
+                    className="h-full w-full"
+                  >
                     <Panel
                       id="traffic-grid-top"
                       order={1}
@@ -2316,7 +2408,11 @@ export const App: React.FC = () => {
                     </Panel>
                     {!inspectorCollapsed && (
                       <>
-                        <PanelResizeHandle className="h-1 w-full bg-hairline transition-colors hover:bg-accent/60" />
+                        <PanelResizeHandle
+                          onDoubleClick={handleResetBottomInnerGroup}
+                          title="Double-click to reset Traffic / Inspector split"
+                          className="h-1 w-full bg-hairline transition-colors hover:bg-accent/60"
+                        />
                         <Panel
                           id="session-inspector-bottom"
                           order={2}
@@ -2332,7 +2428,11 @@ export const App: React.FC = () => {
 
                 {dockedComposer && (
                   <>
-                    <PanelResizeHandle className="w-1 bg-hairline transition-colors hover:bg-accent/60" />
+                    <PanelResizeHandle
+                      onDoubleClick={handleResetBottomOuterGroup}
+                      title="Double-click to reset Traffic / Composer split"
+                      className="w-1 bg-hairline transition-colors hover:bg-accent/60"
+                    />
                     <Panel
                       id="docked-composer-panel"
                       order={2}
@@ -2357,7 +2457,10 @@ export const App: React.FC = () => {
 
             {activeSection === "traffic" && inspectorPosition === "right" && (
               <PanelGroup
+                ref={rightGroupRef}
                 key="traffic-layout-right"
+                autoSaveId={FLUX_PANEL_AUTOSAVE_IDS.right}
+                storage={SAFE_PANEL_STORAGE}
                 direction="horizontal"
                 className="h-full w-full"
               >
@@ -2380,7 +2483,11 @@ export const App: React.FC = () => {
 
                 {!inspectorCollapsed && (
                   <>
-                    <PanelResizeHandle className="w-1 bg-hairline transition-colors hover:bg-accent/60" />
+                    <PanelResizeHandle
+                      onDoubleClick={handleResetRightGroup}
+                      title="Double-click to reset workspace panel split"
+                      className="w-1 bg-hairline transition-colors hover:bg-accent/60"
+                    />
                     <Panel
                       id="session-inspector-right"
                       order={2}
@@ -2394,7 +2501,11 @@ export const App: React.FC = () => {
 
                 {dockedComposer && (
                   <>
-                    <PanelResizeHandle className="w-1 bg-hairline transition-colors hover:bg-accent/60" />
+                    <PanelResizeHandle
+                      onDoubleClick={handleResetRightGroup}
+                      title="Double-click to reset workspace panel split"
+                      className="w-1 bg-hairline transition-colors hover:bg-accent/60"
+                    />
                     <Panel
                       id="docked-composer-right"
                       order={3}
@@ -2658,6 +2769,9 @@ export const App: React.FC = () => {
         onSetInspectorCollapsed={setInspectorCollapsed}
         inspectorPosition={inspectorPosition}
         onSetInspectorPosition={setInspectorPosition}
+        inspectorSplitDirection={inspectorSplitDirection}
+        onSetInspectorSplitDirection={setInspectorSplitDirection}
+        onResetPanelLayout={handleResetPanelLayout}
         followTail={followTail}
         onSetFollowTail={setFollowTail}
         toolbarGroups={toolbarGroups}

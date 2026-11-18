@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
+import type { PanelGroupStorage } from "react-resizable-panels";
 import type {
   ColumnId,
   InspectorDockPosition,
+  InspectorSplitDirection,
   ToolbarGroupId,
   UiLayoutPreferences,
 } from "../types/proxy";
@@ -9,6 +11,109 @@ import {
   SETTINGS_APPLIED_EVENT,
   type FluxUserSettingsProfile,
 } from "../types/settings";
+
+export type { InspectorSplitDirection } from "../types/proxy";
+
+export const FLUX_PANEL_AUTOSAVE_IDS = {
+  bottomOuter: "flux-layout-bottom-outer-v1",
+  bottomInner: "flux-layout-bottom-inner-v1",
+  right: "flux-layout-right-v1",
+  inspectorSplit: "flux-inspector-split-v1",
+} as const;
+
+export const FLUX_PANEL_STORAGE_PREFIX = "react-resizable-panels:flux-";
+export const FLUX_PANEL_LAYOUT_RESET_EVENT = "fluxproxy:panel-layout-reset";
+
+export const SAFE_PANEL_STORAGE: PanelGroupStorage = {
+  getItem(name: string): string | null {
+    if (typeof window === "undefined") return null;
+    try {
+      return window.localStorage.getItem(name);
+    } catch {
+      return null;
+    }
+  },
+  setItem(name: string, value: string): void {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(name, value);
+    } catch {
+      // ignore storage quota / privacy mode errors
+    }
+  },
+};
+
+export function resolveInspectorSplitDirection(
+  splitDirection: InspectorSplitDirection,
+  inspectorPosition: InspectorDockPosition
+): "horizontal" | "vertical" {
+  if (splitDirection === "horizontal" || splitDirection === "vertical") {
+    return splitDirection;
+  }
+  return inspectorPosition === "bottom" ? "horizontal" : "vertical";
+}
+
+export function clearPersistedPanelLayouts(): void {
+  if (typeof window === "undefined") return;
+  try {
+    const keysToRemove: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i += 1) {
+      const k = window.localStorage.key(i);
+      if (k && k.startsWith(FLUX_PANEL_STORAGE_PREFIX)) {
+        keysToRemove.push(k);
+      }
+    }
+    for (const autoSaveId of Object.values(FLUX_PANEL_AUTOSAVE_IDS)) {
+      const fullKey = `react-resizable-panels:${autoSaveId}`;
+      if (!keysToRemove.includes(fullKey)) {
+        keysToRemove.push(fullKey);
+      }
+    }
+    for (const key of keysToRemove) {
+      window.localStorage.removeItem(key);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function readPersistedPanelLayouts(): Record<string, string> {
+  if (typeof window === "undefined") return {};
+  const result: Record<string, string> = {};
+  try {
+    for (let i = 0; i < window.localStorage.length; i += 1) {
+      const key = window.localStorage.key(i);
+      if (!key || !key.startsWith(FLUX_PANEL_STORAGE_PREFIX)) continue;
+      const val = window.localStorage.getItem(key);
+      if (typeof val === "string") {
+        const autoSaveId = key.slice("react-resizable-panels:".length);
+        result[autoSaveId] = val;
+      }
+    }
+  } catch {
+    return {};
+  }
+  return result;
+}
+
+export function writePersistedPanelLayouts(
+  layouts?: Record<string, string>
+): void {
+  if (typeof window === "undefined" || !layouts) return;
+  clearPersistedPanelLayouts();
+  try {
+    for (const [rawKey, rawVal] of Object.entries(layouts)) {
+      if (typeof rawVal !== "string") continue;
+      const fullKey = rawKey.startsWith("react-resizable-panels:")
+        ? rawKey
+        : `react-resizable-panels:${rawKey}`;
+      if (!fullKey.startsWith(FLUX_PANEL_STORAGE_PREFIX)) continue;
+      window.localStorage.setItem(fullKey, rawVal);
+    }
+  } catch {
+    // ignore storage quota errors
+  }
+}
 
 export interface ColumnDefinition {
   id: ColumnId;
@@ -173,7 +278,14 @@ export const DEFAULT_LAYOUT_PREFS: UiLayoutPreferences = {
   sidebarCollapsed: false,
   inspectorCollapsed: false,
   inspectorPosition: "bottom",
+  inspectorSplitDirection: "auto",
 };
+
+function sanitizeSplitDirection(val: unknown): InspectorSplitDirection {
+  return val === "horizontal" || val === "vertical" || val === "auto"
+    ? val
+    : "auto";
+}
 
 const LS_LAYOUT_KEY = "fluxproxy.uiLayout.v1";
 const LS_TOOLBAR_GROUPS_KEY = "fluxproxy.toolbarGroups.v1";
@@ -200,6 +312,9 @@ export function useUiPreferences() {
       inspectorCollapsed: Boolean(saved.inspectorCollapsed ?? false),
       inspectorPosition:
         saved.inspectorPosition === "right" ? "right" : "bottom",
+      inspectorSplitDirection: sanitizeSplitDirection(
+        saved.inspectorSplitDirection
+      ),
     };
   });
 
@@ -303,6 +418,9 @@ export function useUiPreferences() {
         inspectorCollapsed: Boolean(detail.ui.inspectorCollapsed),
         inspectorPosition:
           detail.ui.inspectorPosition === "right" ? "right" : "bottom",
+        inspectorSplitDirection: sanitizeSplitDirection(
+          detail.ui.inspectorSplitDirection
+        ),
       });
       setToolbarGroups({
         ...DEFAULT_TOOLBAR_GROUPS,
@@ -365,6 +483,45 @@ export function useUiPreferences() {
     }));
   }, []);
 
+  const setInspectorSplitDirection = useCallback(
+    (dir: InspectorSplitDirection) => {
+      setLayout((prev) => ({
+        ...prev,
+        inspectorSplitDirection: sanitizeSplitDirection(dir),
+      }));
+    },
+    []
+  );
+
+  const toggleInspectorSplitDirection = useCallback(() => {
+    setLayout((prev) => {
+      const currentResolved = resolveInspectorSplitDirection(
+        prev.inspectorSplitDirection,
+        prev.inspectorPosition
+      );
+      const nextDir: InspectorSplitDirection =
+        currentResolved === "horizontal" ? "vertical" : "horizontal";
+      return {
+        ...prev,
+        inspectorSplitDirection: nextDir,
+      };
+    });
+  }, []);
+
+  const resetPanelLayouts = useCallback(() => {
+    clearPersistedPanelLayouts();
+    setLayout((prev) => ({
+      ...prev,
+      inspectorSplitDirection: "auto",
+    }));
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent(FLUX_PANEL_LAYOUT_RESET_EVENT));
+      window.setTimeout(() => {
+        clearPersistedPanelLayouts();
+      }, 150);
+    }
+  }, []);
+
   const toggleToolbarGroup = useCallback((groupId: ToolbarGroupId) => {
     setToolbarGroups((prev) => ({
       ...prev,
@@ -422,7 +579,19 @@ export function useUiPreferences() {
     setToolbarGroups({ ...DEFAULT_TOOLBAR_GROUPS });
     setVisibleColumns({ ...DEFAULT_VISIBLE_COLUMNS });
     setColumnWidths({ ...DEFAULT_COLUMN_WIDTHS });
+    clearPersistedPanelLayouts();
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent(FLUX_PANEL_LAYOUT_RESET_EVENT));
+      window.setTimeout(() => {
+        clearPersistedPanelLayouts();
+      }, 150);
+    }
   }, []);
+
+  const resolvedInspectorSplitDirection = resolveInspectorSplitDirection(
+    layout.inspectorSplitDirection,
+    layout.inspectorPosition
+  );
 
   return {
     layout,
@@ -432,11 +601,16 @@ export function useUiPreferences() {
     sidebarCollapsed: layout.sidebarCollapsed,
     inspectorCollapsed: layout.inspectorCollapsed,
     inspectorPosition: layout.inspectorPosition,
+    inspectorSplitDirection: layout.inspectorSplitDirection,
+    resolvedInspectorSplitDirection,
     toggleSidebar,
     setSidebarCollapsed,
     toggleInspector,
     setInspectorCollapsed,
     setInspectorPosition,
+    setInspectorSplitDirection,
+    toggleInspectorSplitDirection,
+    resetPanelLayouts,
     toolbarGroups,
     toggleToolbarGroup,
     setToolbarGroupVisible,

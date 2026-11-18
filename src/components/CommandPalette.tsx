@@ -6,6 +6,7 @@ export interface PaletteCommand {
   label: string;
   category: string;
   shortcut?: string;
+  keywords?: string[];
   perform: () => void;
 }
 
@@ -88,7 +89,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       (c) =>
         c.id.toLowerCase().includes(q) ||
         c.label.toLowerCase().includes(q) ||
-        c.category.toLowerCase().includes(q)
+        c.category.toLowerCase().includes(q) ||
+        Boolean(c.keywords?.some((kw) => kw.toLowerCase().includes(q)))
     );
 
     return [...dynamicQuickExec, ...matchedStatic];

@@ -441,9 +441,12 @@ export type ToolbarGroupId =
 
 export type InspectorDockPosition = "bottom" | "right";
 
+export type InspectorSplitDirection = "auto" | "horizontal" | "vertical";
+
 export interface UiLayoutPreferences {
   compactToolbar: boolean;
   sidebarCollapsed: boolean;
   inspectorCollapsed: boolean;
   inspectorPosition: InspectorDockPosition;
+  inspectorSplitDirection: InspectorSplitDirection;
 }

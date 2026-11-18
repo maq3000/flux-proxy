@@ -89,6 +89,7 @@ interface MenuBarProps {
   visibleColumns: Record<ColumnId, boolean>;
   onToggleColumnVisibility: (colId: ColumnId) => void;
   onResetColumns: () => void;
+  onResetPanelLayout: () => void;
   themePreference: ThemePreference;
   onSetTheme: (pref: ThemePreference) => void;
   // Tools
@@ -323,6 +324,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   visibleColumns,
   onToggleColumnVisibility,
   onResetColumns,
+  onResetPanelLayout,
   themePreference,
   onSetTheme,
   sessionRetentionLimit,
@@ -1515,6 +1517,13 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                   </button>
                 </div>
               </div>
+
+              <button
+                type="button"
+                onClick={(e) => activateCommand(e, onResetPanelLayout)}
+              >
+                <span>Reset Panel Layout to Default</span>
+              </button>
 
               <hr />
 

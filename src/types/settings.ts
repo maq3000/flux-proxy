@@ -8,6 +8,7 @@ import type {
   HeaderMutationRule,
   HostListFilterConfig,
   InspectorDockPosition,
+  InspectorSplitDirection,
   NoiseThresholdsConfig,
   TlsBypassRule,
   TlsInterceptMode,
@@ -25,10 +26,13 @@ export interface FluxUserUiSettings {
   sidebarCollapsed: boolean;
   inspectorCollapsed: boolean;
   inspectorPosition: InspectorDockPosition;
+  inspectorSplitDirection: InspectorSplitDirection;
   followTail: boolean;
   columnWidths: Record<ColumnId, number>;
   visibleColumns: Record<ColumnId, boolean>;
   toolbarGroups: Record<ToolbarGroupId, boolean>;
+  /** Persisted `react-resizable-panels` geometries keyed by `flux-*` autoSaveId */
+  panelLayouts?: Record<string, string>;
   /** Optional alias accepted during profile import/migration; canonically stored in `proxy.clearDbOnExit` */
   clearDbOnExit?: boolean;
 }
@@ -117,6 +121,7 @@ export interface SettingsImportPreviewSummary {
   compactToolbar: boolean;
   theme: ThemePreference;
   inspectorPosition: InspectorDockPosition;
+  inspectorSplitDirection: InspectorSplitDirection;
   proxyPort: number;
   tlsInterceptMode: TlsInterceptMode;
   warnings: string[];

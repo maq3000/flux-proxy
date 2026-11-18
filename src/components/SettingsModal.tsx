@@ -42,6 +42,7 @@ import type {
   HostListFilterConfig,
   HostListFilterMode,
   InspectorDockPosition,
+  InspectorSplitDirection,
   NetworkInterfaceInfo,
   NoiseThresholdsConfig,
   ProxyFilterBackendConfig,
@@ -101,6 +102,9 @@ export interface SettingsModalProps {
   onSetInspectorCollapsed: (collapsed: boolean) => void;
   inspectorPosition: InspectorDockPosition;
   onSetInspectorPosition: (pos: InspectorDockPosition) => void;
+  inspectorSplitDirection: InspectorSplitDirection;
+  onSetInspectorSplitDirection: (dir: InspectorSplitDirection) => void;
+  onResetPanelLayout: () => void;
   followTail: boolean;
   onSetFollowTail: (follow: boolean) => void;
   toolbarGroups: Record<ToolbarGroupId, boolean>;
@@ -224,6 +228,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onSetInspectorCollapsed,
   inspectorPosition,
   onSetInspectorPosition,
+  inspectorSplitDirection,
+  onSetInspectorSplitDirection,
+  onResetPanelLayout,
   followTail,
   onSetFollowTail,
   toolbarGroups,
@@ -1298,9 +1305,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             {activeTab === "uiColumns" && (
               <>
                 <div className="space-y-3 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <h3 className="text-xs font-semibold text-fg">
-                    Компоновка рабочей области
-                  </h3>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h3 className="text-xs font-semibold text-fg">
+                      Компоновка рабочей области
+                    </h3>
+                    <button
+                      type="button"
+                      onClick={onResetPanelLayout}
+                      className="inline-flex items-center gap-1 rounded border border-hairline bg-surface px-2.5 py-1 text-[11px] text-muted hover:border-strong hover:text-fg"
+                    >
+                      <RotateCcw className="h-3 w-3" />
+                      <span>Reset Panel Layout to Default</span>
+                    </button>
+                  </div>
 
                   <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
                     <label
@@ -1397,6 +1414,70 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             <span className="font-medium text-fg">
                               {pos.label}
                             </span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </fieldset>
+
+                  <fieldset className="space-y-2 border-t border-hairline pt-2.5">
+                    <legend className="text-[11px] font-medium text-muted">
+                      Ориентация сплиттера внутри Session Inspector (Request / Response)
+                    </legend>
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                      {(
+                        [
+                          {
+                            value: "auto",
+                            label: "Auto",
+                            desc:
+                              inspectorPosition === "bottom"
+                                ? "Сейчас: Horizontal"
+                                : "Сейчас: Vertical",
+                          },
+                          {
+                            value: "horizontal",
+                            label: "Horizontal",
+                            desc: "Request слева, Response справа",
+                          },
+                          {
+                            value: "vertical",
+                            label: "Vertical",
+                            desc: "Request сверху, Response снизу",
+                          },
+                        ] as const
+                      ).map((opt) => {
+                        const radioId = `${baseId}-split-dir-${opt.value}`;
+                        const checked = inspectorSplitDirection === opt.value;
+                        return (
+                          <label
+                            key={opt.value}
+                            htmlFor={radioId}
+                            className={`flex cursor-pointer items-start gap-2 rounded-md border p-2 transition-colors ${
+                              checked
+                                ? "border-accent/50 bg-selected"
+                                : "border-hairline bg-surface hover:bg-hover"
+                            }`}
+                          >
+                            <input
+                              id={radioId}
+                              type="radio"
+                              name={`${baseId}-split-dir`}
+                              value={opt.value}
+                              checked={checked}
+                              onChange={() =>
+                                onSetInspectorSplitDirection(opt.value)
+                              }
+                              className="mt-0.5 cursor-pointer accent-[var(--accent-primary)]"
+                            />
+                            <div className="min-w-0">
+                              <div className="font-medium text-fg">
+                                {opt.label}
+                              </div>
+                              <div className="text-[10px] text-muted">
+                                {opt.desc}
+                              </div>
+                            </div>
                           </label>
                         );
                       })}
@@ -2977,8 +3058,8 @@ export const SettingsImportPreviewModal: React.FC<
                 <div>
                   • Тема / Инспектор / Порт:{" "}
                   <span className="font-mono text-fg">
-                    {preview.theme} / {preview.inspectorPosition} / :
-                    {preview.proxyPort}
+                    {preview.theme} / {preview.inspectorPosition} (
+                    {preview.inspectorSplitDirection}) / :{preview.proxyPort}
                   </span>
                 </div>
               </div>

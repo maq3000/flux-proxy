@@ -4,8 +4,13 @@ import {
   DEFAULT_LAYOUT_PREFS,
   DEFAULT_TOOLBAR_GROUPS,
   DEFAULT_VISIBLE_COLUMNS,
+  FLUX_PANEL_LAYOUT_RESET_EVENT,
   TOOLBAR_GROUP_DEFINITIONS,
   TRAFFIC_COLUMNS,
+  clearPersistedPanelLayouts,
+  readPersistedPanelLayouts,
+  writePersistedPanelLayouts,
+  type InspectorSplitDirection,
 } from "../hooks/useUiPreferences";
 import type { ThemePreference } from "../hooks/useTheme";
 import {
@@ -84,6 +89,11 @@ export const SETTINGS_STORAGE_KEYS = {
 
 const VALID_THEMES = new Set<ThemePreference>(["dark", "light", "system"]);
 const VALID_DOCK_POSITIONS = new Set<InspectorDockPosition>(["bottom", "right"]);
+const VALID_SPLIT_DIRECTIONS = new Set<InspectorSplitDirection>([
+  "auto",
+  "horizontal",
+  "vertical",
+]);
 const VALID_BIND_MODES = new Set<BindHostMode>(["loopback", "all", "specific"]);
 const VALID_TLS_MODES = new Set<TlsInterceptMode>([
   "interceptAll",
@@ -205,10 +215,12 @@ export function createDefaultSettingsProfile(): FluxUserSettingsProfile {
       sidebarCollapsed: DEFAULT_LAYOUT_PREFS.sidebarCollapsed,
       inspectorCollapsed: DEFAULT_LAYOUT_PREFS.inspectorCollapsed,
       inspectorPosition: DEFAULT_LAYOUT_PREFS.inspectorPosition,
+      inspectorSplitDirection: DEFAULT_LAYOUT_PREFS.inspectorSplitDirection,
       followTail: false,
       columnWidths: { ...DEFAULT_COLUMN_WIDTHS },
       visibleColumns: { ...DEFAULT_VISIBLE_COLUMNS },
       toolbarGroups: { ...DEFAULT_TOOLBAR_GROUPS },
+      panelLayouts: {},
     },
     filters: {
       activePresetId: null,
@@ -292,6 +304,15 @@ const SCHEMA_MIGRATIONS: Record<number, SchemaMigrationFn> = {
     }
     if (ui.followTail === undefined && draft.followTail !== undefined) {
       ui.followTail = draft.followTail;
+    }
+    if (
+      ui.inspectorSplitDirection === undefined &&
+      draft.inspectorSplitDirection !== undefined
+    ) {
+      ui.inspectorSplitDirection = draft.inspectorSplitDirection;
+    }
+    if (ui.panelLayouts === undefined && draft.panelLayouts !== undefined) {
+      ui.panelLayouts = draft.panelLayouts;
     }
 
     const filters: Record<string, unknown> = { ...existingFilters };
@@ -1028,6 +1049,60 @@ export function validateAndMigrateSettingsProfileWithReport(
     }
   }
 
+  let inspectorSplitDirection: InspectorSplitDirection =
+    defaults.ui.inspectorSplitDirection;
+  if (rawUi.inspectorSplitDirection !== undefined) {
+    if (
+      typeof rawUi.inspectorSplitDirection === "string" &&
+      VALID_SPLIT_DIRECTIONS.has(
+        rawUi.inspectorSplitDirection as InspectorSplitDirection
+      )
+    ) {
+      inspectorSplitDirection =
+        rawUi.inspectorSplitDirection as InspectorSplitDirection;
+    } else {
+      warnings.push(
+        "Поле «ui.inspectorSplitDirection» некорректно — установлен режим auto."
+      );
+    }
+  }
+
+  let panelLayouts: Record<string, string> | undefined;
+  if (rawUi.panelLayouts !== undefined) {
+    if (isPlainObject(rawUi.panelLayouts)) {
+      const sanitizedLayouts: Record<string, string> = {};
+      for (const [rawKey, rawVal] of Object.entries(rawUi.panelLayouts)) {
+        const cleanKey = rawKey.startsWith("react-resizable-panels:")
+          ? rawKey.slice("react-resizable-panels:".length)
+          : rawKey;
+        if (!cleanKey.startsWith("flux-")) continue;
+        if (typeof rawVal === "string") {
+          try {
+            const parsed = JSON.parse(rawVal) as unknown;
+            if (isPlainObject(parsed)) {
+              sanitizedLayouts[cleanKey] = rawVal;
+            } else {
+              warnings.push(
+                `Сохранённая геометрия панели «${cleanKey}» повреждена и пропущена.`
+              );
+            }
+          } catch {
+            warnings.push(
+              `Сохранённая геометрия панели «${cleanKey}» повреждена и пропущена.`
+            );
+          }
+        } else if (isPlainObject(rawVal)) {
+          sanitizedLayouts[cleanKey] = JSON.stringify(rawVal);
+        }
+      }
+      panelLayouts = sanitizedLayouts;
+    } else {
+      warnings.push(
+        "Поле «ui.panelLayouts» повреждено — размеры панелей сброшены."
+      );
+    }
+  }
+
   const columnWidths: Record<ColumnId, number> = { ...DEFAULT_COLUMN_WIDTHS };
   if (rawUi.columnWidths !== undefined) {
     if (isPlainObject(rawUi.columnWidths)) {
@@ -1314,6 +1389,7 @@ export function validateAndMigrateSettingsProfileWithReport(
         warnings
       ),
       inspectorPosition,
+      inspectorSplitDirection,
       followTail: sanitizeBoolean(
         rawUi.followTail,
         defaults.ui.followTail,
@@ -1323,6 +1399,7 @@ export function validateAndMigrateSettingsProfileWithReport(
       columnWidths,
       visibleColumns,
       toolbarGroups,
+      ...(panelLayouts !== undefined ? { panelLayouts } : {}),
     },
     filters: {
       activePresetId,
@@ -1586,6 +1663,14 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
       inspectorPosition:
         live.ui?.inspectorPosition ??
         (storedLayout.inspectorPosition === "right" ? "right" : "bottom"),
+      inspectorSplitDirection:
+        live.ui?.inspectorSplitDirection ??
+        (typeof storedLayout.inspectorSplitDirection === "string" &&
+        VALID_SPLIT_DIRECTIONS.has(
+          storedLayout.inspectorSplitDirection as InspectorSplitDirection
+        )
+          ? (storedLayout.inspectorSplitDirection as InspectorSplitDirection)
+          : defaults.ui.inspectorSplitDirection),
       followTail: live.ui?.followTail ?? Boolean(storedFollowTail),
       columnWidths: live.ui?.columnWidths ?? {
         ...DEFAULT_COLUMN_WIDTHS,
@@ -1599,6 +1684,7 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
         ...DEFAULT_TOOLBAR_GROUPS,
         ...storedToolbarGroups,
       },
+      panelLayouts: live.ui?.panelLayouts ?? readPersistedPanelLayouts(),
     },
     filters: {
       activePresetId:
@@ -1796,6 +1882,7 @@ export function buildSettingsImportPreview(
     compactToolbar: incoming.ui.compactToolbar,
     theme: incoming.ui.theme,
     inspectorPosition: incoming.ui.inspectorPosition,
+    inspectorSplitDirection: incoming.ui.inspectorSplitDirection,
     proxyPort: incoming.proxy.port,
     tlsInterceptMode: incoming.proxy.tlsInterceptMode,
     warnings: options?.warnings ?? [],
@@ -1866,6 +1953,7 @@ function atomicWriteProfileToLocalStorage(
         sidebarCollapsed: profile.ui.sidebarCollapsed,
         inspectorCollapsed: profile.ui.inspectorCollapsed,
         inspectorPosition: profile.ui.inspectorPosition,
+        inspectorSplitDirection: profile.ui.inspectorSplitDirection,
       }),
     ],
     [
@@ -1954,6 +2042,7 @@ function atomicWriteProfileToLocalStorage(
     for (const [key, value] of nextEntries) {
       window.localStorage.setItem(key, value);
     }
+    writePersistedPanelLayouts(profile.ui.panelLayouts);
   } catch (err) {
     for (const [key, prevVal] of backup.entries()) {
       try {
@@ -1996,6 +2085,16 @@ export async function applySettingsProfile(
         detail: normalized,
       })
     );
+    if (
+      normalized.ui.panelLayouts !== undefined &&
+      Object.keys(normalized.ui.panelLayouts).length === 0
+    ) {
+      clearPersistedPanelLayouts();
+      window.dispatchEvent(new CustomEvent(FLUX_PANEL_LAYOUT_RESET_EVENT));
+      window.setTimeout(() => {
+        clearPersistedPanelLayouts();
+      }, 150);
+    }
   }
 
   // 3. Synchronize proxy filter rules, AutoResponder, retention & listener config to Rust / Preview Engine

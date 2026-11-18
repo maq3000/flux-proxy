@@ -1,6 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Editor from "@monaco-editor/react";
-import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
+import {
+  Panel,
+  PanelGroup,
+  PanelResizeHandle,
+  type ImperativePanelGroupHandle,
+} from "react-resizable-panels";
 import {
   ChevronDown,
   ChevronRight,
@@ -51,6 +56,12 @@ import {
   isSseSession,
 } from "../lib/protocolInspectors";
 import { proxyBridge } from "../lib/tauriBridge";
+import {
+  FLUX_PANEL_AUTOSAVE_IDS,
+  FLUX_PANEL_LAYOUT_RESET_EVENT,
+  SAFE_PANEL_STORAGE,
+  type InspectorSplitDirection,
+} from "../hooks/useUiPreferences";
 import type {
   HeaderPair,
   InspectorDockPosition,
@@ -76,6 +87,9 @@ interface SessionInspectorProps {
   onReturnFocusToGrid?: () => void;
   inspectorPosition?: InspectorDockPosition;
   onChangeInspectorPosition?: (pos: InspectorDockPosition) => void;
+  splitDirection?: "horizontal" | "vertical";
+  inspectorSplitDirection?: InspectorSplitDirection;
+  onToggleSplitDirection?: () => void;
   onCollapseInspector?: () => void;
   externalHexTrigger?: number;
   onReplaySession?: (id: number) => void;
@@ -128,6 +142,9 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
   onReturnFocusToGrid,
   inspectorPosition = "bottom",
   onChangeInspectorPosition,
+  splitDirection: splitDirectionProp,
+  inspectorSplitDirection,
+  onToggleSplitDirection,
   onCollapseInspector,
   externalHexTrigger = 0,
   onReplaySession,
@@ -146,9 +163,37 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
 }) => {
   const [reqTab, setReqTab] = useState<InspectorTab>("headers");
   const [respTab, setRespTab] = useState<InspectorTab>("json");
-  const [splitDirection, setSplitDirection] = useState<
+  const [localSplitDirection, setLocalSplitDirection] = useState<
     "vertical" | "horizontal"
   >(() => (inspectorPosition === "bottom" ? "horizontal" : "vertical"));
+  const effectiveSplitDirection: "horizontal" | "vertical" =
+    splitDirectionProp ?? localSplitDirection;
+
+  const inspectorGroupRef = useRef<ImperativePanelGroupHandle>(null);
+
+  const handleToggleSplitDirection = useCallback(() => {
+    if (onToggleSplitDirection) {
+      onToggleSplitDirection();
+    } else {
+      setLocalSplitDirection((d) =>
+        d === "vertical" ? "horizontal" : "vertical"
+      );
+    }
+  }, [onToggleSplitDirection]);
+
+  const handleResetInspectorSplit = useCallback(() => {
+    inspectorGroupRef.current?.setLayout([44, 56]);
+  }, []);
+
+  useEffect(() => {
+    const onReset = () => {
+      handleResetInspectorSplit();
+    };
+    window.addEventListener(FLUX_PANEL_LAYOUT_RESET_EVENT, onReset);
+    return () => {
+      window.removeEventListener(FLUX_PANEL_LAYOUT_RESET_EVENT, onReset);
+    };
+  }, [handleResetInspectorSplit]);
 
   // Lazy-loaded heavy payload state (> 2 MB bodies offloaded to SQLite for OOM protection)
   const [loadedRespEntry, setLoadedRespEntry] = useState<{
@@ -669,15 +714,15 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
           </button>
           <button
             type="button"
-            onClick={() =>
-              setSplitDirection((d) =>
-                d === "vertical" ? "horizontal" : "vertical"
-              )
+            onClick={handleToggleSplitDirection}
+            title={
+              inspectorSplitDirection
+                ? `Toggle Request/Response Split Orientation (${effectiveSplitDirection}, mode: ${inspectorSplitDirection})`
+                : "Toggle Request/Response Split Orientation"
             }
-            title="Toggle Request/Response Split Orientation"
             className="rounded border border-hairline bg-surface p-1 text-muted hover:text-fg"
           >
-            {splitDirection === "vertical" ? (
+            {effectiveSplitDirection === "vertical" ? (
               <Columns3 className="h-3.5 w-3.5" />
             ) : (
               <Rows3 className="h-3.5 w-3.5" />
@@ -767,9 +812,21 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
       )}
 
       {/* Split Request (Top/Left) & Response (Bottom/Right) */}
-      <PanelGroup direction={splitDirection} className="flex-1 overflow-hidden">
+      <PanelGroup
+        ref={inspectorGroupRef}
+        autoSaveId={FLUX_PANEL_AUTOSAVE_IDS.inspectorSplit}
+        storage={SAFE_PANEL_STORAGE}
+        direction={effectiveSplitDirection}
+        className="flex-1 overflow-hidden"
+      >
         {/* REQUEST PANE */}
-        <Panel defaultSize={44} minSize={20} className="flex flex-col overflow-hidden">
+        <Panel
+          id="inspector-req-pane"
+          order={1}
+          defaultSize={44}
+          minSize={20}
+          className="flex flex-col overflow-hidden"
+        >
           <div className="flex h-8 shrink-0 items-center justify-between border-b border-hairline bg-surface px-2">
             <div className="flex items-center gap-0.5 overflow-x-auto">
               <span className="mr-1.5 shrink-0 font-mono text-[10px] font-bold uppercase tracking-wider text-accent">
@@ -995,15 +1052,23 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
         </Panel>
 
         <PanelResizeHandle
+          onDoubleClick={handleResetInspectorSplit}
+          title="Double-click to reset Request/Response split"
           className={
-            splitDirection === "vertical"
+            effectiveSplitDirection === "vertical"
               ? "h-1 w-full bg-hairline transition-colors hover:bg-accent/60"
               : "h-full w-1 bg-hairline transition-colors hover:bg-accent/60"
           }
         />
 
         {/* RESPONSE PANE */}
-        <Panel defaultSize={56} minSize={20} className="flex flex-col overflow-hidden">
+        <Panel
+          id="inspector-resp-pane"
+          order={2}
+          defaultSize={56}
+          minSize={20}
+          className="flex flex-col overflow-hidden"
+        >
           <div className="flex h-8 shrink-0 items-center justify-between border-b border-hairline bg-surface px-2">
             <div className="flex items-center gap-0.5 overflow-x-auto">
               <span
