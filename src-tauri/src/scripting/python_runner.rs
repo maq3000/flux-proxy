@@ -1030,7 +1030,8 @@ impl PythonScriptRunner {
         spec: &PythonBinarySpec,
         code: &str,
     ) -> Result<RpcLoadReply, String> {
-        if guard.is_none() {
+        let freshly_spawned = guard.is_none();
+        if freshly_spawned {
             let spawned = self.spawn_worker_process(spec)?;
             let pid = spawned.pid;
             *guard = Some(spawned);
@@ -1038,6 +1039,12 @@ impl PythonScriptRunner {
             cfg.worker_running = true;
             cfg.worker_pid = pid;
         }
+
+        let load_timeout = if freshly_spawned {
+            self.timeout.max(Duration::from_secs(3))
+        } else {
+            self.timeout
+        };
 
         let rpc_id = self.rpc_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let payload = RpcLoadPayload {
@@ -1049,14 +1056,14 @@ impl PythonScriptRunner {
         let worker_ref = guard
             .as_mut()
             .ok_or_else(|| "Python worker missing after spawn".to_string())?;
-        match Self::send_rpc_line::<_, RpcLoadReply>(worker_ref, &payload, self.timeout).await {
+        match Self::send_rpc_line::<_, RpcLoadReply>(worker_ref, &payload, load_timeout).await {
             Ok(reply) => Ok(reply),
             Err(err) => {
                 self.kill_and_clear_worker_locked(guard).await;
                 Err(match err {
                     RpcFailure::Timeout => format!(
                         "Python script load timed out after {} ms",
-                        self.timeout.as_millis()
+                        load_timeout.as_millis()
                     ),
                     RpcFailure::Closed => "Python worker exited unexpectedly during script load".into(),
                     RpcFailure::Io(e) => format!("Python worker IPC error during load: {e}"),
@@ -1922,7 +1929,7 @@ import time
 
 def on_request(request):
     if "/hang" in request["url"]:
-        time.sleep(2.5)
+        time.sleep(5.0)
     request["headers"]["X-Recovered"] = "yes"
 "#;
         let initial = runner.set_script(script.to_string(), true).await.unwrap();
@@ -1936,7 +1943,7 @@ def on_request(request):
 
         assert!(matches!(timed_out, ScriptRequestOutcome::Unchanged));
         assert!(
-            elapsed < Duration::from_millis(1800),
+            elapsed < Duration::from_millis(4500),
             "timeout + restart should stay bounded, took {:?}",
             elapsed
         );

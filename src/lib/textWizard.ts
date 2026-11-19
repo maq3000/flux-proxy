@@ -128,7 +128,10 @@ export function urlDecodeText(input: string): {
 interface DurationIntlLike {
   DurationFormat?: new (
     locales?: string | string[],
-    options?: { style?: "long" | "short" | "narrow" | "digital" }
+    options?: {
+      style?: "long" | "short" | "narrow" | "digital";
+      secondsDisplay?: "always" | "auto";
+    }
   ) => {
     format(duration: {
       days?: number;
@@ -149,11 +152,21 @@ export function formatSecondsSpan(totalSeconds: number, locale = "ru-RU"): strin
   const intlObj = Intl as unknown as DurationIntlLike;
   if (typeof intlObj.DurationFormat === "function") {
     try {
-      const df = new intlObj.DurationFormat(locale, { style: "short" });
-      if (days > 0) return df.format({ days, hours, minutes });
-      if (hours > 0) return df.format({ hours, minutes, seconds });
-      if (minutes > 0) return df.format({ minutes, seconds });
-      return df.format({ seconds });
+      const df = new intlObj.DurationFormat(
+        locale,
+        abs === 0
+          ? { style: "short", secondsDisplay: "always" }
+          : { style: "short" }
+      );
+      const formatted =
+        days > 0
+          ? df.format({ days, hours, minutes })
+          : hours > 0
+            ? df.format({ hours, minutes, seconds })
+            : minutes > 0
+              ? df.format({ minutes, seconds })
+              : df.format({ seconds });
+      if (formatted) return formatted;
     } catch {
       // fall through to concise fallback
     }
