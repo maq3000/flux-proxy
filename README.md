@@ -19,7 +19,7 @@
 >
 > 📖 **Ищете понятную инструкцию по работе с программой?** Откройте [**Руководство пользователя (USER_GUIDE.md)**](USER_GUIDE.md) — пошаговое описание всех возможностей простым языком: от первого запуска и настройки телефона до подмены ответов и сравнения запросов.
 >
-> 🐍 **Нужна программируемая модификация трафика на Python?** Откройте [**Руководство по Python Scripting Engine (PYTHON_SCRIPTING_GUIDE.md)**](PYTHON_SCRIPTING_GUIDE.md) — API хуков `on_request` / `on_response`, локальные моки, готовые рецепты и отказоустойчивость.
+> 🐍 **Нужна программируемая модификация трафика на Python?** Откройте [**Руководство по Python Scripting Engine (PYTHON_SCRIPTING_GUIDE.md)**](PYTHON_SCRIPTING_GUIDE.md) — API хуков `on_request` / `on_response`, локальные моки, готовые рецепты и отказоустойчивость. Для генерации скриптов с помощью нейросетей используйте [**инструкцию для AI-агентов (PYTHON_SCRIPTING_AI_GUIDE.md)**](PYTHON_SCRIPTING_AI_GUIDE.md).
 >
 > 🗺️ **План развития проекта и спецификации задач:** См. [**Дорожную карту проекта (ROADMAP.md)**](ROADMAP.md).
 
@@ -32,6 +32,7 @@
 - [📥 Скачать готовые сборки (Releases)](#-скачать-готовые-сборки-releases)
 - [📖 Руководство пользователя (USER_GUIDE.md)](USER_GUIDE.md)
 - [🐍 Руководство по Python Scripting Engine (PYTHON_SCRIPTING_GUIDE.md)](PYTHON_SCRIPTING_GUIDE.md)
+- [🤖 Инструкция для AI-агента по Python-скриптам (PYTHON_SCRIPTING_AI_GUIDE.md)](PYTHON_SCRIPTING_AI_GUIDE.md)
 - [🗺️ Дорожная карта проекта (ROADMAP.md)](ROADMAP.md)
 - [Особенности и возможности](#-особенности-и-возможности)
 - [Архитектура и стек технологий](#-архитектура-и-стек-технологий)
@@ -161,6 +162,7 @@
 ├── package.json                         # Зависимости и npm-скрипты фронтенда
 ├── USER_GUIDE.md                        # Подробная инструкция для пользователей
 ├── PYTHON_SCRIPTING_GUIDE.md            # Руководство по встроенному Python Scripting Engine
+├── PYTHON_SCRIPTING_AI_GUIDE.md         # Спецификация для AI-агентов по генерации скриптов FluxProxy
 ├── ROADMAP.md                           # Дорожная карта развития проекта
 │
 ├── src/                                 # Исходный код Frontend UI (React + TypeScript)
