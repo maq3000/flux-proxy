@@ -19,6 +19,8 @@
 >
 > 📖 **Ищете понятную инструкцию по работе с программой?** Откройте [**Руководство пользователя (USER_GUIDE.md)**](USER_GUIDE.md) — пошаговое описание всех возможностей простым языком: от первого запуска и настройки телефона до подмены ответов и сравнения запросов.
 >
+> 🐍 **Нужна программируемая модификация трафика на Python?** Откройте [**Руководство по Python Scripting Engine (PYTHON_SCRIPTING_GUIDE.md)**](PYTHON_SCRIPTING_GUIDE.md) — API хуков `on_request` / `on_response`, локальные моки, готовые рецепты и отказоустойчивость.
+>
 > 🗺️ **План развития проекта и спецификации задач:** См. [**Дорожную карту проекта (ROADMAP.md)**](ROADMAP.md).
 
 </div>
@@ -29,6 +31,7 @@
 
 - [📥 Скачать готовые сборки (Releases)](#-скачать-готовые-сборки-releases)
 - [📖 Руководство пользователя (USER_GUIDE.md)](USER_GUIDE.md)
+- [🐍 Руководство по Python Scripting Engine (PYTHON_SCRIPTING_GUIDE.md)](PYTHON_SCRIPTING_GUIDE.md)
 - [🗺️ Дорожная карта проекта (ROADMAP.md)](ROADMAP.md)
 - [Особенности и возможности](#-особенности-и-возможности)
 - [Архитектура и стек технологий](#-архитектура-и-стек-технологий)
@@ -89,6 +92,8 @@
 - **AutoResponder & Header Mutations**:
   - Мокирование ответов без правки бэкенда, переопределение HTTP-статусов и эмуляция сетевой задержки (Latency).
   - Автоматические мутации заголовков (*Force No-Cache*, *CORS Injection*, пресеты *User-Agent*).
+- **Python Scripting Engine (`Alt+5`)**:
+  - Программируемая обработка и мокирование трафика на лету с помощью хуков `on_request(request)` и `on_response(response, request)` через долгоживущий IPC-процесс Python 3 (fail-open, таймаут 1500 мс), встроенный Monaco Editor, готовые пресеты и живую консоль вывода. Подробнее см. [**PYTHON_SCRIPTING_GUIDE.md**](PYTHON_SCRIPTING_GUIDE.md).
 - **HTTP Composer & Session Diff**:
   - Конструктор запросов с поддержкой **Drag-and-Drop** строк из таблицы и параллельным режимом (*Split Composer*).
   - Визуальное сравнение двух сессий (**Session Diff**, `Ctrl+D`) с сортировкой ключей JSON и фильтрацией динамических заголовков.
@@ -155,6 +160,7 @@
 ├── index.html                           # HTML точка входа Vite
 ├── package.json                         # Зависимости и npm-скрипты фронтенда
 ├── USER_GUIDE.md                        # Подробная инструкция для пользователей
+├── PYTHON_SCRIPTING_GUIDE.md            # Руководство по встроенному Python Scripting Engine
 ├── ROADMAP.md                           # Дорожная карта развития проекта
 │
 ├── src/                                 # Исходный код Frontend UI (React + TypeScript)
@@ -167,6 +173,7 @@
 │   │   ├── HostFiltersTab.tsx           # Пакетный фильтр хостов (Whitelist / Blacklist)
 │   │   ├── ComposerPanel.tsx            # Конструктор и повторитель HTTP-запросов
 │   │   ├── AutoResponderPanel.tsx       # Правила подмены ответов и эмуляции задержек
+│   │   ├── ScriptingPanel.tsx           # Редактор Python-скриптов (Monaco), пресеты и консоль логов
 │   │   ├── BreakpointModal.tsx          # Перехватчик запросов и ответов на лету
 │   │   ├── SessionDiffView.tsx          # Визуальное сравнение двух сессий
 │   │   ├── SanitizedExportModal.tsx     # Экспорт сессий с очисткой PII и секретов (Ctrl+Shift+S)
@@ -200,6 +207,9 @@
         │   ├── sysproxy.rs              # Автонастройка системного прокси (Windows / macOS / Linux)
         │   ├── process.rs               # Определение PID и имени процесса-источника
         │   └── network.rs               # Сетевые интерфейсы и определение LAN IP
+        ├── scripting/                   # Движок пользовательских Python-скриптов
+        │   ├── mod.rs                   # Экспорт типов и интерфейса скриптового раннера
+        │   └── python_runner.rs         # Долгоживущий воркер Python (JSON Lines, fail-open таймаут, логи)
         └── storage/                     # Хранение и обмен данными
             ├── mod.rs                   # Потокобезопасный Ring Buffer и оффлоадинг тяжелых тел
             ├── sqlite.rs                # Архивация и чтение сессий из SQLite (WAL)
@@ -318,7 +328,7 @@ FluxProxy умеет перехватывать трафик со смартфо
 | `Ctrl+X` / `Cmd+X` | Полностью очистить список сессий (**Clear All**) |
 | `Ctrl+C` / `Cmd+C` | Скопировать URL выбранных сессий |
 | `Ctrl+B` / `Cmd+B` | Показать / скрыть боковую панель навигации (**Sidebar**) |
-| `Alt+1` … `Alt+4` | Переключение разделов: *Traffic*, *Composer*, *AutoResponder*, *Filter Matrix* |
+| `Alt+1` … `Alt+5` | Переключение разделов: *Traffic*, *Composer*, *AutoResponder*, *Filter Matrix*, [*Python Scripts*](PYTHON_SCRIPTING_GUIDE.md) |
 | `?` | Показать справку по всем горячим клавишам |
 
 ---
@@ -364,9 +374,10 @@ curl -x http://127.0.0.1:8888 https://httpbin.org/get -k
 - ✅ Сортировка всех колонок таблицы (`ASC`/`DESC`), `Ctrl+A`, автоподбор ширины колонок (`Auto-fit`), персистентность геометрии сплитов, однострочный **Slim Toolbar (`Ctrl+Shift+T`)**, шорткаты вкладок `Ctrl+1..6`, виртуализация `HexViewer` и `manualChunks` в Vite.
 - ✅ Очистка и маскирование PII/секретов при экспорте (**Sanitized Export**, `Ctrl+Shift+S`) для `.har`, `.saz`, `.json` и Raw HTTP.
 - ✅ Диагностический мастер самопроверки и 1-клик починки **«Proxy Doctor» (`Ctrl+Shift+D`)**, единая точка старта порта (`proxy_port.pref`) и транзакционное применение профилей настроек с поддержкой `breakpoints`.
+- ✅ Встроенный **Python Scripting Engine (`Alt+5`)** для программируемой модификации и мокирования трафика (`on_request` / `on_response`) через долгоживущий IPC-процесс с fail-open защитой 1500 мс, встроенным Monaco Editor и живой консолью логов (см. [**PYTHON_SCRIPTING_GUIDE.md**](PYTHON_SCRIPTING_GUIDE.md)).
 
 ### Ближайшие этапы разработки:
-- 🔜 **P1** — Продвинутые темы-пресеты и палитра, **Selective MITM 2.0**, клиентские сертификаты (**mTLS**), **Python Scripting Engine**, **Composer 2.0** («Paste cURL» и кодогенератор), генератор **OpenAPI 3.0 / Swagger** и тесты **Vitest & CI/CD**.
+- 🔜 **P1** — Продвинутые темы-пресеты и палитра, **Selective MITM 2.0**, клиентские сертификаты (**mTLS**), **Composer 2.0** («Paste cURL» и кодогенератор), генератор **OpenAPI 3.0 / Swagger** и тесты **Vitest & CI/CD**.
 - 🔜 **P2** — **HOSTS Remapping** (виртуальный DNS), **Bandwidth Throttling** (эмуляция 3G/LTE), архитектурная декомпозиция + **Zustand**, **Waterfall Timeline**, статистика трафика, **Upstream Proxy** и ручная отправка WebSocket-сообщений.
 
 ---
