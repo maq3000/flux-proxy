@@ -3,6 +3,7 @@
 <div align="center">
 
 [![Latest Release](https://img.shields.io/github/v/release/maq3000/flux-proxy?color=blue&logo=github)](https://github.com/maq3000/flux-proxy/releases/latest)
+[![CI](https://github.com/maq3000/flux-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/maq3000/flux-proxy/actions/workflows/ci.yml)
 [![Downloads](https://img.shields.io/github/downloads/maq3000/flux-proxy/total?color=success&logo=github)](https://github.com/maq3000/flux-proxy/releases)
 [![Tauri v2](https://img.shields.io/badge/Tauri-v2.2-blue?logo=tauri&logoColor=white)](https://tauri.app/)
 [![Rust](https://img.shields.io/badge/Rust-2021_%281.80%2B%29-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
@@ -15,7 +16,7 @@
 
 Мгновенный запуск, умный контроль памяти, аппаратное ускорение интерфейса и стабильные 60 FPS при работе с десятками тысяч перехваченных запросов.
 
-> 📥 **Скачать готовую сборку для Windows:** [**FluxProxy Setup v0.3.0 (.exe)**](https://github.com/maq3000/flux-proxy/releases/download/v0.3.0/FluxProxy_0.3.0_x64-setup.exe) или [**MSI-пакет (.msi)**](https://github.com/maq3000/flux-proxy/releases/download/v0.3.0/FluxProxy_0.3.0_x64_en-US.msi). Подробнее см. раздел [Скачать готовые сборки](#-скачать-готовые-сборки-releases).
+> 📥 **Скачать готовую сборку для Windows:** [**FluxProxy Setup v0.4.0 (.exe)**](https://github.com/maq3000/flux-proxy/releases/download/v0.4.0/FluxProxy_0.4.0_x64-setup.exe) или [**MSI-пакет (.msi)**](https://github.com/maq3000/flux-proxy/releases/download/v0.4.0/FluxProxy_0.4.0_x64_en-US.msi). Подробнее см. раздел [Скачать готовые сборки](#-скачать-готовые-сборки-releases).
 >
 > 📖 **Ищете понятную инструкцию по работе с программой?** Откройте [**Руководство пользователя (USER_GUIDE.md)**](USER_GUIDE.md) — пошаговое описание всех возможностей простым языком: от первого запуска и настройки телефона до подмены ответов и сравнения запросов.
 >
@@ -52,12 +53,12 @@
 
 ## 📥 Скачать готовые сборки (Releases)
 
-Для запуска FluxProxy на **Windows** вам не требуется компилировать проект из исходных кодов — вы можете скачать готовые официальные установщики из [**GitHub Releases v0.3.0**](https://github.com/maq3000/flux-proxy/releases/tag/v0.3.0):
+Для запуска FluxProxy на **Windows** вам не требуется компилировать проект из исходных кодов — вы можете скачать готовые официальные установщики из [**GitHub Releases v0.4.0**](https://github.com/maq3000/flux-proxy/releases/tag/v0.4.0):
 
 | Дистрибутив | Версия | Архитектура | Описание | Ссылка на загрузку | Контрольная сумма (SHA-256) |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Windows Setup (`.exe`)** | `v0.3.0` | x64 | **Рекомендуемый** автономный инсталлятор (NSIS). Автоматическое создание ярлыков на рабочем столе и в меню «Пуск», встроенный деинсталлятор. | [📥 **FluxProxy_0.3.0_x64-setup.exe** (9.1 МБ)](https://github.com/maq3000/flux-proxy/releases/download/v0.3.0/FluxProxy_0.3.0_x64-setup.exe) | `d717be130f6f8233e5d4c180c27552445329b57a70036c7bdfe7f5548b17f69a` |
-| **Windows Package (`.msi`)** | `v0.3.0` | x64 | Пакет Windows Installer (MSI). Оптимизирован для тихой установки (`msiexec /i ... /qn`) и автоматизированного развертывания через Active Directory (GPO). | [📥 **FluxProxy_0.3.0_x64_en-US.msi** (11.8 МБ)](https://github.com/maq3000/flux-proxy/releases/download/v0.3.0/FluxProxy_0.3.0_x64_en-US.msi) | `f1b5129e3ce269ee4db1ab9a58b0573f2ac3a2d19b2a6d9ab2f20f67f905fa3a` |
+| **Windows Setup (`.exe`)** | `v0.4.0` | x64 | **Рекомендуемый** автономный инсталлятор (NSIS). Автоматическое создание ярлыков на рабочем столе и в меню «Пуск», встроенный деинсталлятор. | [📥 **FluxProxy_0.4.0_x64-setup.exe** (9.4 МБ)](https://github.com/maq3000/flux-proxy/releases/download/v0.4.0/FluxProxy_0.4.0_x64-setup.exe) | `74c8ba84279f1013906f5ae179d929f1070074bd95bef284ba2fc98c481ca7c6` |
+| **Windows Package (`.msi`)** | `v0.4.0` | x64 | Пакет Windows Installer (MSI). Оптимизирован для тихой установки (`msiexec /i ... /qn`) и автоматизированного развертывания через Active Directory (GPO). | [📥 **FluxProxy_0.4.0_x64_en-US.msi** (12.3 МБ)](https://github.com/maq3000/flux-proxy/releases/download/v0.4.0/FluxProxy_0.4.0_x64_en-US.msi) | `78b27599f1bba2905079e5ec17cdf19f0baaf3c28f9d2e1fe495fcbe0391b475` |
 
 > 📦 **Все релизы проекта:** [github.com/maq3000/flux-proxy/releases](https://github.com/maq3000/flux-proxy/releases)  
 > 🐧 🍏 **macOS и Linux:** На текущем этапе сборка выполняется из исходного кода с помощью команды `npx @tauri-apps/cli build` (см. раздел [Быстрый старт](#-быстрый-старт)). Готовые дистрибутивы `.dmg` и `.AppImage` будут доступны в следующих релизах.
@@ -71,7 +72,8 @@
 - **Двухфазный захват сессий (In-Flight / Pending)**: Мгновенное появление запроса в таблице еще до ответа сервера (`Pending`) с реальной инспекцией исходящих данных и последующим обновлением статуса, таймингов и ответа.
 - **Zero-Buffering видео/CDN-стриминг и надежность upstream**: Потоковая передача медиа, `206 Partial Content` и крупных ответов без буферизации, мгновенный сброс активных MITM-туннелей в Passthrough при изменении правил и диагностика сбоев с полной цепочкой причин (`err.source()`).
 - **Расшифровка HTTPS на лету и Zstandard (`zstd`)**: Динамическая генерация X.509 сертификатов (ECDSA P-256) под целевые домены через `rcgen` с LRU-кэшированием (`moka`), а также прозрачная распаковка `Content-Encoding: zstd` (RFC 8878) на лету в прокси и Composer.
-- **Избирательный перехват (Selective MITM & TLS Bypass)**: Режимы *Intercept All* и *Targeted Allowlist*, готовые пресеты (включая *Video & CDN*), пропускающие трафик приложений с жестким Certificate Pinning или крупные медиа-CDN через прямой TCP-туннель.
+- **Избирательный перехват (Selective MITM & TLS Bypass 2.0)**: Режимы *Intercept All* и *Targeted Allowlist*, переключение `Table View` ↔ `Bulk Text Editor`, диалог `Quick Paste…`, импорт/экспорт TXT/JSON, **11 готовых Quick-Packs** (включая *OCSP / CRL PKI*, *Payment Gateways*, *Gaming & Anti-Cheat*, *РФ FinTech & Госуслуги* и *Video & CDN*), сброс к рекомендованным PKI-дефолтам, lock-free счётчики попаданий `Hits: N` и бейдж `TUNNEL` в таблице.
+- **Клиентские сертификаты (mTLS, `Ctrl+Shift+C`)**: Хранилище сертификатов **PKCS#12 (`.p12` / `.pfx`)** и **PEM** с привязкой к точным и wildcard-маскам доменов (`*.corp.local`), безопасным хранением в `app_data_dir/client_certs` (пароли и ключи не утекают в JSON-профиль настроек) и кэшируемыми mTLS-клиентами upstream на базе `moka`.
 - **Блокировка обхода через HTTP/3 (QUIC)**: Автоматическое удаление заголовков `Alt-Svc` и `Alternate-Protocol`, предотвращающее уход современных браузеров в UDP-туннель мимо системного прокси.
 - **Перехват WebSocket (WS/WSS) и SSE**: Инкрементальное декодирование кадров в реальном времени ($O(1)$ append без лишних аллокаций, `tokio-tungstenite`) с полной передачей заголовков авторизации и субпротоколов (включая SignalR).
 - **Гибкая привязка к IP и адаптерам ОС (Dual Listener)**: Точный выбор сетевого интерфейса (*Loopback Only*, *All Interfaces `0.0.0.0`* или *Specific Interface* — Wi-Fi / Ethernet / WSL / VPN + опциональный одновременный loopback-листенер), неблокирующий Tokio-рантайм (`spawn_blocking` для OS/SQLite), предкомпиляция Regex, управление системным прокси и определение процессов/LAN-клиентов.
@@ -94,10 +96,14 @@
   - Мокирование ответов без правки бэкенда, переопределение HTTP-статусов и эмуляция сетевой задержки (Latency).
   - Автоматические мутации заголовков (*Force No-Cache*, *CORS Injection*, пресеты *User-Agent*).
 - **Python Scripting Engine (`Alt+5`)**:
-  - Программируемая обработка и мокирование трафика на лету с помощью хуков `on_request(request)` и `on_response(response, request)` через долгоживущий IPC-процесс Python 3 (fail-open, таймаут 1500 мс), встроенный Monaco Editor, готовые пресеты и живую консоль вывода. Подробнее см. [**PYTHON_SCRIPTING_GUIDE.md**](PYTHON_SCRIPTING_GUIDE.md).
-- **HTTP Composer & Session Diff**:
-  - Конструктор запросов с поддержкой **Drag-and-Drop** строк из таблицы и параллельным режимом (*Split Composer*).
+  - Программируемая обработка и мокирование трафика на лету с помощью хуков `on_request(request)` и `on_response(response, request)` через долгоживущий IPC-процесс Python 3 (fail-open, таймаут 1500 мс), встроенный Monaco Editor, готовые пресеты и живую консоль вывода. Подробнее см. [**PYTHON_SCRIPTING_GUIDE.md**](PYTHON_SCRIPTING_GUIDE.md) и [**PYTHON_SCRIPTING_AI_GUIDE.md**](PYTHON_SCRIPTING_AI_GUIDE.md).
+- **HTTP Composer 2.0, Code Generator & Session Diff**:
+  - Конструктор запросов с поддержкой **Drag-and-Drop** строк из таблицы, параллельным режимом (*Split Composer*), умным **Import / Paste cURL** (поддержка POSIX Bash, Windows cmd и PowerShell прямо при вставке в URL или через диалог) и генератором клиентского кода на **5 языках** (8 таргетов: *JavaScript `fetch`/`axios`*, *Python `requests`/`httpx`*, *Go `net/http`*, *Rust `reqwest`*, *cURL Bash/PowerShell*).
   - Визуальное сравнение двух сессий (**Session Diff**, `Ctrl+D`) с сортировкой ключей JSON и фильтрацией динамических заголовков.
+- **Генератор спецификаций OpenAPI 3.0.3 / Swagger**:
+  - Автоматический синтез OpenAPI 3.0.3 контрактов (`YAML` / `JSON`) по выбранным или всем захваченным сессиям (`File → Export as OpenAPI 3.0 Spec…` или контекстное меню таблицы): параметризация числовых/UUID-сегментов (`{id}`, `{uuid}`), рекурсивное слияние JSON Schema, безопасный вынос `Authorization` / `Cookie` / `X-Api-Key` в `components.securitySchemes` без раскрытия секретов и предпросмотр в Monaco Editor.
+- **Темы оформления и детальный редактор палитры**:
+  - 8 встроенных цветовых тем-пресетов (*Flux Dark*, *Flux Light*, *Dracula*, *Tokyo Night*, *Nord*, *Fiddler Classic*, *GitHub Dark*, *Monokai Pro*) в настройках (`Ctrl+,` → *UI & Columns*) и командной палитре (`Ctrl+K`), детальный редактор CSS-токенов (фоны, акценты, цвета статусов) и мгновенная синхронизация темы **Monaco Editor**.
 - **Text Wizard & Codec Suite (`Ctrl+E`)**:
   - Декодер JWT с проверкой срока жизни токена, конвертеры Base64, URL, Hex, Unix Timestamp и сжатие/распаковка Gzip / Brotli / Deflate / Zstd.
 
@@ -134,10 +140,10 @@
 │                  Asynchronous MITM Engine                   │
 │   ├── Hyper 1.x + Tokio (HTTP/1.1 & HTTP/2 Server/Client)   │
 │   ├── Two-Phase In-Flight Capture, Zstd & Zero-Buffering    │
-│   ├── Tokio-Rustls + rcgen + Moka (On-the-fly ECDSA CA)     │
-│   ├── Selective MITM, Alt-Svc Strip & Capture-Stage Drop    │
+│   ├── Tokio-Rustls + rcgen + Moka (ECDSA CA & mTLS Client)  │
+│   ├── Selective MITM 2.0, Alt-Svc Strip & Capture-Drop      │
 │   ├── Tokio-Tungstenite (WebSocket / SignalR Interception)  │
-│   ├── Breakpoints, AutoResponder & Header Mutation Engine   │
+│   ├── Breakpoints, AutoResponder, Mutations & Python IPC    │
 │   └── Dual-Bind Listener, SysProxy, SQLite & OS Resolver    │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -146,18 +152,21 @@
 | :--- | :--- | :--- |
 | **Desktop Runtime** | Оконный менеджер, нативные диалоги, IPC, CSP | [Tauri v2](https://tauri.app/) (Rust 2021), `rfd` |
 | **Сетевой движок** | Асинхронный HTTP/HTTPS сервер и клиент | `tokio`, `hyper 1.5`, `hyper-util`, `reqwest` |
-| **TLS & Сертификаты** | MITM-расшифровка, управление доверием ОС | `rustls`, `tokio-rustls`, `rcgen`, `moka` |
+| **TLS, Root CA & mTLS** | MITM-расшифровка, управление доверием ОС, клиентские сертификаты | `rustls`, `tokio-rustls`, `rcgen`, `moka`, `p12-keystore`, `x509-parser` |
 | **WebSockets** | Перехват и разбор фреймов WS/WSS | `tokio-tungstenite` |
+| **Python Scripting** | Долгоживущий IPC-раннер хуков `on_request` / `on_response` | Python 3 subprocess (`JSON Lines`, fail-open 1500 ms) |
 | **Хранилище и архивы** | Ring Buffer в RAM, база SQLite, экспорт HAR/SAZ | `DashMap` + `rusqlite` (WAL) + `zip` |
 | **Кодеки и сжатие** | Сжатие/распаковка и кодировки | `flate2` (Gzip/Deflate), `brotli`, `zstd`, `base64`, `hex`, `sha2` |
-| **Frontend UI** | Компонентный реактивный интерфейс | `React 18`, `TypeScript 5.6`, `Vite 6`, `Tailwind CSS` |
-| **Виртуализация и код** | Скроллинг 60 FPS, редакторы и diff-сравнение | `@tanstack/react-virtual 3`, `@monaco-editor/react` |
+| **Frontend UI** | Компонентный реактивный интерфейс и 8 тем-пресетов | `React 18`, `TypeScript 5.6`, `Vite 6`, `Tailwind CSS` |
+| **Виртуализация и код** | Скроллинг 60 FPS, редакторы, OpenAPI и diff-сравнение | `@tanstack/react-virtual 3`, `@monaco-editor/react` |
+| **Тестирование и CI** | 80 frontend-тестов + 101 Rust-тест, матрица Windows/Linux/macOS | `Vitest 3`, `@testing-library/react`, `cargo clippy`, GitHub Actions |
 
 ---
 
 ## 📁 Структура проекта
 
 ```text
+├── .github/workflows/ci.yml             # Кроссплатформенный CI (typecheck, Vitest, build, clippy, cargo test)
 ├── index.html                           # HTML точка входа Vite
 ├── package.json                         # Зависимости и npm-скрипты фронтенда
 ├── USER_GUIDE.md                        # Подробная инструкция для пользователей
@@ -167,28 +176,31 @@
 │
 ├── src/                                 # Исходный код Frontend UI (React + TypeScript)
 │   ├── components/                      # Компоненты интерфейса
-│   │   ├── TrafficGrid.tsx              # Виртуализированная таблица с сортировкой колонок и контекстным меню
+│   │   ├── TrafficGrid.tsx              # Виртуализированная таблица, сортировка, бейдж TUNNEL и контекстное меню
 │   │   ├── SessionInspector.tsx         # Инспектор запросов/ответов с ленивой подгрузкой тел и шорткатами Ctrl+1..6
 │   │   ├── HexViewer.tsx                # Виртуализированный шестнадцатеричный инспектор байтов
 │   │   ├── InspectorProtocolPanels.tsx  # Панели SSE/LLM, gRPC/Protobuf, Auth, Cache, Multipart
-│   │   ├── FilterDrawer.tsx             # Матрица фильтров, пороги шума, Selective TLS, мутации
+│   │   ├── FilterDrawer.tsx             # Матрица фильтров, пороги шума, Selective MITM 2.0 (Bulk / Quick Paste), мутации
 │   │   ├── HostFiltersTab.tsx           # Пакетный фильтр хостов (Whitelist / Blacklist)
-│   │   ├── ComposerPanel.tsx            # Конструктор и повторитель HTTP-запросов
+│   │   ├── ComposerPanel.tsx            # Конструктор HTTP-запросов с Import / Paste cURL
+│   │   ├── CodeSnippetModal.tsx         # Модальный генератор клиентского кода на 5 языках (Monaco)
+│   │   ├── OpenApiExportModal.tsx       # Экспорт захваченных сессий в OpenAPI 3.0.3 (YAML / JSON)
 │   │   ├── AutoResponderPanel.tsx       # Правила подмены ответов и эмуляции задержек
 │   │   ├── ScriptingPanel.tsx           # Редактор Python-скриптов (Monaco), пресеты и консоль логов
 │   │   ├── BreakpointModal.tsx          # Перехватчик запросов и ответов на лету
 │   │   ├── SessionDiffView.tsx          # Визуальное сравнение двух сессий
 │   │   ├── SanitizedExportModal.tsx     # Экспорт сессий с очисткой PII и секретов (Ctrl+Shift+S)
 │   │   ├── ProxyDoctorModal.tsx         # Диагностический мастер самопроверки и автоисправления (Ctrl+Shift+D)
-│   │   ├── SettingsModal.tsx            # Централизованные настройки и профили (Ctrl+,)
+│   │   ├── SettingsModal.tsx            # Настройки, галерея 8 тем-пресетов, редактор палитры и профили (Ctrl+,)
 │   │   ├── TextWizardModal.tsx          # Декодер JWT, Base64, URL, Hex, Gzip/Brotli/Zstd
 │   │   ├── MobileSetupModal.tsx         # Мастер подключения iOS/Android по Wi-Fi с QR-кодом
 │   │   ├── CertificateModal.tsx         # Установка, проверка и удаление Root CA
+│   │   ├── ClientCertificatesModal.tsx  # Хранилище клиентских сертификатов mTLS (.p12 / .pfx / .pem, Ctrl+Shift+C)
 │   │   ├── CommandPalette.tsx           # Командная палитра и QuickExec (Ctrl+K)
 │   │   ├── TopToolbar.tsx               # Панель управления, Slim Toolbar, поиска, лимита Keep и пресетов
 │   │   └── MenuBar.tsx                  # Главное меню приложения
-│   ├── hooks/                           # Хуки управления сессиями, темой и раскладкой UI
-│   ├── lib/                             # Движок фильтров, парсеры протоколов, менеджер настроек, IPC-мост
+│   ├── hooks/                           # Хуки управления сессиями, темой, раскладкой и тесты (*.test.tsx)
+│   ├── lib/                             # Движки фильтров, cURL/кодогенерации, OpenAPI, тем, настроек и тесты (*.test.ts)
 │   └── types/                           # TypeScript-интерфейсы сессий, правил и схемы настроек
 │
 └── src-tauri/                           # Исходный код Core & MITM Proxy (Rust)
@@ -202,7 +214,8 @@
         │   ├── server.rs                # HTTP/1.1, HTTP/2, HTTPS, WS прокси и портал flux.proxy (/health)
         │   ├── doctor.rs                # Самодиагностика порта, Root CA, SysProxy, VPN, Firewall и /health
         │   ├── ca.rs                    # Генерация Root CA, сертификатов доменов и управление хранилищем ОС
-        │   ├── filters.rs               # Selective TLS, стриппинг Alt-Svc, мутации заголовков, capture-drop
+        │   ├── client_certs.rs          # Хранилище клиентских сертификатов mTLS (PKCS#12 / PEM) и кэш клиентов
+        │   ├── filters.rs               # Selective MITM 2.0 (hit counters), стриппинг Alt-Svc, мутации заголовков, capture-drop
         │   ├── breakpoints.rs           # Менеджер живых точек останова
         │   ├── rules.rs                 # Движок правил AutoResponder
         │   ├── codec.rs                 # Сжатие/распаковка и преобразования данных для TextWizard
@@ -320,6 +333,7 @@ FluxProxy умеет перехватывать трафик со смартфо
 | `Ctrl+D` / `Cmd+D` | Открыть визуальное сравнение двух сессий (**Session Diff**) |
 | `Ctrl+E` / `Cmd+E` | Открыть **Text Wizard & JWT Decoder** |
 | `Ctrl+Shift+M` | Мастер подключения мобильных устройств (**Mobile Setup**) |
+| `Ctrl+Shift+C` | Хранилище клиентских сертификатов (**Client Certificates / mTLS**) |
 | `Ctrl+Shift+D` | Запустить диагностический мастер самопроверки (**Proxy Doctor**) |
 | `Ctrl+Shift+T` | Переключить однострочный компактный тулбар (**Slim / Compact Toolbar**) |
 | `Ctrl+A` / `Cmd+A` | Выделить все видимые сессии в таблице |
@@ -376,11 +390,16 @@ curl -x http://127.0.0.1:8888 https://httpbin.org/get -k
 - ✅ Сортировка всех колонок таблицы (`ASC`/`DESC`), `Ctrl+A`, автоподбор ширины колонок (`Auto-fit`), персистентность геометрии сплитов, однострочный **Slim Toolbar (`Ctrl+Shift+T`)**, шорткаты вкладок `Ctrl+1..6`, виртуализация `HexViewer` и `manualChunks` в Vite.
 - ✅ Очистка и маскирование PII/секретов при экспорте (**Sanitized Export**, `Ctrl+Shift+S`) для `.har`, `.saz`, `.json` и Raw HTTP.
 - ✅ Диагностический мастер самопроверки и 1-клик починки **«Proxy Doctor» (`Ctrl+Shift+D`)**, единая точка старта порта (`proxy_port.pref`) и транзакционное применение профилей настроек с поддержкой `breakpoints`.
-- ✅ Встроенный **Python Scripting Engine (`Alt+5`)** для программируемой модификации и мокирования трафика (`on_request` / `on_response`) через долгоживущий IPC-процесс с fail-open защитой 1500 мс, встроенным Monaco Editor и живой консолью логов (см. [**PYTHON_SCRIPTING_GUIDE.md**](PYTHON_SCRIPTING_GUIDE.md)).
+- ✅ Встроенный **Python Scripting Engine (`Alt+5`)** для программируемой модификации и мокирования трафика (`on_request` / `on_response`) через долгоживущий IPC-процесс с fail-open защитой 1500 мс, встроенным Monaco Editor и живой консолью логов (см. [**PYTHON_SCRIPTING_GUIDE.md**](PYTHON_SCRIPTING_GUIDE.md) и [**PYTHON_SCRIPTING_AI_GUIDE.md**](PYTHON_SCRIPTING_AI_GUIDE.md)).
+- ✅ **Галерея 8 цветовых тем и редактор палитры**: пресеты *Flux Dark*, *Flux Light*, *Dracula*, *Tokyo Night*, *Nord*, *Fiddler Classic*, *GitHub Dark*, *Monokai Pro*, кастомная настройка CSS-токенов и синхронизация темы Monaco Editor.
+- ✅ **Selective MITM & Bypass 2.0**: переключение `Table View` ↔ `Bulk Text Editor`, диалог `Quick Paste…`, импорт/экспорт TXT/JSON, 11 курируемых Quick-Packs, PKI/OCSP/CRL-дефолты, lock-free счётчики `Hits: N` и бейдж `TUNNEL`.
+- ✅ **Клиентские сертификаты (mTLS, `Ctrl+Shift+C`)**: хранилище PKCS#12 (`.p12`/`.pfx`) и PEM с масками доменов (`*.corp.local`) и кэшированием mTLS-клиентов в `moka`.
+- ✅ **Composer 2.0 & Кодогенератор**: умный импорт / вставка команд **cURL** (Bash / cmd / PowerShell) и генератор клиентского кода на 5 языках (8 вариантов: JS, Python, Go, Rust, cURL).
+- ✅ **Генератор OpenAPI 3.0.3 / Swagger**: автоматический вывод контракта (`YAML` / `JSON`) с параметризацией `{id}` / `{uuid}`, слиянием JSON Schema и безопасными `components.securitySchemes`.
+- ✅ **Тестирование и CI/CD**: 11 наборов Vitest (80 frontend-тестов) + 101 Rust-тест и кроссплатформенный GitHub Actions CI (`ubuntu-latest`, `windows-latest`, `macos-latest`, `clippy -D warnings`).
 
 ### Ближайшие этапы разработки:
-- 🔜 **P1** — Продвинутые темы-пресеты и палитра, **Selective MITM 2.0**, клиентские сертификаты (**mTLS**), **Composer 2.0** («Paste cURL» и кодогенератор), генератор **OpenAPI 3.0 / Swagger** и тесты **Vitest & CI/CD**.
-- 🔜 **P2** — **HOSTS Remapping** (виртуальный DNS), **Bandwidth Throttling** (эмуляция 3G/LTE), архитектурная декомпозиция + **Zustand**, **Waterfall Timeline**, статистика трафика, **Upstream Proxy** и ручная отправка WebSocket-сообщений.
+- 🔜 **P2** — **HOSTS Remapping** (виртуальный DNS), **Bandwidth Throttling** (эмуляция 3G/LTE), архитектурная декомпозиция + **Zustand** + `React.lazy()`, **Waterfall Timeline**, статистика трафика, **Upstream Proxy Chaining** и ручная отправка WebSocket-сообщений.
 
 ---
 
@@ -390,7 +409,9 @@ curl -x http://127.0.0.1:8888 https://httpbin.org/get -k
 2. Внесите изменения и убедитесь, что сборка и тесты проходят чисто:
    ```bash
    npm run typecheck
+   npm run test
    npm run build
+   cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
    cargo test --manifest-path src-tauri/Cargo.toml
    ```
 3. Сделайте коммит и откройте **Pull Request**.

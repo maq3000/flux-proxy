@@ -73,6 +73,7 @@ import {
   SETTINGS_STORAGE_KEYS,
 } from "./lib/settingsManager";
 import { isTauriRuntime, proxyBridge } from "./lib/tauriBridge";
+import { THEME_PRESETS } from "./lib/themePresets";
 import type {
   ActiveNavSection,
   AutoResponderRule,
@@ -2197,8 +2198,8 @@ export const App: React.FC = () => {
         label: status.running
           ? "Pause MITM Capture & Rollback OS System Proxy"
           : status.autoSystemProxy
-            ? "Start MITM Capture & Enable OS System Proxy (127.0.0.1:8888)"
-            : "Start Local MITM Proxy Listener Only (127.0.0.1:8888)",
+            ? `Start MITM Capture & Enable OS System Proxy (127.0.0.1:${status.port})`
+            : `Start Local MITM Proxy Listener Only (127.0.0.1:${status.port})`,
         shortcut: "F12",
         perform: () => void toggleProxy(),
       },
@@ -2230,6 +2231,7 @@ export const App: React.FC = () => {
         category: "View",
         label: "Switch to Request Composer",
         shortcut: "Alt+2",
+        keywords: ["composer", "curl", "import", "paste", "request", "http"],
         perform: () => setActiveSection("composer"),
       },
       {
@@ -2408,6 +2410,39 @@ export const App: React.FC = () => {
         perform: () => setTheme("system"),
       },
       {
+        id: "open-theme-gallery",
+        category: "Theme",
+        label: "Theme Gallery & Custom Palette… (8 тем-пресетов и редактор цветов)",
+        keywords: [
+          "theme",
+          "preset",
+          "palette",
+          "colors",
+          "dracula",
+          "tokyo",
+          "nord",
+          "fiddler",
+          "github",
+          "monokai",
+          "тема",
+          "палитра",
+        ],
+        perform: () => openPreferencesAt("uiColumns"),
+      },
+      ...THEME_PRESETS.map((preset) => ({
+        id: `theme-preset-${preset.id}`,
+        category: "Theme",
+        label: `Set Theme Preset: ${preset.name} (${preset.baseScheme === "dark" ? "Dark" : "Light"})`,
+        keywords: [
+          "theme",
+          "preset",
+          preset.id,
+          preset.name.toLowerCase(),
+          preset.baseScheme,
+        ],
+        perform: () => setThemePreset(preset.id),
+      })),
+      {
         id: "open-preferences",
         category: "Settings",
         label: "Preferences... — Открыть настройки и управление профилем",
@@ -2484,6 +2519,7 @@ export const App: React.FC = () => {
       setQuickCategory,
       setSessionRetentionLimit,
       setTheme,
+      setThemePreset,
       showToast,
       sidebarCollapsed,
       status.allowRemote,
@@ -2760,6 +2796,7 @@ export const App: React.FC = () => {
         onResetPanelLayout={handleResetPanelLayout}
         themePreference={preference}
         onSetTheme={setTheme}
+        onOpenThemeGallery={() => openPreferencesAt("uiColumns")}
         onReplaySelected={() => {
           if (effectiveSelectedIds.length > 0) {
             void replaySessions(effectiveSelectedIds);

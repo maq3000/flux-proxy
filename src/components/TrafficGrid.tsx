@@ -1329,7 +1329,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
                             )}
                             {s.isMocked && (
                               <span
-                                title="Intercepted by AutoResponder Rule"
+                                title="Mocked response (AutoResponder / Python Script)"
                                 className="shrink-0 rounded bg-status4xx-bg px-1 text-[9px] font-bold text-status4xx-fg"
                               >
                                 MOCK
@@ -1337,7 +1337,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
                             )}
                             {s.headersMutated && (
                               <span
-                                title="Headers mutated by Filter Rule"
+                                title="Modified by Filter Rule / Python Script"
                                 className="shrink-0 rounded bg-statusWs-bg px-1 text-[9px] font-bold text-statusWs-fg"
                               >
                                 HDR

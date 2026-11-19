@@ -506,5 +506,5 @@ def on_response(response, request):
 - [🤖 Инструкция для AI-агента по написанию скриптов (`PYTHON_SCRIPTING_AI_GUIDE.md`)](PYTHON_SCRIPTING_AI_GUIDE.md)
 - [📖 Руководство пользователя FluxProxy (`USER_GUIDE.md`)](USER_GUIDE.md)
 - [⚡ Обзор проекта и быстрый старт (`README.md`)](README.md)
-- [🗺️ Дорожная карта и спецификация Этапа 7 (`ROADMAP.md`)](ROADMAP.md)
+- [🗺️ Дорожная карта развития проекта (`ROADMAP.md`)](ROADMAP.md)
 - Исходный код движка: [`src-tauri/src/scripting/python_runner.rs`](src-tauri/src/scripting/python_runner.rs), [`src/components/ScriptingPanel.tsx`](src/components/ScriptingPanel.tsx)

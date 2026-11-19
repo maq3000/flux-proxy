@@ -95,6 +95,7 @@ interface MenuBarProps {
   onResetPanelLayout: () => void;
   themePreference: ThemePreference;
   onSetTheme: (pref: ThemePreference) => void;
+  onOpenThemeGallery?: () => void;
   // Tools
   sessionRetentionLimit: number | null;
   onSetSessionRetentionLimit: (limit: number | null) => void;
@@ -335,6 +336,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onResetPanelLayout,
   themePreference,
   onSetTheme,
+  onOpenThemeGallery,
   sessionRetentionLimit,
   onSetSessionRetentionLimit,
   onOpenCustomRetentionLimit,
@@ -1673,6 +1675,14 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 >
                   <span>Theme: System</span>
                 </button>
+                {onOpenThemeGallery && (
+                  <button
+                    type="button"
+                    onClick={(e) => activateCommand(e, onOpenThemeGallery)}
+                  >
+                    <span>Theme Gallery &amp; Custom Palette…</span>
+                  </button>
+                )}
               </div>
             </div>
           </div>
