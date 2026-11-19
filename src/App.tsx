@@ -22,6 +22,7 @@ import { ComposerPanel } from "./components/ComposerPanel";
 import { FilterDrawer } from "./components/FilterDrawer";
 import { MenuBar } from "./components/MenuBar";
 import { MobileSetupModal } from "./components/MobileSetupModal";
+import { OpenApiExportModal } from "./components/OpenApiExportModal";
 import { ProxyDoctorModal } from "./components/ProxyDoctorModal";
 import { SanitizedExportModal } from "./components/SanitizedExportModal";
 import { ScriptingPanel } from "./components/ScriptingPanel";
@@ -289,6 +290,9 @@ export const App: React.FC = () => {
   const [proxyDoctorModalOpen, setProxyDoctorModalOpen] = useState(false);
   const [sanitizedExportModalOpen, setSanitizedExportModalOpen] =
     useState(false);
+  const [openApiModalOpen, setOpenApiModalOpen] = useState(false);
+  const [openApiSelectedIds, setOpenApiSelectedIds] = useState<number[]>([]);
+  const [openApiAllIds, setOpenApiAllIds] = useState<number[]>([]);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsModalOpen, setShortcutsModalOpen] = useState(false);
   const [hexTriggerSeq, setHexTriggerSeq] = useState(0);
@@ -1071,6 +1075,26 @@ export const App: React.FC = () => {
     }
     setSanitizedExportModalOpen(true);
   }, [sessions.length, showToast]);
+
+  const openOpenApiExportModal = useCallback(
+    (explicitIds?: number[]) => {
+      const targetSelected =
+        explicitIds && explicitIds.length > 0
+          ? [...explicitIds]
+          : [...effectiveSelectedIds];
+      const targetAll = (
+        filteredSessions.length > 0 ? filteredSessions : sessions
+      ).map((s) => s.id);
+      if (targetSelected.length === 0 && targetAll.length === 0) {
+        showToast("⚠️ Нет захваченных сессий для генерации OpenAPI 3.0");
+        return;
+      }
+      setOpenApiSelectedIds(targetSelected);
+      setOpenApiAllIds(targetAll);
+      setOpenApiModalOpen(true);
+    },
+    [effectiveSelectedIds, filteredSessions, sessions, showToast]
+  );
 
   const openTextWizardAt = useCallback(
     (tab: TextWizardTab = "jwt", input?: string) => {
@@ -2302,6 +2326,13 @@ export const App: React.FC = () => {
         perform: openSanitizedExportModal,
       },
       {
+        id: "export-openapi-spec",
+        category: "Traffic",
+        label: "Export as OpenAPI 3.0 Spec… (YAML / JSON)",
+        keywords: ["openapi", "swagger", "spec", "yaml", "json", "schema", "api"],
+        perform: () => openOpenApiExportModal(),
+      },
+      {
         id: "import-archive",
         category: "Storage",
         label: "Open / Import Archive... (.har, .saz, .json)",
@@ -2438,6 +2469,7 @@ export const App: React.FC = () => {
       openCodeGeneratorForSession,
       openDiffWithPairSmart,
       openFilterDrawerAt,
+      openOpenApiExportModal,
       openPreferencesAt,
       openSanitizedExportModal,
       openTextWizardAt,
@@ -2538,6 +2570,7 @@ export const App: React.FC = () => {
       onExportSelectedSessions={(ids, fmt) =>
         void exportSelectedSessionsAs(ids, fmt)
       }
+      onExportOpenApi={(ids) => openOpenApiExportModal(ids)}
       onSaveSessionBody={(id, isResponse) =>
         void saveSessionBodyAs(id, isResponse)
       }
@@ -2642,6 +2675,7 @@ export const App: React.FC = () => {
         onSaveAllSessionsAs={() => void exportAllSessionsAs()}
         onSaveSelectedSessionsAs={() => void exportSelectedSessionsAs()}
         onOpenSanitizedExport={openSanitizedExportModal}
+        onOpenOpenApiExport={() => openOpenApiExportModal()}
         onImportArchive={() => void importArchiveDialog()}
         onSaveSqlite={() => void saveToSqlite()}
         onLoadSqlite={() => void loadFromSqlite()}
@@ -3533,6 +3567,15 @@ export const App: React.FC = () => {
         selectedIds={effectiveSelectedIds}
         onClose={() => setSanitizedExportModalOpen(false)}
         onExport={exportSanitizedSessions}
+      />
+
+      <OpenApiExportModal
+        open={openApiModalOpen}
+        selectedIds={openApiSelectedIds}
+        allSessionIds={openApiAllIds}
+        resolvedTheme={resolvedTheme}
+        onClose={() => setOpenApiModalOpen(false)}
+        onNotify={showToast}
       />
 
       <CodeSnippetModal

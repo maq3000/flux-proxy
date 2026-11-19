@@ -37,6 +37,7 @@ interface MenuBarProps {
   onSaveAllSessionsAs: () => void;
   onSaveSelectedSessionsAs: () => void;
   onOpenSanitizedExport: () => void;
+  onOpenOpenApiExport: () => void;
   onImportArchive: () => void;
   onSaveSqlite: () => void;
   onLoadSqlite: () => void;
@@ -279,6 +280,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onSaveAllSessionsAs,
   onSaveSelectedSessionsAs,
   onOpenSanitizedExport,
+  onOpenOpenApiExport,
   onImportArchive,
   onSaveSqlite,
   onLoadSqlite,
@@ -1011,6 +1013,13 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 <span className="hint" aria-hidden="true">
                   Ctrl+Shift+S
                 </span>
+              </button>
+              <button
+                type="button"
+                disabled={totalCount === 0}
+                onClick={(e) => activateCommand(e, onOpenOpenApiExport)}
+              >
+                <span>Export as OpenAPI 3.0 Spec…</span>
               </button>
               <button
                 type="button"

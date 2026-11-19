@@ -754,7 +754,8 @@ pub async fn export_settings_file(
     file_path: String,
     contents: String,
 ) -> Result<usize, ProxyError> {
-    let validated_path = validate_user_file_path(&file_path, Some(&["json"]), false)?;
+    let validated_path =
+        validate_user_file_path(&file_path, Some(&["json", "yaml", "yml"]), false)?;
     tokio::task::spawn_blocking(move || {
         write_raw_bytes_to_file(&validated_path, contents.as_bytes())
     })

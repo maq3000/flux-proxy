@@ -3267,6 +3267,29 @@ export const proxyBridge = {
     );
   },
 
+  async exportTextFile(
+    filePath: string,
+    contents: string,
+    mimeType = "text/plain;charset=utf-8"
+  ): Promise<void> {
+    if (isTauriRuntime()) {
+      try {
+        await invoke<number>("export_settings_file", {
+          filePath,
+          contents,
+        });
+        return;
+      } catch {
+        // Fallback to browser download if native command unavailable or rejects extension
+      }
+    }
+    triggerBrowserDownload(
+      new TextEncoder().encode(contents),
+      filePath,
+      mimeType
+    );
+  },
+
   async readSettingsJsonFile(filePath: string): Promise<string> {
     if (!isTauriRuntime() || filePath.startsWith("preview://")) {
       const file = previewPickedFiles.get(filePath);

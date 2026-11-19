@@ -8,6 +8,7 @@ import {
   Download,
   Eraser,
   FileCode2,
+  FileJson,
   FileText,
   Flame,
   GitCompareArrows,
@@ -75,6 +76,7 @@ interface TrafficGridProps {
     ids: number[],
     format: "har" | "saz" | "raw"
   ) => void;
+  onExportOpenApi?: (ids: number[]) => void;
   onSaveSessionBody?: (id: number, isResponse: boolean) => void;
   onFilterByProcess?: (processName: string) => void;
   onFilterByClientIp?: (clientIp: string) => void;
@@ -356,6 +358,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
   onSendToComposer,
   onCreateRuleFromSession,
   onExportSelectedSessions,
+  onExportOpenApi,
   onSaveSessionBody,
   onFilterByProcess,
   onFilterByClientIp,
@@ -1811,7 +1814,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
             </button>
           )}
 
-          {ctxSession && (onExportSelectedSessions || onSaveSessionBody) && (
+          {ctxSession && (onExportSelectedSessions || onExportOpenApi || onSaveSessionBody) && (
             <>
               <hr />
 
@@ -1842,6 +1845,22 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
                   <Archive className="h-3.5 w-3.5 shrink-0 text-status3xx-fg" />
                   <span className="truncate">
                     Save Selected as Fiddler SAZ (.saz)
+                    {ctxTargetIds.length > 1 ? ` (${ctxTargetIds.length})` : ""}
+                  </span>
+                </button>
+              )}
+
+              {onExportOpenApi && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    closeContextMenu();
+                    onExportOpenApi(ctxTargetIds);
+                  }}
+                >
+                  <FileJson className="h-3.5 w-3.5 shrink-0 text-accent" />
+                  <span className="truncate">
+                    Export as OpenAPI 3.0 Spec…
                     {ctxTargetIds.length > 1 ? ` (${ctxTargetIds.length})` : ""}
                   </span>
                 </button>
