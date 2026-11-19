@@ -32,6 +32,7 @@ use crate::models::{
 };
 use crate::proxy::breakpoints::BreakpointEngine;
 use crate::proxy::ca::CertificateAuthority;
+use crate::proxy::client_certs::ClientCertificateStore;
 use crate::proxy::filters::{
     is_alt_svc_header, ConnectTunnelDecision, PassthroughReason, ProxyFilterEngine,
 };
@@ -74,16 +75,18 @@ where
 }
 
 /// Builds the shared upstream HTTP/HTTPS `reqwest::Client` with keep-alive, pool timeouts,
-/// native root CAs (`rustls-tls-native-roots`), and `.no_proxy()` to prevent loopback recursion.
-pub(crate) fn build_upstream_client(
+/// native root CAs (`rustls-tls-native-roots`), optional mTLS `Identity`, and `.no_proxy()` to prevent loopback recursion.
+pub(crate) fn build_upstream_client_with_identity(
     follow_redirects: bool,
+    identity: Option<reqwest::Identity>,
 ) -> Result<reqwest::Client, reqwest::Error> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let redirect_policy = if follow_redirects {
         reqwest::redirect::Policy::default()
     } else {
         reqwest::redirect::Policy::none()
     };
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .no_proxy()
         .redirect(redirect_policy)
         .connect_timeout(Duration::from_secs(15))
@@ -91,8 +94,18 @@ pub(crate) fn build_upstream_client(
         .http2_keep_alive_interval(Some(Duration::from_secs(20)))
         .http2_keep_alive_timeout(Duration::from_secs(10))
         .http2_keep_alive_while_idle(true)
-        .pool_idle_timeout(Some(Duration::from_secs(35)))
-        .build()
+        .pool_idle_timeout(Some(Duration::from_secs(35)));
+    if let Some(id) = identity {
+        builder = builder.identity(id);
+    }
+    builder.build()
+}
+
+/// Builds the shared upstream HTTP/HTTPS `reqwest::Client` without a client mTLS identity.
+pub(crate) fn build_upstream_client(
+    follow_redirects: bool,
+) -> Result<reqwest::Client, reqwest::Error> {
+    build_upstream_client_with_identity(follow_redirects, None)
 }
 
 /// Traverses the full `std::error::Error::source()` chain and formats all causes joined with `" -> "`.
@@ -445,6 +458,7 @@ pub struct SharedProxyContext {
     pub store: Arc<TrafficStore>,
     pub upstream_client: reqwest::Client,
     pub upstream_redirect_client: reqwest::Client,
+    pub client_certs: Arc<ClientCertificateStore>,
     pub event_tx: mpsc::UnboundedSender<SessionSummary>,
     pub removed_tx: mpsc::UnboundedSender<Vec<u64>>,
     pub active_port: AtomicU16,
@@ -670,12 +684,14 @@ pub struct ProxyEngineController {
 }
 
 impl ProxyEngineController {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ca: Arc<CertificateAuthority>,
         rules: Arc<RuleEngine>,
         filters: Arc<ProxyFilterEngine>,
         store: Arc<TrafficStore>,
         sysproxy: Arc<SystemProxyManager>,
+        client_certs: Arc<ClientCertificateStore>,
         app_handle: AppHandle,
     ) -> Result<Self, ProxyError> {
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SessionSummary>();
@@ -759,6 +775,7 @@ impl ProxyEngineController {
             filters,
             store,
             sysproxy,
+            client_certs,
             event_tx,
             removed_tx,
             bp_tx,
@@ -807,6 +824,7 @@ impl ProxyEngineController {
             filters,
             store,
             sysproxy,
+            Arc::new(ClientCertificateStore::in_memory()),
             event_tx,
             removed_tx,
             bp_tx,
@@ -822,6 +840,7 @@ impl ProxyEngineController {
         filters: Arc<ProxyFilterEngine>,
         store: Arc<TrafficStore>,
         sysproxy: Arc<SystemProxyManager>,
+        client_certs: Arc<ClientCertificateStore>,
         event_tx: mpsc::UnboundedSender<SessionSummary>,
         removed_tx: mpsc::UnboundedSender<Vec<u64>>,
         bp_tx: mpsc::UnboundedSender<Vec<PausedBreakpointItem>>,
@@ -843,6 +862,7 @@ impl ProxyEngineController {
             store,
             upstream_client,
             upstream_redirect_client,
+            client_certs,
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(initial_port),
@@ -1755,19 +1775,66 @@ impl ProxyEngineController {
             }
         }
 
-        let client = if composed.follow_redirects {
-            self.context.upstream_redirect_client.clone()
-        } else {
-            self.context.upstream_client.clone()
-        };
-
         let in_flight_proto = if scheme == "https" {
             "HTTPS/2".to_string()
         } else {
             "HTTP/1.1".to_string()
         };
+        let target_host = parsed_url.host_str().unwrap_or(&host).to_string();
+        let (client, mtls_cn) = if scheme.eq_ignore_ascii_case("https") {
+            match self
+                .context
+                .client_certs
+                .get_or_build_client(&target_host, composed.follow_redirects)
+            {
+                Ok(Some((mtls_client, entry))) => (mtls_client, Some(entry.common_name)),
+                Ok(None) => (
+                    if composed.follow_redirects {
+                        self.context.upstream_redirect_client.clone()
+                    } else {
+                        self.context.upstream_client.clone()
+                    },
+                    None,
+                ),
+                Err(err) => {
+                    let err_msg =
+                        format!("Client certificate (mTLS) error for '{target_host}': {err}");
+                    record_error_session(
+                        &self.context,
+                        session_id,
+                        in_flight_proto,
+                        &scheme,
+                        &method_str,
+                        &host,
+                        &path,
+                        &full_url,
+                        req_headers,
+                        &req_bytes,
+                        start.elapsed().as_millis() as u64,
+                        timestamp,
+                        Some("flux-proxy (Composer)".into()),
+                        Some(self_pid),
+                        false,
+                        req_mutated,
+                        bp_modified,
+                        Some("127.0.0.1".into()),
+                        "Composer (Local)".into(),
+                        &err_msg,
+                    );
+                    return Err(ProxyError::Custom(err_msg));
+                }
+            }
+        } else if composed.follow_redirects {
+            (self.context.upstream_redirect_client.clone(), None)
+        } else {
+            (self.context.upstream_client.clone(), None)
+        };
+
         let in_flight_tls = if scheme == "https" {
-            Some("TLS 1.3 (Composer)".to_string())
+            Some(match &mtls_cn {
+                Some(cn) => format!("TLS 1.3 (Composer · mTLS: {cn})"),
+                None => "TLS 1.3 (Composer)".to_string(),
+            })
         } else {
             None
         };
@@ -2022,7 +2089,10 @@ impl ProxyEngineController {
             request_body_text: req_txt,
             response_body_text: resp_txt,
             tls_version: if scheme == "https" {
-                Some("TLS 1.3".into())
+                Some(match &mtls_cn {
+                    Some(cn) => format!("TLS 1.3 (Composer · mTLS: {cn})"),
+                    None => "TLS 1.3".to_string(),
+                })
             } else {
                 None
             },
@@ -2777,6 +2847,41 @@ async fn handle_intercepted_request(
         }
     };
 
+    let target_host = reqwest::Url::parse(&full_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| host_header.clone());
+    let (upstream_client, mtls_cn) = if scheme_str.eq_ignore_ascii_case("https") {
+        match ctx.client_certs.get_or_build_client(&target_host, false) {
+            Ok(Some((mtls_client, entry))) => (mtls_client, Some(entry.common_name)),
+            Ok(None) => (ctx.upstream_client.clone(), None),
+            Err(err) => {
+                let msg = format!("Client certificate (mTLS) error for '{target_host}': {err}");
+                tracing::warn!("{msg}");
+                return record_and_return_error(
+                    &ctx,
+                    session_id,
+                    &scheme_str,
+                    &method_str,
+                    &host_header,
+                    &path_and_query,
+                    &full_url,
+                    req_headers,
+                    body_bytes,
+                    start,
+                    timestamp,
+                    client_addr,
+                    client_proc.as_ref(),
+                    false,
+                    bp_modified,
+                    msg,
+                );
+            }
+        }
+    } else {
+        (ctx.upstream_client.clone(), None)
+    };
+
     record_in_flight_session(
         &ctx,
         session_id,
@@ -2794,7 +2899,10 @@ async fn handle_intercepted_request(
         Some(normalize_client_ip(client_addr)),
         client_addr.to_string(),
         if scheme_str == "https" {
-            Some("TLS 1.3 (MITM)".into())
+            Some(match &mtls_cn {
+                Some(cn) => format!("TLS 1.3 (MITM · mTLS: {cn})"),
+                None => "TLS 1.3 (MITM)".into(),
+            })
         } else {
             None
         },
@@ -2802,7 +2910,7 @@ async fn handle_intercepted_request(
         &body_bytes,
     );
 
-    let mut upstream_resp = match send_upstream_with_retry(&ctx.upstream_client, &reqwest_method, |client| {
+    let mut upstream_resp = match send_upstream_with_retry(&upstream_client, &reqwest_method, |client| {
         let mut upstream_req = client.request(reqwest_method.clone(), &full_url);
         for h in &req_headers {
             if !is_hop_by_hop_header(&h.name)
@@ -2928,7 +3036,10 @@ async fn handle_intercepted_request(
             request_body_text: req_txt,
             response_body_text: Some(String::new()),
             tls_version: if scheme_str == "https" {
-                Some("TLS 1.3 (MITM SSE)".into())
+                Some(match &mtls_cn {
+                    Some(cn) => format!("TLS 1.3 (MITM SSE · mTLS: {cn})"),
+                    None => "TLS 1.3 (MITM SSE)".into(),
+                })
             } else {
                 None
             },
@@ -3124,7 +3235,10 @@ async fn handle_intercepted_request(
             request_body_text: req_txt,
             response_body_text: None,
             tls_version: if scheme_str == "https" {
-                Some("TLS 1.3 (MITM Stream)".into())
+                Some(match &mtls_cn {
+                    Some(cn) => format!("TLS 1.3 (MITM Stream · mTLS: {cn})"),
+                    None => "TLS 1.3 (MITM Stream)".into(),
+                })
             } else {
                 None
             },
@@ -3474,7 +3588,10 @@ async fn handle_intercepted_request(
         request_body_text: req_txt,
         response_body_text: resp_txt,
         tls_version: if scheme_str == "https" {
-            Some("TLS 1.3 (MITM)".into())
+            Some(match &mtls_cn {
+                Some(cn) => format!("TLS 1.3 (MITM · mTLS: {cn})"),
+                None => "TLS 1.3 (MITM)".into(),
+            })
         } else {
             None
         },
@@ -4899,6 +5016,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -5012,6 +5130,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -5259,6 +5378,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -5401,6 +5521,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -5535,6 +5656,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(bound_port),
@@ -5736,6 +5858,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
@@ -5898,6 +6021,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
@@ -6113,6 +6237,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
@@ -6379,6 +6504,7 @@ mod tests {
             store: store.clone(),
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
@@ -6914,6 +7040,7 @@ mod tests {
             store: store.clone(),
             upstream_client: build_upstream_client(false).unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),

@@ -11,6 +11,7 @@ use crate::models::{
     ProxyFilterBackendConfig, ProxyStatus, SanitizationOptions, SessionDetail, SessionSummary,
     StorageStats,
 };
+use crate::proxy::client_certs::{AddClientCertificateRequest, ClientCertificateEntry};
 use crate::proxy::codec::execute_codec_transform;
 use crate::proxy::network::list_network_interfaces_with_options;
 use crate::proxy::server::ProxyEngineController;
@@ -219,6 +220,45 @@ pub async fn uninstall_root_ca(state: State<'_, AppState>) -> Result<String, Pro
     tokio::task::spawn_blocking(move || ca.uninstall_from_os_trust_store())
         .await
         .map_err(|e| ProxyError::Custom(format!("CA uninstall task join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn list_client_certificates(
+    state: State<'_, AppState>,
+) -> Result<Vec<ClientCertificateEntry>, ProxyError> {
+    let certs = state.controller.context.client_certs.clone();
+    run_blocking("List client certificates", move || certs.list()).await
+}
+
+#[tauri::command]
+pub async fn add_client_certificate(
+    request: AddClientCertificateRequest,
+    state: State<'_, AppState>,
+) -> Result<ClientCertificateEntry, ProxyError> {
+    let certs = state.controller.context.client_certs.clone();
+    run_blocking("Add client certificate", move || certs.add_certificate(request)).await?
+}
+
+#[tauri::command]
+pub async fn toggle_client_certificate(
+    id: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<ClientCertificateEntry, ProxyError> {
+    let certs = state.controller.context.client_certs.clone();
+    run_blocking("Toggle client certificate", move || {
+        certs.toggle_certificate(&id, enabled)
+    })
+    .await?
+}
+
+#[tauri::command]
+pub async fn remove_client_certificate(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ClientCertificateEntry>, ProxyError> {
+    let certs = state.controller.context.client_certs.clone();
+    run_blocking("Remove client certificate", move || certs.remove_certificate(&id)).await?
 }
 
 #[tauri::command]

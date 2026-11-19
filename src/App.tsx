@@ -12,6 +12,7 @@ import {
   BreakpointInterceptorModal,
 } from "./components/BreakpointModal";
 import { CertificateModal } from "./components/CertificateModal";
+import { ClientCertificatesModal } from "./components/ClientCertificatesModal";
 import {
   CommandPalette,
   type PaletteCommand,
@@ -259,6 +260,7 @@ export const App: React.FC = () => {
     preview: SettingsImportPreviewSummary;
   } | null>(null);
   const [certModalOpen, setCertModalOpen] = useState(false);
+  const [clientCertsModalOpen, setClientCertsModalOpen] = useState(false);
   const [mobileModalOpen, setMobileModalOpen] = useState(false);
   const [proxyDoctorModalOpen, setProxyDoctorModalOpen] = useState(false);
   const [sanitizedExportModalOpen, setSanitizedExportModalOpen] =
@@ -1236,6 +1238,22 @@ export const App: React.FC = () => {
         return;
       }
 
+      // Ctrl+Shift+C / Cmd+Shift+C -> Client Certificates (mTLS)
+      if (
+        ctrlOrMeta &&
+        !e.altKey &&
+        e.shiftKey &&
+        (keyLower === "c" || e.code === "KeyC")
+      ) {
+        e.preventDefault();
+        if (clientCertsModalOpen) {
+          setClientCertsModalOpen(false);
+        } else if (!hasOpenModal()) {
+          setClientCertsModalOpen(true);
+        }
+        return;
+      }
+
       // Ctrl+Shift+D / Cmd+Shift+D -> Run Proxy Doctor
       if (
         ctrlOrMeta &&
@@ -1454,6 +1472,7 @@ export const App: React.FC = () => {
   }, [
     activeSection,
     clearAllSessions,
+    clientCertsModalOpen,
     copyUrlsForIds,
     deleteSessions,
     diffModalOpen,
@@ -1907,6 +1926,25 @@ export const App: React.FC = () => {
         category: "TLS / CA",
         label: "Inspect or Install HTTPS MITM Root CA Certificate",
         perform: () => setCertModalOpen(true),
+      },
+      {
+        id: "client-certificates",
+        category: "TLS / mTLS",
+        label: "Client Certificates… (mTLS — .p12 / .pfx / .pem)",
+        shortcut: "Ctrl+Shift+C",
+        keywords: [
+          "mtls",
+          "client",
+          "cert",
+          "certificate",
+          "p12",
+          "pfx",
+          "pem",
+          "pkcs12",
+          "сертификат",
+          "клиентский",
+        ],
+        perform: () => setClientCertsModalOpen(true),
       },
       {
         id: "save-all-archive",
@@ -2374,6 +2412,7 @@ export const App: React.FC = () => {
         onOpenCompressionCodec={() => openTextWizardAt("compression")}
         onOpenMobileSetup={() => setMobileModalOpen(true)}
         onOpenCertificates={() => setCertModalOpen(true)}
+        onOpenClientCertificates={() => setClientCertsModalOpen(true)}
         sessionRetentionLimit={sessionRetentionLimit}
         onSetSessionRetentionLimit={(limit) =>
           void setSessionRetentionLimit(limit)
@@ -3103,6 +3142,12 @@ export const App: React.FC = () => {
         onNotify={showToast}
       />
 
+      <ClientCertificatesModal
+        open={clientCertsModalOpen}
+        onClose={() => setClientCertsModalOpen(false)}
+        onNotify={showToast}
+      />
+
       <MobileSetupModal
         open={mobileModalOpen}
         status={status}
@@ -3136,6 +3181,7 @@ export const App: React.FC = () => {
         onQuickOpenJwt={(token) => openTextWizardAt("jwt", token)}
         onQuickOpenSanitizedExport={openSanitizedExportModal}
         onQuickOpenProxyDoctor={() => setProxyDoctorModalOpen(true)}
+        onQuickOpenClientCerts={() => setClientCertsModalOpen(true)}
       />
 
       <dialog

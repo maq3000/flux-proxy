@@ -1,6 +1,7 @@
 import {
   BUILTIN_REDACTED_AUTH_HEADERS,
   type AutoResponderRule,
+  type ClientCertificateEntry,
   type DoctorCheckResult,
   type HeaderPair,
   type ProxyStatus,
@@ -839,6 +840,47 @@ export const PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY =
   "fluxproxy.clearDbOnExit.v1";
 export const PREVIEW_SANITIZATION_OPTIONS_STORAGE_KEY =
   "fluxproxy.sanitizationOptions.v1";
+export const PREVIEW_CLIENT_CERTS_STORAGE_KEY =
+  "fluxproxy.previewClientCerts.v1";
+
+export function buildDefaultPreviewClientCertificates(): ClientCertificateEntry[] {
+  const now = Date.now();
+  const daysFromNowIso = (days: number) =>
+    new Date(now + days * 24 * 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+
+  return [
+    {
+      id: "preview-mcert-1",
+      domainPattern: "*.internal.corp",
+      label: "Corp Internal mTLS Gateway",
+      format: "pkcs12",
+      storedCertPath: "%APPDATA%\\dev.fluxproxy.desktop\\client_certs\\preview-mcert-1.p12",
+      commonName: "flux-dev-operator.internal.corp",
+      expiresAt: daysFromNowIso(240),
+      enabled: true,
+    },
+    {
+      id: "preview-mcert-2",
+      domainPattern: "payments.staging.corp",
+      label: "Staging Payments Sandbox",
+      format: "pem",
+      storedCertPath: "%APPDATA%\\dev.fluxproxy.desktop\\client_certs\\preview-mcert-2.pem",
+      commonName: "sandbox-client@payments.staging.corp",
+      expiresAt: daysFromNowIso(12),
+      enabled: true,
+    },
+    {
+      id: "preview-mcert-3",
+      domainPattern: "legacy-vault.corp",
+      label: "Legacy Vault (Expired)",
+      format: "pkcs12",
+      storedCertPath: "%APPDATA%\\dev.fluxproxy.desktop\\client_certs\\preview-mcert-3.pfx",
+      commonName: "legacy-vault-client",
+      expiresAt: daysFromNowIso(-15),
+      enabled: false,
+    },
+  ];
+}
 
 const BUILTIN_REDACTED_AUTH_HEADERS_SET = new Set(
   BUILTIN_REDACTED_AUTH_HEADERS.map((h) => h.toLowerCase())

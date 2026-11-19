@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type {
+  AddClientCertificateInput,
   AutoResponderRule,
   BindHostMode,
   BreakpointAction,
@@ -9,6 +10,8 @@ import type {
   BreakpointResolution,
   BreakpointStage,
   CaCertificateInfo,
+  ClientCertificateEntry,
+  ClientCertificateFormat,
   CodecOperation,
   CodecTransformResult,
   ComposedRequest,
@@ -39,6 +42,7 @@ import {
   parseQueryParams,
 } from "./formatters";
 import {
+  buildDefaultPreviewClientCertificates,
   buildInFlightSnapshot,
   buildPreviewDoctorChecks,
   buildSimulatedSession,
@@ -46,6 +50,7 @@ import {
   DEFAULT_CLEAR_DB_ON_EXIT,
   getSimulatedTwoPhaseDelayMs,
   PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
+  PREVIEW_CLIENT_CERTS_STORAGE_KEY,
   PREVIEW_SQLITE_ARCHIVE_STORAGE_KEY,
   PREVIEW_SQLITE_COUNT_STORAGE_KEY,
   sanitizeSessionsInPreview,
@@ -172,6 +177,8 @@ class BrowserPreviewEngine {
     DEFAULT_BREAKPOINT_CONFIG
   );
   private pausedBreakpoints = new Map<string, ParkedPreviewEntry>();
+  private clientCertificates: ClientCertificateEntry[] =
+    buildDefaultPreviewClientCertificates();
   private listeners = new Set<(batch: SessionSummary[]) => void>();
   private removedListeners = new Set<(ids: number[]) => void>();
   private bpListeners = new Set<(items: PausedBreakpointItem[]) => void>();
@@ -284,6 +291,15 @@ class BrowserPreviewEngine {
             if (Array.isArray(parsedAutoResp.rules)) {
               this.rules = parsedAutoResp.rules as AutoResponderRule[];
             }
+          }
+        }
+        const rawClientCerts = window.localStorage.getItem(
+          PREVIEW_CLIENT_CERTS_STORAGE_KEY
+        );
+        if (rawClientCerts !== null) {
+          const parsedCerts = JSON.parse(rawClientCerts);
+          if (Array.isArray(parsedCerts)) {
+            this.clientCertificates = parsedCerts as ClientCertificateEntry[];
           }
         }
       } catch {
@@ -2217,6 +2233,132 @@ class BrowserPreviewEngine {
     triggerBrowserDownload(bytes, filePath);
     return bytes.byteLength;
   }
+
+  private persistClientCertificates(): void {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        PREVIEW_CLIENT_CERTS_STORAGE_KEY,
+        JSON.stringify(this.clientCertificates)
+      );
+    } catch {
+      // ignore storage errors in preview
+    }
+  }
+
+  listClientCertificates(): ClientCertificateEntry[] {
+    return this.clientCertificates.map((c) => ({ ...c }));
+  }
+
+  addClientCertificate(
+    req: AddClientCertificateInput
+  ): ClientCertificateEntry {
+    const rawPattern = req.domainPattern.trim();
+    if (!rawPattern || /\s/.test(rawPattern)) {
+      throw new Error("Укажите корректную маску домена без пробелов.");
+    }
+    let clean = rawPattern.replace(/^(https?|wss?):\/\//i, "");
+    const slashIdx = clean.indexOf("/");
+    if (slashIdx >= 0) clean = clean.slice(0, slashIdx);
+    if (!clean.startsWith("[")) {
+      const colonCount = (clean.match(/:/g) ?? []).length;
+      if (colonCount === 1) {
+        clean = clean.replace(/:\d+$/, "");
+      }
+    }
+    clean = clean.replace(/\.+$/, "").toLowerCase();
+    if (!clean || clean === "*" || clean === "*.") {
+      throw new Error(
+        "Укажите конкретный домен или wildcard-маску вида *.domain.com."
+      );
+    }
+    if (clean.startsWith("*.")) {
+      const suffix = clean.slice(2);
+      if (
+        !suffix ||
+        suffix.includes("*") ||
+        suffix.startsWith(".") ||
+        suffix.includes("..")
+      ) {
+        throw new Error(
+          `Некорректная wildcard-маска '${req.domainPattern}'. Ожидается *.domain.com.`
+        );
+      }
+    } else if (clean.includes("*")) {
+      throw new Error("Wildcard '*' допускается только в начале маски (*.domain.com).");
+    }
+
+    const certPath = req.certPath.trim();
+    if (!certPath) {
+      throw new Error("Не указан путь к файлу сертификата.");
+    }
+    const cleanName = certPath.split(/[\\/]/).pop() ?? certPath;
+    const ext = (cleanName.split(".").pop() ?? "").toLowerCase();
+    if (!["p12", "pfx", "pem", "crt", "cer"].includes(ext)) {
+      throw new Error(
+        `Неподдерживаемое расширение '.${ext}'. Используйте .p12, .pfx, .pem, .crt или .cer.`
+      );
+    }
+    previewPickedFiles.delete(certPath);
+    if (req.keyPath) {
+      previewPickedFiles.delete(req.keyPath);
+    }
+
+    const format: ClientCertificateFormat =
+      ext === "p12" || ext === "pfx" ? "pkcs12" : "pem";
+    const id = `preview-mcert-${Date.now()}`;
+    const commonName = clean.startsWith("*.")
+      ? `client.${clean.slice(2)}`
+      : `client@${clean}`;
+    const label = req.label?.trim() || commonName;
+    const expiresAt = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000)
+      .toISOString()
+      .replace(/\.\d{3}Z$/, "Z");
+
+    const entry: ClientCertificateEntry = {
+      id,
+      domainPattern: clean,
+      label,
+      format,
+      storedCertPath: `%APPDATA%\\dev.fluxproxy.desktop\\client_certs\\${id}.${
+        format === "pkcs12" ? ext : "pem"
+      }`,
+      commonName,
+      expiresAt,
+      enabled: req.enabled ?? true,
+    };
+
+    this.clientCertificates = [...this.clientCertificates, entry];
+    this.persistClientCertificates();
+    return { ...entry };
+  }
+
+  toggleClientCertificate(
+    id: string,
+    enabled: boolean
+  ): ClientCertificateEntry {
+    const idx = this.clientCertificates.findIndex((c) => c.id === id);
+    if (idx < 0) {
+      throw new Error(`Клиентский сертификат '${id}' не найден.`);
+    }
+    const updated: ClientCertificateEntry = {
+      ...this.clientCertificates[idx],
+      enabled,
+    };
+    this.clientCertificates = this.clientCertificates.map((c, i) =>
+      i === idx ? updated : c
+    );
+    this.persistClientCertificates();
+    return { ...updated };
+  }
+
+  removeClientCertificate(id: string): ClientCertificateEntry[] {
+    this.clientCertificates = this.clientCertificates.filter(
+      (c) => c.id !== id
+    );
+    this.persistClientCertificates();
+    return this.listClientCertificates();
+  }
 }
 
 const previewEngine = new BrowserPreviewEngine();
@@ -2525,6 +2667,48 @@ export const proxyBridge = {
     }
     previewCaTrusted = false;
     return "Preview Mode: Run inside Tauri (`cargo tauri dev`) to remove the Root CA from the OS trust store (`certutil -user -delstore Root` / Keychain).";
+  },
+
+  async listClientCertificates(): Promise<ClientCertificateEntry[]> {
+    if (isTauriRuntime()) {
+      return invoke<ClientCertificateEntry[]>("list_client_certificates");
+    }
+    return previewEngine.listClientCertificates();
+  },
+
+  async addClientCertificate(
+    request: AddClientCertificateInput
+  ): Promise<ClientCertificateEntry> {
+    if (isTauriRuntime()) {
+      return invoke<ClientCertificateEntry>("add_client_certificate", {
+        request,
+      });
+    }
+    return previewEngine.addClientCertificate(request);
+  },
+
+  async toggleClientCertificate(
+    id: string,
+    enabled: boolean
+  ): Promise<ClientCertificateEntry> {
+    if (isTauriRuntime()) {
+      return invoke<ClientCertificateEntry>("toggle_client_certificate", {
+        id,
+        enabled,
+      });
+    }
+    return previewEngine.toggleClientCertificate(id, enabled);
+  },
+
+  async removeClientCertificate(
+    id: string
+  ): Promise<ClientCertificateEntry[]> {
+    if (isTauriRuntime()) {
+      return invoke<ClientCertificateEntry[]>("remove_client_certificate", {
+        id,
+      });
+    }
+    return previewEngine.removeClientCertificate(id);
   },
 
   async listRules(): Promise<AutoResponderRule[]> {

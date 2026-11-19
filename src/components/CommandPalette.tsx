@@ -18,6 +18,7 @@ interface CommandPaletteProps {
   onQuickOpenJwt?: (token: string) => void;
   onQuickOpenSanitizedExport?: () => void;
   onQuickOpenProxyDoctor?: () => void;
+  onQuickOpenClientCerts?: () => void;
 }
 
 export const CommandPalette: React.FC<CommandPaletteProps> = ({
@@ -28,6 +29,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   onQuickOpenJwt,
   onQuickOpenSanitizedExport,
   onQuickOpenProxyDoctor,
+  onQuickOpenClientCerts,
 }) => {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -117,6 +119,24 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       });
     }
 
+    if (
+      onQuickOpenClientCerts &&
+      (q === "mtls" ||
+        q.startsWith("mtls ") ||
+        q.startsWith("client cert") ||
+        q === "p12" ||
+        q === "pfx")
+    ) {
+      dynamicQuickExec.push({
+        id: "quickexec-client-certs",
+        category: "TLS / mTLS",
+        label:
+          "Client Certificates… (mTLS хранилище .p12 / .pfx / .pem и маски доменов)",
+        shortcut: "Ctrl+Shift+C",
+        perform: () => onQuickOpenClientCerts(),
+      });
+    }
+
     const matchedStatic = commands.filter(
       (c) =>
         c.id.toLowerCase().includes(q) ||
@@ -133,6 +153,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     onQuickOpenJwt,
     onQuickOpenSanitizedExport,
     onQuickOpenProxyDoctor,
+    onQuickOpenClientCerts,
   ]);
 
   useEffect(() => {

@@ -108,6 +108,7 @@ interface MenuBarProps {
   onOpenCompressionCodec: () => void;
   onOpenMobileSetup: () => void;
   onOpenCertificates: () => void;
+  onOpenClientCertificates: () => void;
   onGenerateStress10k: () => void;
   // Help
   onOpenCommandPalette: () => void;
@@ -344,6 +345,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onOpenCompressionCodec,
   onOpenMobileSetup,
   onOpenCertificates,
+  onOpenClientCertificates,
   onGenerateStress10k,
   onOpenCommandPalette,
   onOpenShortcutsModal,
@@ -1835,6 +1837,15 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 onClick={(e) => activateCommand(e, onOpenCertificates)}
               >
                 <span>HTTPS Root CA Certificate…</span>
+              </button>
+              <button
+                type="button"
+                onClick={(e) => activateCommand(e, onOpenClientCertificates)}
+              >
+                <span>Client Certificates…</span>
+                <span className="hint" aria-hidden="true">
+                  Ctrl+Shift+C
+                </span>
               </button>
               <hr />
               <button

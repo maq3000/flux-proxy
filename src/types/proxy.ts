@@ -275,6 +275,28 @@ export interface CaCertificateInfo {
   isTrusted?: boolean;
 }
 
+export type ClientCertificateFormat = "pkcs12" | "pem";
+
+export interface ClientCertificateEntry {
+  id: string;
+  domainPattern: string;
+  label: string;
+  format: ClientCertificateFormat;
+  storedCertPath: string;
+  commonName: string;
+  expiresAt: string;
+  enabled: boolean;
+}
+
+export interface AddClientCertificateInput {
+  domainPattern: string;
+  label?: string | null;
+  certPath: string;
+  keyPath?: string | null;
+  password?: string | null;
+  enabled?: boolean;
+}
+
 export type DoctorCheckStatus = "ok" | "warning" | "error";
 
 export interface DoctorCheckResult {

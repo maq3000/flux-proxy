@@ -8,6 +8,7 @@ use tauri::Manager;
 
 use crate::commands::AppState;
 use crate::proxy::ca::CertificateAuthority;
+use crate::proxy::client_certs::ClientCertificateStore;
 use crate::proxy::filters::ProxyFilterEngine;
 use crate::proxy::rules::RuleEngine;
 use crate::proxy::server::ProxyEngineController;
@@ -46,6 +47,10 @@ pub fn run() {
                 TrafficStore::new(app_data_dir.join("sessions.sqlite"))
                     .expect("Failed to initialize SQLite TrafficStore"),
             );
+            let client_certs = Arc::new(
+                ClientCertificateStore::init_or_load(&app_data_dir)
+                    .expect("Failed to initialize ClientCertificateStore"),
+            );
 
             let controller = Arc::new(
                 ProxyEngineController::new(
@@ -54,6 +59,7 @@ pub fn run() {
                     filters,
                     store,
                     sysproxy,
+                    client_certs,
                     app.handle().clone(),
                 )
                 .expect("Failed to create ProxyEngineController"),
@@ -106,6 +112,10 @@ pub fn run() {
             commands::get_ca_info,
             commands::install_root_ca,
             commands::uninstall_root_ca,
+            commands::list_client_certificates,
+            commands::add_client_certificate,
+            commands::toggle_client_certificate,
+            commands::remove_client_certificate,
             commands::list_rules,
             commands::upsert_rule,
             commands::delete_rule,
