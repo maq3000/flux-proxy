@@ -1,6 +1,22 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useId, useMemo, useRef, useState } from "react";
 import Editor from "@monaco-editor/react";
-import { AlertTriangle, Loader2, Plus, Send, Trash2, UploadCloud, X } from "lucide-react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Code2,
+  Loader2,
+  Plus,
+  Send,
+  Terminal,
+  Trash2,
+  UploadCloud,
+  X,
+} from "lucide-react";
+import {
+  isCurlCommand,
+  parseCurlCommand,
+  type ParsedCurlResult,
+} from "../lib/curlParser";
 import { formatBytes, formatDuration, tryFormatJson } from "../lib/formatters";
 import { getMonacoThemeName } from "../lib/monaco";
 import { proxyBridge } from "../lib/tauriBridge";
@@ -15,6 +31,8 @@ interface ComposerPanelProps {
   resolvedTheme: "dark" | "light";
   onLoadSessionIntoComposer: (sessionId: number) => void;
   onSessionCreated: (detail: SessionDetail) => void;
+  onGenerateCode?: (request: ComposedRequest) => void;
+  onNotify?: (msg: string) => void;
 }
 
 const HTTP_METHODS = [
@@ -32,7 +50,13 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
   resolvedTheme,
   onLoadSessionIntoComposer,
   onSessionCreated,
+  onGenerateCode,
+  onNotify,
 }) => {
+  const curlDialogRef = useRef<HTMLDialogElement>(null);
+  const curlTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const curlTitleId = useId();
+
   const [method, setMethod] = useState("POST");
   const [url, setUrl] = useState("https://auth.internal.corp/oauth2/token");
   const [headers, setHeaders] = useState<HeaderPair[]>([
@@ -56,6 +80,68 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [lastResponse, setLastResponse] = useState<SessionDetail | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
+
+  const [curlModalOpen, setCurlModalOpen] = useState(false);
+  const [curlInput, setCurlInput] = useState("");
+
+  const methodOptions = useMemo(
+    () => (HTTP_METHODS.includes(method) ? HTTP_METHODS : [...HTTP_METHODS, method]),
+    [method]
+  );
+
+  const parsedCurlPreview = useMemo(
+    () => (curlInput.trim().length > 0 ? parseCurlCommand(curlInput) : null),
+    [curlInput]
+  );
+
+  useEffect(() => {
+    const dialog = curlDialogRef.current;
+    if (!dialog) return;
+
+    if (curlModalOpen) {
+      if (!dialog.open) {
+        dialog.showModal();
+      }
+      window.requestAnimationFrame(() => {
+        curlTextareaRef.current?.focus();
+      });
+    } else if (dialog.open) {
+      dialog.close();
+    }
+  }, [curlModalOpen]);
+
+  // Light-dismiss pointer-bounds fallback when `<dialog closedby="any">` is not natively supported
+  useEffect(() => {
+    const dialog = curlDialogRef.current;
+    if (!dialog || "closedBy" in HTMLDialogElement.prototype) return;
+
+    const isOutside = (e: PointerEvent) => {
+      const r = dialog.getBoundingClientRect();
+      return (
+        e.clientX < r.left ||
+        e.clientX > r.right ||
+        e.clientY < r.top ||
+        e.clientY > r.bottom
+      );
+    };
+
+    let pressedOutside = false;
+    const onDown = (e: PointerEvent) => {
+      pressedOutside = isOutside(e);
+    };
+    const onUp = (e: PointerEvent) => {
+      if (pressedOutside && isOutside(e)) {
+        dialog.close();
+      }
+    };
+
+    dialog.addEventListener("pointerdown", onDown);
+    dialog.addEventListener("pointerup", onUp);
+    return () => {
+      dialog.removeEventListener("pointerdown", onDown);
+      dialog.removeEventListener("pointerup", onUp);
+    };
+  }, []);
 
   useEffect(() => {
     if (!draftRequest) return;
@@ -87,6 +173,65 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
     if (!Number.isNaN(parsed) && parsed > 0) {
       onLoadSessionIntoComposer(parsed);
     }
+  };
+
+  const applyParsedCurlResult = (
+    parsed: ParsedCurlResult,
+    sourceHint?: string
+  ) => {
+    setMethod(parsed.request.method);
+    setUrl(parsed.request.url);
+    setHeaders(parsed.request.headers);
+    setBody(parsed.request.body);
+    setFollowRedirects(parsed.request.followRedirects);
+    setErrorMessage(null);
+
+    if (parsed.request.body.trim().length > 0) {
+      setActiveTab("body");
+    } else if (parsed.request.headers.length > 0) {
+      setActiveTab("headers");
+    }
+
+    const warnNote =
+      parsed.warnings.length > 0
+        ? ` (предупреждений: ${parsed.warnings.length})`
+        : "";
+    onNotify?.(
+      `Импортирован cURL${sourceHint ? ` (${sourceHint})` : ""}: ${parsed.request.method} ${parsed.request.url} • заголовков: ${parsed.request.headers.length}${warnNote}`
+    );
+  };
+
+  const handleUrlPaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
+    const pasted = e.clipboardData.getData("text");
+    if (!isCurlCommand(pasted)) return;
+
+    e.preventDefault();
+    const outcome = parseCurlCommand(pasted);
+    if (!outcome.ok) {
+      setErrorMessage(`Не удалось разобрать cURL: ${outcome.error}`);
+      return;
+    }
+    applyParsedCurlResult(outcome.result, "вставка в URL");
+  };
+
+  const handleImportCurlSubmit = (e?: React.FormEvent) => {
+    e?.preventDefault();
+    const outcome = parseCurlCommand(curlInput);
+    if (!outcome.ok) return;
+    applyParsedCurlResult(outcome.result);
+    setCurlModalOpen(false);
+    setCurlInput("");
+  };
+
+  const handleGenerateCodeClick = () => {
+    if (!url.trim() || !onGenerateCode) return;
+    onGenerateCode({
+      method,
+      url: url.trim(),
+      headers: headers.filter((h) => h.name.trim().length > 0),
+      body,
+      followRedirects,
+    });
   };
 
   const handleExecute = async (e: React.FormEvent) => {
@@ -140,25 +285,50 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
       )}
 
       {/* Composer Header */}
-      <div className="flex h-9 shrink-0 items-center justify-between border-b border-hairline bg-elevated/60 px-3">
+      <div className="flex min-h-9 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-hairline bg-elevated/60 px-3 py-1">
         <div className="flex items-center gap-2">
           <span className="font-mono text-xs font-semibold text-fg">
             Request Composer
           </span>
-          <span className="rounded bg-sky-500/10 px-1.5 py-0.5 text-[10px] text-sky-400">
+          <span className="hidden rounded bg-sky-500/10 px-1.5 py-0.5 text-[10px] text-sky-400 sm:inline">
             Drag & Drop enabled
           </span>
         </div>
 
-        <label className="flex items-center gap-1.5 text-xs text-muted">
-          <input
-            type="checkbox"
-            checked={followRedirects}
-            onChange={(e) => setFollowRedirects(e.target.checked)}
-            className="rounded"
-          />
-          <span>Follow redirects</span>
-        </label>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setCurlModalOpen(true)}
+            title="Вставить или импортировать команду cURL (Bash / Windows cmd / PowerShell)"
+            className="inline-flex h-6 items-center gap-1 rounded border border-hairline bg-surface px-2 text-[11px] font-medium text-fg transition-colors hover:border-strong hover:bg-hover"
+          >
+            <Terminal className="h-3 w-3 text-sky-400" aria-hidden="true" />
+            <span>Import cURL</span>
+          </button>
+
+          {onGenerateCode && (
+            <button
+              type="button"
+              disabled={!url.trim()}
+              onClick={handleGenerateCodeClick}
+              title="Сгенерировать клиентский код для текущего запроса (JS / Python / Go / Rust / cURL)"
+              className="inline-flex h-6 items-center gap-1 rounded border border-hairline bg-surface px-2 text-[11px] font-medium text-fg transition-colors hover:border-strong hover:bg-hover disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              <Code2 className="h-3 w-3 text-accent" aria-hidden="true" />
+              <span>Generate Client Code…</span>
+            </button>
+          )}
+
+          <label className="flex items-center gap-1.5 text-xs text-muted">
+            <input
+              type="checkbox"
+              checked={followRedirects}
+              onChange={(e) => setFollowRedirects(e.target.checked)}
+              className="rounded"
+            />
+            <span>Follow redirects</span>
+          </label>
+        </div>
       </div>
 
       {/* URL & Method Bar */}
@@ -172,7 +342,7 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
           aria-label="HTTP Method"
           className="h-8 rounded-md border border-strong bg-canvas px-2 font-mono text-xs font-bold text-sky-400 focus:border-sky-500 focus:outline-none"
         >
-          {HTTP_METHODS.map((m) => (
+          {methodOptions.map((m) => (
             <option key={m} value={m}>
               {m}
             </option>
@@ -184,7 +354,8 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
           required
           value={url}
           onChange={(e) => setUrl(e.target.value)}
-          placeholder="https://api.example.com/v1/resource"
+          onPaste={handleUrlPaste}
+          placeholder="https://api.example.com/v1/resource (или вставьте curl ...)"
           aria-label="Target Request URL"
           className="h-8 flex-1 rounded-md border border-strong bg-canvas px-2.5 font-mono text-xs text-fg focus:border-sky-500 focus:outline-none"
         />
@@ -384,6 +555,141 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
           </div>
         </div>
       )}
+
+      {/* Import cURL Dialog */}
+      <dialog
+        ref={curlDialogRef}
+        aria-labelledby={curlTitleId}
+        onClose={() => {
+          if (curlDialogRef.current) {
+            curlDialogRef.current.returnValue = "";
+          }
+          setCurlModalOpen(false);
+        }}
+        {...({ closedby: "any" } as Record<string, string>)}
+        className="m-auto w-[92vw] max-w-2xl overflow-hidden rounded-xl border border-strong bg-surface p-0 text-fg shadow-2xl open:flex open:flex-col"
+      >
+        <div className="flex items-center justify-between border-b border-hairline bg-elevated/70 px-4 py-3">
+          <div className="flex items-center gap-2">
+            <Terminal className="h-4 w-4 text-sky-400" aria-hidden="true" />
+            <h2 id={curlTitleId} className="text-sm font-semibold text-fg">
+              Import cURL Command
+            </h2>
+          </div>
+          <button
+            type="button"
+            onClick={() => curlDialogRef.current?.close()}
+            aria-label="Закрыть импорт cURL"
+            className="rounded p-1 text-muted hover:bg-hover hover:text-fg"
+          >
+            <X className="h-4 w-4" aria-hidden="true" />
+          </button>
+        </div>
+
+        <form onSubmit={handleImportCurlSubmit} className="space-y-3 p-4 text-xs">
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between">
+              <label
+                htmlFor={`${curlTitleId}-input`}
+                className="text-[11px] font-semibold uppercase tracking-wider text-subtle"
+              >
+                Команда cURL (Bash, Windows cmd ^, ANSI-C $&apos;...&apos;)
+              </label>
+              <span className="text-[11px] text-muted">
+                Ctrl+Enter — импортировать
+              </span>
+            </div>
+            <textarea
+              ref={curlTextareaRef}
+              id={`${curlTitleId}-input`}
+              value={curlInput}
+              onChange={(e) => setCurlInput(e.target.value)}
+              onKeyDown={(e) => {
+                if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+                  e.preventDefault();
+                  handleImportCurlSubmit();
+                }
+              }}
+              rows={8}
+              autoFocus
+              {...({ autofocus: "" } as Record<string, string>)}
+              placeholder={`curl -X POST 'https://api.example.com/v1/items' \\\n  -H 'Authorization: Bearer token' \\\n  --json '{"name":"demo"}'`}
+              className="w-full resize-y rounded-lg border border-strong bg-canvas p-3 font-mono text-xs text-fg placeholder:text-subtle focus:border-sky-500 focus:outline-none"
+            />
+          </div>
+
+          {parsedCurlPreview && parsedCurlPreview.ok && (
+            <div className="space-y-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-2.5">
+              <div className="flex items-center gap-2 font-mono text-[11px]">
+                <CheckCircle2
+                  className="h-3.5 w-3.5 shrink-0 text-emerald-400"
+                  aria-hidden="true"
+                />
+                <span className="rounded bg-sky-500/20 px-1.5 py-0.5 font-bold text-sky-300">
+                  {parsedCurlPreview.result.request.method}
+                </span>
+                <span
+                  className="truncate text-fg"
+                  title={parsedCurlPreview.result.request.url}
+                >
+                  {parsedCurlPreview.result.request.url}
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 pl-5 font-mono text-[11px] text-muted">
+                <span>
+                  Headers: {parsedCurlPreview.result.request.headers.length}
+                </span>
+                <span>
+                  Body:{" "}
+                  {formatBytes(
+                    new TextEncoder().encode(
+                      parsedCurlPreview.result.request.body
+                    ).length
+                  )}
+                </span>
+              </div>
+              {parsedCurlPreview.result.warnings.length > 0 && (
+                <ul className="space-y-0.5 pl-5 text-[11px] text-amber-300">
+                  {parsedCurlPreview.result.warnings.map((w, idx) => (
+                    <li key={idx}>• {w}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+
+          {parsedCurlPreview && !parsedCurlPreview.ok && (
+            <div
+              role="alert"
+              className="flex items-start gap-2 rounded-lg border border-status5xx-fg/35 bg-status5xx-bg p-2.5 text-[11px] text-status5xx-fg"
+            >
+              <AlertTriangle
+                className="mt-0.5 h-3.5 w-3.5 shrink-0"
+                aria-hidden="true"
+              />
+              <span>{parsedCurlPreview.error}</span>
+            </div>
+          )}
+
+          <div className="flex items-center justify-end gap-2 border-t border-hairline pt-3">
+            <button
+              type="button"
+              onClick={() => curlDialogRef.current?.close()}
+              className="rounded border border-strong bg-surface px-3 py-1.5 text-xs font-medium text-fg hover:bg-hover"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={!parsedCurlPreview || !parsedCurlPreview.ok}
+              className="inline-flex items-center gap-1.5 rounded bg-sky-600 px-3.5 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              <Terminal className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Import into Composer</span>
+            </button>
+          </div>
+        </form>
+      </dialog>
     </div>
   );
 };

@@ -13,6 +13,7 @@ import {
 } from "./components/BreakpointModal";
 import { CertificateModal } from "./components/CertificateModal";
 import { ClientCertificatesModal } from "./components/ClientCertificatesModal";
+import { CodeSnippetModal } from "./components/CodeSnippetModal";
 import {
   CommandPalette,
   type PaletteCommand,
@@ -51,6 +52,11 @@ import {
   readPersistedPanelLayouts,
   useUiPreferences,
 } from "./hooks/useUiPreferences";
+import {
+  requestFromComposedRequest,
+  requestFromSessionDetail,
+  type CodeGenRequest,
+} from "./lib/codeGenerators";
 import { buildCurlCommand, buildHeadersBlock } from "./lib/formatters";
 import { DEFAULT_PYTHON_SCRIPT_CODE } from "./lib/mockTraffic";
 import {
@@ -296,6 +302,9 @@ export const App: React.FC = () => {
   const [annotationTargetIds, setAnnotationTargetIds] = useState<number[]>([]);
   const [diffModalOpen, setDiffModalOpen] = useState(false);
   const [inlineDiffDismissed, setInlineDiffDismissed] = useState(false);
+  const [codeSnippetModalOpen, setCodeSnippetModalOpen] = useState(false);
+  const [codeSnippetRequest, setCodeSnippetRequest] =
+    useState<CodeGenRequest | null>(null);
 
   // Drag-and-Drop Archive & Settings Profile Import (.har, .saz, .json) State
   const [fileDropActive, setFileDropActive] = useState(false);
@@ -1231,6 +1240,44 @@ export const App: React.FC = () => {
     [showToast]
   );
 
+  const openCodeGeneratorForSession = useCallback(
+    async (sessionId: number) => {
+      let detail = await proxyBridge.getSessionDetail(sessionId);
+      if (!detail) {
+        showToast(`Не удалось загрузить данные сессии #${sessionId}`);
+        return;
+      }
+      if (detail.requestBodyOffloaded) {
+        try {
+          const loaded = await proxyBridge.loadSessionBody(sessionId, false);
+          detail = {
+            ...detail,
+            requestBodyBase64: loaded.bodyBase64,
+            requestBodyText: loaded.bodyText,
+            requestBodyOffloaded: false,
+          };
+        } catch {
+          // Proceed with headers/URL if offloaded body cannot be retrieved
+        }
+      }
+      setCodeSnippetRequest(requestFromSessionDetail(detail));
+      setCodeSnippetModalOpen(true);
+    },
+    [showToast]
+  );
+
+  const openCodeGeneratorForComposerDraft = useCallback(
+    (draft: ComposedRequest) => {
+      if (!draft.url.trim()) {
+        showToast("Укажите URL запроса для генерации клиентского кода");
+        return;
+      }
+      setCodeSnippetRequest(requestFromComposedRequest(draft));
+      setCodeSnippetModalOpen(true);
+    },
+    [showToast]
+  );
+
   const copySessionHeaders = useCallback(
     async (sessionId: number, kind: "request" | "response") => {
       const detail = await proxyBridge.getSessionDetail(sessionId);
@@ -1838,6 +1885,33 @@ export const App: React.FC = () => {
         },
       },
       {
+        id: "generate-client-code",
+        category: "Traffic",
+        label: "Generate Client Code… (JavaScript, Python, Go, Rust, cURL)",
+        keywords: [
+          "code",
+          "snippet",
+          "fetch",
+          "axios",
+          "python",
+          "requests",
+          "httpx",
+          "go",
+          "rust",
+          "reqwest",
+          "curl",
+          "генератор",
+        ],
+        perform: () => {
+          const targetId = selectedId ?? effectiveSelectedIds[0] ?? null;
+          if (targetId !== null) {
+            void openCodeGeneratorForSession(targetId);
+          } else {
+            showToast("Сначала выберите сессию в таблице");
+          }
+        },
+      },
+      {
         id: "open-session-diff",
         category: "Session Diff",
         label:
@@ -2361,6 +2435,7 @@ export const App: React.FC = () => {
       loadFromSqlite,
       openAnnotationFor,
       openBreakpointsAt,
+      openCodeGeneratorForSession,
       openDiffWithPairSmart,
       openFilterDrawerAt,
       openPreferencesAt,
@@ -2449,6 +2524,7 @@ export const App: React.FC = () => {
       onUnmarkSessions={(ids) => void unmarkSessions(ids)}
       onCopyUrl={copyUrlsForIds}
       onCopyCurl={(id) => void copySessionAsCurl(id)}
+      onGenerateClientCode={(id) => void openCodeGeneratorForSession(id)}
       onCopyHeaders={(id, kind) => void copySessionHeaders(id, kind)}
       onCompareWithSession={(id) => {
         setInlineDiffDismissed(false);
@@ -2578,6 +2654,10 @@ export const App: React.FC = () => {
         onCopyUrl={() => copyUrlsForIds(effectiveSelectedIds)}
         onCopyCurl={() => {
           if (selectedId !== null) void copySessionAsCurl(selectedId);
+        }}
+        onGenerateClientCode={() => {
+          const id = selectedId ?? effectiveSelectedIds[0] ?? null;
+          if (id !== null) void openCodeGeneratorForSession(id);
         }}
         onCopyRequestHeaders={() => {
           if (selectedId !== null) void copySessionHeaders(selectedId, "request");
@@ -2887,6 +2967,8 @@ export const App: React.FC = () => {
                         onSessionCreated={(detail) =>
                           setSelectedId(detail.summary.id)
                         }
+                        onGenerateCode={openCodeGeneratorForComposerDraft}
+                        onNotify={showToast}
                       />
                     </Panel>
                   </>
@@ -2960,6 +3042,8 @@ export const App: React.FC = () => {
                         onSessionCreated={(detail) =>
                           setSelectedId(detail.summary.id)
                         }
+                        onGenerateCode={openCodeGeneratorForComposerDraft}
+                        onNotify={showToast}
                       />
                     </Panel>
                   </>
@@ -2975,6 +3059,8 @@ export const App: React.FC = () => {
                   void loadSessionIntoComposer(id, true)
                 }
                 onSessionCreated={(detail) => setSelectedId(detail.summary.id)}
+                onGenerateCode={openCodeGeneratorForComposerDraft}
+                onNotify={showToast}
               />
             )}
 
@@ -3447,6 +3533,14 @@ export const App: React.FC = () => {
         selectedIds={effectiveSelectedIds}
         onClose={() => setSanitizedExportModalOpen(false)}
         onExport={exportSanitizedSessions}
+      />
+
+      <CodeSnippetModal
+        open={codeSnippetModalOpen}
+        request={codeSnippetRequest}
+        resolvedTheme={resolvedTheme}
+        onClose={() => setCodeSnippetModalOpen(false)}
+        onNotify={showToast}
       />
 
       <CommandPalette

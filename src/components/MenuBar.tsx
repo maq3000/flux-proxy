@@ -49,6 +49,7 @@ interface MenuBarProps {
   onSelectAllSessions?: () => void;
   onCopyUrl: () => void;
   onCopyCurl: () => void;
+  onGenerateClientCode: () => void;
   onCopyRequestHeaders: () => void;
   onCopyResponseHeaders: () => void;
   onAnnotateSelected: () => void;
@@ -289,6 +290,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onSelectAllSessions,
   onCopyUrl,
   onCopyCurl,
+  onGenerateClientCode,
   onCopyRequestHeaders,
   onCopyResponseHeaders,
   onAnnotateSelected,
@@ -1119,6 +1121,13 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 onClick={(e) => activateCommand(e, onCopyCurl)}
               >
                 <span>Copy as cURL</span>
+              </button>
+              <button
+                type="button"
+                disabled={!hasSelection}
+                onClick={(e) => activateCommand(e, onGenerateClientCode)}
+              >
+                <span>Generate Client Code…</span>
               </button>
               <button
                 type="button"

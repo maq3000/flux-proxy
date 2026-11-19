@@ -3,6 +3,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Archive,
   ArrowLeftRight,
+  Code2,
   Copy,
   Download,
   Eraser,
@@ -62,6 +63,7 @@ interface TrafficGridProps {
   onUnmarkSessions: (ids: number[]) => void;
   onCopyUrl: (ids: number[]) => void;
   onCopyCurl: (id: number) => void;
+  onGenerateClientCode?: (id: number) => void;
   onCopyHeaders: (id: number, kind: "request" | "response") => void;
   onCompareWithSession: (id: number) => void;
   onSwapCompare: () => void;
@@ -345,6 +347,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
   onUnmarkSessions,
   onCopyUrl,
   onCopyCurl,
+  onGenerateClientCode,
   onCopyHeaders,
   onCompareWithSession,
   onSwapCompare,
@@ -1766,6 +1769,19 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
             >
               <Terminal className="h-3.5 w-3.5 shrink-0 text-muted" />
               <span className="truncate">Copy as cURL</span>
+            </button>
+          )}
+
+          {ctxSession && onGenerateClientCode && (
+            <button
+              type="button"
+              onClick={() => {
+                closeContextMenu();
+                onGenerateClientCode(ctxSession.id);
+              }}
+            >
+              <Code2 className="h-3.5 w-3.5 shrink-0 text-accent" />
+              <span className="truncate">Generate Client Code…</span>
             </button>
           )}
 
