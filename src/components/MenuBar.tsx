@@ -1287,6 +1287,17 @@ export const MenuBar: React.FC<MenuBarProps> = ({
               </button>
               <button
                 type="button"
+                onClick={(e) =>
+                  activateCommand(e, () => onSelectSection("scripts"))
+                }
+              >
+                <span>Python Scripting Engine (on_request / on_response)…</span>
+                <span className="hint" aria-hidden="true">
+                  Alt+5
+                </span>
+              </button>
+              <button
+                type="button"
                 onClick={(e) => activateCommand(e, onOpenHostsListDrawer)}
               >
                 <span>Hosts List (Whitelist / Blacklist)…</span>
@@ -1598,6 +1609,19 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                   <span>AutoResponder</span>
                   <span className="hint" aria-hidden="true">
                     Alt+3
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={activeSection === "scripts"}
+                  onClick={(e) =>
+                    activateCommand(e, () => onSelectSection("scripts"))
+                  }
+                >
+                  <span>Python Scripting Engine</span>
+                  <span className="hint" aria-hidden="true">
+                    Alt+5
                   </span>
                 </button>
               </div>

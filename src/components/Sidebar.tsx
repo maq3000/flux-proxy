@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import {
   Activity,
   Command,
+  FileCode2,
   GitCompareArrows,
   ListFilter,
   Moon,
@@ -36,6 +37,7 @@ interface SidebarProps {
   resolvedTheme: "dark" | "light";
   onToggleTheme: () => void;
   activeRulesCount: number;
+  pythonScriptEnabled?: boolean;
   onCollapseSidebar?: () => void;
 }
 
@@ -59,6 +61,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   resolvedTheme,
   onToggleTheme,
   activeRulesCount,
+  pythonScriptEnabled = false,
   onCollapseSidebar,
 }) => {
   const [composerDragOver, setComposerDragOver] = useState(false);
@@ -165,6 +168,26 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-status3xx-bg px-1 font-mono text-[9px] font-bold text-status3xx-fg ring-1 ring-status3xx-fg/40">
               {activeFilterCount}
             </span>
+          )}
+        </button>
+
+        {/* Python Scripting Engine (on_request / on_response) */}
+        <button
+          type="button"
+          onClick={() => onSelectSection("scripts")}
+          title="Python Scripting Engine — on_request / on_response (Alt+5)"
+          className={`group relative flex h-8 w-8 items-center justify-center rounded-md transition-colors ${
+            activeSection === "scripts"
+              ? "bg-elevated text-accent ring-1 ring-strong"
+              : "text-muted hover:bg-hover hover:text-fg"
+          }`}
+        >
+          <FileCode2 className="h-4 w-4" />
+          {pythonScriptEnabled && (
+            <span
+              aria-hidden="true"
+              className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-status2xx-fg"
+            />
           )}
         </button>
 

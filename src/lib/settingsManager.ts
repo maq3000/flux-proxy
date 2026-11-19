@@ -37,7 +37,9 @@ import {
 import {
   DEFAULT_AUTORESPONDER_RULES,
   DEFAULT_CLEAR_DB_ON_EXIT,
+  DEFAULT_PYTHON_SCRIPT_CODE,
   PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
+  PREVIEW_PYTHON_SCRIPT_STORAGE_KEY,
   PREVIEW_SANITIZATION_OPTIONS_STORAGE_KEY,
 } from "./mockTraffic";
 import { DEFAULT_BREAKPOINT_CONFIG, proxyBridge } from "./tauriBridge";
@@ -83,6 +85,7 @@ import {
   DEFAULT_SETTINGS_EXPORT_FILENAME,
   PROXY_STATUS_SYNCED_EVENT,
   SETTINGS_APPLIED_EVENT,
+  type FluxUserScriptingSettings,
   type FluxUserSettingsProfile,
   type SettingsImportPreviewSummary,
   type SettingsProfileValidationReport,
@@ -114,6 +117,7 @@ export const SETTINGS_STORAGE_KEYS = {
   dropNonMatching: "fluxproxy.dropNonMatching.v1",
   clearDbOnExit: PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
   sanitizationOptions: PREVIEW_SANITIZATION_OPTIONS_STORAGE_KEY,
+  pythonScript: PREVIEW_PYTHON_SCRIPT_STORAGE_KEY,
 } as const;
 
 const VALID_THEMES = new Set<ThemePreference>(["dark", "light", "system"]);
@@ -192,6 +196,7 @@ const RECOGNIZED_PROFILE_TOP_KEYS = new Set<string>([
   "autoResponder",
   "breakpoints",
   "breakpointConfig",
+  "scripting",
   // Legacy v0 keys supported by migration chain
   "version",
   "theme",
@@ -300,6 +305,11 @@ export function createDefaultSettingsProfile(): FluxUserSettingsProfile {
       rules: structuredClone(DEFAULT_AUTORESPONDER_RULES),
     },
     breakpoints: structuredClone(DEFAULT_BREAKPOINT_CONFIG),
+    scripting: {
+      enabled: false,
+      code: DEFAULT_PYTHON_SCRIPT_CODE,
+      activePresetId: "hmac-header-injection",
+    },
   };
 }
 
@@ -459,6 +469,7 @@ const SCHEMA_MIGRATIONS: Record<number, SchemaMigrationFn> = {
       proxy,
       autoResponder,
       ...(breakpoints !== undefined ? { breakpoints } : {}),
+      ...(draft.scripting !== undefined ? { scripting: draft.scripting } : {}),
     };
   },
 };
@@ -1024,6 +1035,49 @@ function sanitizeBreakpointConfig(
       warnings
     ),
     rules,
+  };
+}
+
+function sanitizeScriptingSettings(
+  raw: unknown,
+  warnings: string[]
+): FluxUserScriptingSettings {
+  const def: FluxUserScriptingSettings = {
+    enabled: false,
+    code: DEFAULT_PYTHON_SCRIPT_CODE,
+    activePresetId: "hmac-header-injection",
+  };
+  if (raw === undefined) {
+    return { ...def };
+  }
+  if (!isPlainObject(raw)) {
+    warnings.push(
+      "Секция «scripting» повреждена — восстановлен скрипт по умолчанию."
+    );
+    return { ...def };
+  }
+  return {
+    enabled: sanitizeBoolean(
+      raw.enabled,
+      def.enabled,
+      "scripting.enabled",
+      warnings
+    ),
+    code:
+      typeof raw.code === "string"
+        ? raw.code
+        : (() => {
+            warnings.push(
+              "Поле «scripting.code» должно быть строкой — восстановлен шаблон по умолчанию."
+            );
+            return def.code;
+          })(),
+    activePresetId:
+      raw.activePresetId === null
+        ? null
+        : typeof raw.activePresetId === "string" && raw.activePresetId.trim()
+          ? raw.activePresetId.trim()
+          : def.activePresetId,
   };
 }
 
@@ -1808,6 +1862,7 @@ export function validateAndMigrateSettingsProfileWithReport(
         : rawProxy.breakpoints,
       warnings
     ),
+    scripting: sanitizeScriptingSettings(workingDraft.scripting, warnings),
   };
 
   return {
@@ -1940,6 +1995,14 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
   const storedBreakpoints = readLocalStorageJson<Partial<BreakpointConfig>>(
     SETTINGS_STORAGE_KEYS.breakpointConfig,
     structuredClone(DEFAULT_BREAKPOINT_CONFIG)
+  );
+  const storedScripting = readLocalStorageJson<Partial<FluxUserScriptingSettings>>(
+    SETTINGS_STORAGE_KEYS.pythonScript,
+    defaults.scripting ?? {
+      enabled: false,
+      code: DEFAULT_PYTHON_SCRIPT_CODE,
+      activePresetId: "hmac-header-injection",
+    }
   );
 
   const live = liveSnapshotGetter ? liveSnapshotGetter() : {};
@@ -2114,6 +2177,21 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
       ...storedBreakpoints,
       ...(live.breakpoints ?? {}),
     }),
+    scripting: {
+      enabled:
+        live.scripting?.enabled ??
+        Boolean(storedScripting.enabled ?? defaults.scripting?.enabled),
+      code:
+        typeof live.scripting?.code === "string"
+          ? live.scripting.code
+          : typeof storedScripting.code === "string"
+            ? storedScripting.code
+            : DEFAULT_PYTHON_SCRIPT_CODE,
+      activePresetId:
+        live.scripting?.activePresetId !== undefined
+          ? live.scripting.activePresetId
+          : (storedScripting.activePresetId ?? "hmac-header-injection"),
+    },
   };
 
   return validateAndMigrateSettingsProfile(mergedCandidate);
@@ -2401,6 +2479,16 @@ function atomicWriteProfileToLocalStorage(
         profile.proxy.sanitizationOptions ?? DEFAULT_SANITIZATION_OPTIONS
       ),
     ],
+    [
+      SETTINGS_STORAGE_KEYS.pythonScript,
+      JSON.stringify(
+        profile.scripting ?? {
+          enabled: false,
+          code: DEFAULT_PYTHON_SCRIPT_CODE,
+          activePresetId: "hmac-header-injection",
+        }
+      ),
+    ],
   ];
 
   // Capture rollback snapshot for atomic recovery if quota is exceeded mid-batch
@@ -2447,9 +2535,18 @@ export async function applySettingsProfile(
   const nextBreakpoints: BreakpointConfig = structuredClone(
     normalized.breakpoints ?? DEFAULT_BREAKPOINT_CONFIG
   );
+  const nextScripting: FluxUserScriptingSettings = {
+    enabled: Boolean(normalized.scripting?.enabled ?? false),
+    code: normalized.scripting?.code ?? DEFAULT_PYTHON_SCRIPT_CODE,
+    activePresetId:
+      normalized.scripting?.activePresetId !== undefined
+        ? normalized.scripting.activePresetId
+        : "hmac-header-injection",
+  };
   const normalizedWithBreakpoints: FluxUserSettingsProfile = {
     ...normalized,
     breakpoints: nextBreakpoints,
+    scripting: nextScripting,
   };
 
   const retentionLimit =
@@ -2472,6 +2569,7 @@ export async function applySettingsProfile(
     prevAutoRespRules,
     prevStats,
     prevClearOnExit,
+    prevPythonScript,
   ] = await Promise.all([
     proxyBridge.getStatus(),
     proxyBridge.getFilterBackendConfig(),
@@ -2480,6 +2578,7 @@ export async function applySettingsProfile(
     proxyBridge.listRules(),
     proxyBridge.getMemoryStorageStats(),
     proxyBridge.getClearDbOnExit(),
+    proxyBridge.getPythonRunnerStatus(),
   ]);
 
   let latestStatus: ProxyStatus = prevStatus;
@@ -2500,6 +2599,7 @@ export async function applySettingsProfile(
       proxyBridge.setSessionRetentionLimit(retentionLimit),
       proxyBridge.setDropNonMatching(dropNonMatching),
       proxyBridge.setClearDbOnExit(clearDbOnExit),
+      proxyBridge.setPythonScript(nextScripting.code, nextScripting.enabled),
     ]);
 
     if (
@@ -2582,6 +2682,10 @@ export async function applySettingsProfile(
       proxyBridge.setSessionRetentionLimit(prevStats.sessionRetentionLimit),
       proxyBridge.setDropNonMatching(prevStats.dropNonMatching),
       proxyBridge.setClearDbOnExit(prevClearOnExit),
+      proxyBridge.setPythonScript(
+        prevPythonScript.code,
+        prevPythonScript.enabled
+      ),
     ]);
     const configLabels = [
       "фильтры прокси",
@@ -2590,6 +2694,7 @@ export async function applySettingsProfile(
       "лимит хранения сессий",
       "dropNonMatching",
       "clearDbOnExit",
+      "Python Scripting",
     ];
     configRollback.forEach((res, idx) => {
       if (res.status === "rejected") {

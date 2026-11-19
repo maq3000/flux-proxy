@@ -72,6 +72,11 @@ const SHORTCUT_GROUPS: {
       { keys: "Ctrl+Shift+D", description: "Запустить диагностический мастер Proxy Doctor" },
       { keys: "Ctrl+E", description: "Открыть Text Wizard & JWT Decoder" },
       {
+        keys: "Alt+1 … Alt+5",
+        description:
+          "Разделы: 1 Traffic, 2 Composer, 3 AutoResponder, 4 Filters, 5 Python Scripts",
+      },
+      {
         keys: "Ctrl+, / Cmd+,",
         description: "Открыть настройки и профиль (Preferences)",
       },

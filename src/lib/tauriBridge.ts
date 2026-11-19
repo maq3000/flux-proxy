@@ -21,7 +21,9 @@ import type {
   PausedBreakpointItem,
   ProxyFilterBackendConfig,
   ProxyStatus,
+  PythonRunnerStatus,
   SanitizationOptions,
+  ScriptConsoleLogEvent,
   SessionDetail,
   SessionSummary,
   StorageStats,
@@ -48,9 +50,11 @@ import {
   buildSimulatedSession,
   DEFAULT_AUTORESPONDER_RULES,
   DEFAULT_CLEAR_DB_ON_EXIT,
+  DEFAULT_PYTHON_SCRIPT_CODE,
   getSimulatedTwoPhaseDelayMs,
   PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
   PREVIEW_CLIENT_CERTS_STORAGE_KEY,
+  PREVIEW_PYTHON_SCRIPT_STORAGE_KEY,
   PREVIEW_SQLITE_ARCHIVE_STORAGE_KEY,
   PREVIEW_SQLITE_COUNT_STORAGE_KEY,
   sanitizeSessionsInPreview,
@@ -184,6 +188,11 @@ class BrowserPreviewEngine {
   private bpListeners = new Set<(items: PausedBreakpointItem[]) => void>();
   private statusListeners = new Set<(status: ProxyStatus) => void>();
   private storageStatsListeners = new Set<(stats: StorageStats) => void>();
+  private scriptLogListeners = new Set<(entry: ScriptConsoleLogEvent) => void>();
+  private scriptEnabled = false;
+  private scriptCode = DEFAULT_PYTHON_SCRIPT_CODE;
+  private scriptInvocationsCount = 0;
+  private nextScriptLogId = 1;
   private timer: number | null = null;
 
   constructor() {
@@ -300,6 +309,23 @@ class BrowserPreviewEngine {
           const parsedCerts = JSON.parse(rawClientCerts);
           if (Array.isArray(parsedCerts)) {
             this.clientCertificates = parsedCerts as ClientCertificateEntry[];
+          }
+        }
+        const rawScript = window.localStorage.getItem(
+          PREVIEW_PYTHON_SCRIPT_STORAGE_KEY
+        );
+        if (rawScript !== null) {
+          const parsedScript = JSON.parse(rawScript) as {
+            enabled?: unknown;
+            code?: unknown;
+          };
+          if (parsedScript && typeof parsedScript === "object") {
+            if (typeof parsedScript.enabled === "boolean") {
+              this.scriptEnabled = parsedScript.enabled;
+            }
+            if (typeof parsedScript.code === "string") {
+              this.scriptCode = parsedScript.code;
+            }
           }
         }
       } catch {
@@ -689,6 +715,23 @@ class BrowserPreviewEngine {
     );
     const id = detail.summary.id;
     let bpModified = false;
+
+    if (
+      this.scriptEnabled &&
+      !detail.summary.tlsBypassed &&
+      detail.summary.scheme !== "wss"
+    ) {
+      const hooks = this.detectScriptHooks(this.scriptCode);
+      if (hooks.hasOnRequest) {
+        this.scriptInvocationsCount += 1;
+        this.emitScriptLog(
+          "info",
+          "on_request",
+          id,
+          `[Simulator] on_request(${detail.summary.method} ${detail.summary.url}) — в Browser Preview Python-раннер не запускается; используйте \`cargo tauri dev\`.`
+        );
+      }
+    }
 
     if (
       !detail.summary.tlsBypassed &&
@@ -2359,6 +2402,90 @@ class BrowserPreviewEngine {
     this.persistClientCertificates();
     return this.listClientCertificates();
   }
+
+  private detectScriptHooks(code: string): {
+    hasOnRequest: boolean;
+    hasOnResponse: boolean;
+  } {
+    return {
+      hasOnRequest: /(?:^|\n)\s*def\s+on_request\s*\(/m.test(code),
+      hasOnResponse: /(?:^|\n)\s*def\s+on_response\s*\(/m.test(code),
+    };
+  }
+
+  private emitScriptLog(
+    level: ScriptConsoleLogEvent["level"],
+    hook: string | null,
+    sessionId: number | null,
+    message: string
+  ): void {
+    const entry: ScriptConsoleLogEvent = {
+      id: this.nextScriptLogId++,
+      timestamp: new Date().toISOString(),
+      level,
+      hook,
+      sessionId,
+      message,
+    };
+    for (const cb of this.scriptLogListeners) {
+      cb(entry);
+    }
+  }
+
+  getPythonRunnerStatus(): PythonRunnerStatus {
+    const hooks = this.detectScriptHooks(this.scriptCode);
+    return {
+      available: false,
+      enabled: this.scriptEnabled,
+      running: this.scriptEnabled,
+      pythonExecutable: null,
+      pythonVersion: "Browser Preview Simulator",
+      workerPid: null,
+      hasOnRequest: this.scriptEnabled && hooks.hasOnRequest,
+      hasOnResponse: this.scriptEnabled && hooks.hasOnResponse,
+      timeoutMs: 1500,
+      lastError: null,
+      restartCount: 0,
+      invocationsCount: this.scriptInvocationsCount,
+      timeoutCount: 0,
+      isSimulator: true,
+      code: this.scriptCode,
+    };
+  }
+
+  setPythonScript(code: string, enabled: boolean): PythonRunnerStatus {
+    this.scriptCode = code;
+    this.scriptEnabled = enabled;
+    if (typeof window !== "undefined") {
+      try {
+        window.localStorage.setItem(
+          PREVIEW_PYTHON_SCRIPT_STORAGE_KEY,
+          JSON.stringify({ enabled, code })
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+    }
+    const status = this.getPythonRunnerStatus();
+    this.emitScriptLog(
+      "info",
+      "load",
+      null,
+      enabled
+        ? `[Simulator] Скрипт сохранён и включён (on_request: ${status.hasOnRequest}, on_response: ${status.hasOnResponse}). Реальный Python-процесс работает в Tauri desktop (\`cargo tauri dev\`).`
+        : "[Simulator] Скрипт сохранён (выполнение отключено)."
+    );
+    return status;
+  }
+
+  subscribeScriptLogs(
+    cb: (entry: ScriptConsoleLogEvent) => void
+  ): () => void {
+    this.scriptLogListeners.add(cb);
+    return () => {
+      this.scriptLogListeners.delete(cb);
+    };
+  }
 }
 
 const previewEngine = new BrowserPreviewEngine();
@@ -3171,6 +3298,39 @@ export const proxyBridge = {
         onEvent({ type: "leave" });
       }
     });
+  },
+
+  async setPythonScript(
+    code: string,
+    enabled: boolean
+  ): Promise<PythonRunnerStatus> {
+    if (isTauriRuntime()) {
+      return invoke<PythonRunnerStatus>("set_python_script", { code, enabled });
+    }
+    return previewEngine.setPythonScript(code, enabled);
+  },
+
+  async getPythonRunnerStatus(): Promise<PythonRunnerStatus> {
+    if (isTauriRuntime()) {
+      return invoke<PythonRunnerStatus>("get_python_runner_status");
+    }
+    return previewEngine.getPythonRunnerStatus();
+  },
+
+  async subscribeScriptConsoleLogs(
+    onLog: (entry: ScriptConsoleLogEvent) => void
+  ): Promise<UnlistenFn> {
+    if (isTauriRuntime()) {
+      return listen<ScriptConsoleLogEvent>(
+        "proxy://script-console-log",
+        (event) => {
+          if (event.payload) {
+            onLog(event.payload);
+          }
+        }
+      );
+    }
+    return previewEngine.subscribeScriptLogs(onLog);
   },
 
   async generateStressTestSessions(count = 10_000): Promise<number> {

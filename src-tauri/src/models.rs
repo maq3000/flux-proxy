@@ -525,6 +525,37 @@ impl Default for SanitizationOptions {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PythonRunnerStatus {
+    pub available: bool,
+    pub enabled: bool,
+    pub running: bool,
+    pub python_executable: Option<String>,
+    pub python_version: Option<String>,
+    pub worker_pid: Option<u32>,
+    pub has_on_request: bool,
+    pub has_on_response: bool,
+    pub timeout_ms: u64,
+    pub last_error: Option<String>,
+    pub restart_count: u64,
+    pub invocations_count: u64,
+    pub timeout_count: u64,
+    pub is_simulator: bool,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScriptConsoleLogEvent {
+    pub id: u64,
+    pub timestamp: String,
+    pub level: String,
+    pub hook: Option<String>,
+    pub session_id: Option<u64>,
+    pub message: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
     #[error("I/O error: {0}")]

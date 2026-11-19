@@ -333,7 +333,56 @@ export interface ProxyStatus {
   boundIps?: string[];
 }
 
-export type ActiveNavSection = "traffic" | "composer" | "rules";
+export type ActiveNavSection = "traffic" | "composer" | "rules" | "scripts";
+
+export type ScriptConsoleLogLevel =
+  | "stdout"
+  | "stderr"
+  | "info"
+  | "warn"
+  | "error";
+
+export interface PythonRunnerStatus {
+  available: boolean;
+  enabled: boolean;
+  running: boolean;
+  pythonExecutable: string | null;
+  pythonVersion: string | null;
+  workerPid: number | null;
+  hasOnRequest: boolean;
+  hasOnResponse: boolean;
+  timeoutMs: number;
+  lastError: string | null;
+  restartCount: number;
+  invocationsCount: number;
+  timeoutCount: number;
+  isSimulator: boolean;
+  code: string;
+}
+
+export interface ScriptConsoleLogEvent {
+  id: number;
+  timestamp: string;
+  level: ScriptConsoleLogLevel;
+  hook: string | null;
+  sessionId: number | null;
+  message: string;
+}
+
+export interface PythonScriptPreset {
+  id: string;
+  name: string;
+  badge: string;
+  description: string;
+  hooks: ("on_request" | "on_response")[];
+  code: string;
+}
+
+export interface PythonScriptConfig {
+  enabled: boolean;
+  code: string;
+  activePresetId?: string | null;
+}
 
 export type QuickFilterCategory =
   | "all"

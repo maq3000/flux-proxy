@@ -40,6 +40,10 @@ use crate::proxy::network::{is_host_own_ip, normalize_client_ip};
 use crate::proxy::process::{resolve_client_process_async, ClientProcessInfo};
 use crate::proxy::rules::RuleEngine;
 use crate::proxy::sysproxy::{resolve_sysproxy_host_for_bind, SystemProxyManager};
+use crate::scripting::{
+    apply_header_diff, PythonScriptRunner, ScriptRequestEdits, ScriptRequestOutcome,
+    ScriptResponseOutcome,
+};
 use crate::storage::{TrafficStore, BODY_OFFLOAD_THRESHOLD_BYTES};
 
 const MAX_CAPTURED_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB safety cap per body (> 2 MiB offloaded to SQLite)
@@ -459,6 +463,7 @@ pub struct SharedProxyContext {
     pub upstream_client: reqwest::Client,
     pub upstream_redirect_client: reqwest::Client,
     pub client_certs: Arc<ClientCertificateStore>,
+    pub script_runner: Arc<PythonScriptRunner>,
     pub event_tx: mpsc::UnboundedSender<SessionSummary>,
     pub removed_tx: mpsc::UnboundedSender<Vec<u64>>,
     pub active_port: AtomicU16,
@@ -852,6 +857,7 @@ impl ProxyEngineController {
         let upstream_redirect_client = build_upstream_client(true)?;
 
         let breakpoints = Arc::new(BreakpointEngine::new(Some(bp_tx)));
+        let script_runner = Arc::new(PythonScriptRunner::new(app_handle.clone()));
 
         let initial_port = sysproxy.load_proxy_port_pref();
         let context = Arc::new(SharedProxyContext {
@@ -863,6 +869,7 @@ impl ProxyEngineController {
             upstream_client,
             upstream_redirect_client,
             client_certs,
+            script_runner,
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(initial_port),
@@ -1522,6 +1529,7 @@ impl ProxyEngineController {
         self.context
             .breakpoints
             .resume_all(BreakpointAction::Continue);
+        self.context.script_runner.shutdown_sync();
         {
             let mut guard = self.lock_runtime();
             if let Some(tx) = guard.shutdown_tx.take() {
@@ -2508,7 +2516,7 @@ async fn handle_intercepted_request(
     let mut method_str = req.method().as_str().to_string();
     let req_version = req.version();
     let mut req_headers = extract_hyper_headers(req.headers());
-    let req_mutated = ctx.filters.apply_header_mutations(
+    let mut req_mutated = ctx.filters.apply_header_mutations(
         HeaderMutationDirection::Request,
         &full_url,
         &mut req_headers,
@@ -2732,6 +2740,143 @@ async fn handle_intercepted_request(
             }
             _ => {
                 ctx.breakpoints.remove_expired(&bp_id);
+            }
+        }
+    }
+
+    // 1c. Python Scripting Engine: on_request(request)
+    if ctx.script_runner.should_run_request() {
+        match ctx
+            .script_runner
+            .run_on_request(session_id, &method_str, &full_url, &req_headers, &body_bytes)
+            .await
+        {
+            ScriptRequestOutcome::Unchanged => {}
+            ScriptRequestOutcome::Modified(edits) => {
+                apply_script_request_edits(
+                    edits,
+                    &mut method_str,
+                    &mut full_url,
+                    &mut scheme_str,
+                    &mut host_header,
+                    &mut path_and_query,
+                    &mut req_headers,
+                    &mut body_bytes,
+                    &mut req_mutated,
+                );
+            }
+            ScriptRequestOutcome::MockResponse { edits, mock } => {
+                apply_script_request_edits(
+                    edits,
+                    &mut method_str,
+                    &mut full_url,
+                    &mut scheme_str,
+                    &mut host_header,
+                    &mut path_and_query,
+                    &mut req_headers,
+                    &mut body_bytes,
+                    &mut req_mutated,
+                );
+
+                let mock_bytes = Bytes::from(mock.body);
+                let mut mock_resp_headers = mock.headers;
+                let resp_mutated = ctx.filters.apply_header_mutations(
+                    HeaderMutationDirection::Response,
+                    &full_url,
+                    &mut mock_resp_headers,
+                );
+                let content_type = mock_resp_headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("content-type"))
+                    .map(|h| h.value.clone())
+                    .unwrap_or_else(|| "application/json; charset=utf-8".to_string());
+                let sse_events =
+                    if content_type.to_ascii_lowercase().starts_with("text/event-stream") {
+                        parse_sse_events_from_bytes(&mock_bytes, start.elapsed().as_millis() as u64)
+                    } else {
+                        Vec::new()
+                    };
+
+                let protocol_label = resolve_protocol_label(&scheme_str, alpn, req_version);
+                let duration_ms = start.elapsed().as_millis() as u64;
+                let summary = SessionSummary {
+                    id: session_id,
+                    status: mock.status,
+                    protocol: protocol_label,
+                    scheme: scheme_str.clone(),
+                    method: method_str,
+                    host: host_header,
+                    path: path_and_query,
+                    url: full_url,
+                    content_type,
+                    body_size: mock_bytes.len(),
+                    duration_ms,
+                    timestamp,
+                    is_mocked: true,
+                    matched_rule_id: Some("python-script".to_string()),
+                    error: None,
+                    process_name: client_proc.as_ref().map(|p| p.name.clone()),
+                    process_pid: client_proc.as_ref().map(|p| p.pid),
+                    tls_bypassed: false,
+                    headers_mutated: req_mutated || resp_mutated,
+                    breakpoint_paused: None,
+                    breakpoint_modified: bp_modified,
+                    comment: None,
+                    marked_color: None,
+                    client_ip: Some(normalize_client_ip(client_addr)),
+                };
+
+                let capped_req = &body_bytes[..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
+                let capped_mock = &mock_bytes[..mock_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
+                let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
+                let (resp_b64, resp_txt, resp_offloaded) = encode_inline_or_offload(capped_mock);
+                let detail = SessionDetail {
+                    summary,
+                    request_headers: req_headers,
+                    response_headers: mock_resp_headers.clone(),
+                    request_body_base64: req_b64,
+                    response_body_base64: resp_b64,
+                    request_body_text: req_txt,
+                    response_body_text: resp_txt,
+                    tls_version: if scheme_str == "https" {
+                        Some("TLS 1.3 (MITM Python Mock)".into())
+                    } else {
+                        None
+                    },
+                    client_addr: client_addr.to_string(),
+                    websocket_frames: Vec::new(),
+                    sse_events,
+                    body_offloaded: resp_offloaded,
+                    request_body_offloaded: req_offloaded,
+                };
+
+                record_completed_session(&ctx, detail, Some(capped_req), Some(capped_mock));
+
+                let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
+                let mut resp_builder = Response::builder()
+                    .status(StatusCode::from_u16(mock.status).unwrap_or(StatusCode::OK));
+                for h in &mock_resp_headers {
+                    if !h.name.trim().is_empty()
+                        && !is_hop_by_hop_header(&h.name)
+                        && !h.name.eq_ignore_ascii_case("content-length")
+                        && !(strip_alt_svc && is_alt_svc_header(&h.name))
+                    {
+                        if let (Ok(hn), Ok(hv)) = (
+                            http::HeaderName::from_bytes(h.name.trim().as_bytes()),
+                            http::HeaderValue::from_str(&h.value),
+                        ) {
+                            resp_builder = resp_builder.header(hn, hv);
+                        }
+                    }
+                }
+                return resp_builder
+                    .body(boxed_full(mock_bytes))
+                    .unwrap_or_else(|_| {
+                        plain_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Python script mock build error",
+                        )
+                    });
             }
         }
     }
@@ -3389,6 +3534,52 @@ async fn handle_intercepted_request(
     let (mut resp_bytes, zstd_decompressed) =
         maybe_decompress_zstd(&resp_headers, raw_resp_bytes).await;
     let mut preserve_content_encoding = has_zstd && !zstd_decompressed;
+
+    // 4c-script. Python Scripting Engine: on_response(response)
+    // Explicitly skipped for SSE (`text/event-stream`), media (`video/*`, `audio/*`),
+    // and `206 Partial Content` streams so zero-buffering paths remain untouched.
+    let is_streaming_response = is_sse_stream
+        || final_status == 206
+        || ct_lower.starts_with("video/")
+        || ct_lower.starts_with("audio/");
+    if !is_streaming_response && ctx.script_runner.should_run_response() {
+        if let ScriptResponseOutcome::Modified(edits) = ctx
+            .script_runner
+            .run_on_response(
+                session_id,
+                &method_str,
+                &full_url,
+                final_status,
+                &resp_headers,
+                &resp_bytes,
+            )
+            .await
+        {
+            if let Some(next_status) = edits.status {
+                if (100..=599).contains(&next_status) && next_status != final_status {
+                    final_status = next_status;
+                    resp_mutated = true;
+                }
+            }
+            if edits.headers_changed
+                && apply_header_diff(&mut resp_headers, &edits.headers_removed, &edits.headers_set)
+            {
+                let _ = ctx.filters.strip_alt_svc_headers(&mut resp_headers);
+                if let Some(ct_hdr) = resp_headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("content-type"))
+                {
+                    content_type = ct_hdr.value.clone();
+                }
+                resp_mutated = true;
+            }
+            if let Some(next_body) = edits.body {
+                resp_bytes = Bytes::from(next_body);
+                preserve_content_encoding = false;
+                resp_mutated = true;
+            }
+        }
+    }
 
     // 4c. Live Breakpoint: After Response (Alt+F11 / `bpafter`)
     if should_break_resp {
@@ -4135,6 +4326,45 @@ fn record_ws_frame(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn rewrite_request_url_fields(
+    next_url: &str,
+    full_url: &mut String,
+    scheme_str: &mut String,
+    host_header: &mut String,
+    path_and_query: &mut String,
+    req_headers: &mut Vec<HeaderPair>,
+) -> bool {
+    let trimmed_u = next_url.trim();
+    if trimmed_u.is_empty() || trimmed_u == full_url.as_str() {
+        return false;
+    }
+    let Ok(parsed) = reqwest::Url::parse(trimmed_u) else {
+        return false;
+    };
+    *scheme_str = parsed.scheme().to_string();
+    let host_part = parsed.host_str().unwrap_or("localhost");
+    *host_header = match parsed.port() {
+        Some(p) => format!("{host_part}:{p}"),
+        None => host_part.to_string(),
+    };
+    *path_and_query = match parsed.query() {
+        Some(q) => format!("{}?{}", parsed.path(), q),
+        None => parsed.path().to_string(),
+    };
+    *full_url = parsed.to_string();
+    // Keep Host header synchronized with the rewritten URL
+    req_headers.retain(|h| !h.name.eq_ignore_ascii_case("host"));
+    req_headers.insert(
+        0,
+        HeaderPair {
+            name: "Host".into(),
+            value: host_header.clone(),
+        },
+    );
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_request_breakpoint_edits(
     verdict: &crate::models::BreakpointResolution,
     method_str: &mut String,
@@ -4159,32 +4389,61 @@ fn apply_request_breakpoint_edits(
     }
 
     if let Some(ref u) = verdict.url {
-        let trimmed_u = u.trim();
-        if !trimmed_u.is_empty() && trimmed_u != full_url.as_str() {
-            if let Ok(parsed) = reqwest::Url::parse(trimmed_u) {
-                *scheme_str = parsed.scheme().to_string();
-                let host_part = parsed.host_str().unwrap_or("localhost");
-                *host_header = match parsed.port() {
-                    Some(p) => format!("{host_part}:{p}"),
-                    None => host_part.to_string(),
-                };
-                *path_and_query = match parsed.query() {
-                    Some(q) => format!("{}?{}", parsed.path(), q),
-                    None => parsed.path().to_string(),
-                };
-                *full_url = parsed.to_string();
-                // Keep Host header synchronized with the rewritten URL
-                req_headers.retain(|h| !h.name.eq_ignore_ascii_case("host"));
-                req_headers.insert(
-                    0,
-                    HeaderPair {
-                        name: "Host".into(),
-                        value: host_header.clone(),
-                    },
-                );
-                *bp_modified = true;
-            }
+        if rewrite_request_url_fields(
+            u,
+            full_url,
+            scheme_str,
+            host_header,
+            path_and_query,
+            req_headers,
+        ) {
+            *bp_modified = true;
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_script_request_edits(
+    edits: ScriptRequestEdits,
+    method_str: &mut String,
+    full_url: &mut String,
+    scheme_str: &mut String,
+    host_header: &mut String,
+    path_and_query: &mut String,
+    req_headers: &mut Vec<HeaderPair>,
+    body_bytes: &mut Bytes,
+    req_mutated: &mut bool,
+) {
+    if let Some(ref m) = edits.method {
+        let trimmed = m.trim().to_ascii_uppercase();
+        if !trimmed.is_empty() && trimmed != *method_str {
+            *method_str = trimmed;
+            *req_mutated = true;
+        }
+    }
+
+    if edits.headers_changed
+        && apply_header_diff(req_headers, &edits.headers_removed, &edits.headers_set)
+    {
+        *req_mutated = true;
+    }
+
+    if let Some(ref u) = edits.url {
+        if rewrite_request_url_fields(
+            u,
+            full_url,
+            scheme_str,
+            host_header,
+            path_and_query,
+            req_headers,
+        ) {
+            *req_mutated = true;
+        }
+    }
+
+    if let Some(next_body) = edits.body {
+        *body_bytes = Bytes::from(next_body);
+        *req_mutated = true;
     }
 }
 
@@ -5017,6 +5276,7 @@ mod tests {
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -5131,6 +5391,7 @@ mod tests {
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -5379,6 +5640,7 @@ mod tests {
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -5522,6 +5784,7 @@ mod tests {
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -5657,6 +5920,7 @@ mod tests {
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(bound_port),
@@ -5859,6 +6123,7 @@ mod tests {
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
@@ -6022,6 +6287,7 @@ mod tests {
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
@@ -6238,6 +6504,7 @@ mod tests {
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
@@ -6505,6 +6772,7 @@ mod tests {
             upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
@@ -7041,6 +7309,7 @@ mod tests {
             upstream_client: build_upstream_client(false).unwrap(),
             upstream_redirect_client: build_upstream_client(true).unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -7297,6 +7566,194 @@ mod tests {
 
         controller.stop().await;
         drop(occupied);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn python_script_hooks_run_after_zstd_and_skip_sse_and_video_streams() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        let zstd_json = zstd::encode_all(br#"{"msg":"hello-zstd"}"#.as_slice(), 1).unwrap();
+        let received_req_header = Arc::new(std::sync::Mutex::new(None::<String>));
+        let received_req_header_clone = received_req_header.clone();
+
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((mut sock, _)) = upstream_listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                let lower = req_str.to_ascii_lowercase();
+
+                if req_str.contains("/zstd-api") {
+                    for line in req_str.lines() {
+                        if line.to_ascii_lowercase().starts_with("x-from-pyreq:") {
+                            if let Ok(mut g) = received_req_header_clone.lock() {
+                                *g = Some(line.split_once(':').map(|x| x.1.trim().to_string()).unwrap_or_default());
+                            }
+                        }
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        zstd_json.len()
+                    );
+                    sock.write_all(head.as_bytes()).await.unwrap();
+                    sock.write_all(&zstd_json).await.unwrap();
+                } else if req_str.contains("/sse-stream") {
+                    let body = b"data: {\"ping\":1}\n\n";
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    sock.write_all(head.as_bytes()).await.unwrap();
+                    sock.write_all(body).await.unwrap();
+                } else if lower.contains("/clip.mp4") {
+                    let body = vec![b'V'; 1024];
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes 0-1023/4096\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    sock.write_all(head.as_bytes()).await.unwrap();
+                    sock.write_all(&body).await.unwrap();
+                }
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-py-hooks-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("py-hooks.sqlite")).unwrap());
+        let script_runner = Arc::new(PythonScriptRunner::new(None));
+        if !script_runner.get_status().await.available {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+
+        let py_code = r#"
+import json
+
+def on_request(request):
+    request["headers"]["X-From-PyReq"] = "signed-v1"
+
+def on_response(response, request):
+    response["headers"]["X-From-PyResp"] = "decompressed"
+    data = json.loads(response["body"])
+    data["via_python"] = True
+    response["body"] = json.dumps(data)
+"#;
+        let status = script_runner.set_script(py_code.to_string(), true).await.unwrap();
+        assert!(status.enabled && status.has_on_request && status.has_on_response);
+
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            store: store.clone(),
+            upstream_client: build_upstream_client(false).unwrap(),
+            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: script_runner.clone(),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(0),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_ctx = ctx.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await else {
+                    break;
+                };
+                let c = proxy_ctx.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let inner_c = c.clone();
+                        async move {
+                            Ok::<_, Infallible>(
+                                handle_outer_proxy_request(req, client_addr, None, inner_c).await,
+                            )
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, service)
+                        .await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap();
+
+        // 1. Standard zstd response -> on_request + on_response (after zstd decompression) must run
+        let resp_zstd = client
+            .get(format!("http://{upstream_addr}/zstd-api"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp_zstd.status().as_u16(), 200);
+        assert_eq!(
+            resp_zstd.headers().get("x-from-pyresp").and_then(|v| v.to_str().ok()),
+            Some("decompressed")
+        );
+        let zstd_body_text = resp_zstd.text().await.unwrap();
+        assert!(zstd_body_text.contains("\"msg\": \"hello-zstd\""));
+        assert!(zstd_body_text.contains("\"via_python\": true"));
+        assert_eq!(
+            received_req_header.lock().unwrap().as_deref(),
+            Some("signed-v1")
+        );
+
+        // 2. SSE response -> on_request runs (1 more invocation), on_response MUST be skipped
+        let resp_sse = client
+            .get(format!("http://{upstream_addr}/sse-stream"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp_sse.status().as_u16(), 200);
+        assert!(resp_sse.headers().get("x-from-pyresp").is_none());
+        let sse_body = resp_sse.text().await.unwrap();
+        assert!(sse_body.contains("data: {\"ping\":1}"));
+
+        // 3. 206 video/mp4 response -> on_request runs (1 more invocation), on_response MUST be skipped
+        let resp_video = client
+            .get(format!("http://{upstream_addr}/clip.mp4"))
+            .header("Range", "bytes=0-1023")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp_video.status().as_u16(), 206);
+        assert!(resp_video.headers().get("x-from-pyresp").is_none());
+        let video_bytes = resp_video.bytes().await.unwrap();
+        assert_eq!(video_bytes.len(), 1024);
+
+        // Invocations: #1 (on_req + on_resp = 2), #2 SSE (on_req only = 1), #3 206 video (on_req only = 1) => 4 total
+        let final_status = script_runner.get_status().await;
+        assert_eq!(final_status.invocations_count, 4);
+
+        script_runner.shutdown_sync();
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

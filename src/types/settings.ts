@@ -89,6 +89,12 @@ export interface FluxUserAutoResponderSettings {
   rules: AutoResponderRule[];
 }
 
+export interface FluxUserScriptingSettings {
+  enabled: boolean;
+  code: string;
+  activePresetId?: string | null;
+}
+
 export interface FluxUserSettingsProfile {
   schemaVersion: number;
   exportedAt: string;
@@ -97,6 +103,7 @@ export interface FluxUserSettingsProfile {
   proxy: FluxUserProxySettings;
   autoResponder: FluxUserAutoResponderSettings;
   breakpoints?: BreakpointConfig;
+  scripting?: FluxUserScriptingSettings;
 }
 
 export type SettingsModalTab =

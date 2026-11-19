@@ -23,6 +23,7 @@ import { MenuBar } from "./components/MenuBar";
 import { MobileSetupModal } from "./components/MobileSetupModal";
 import { ProxyDoctorModal } from "./components/ProxyDoctorModal";
 import { SanitizedExportModal } from "./components/SanitizedExportModal";
+import { ScriptingPanel } from "./components/ScriptingPanel";
 import { SessionAnnotationModal } from "./components/SessionAnnotationModal";
 import {
   SessionDiffModal,
@@ -51,6 +52,7 @@ import {
   useUiPreferences,
 } from "./hooks/useUiPreferences";
 import { buildCurlCommand, buildHeadersBlock } from "./lib/formatters";
+import { DEFAULT_PYTHON_SCRIPT_CODE } from "./lib/mockTraffic";
 import {
   applySettingsProfile,
   buildSettingsImportPreview,
@@ -69,6 +71,9 @@ import type {
   AutoResponderRule,
   ComposedRequest,
   FilterDrawerTab,
+  PythonRunnerStatus,
+  PythonScriptPreset,
+  ScriptConsoleLogEvent,
   SessionSummary,
 } from "./types/proxy";
 import type {
@@ -252,6 +257,19 @@ export const App: React.FC = () => {
   );
   const [autoResponderEnabled, setAutoResponderEnabled] = useState(true);
   const [rules, setRules] = useState<AutoResponderRule[]>([]);
+  const [scriptCode, setScriptCode] = useState<string>(
+    DEFAULT_PYTHON_SCRIPT_CODE
+  );
+  const [scriptEnabled, setScriptEnabled] = useState<boolean>(false);
+  const [scriptActivePresetId, setScriptActivePresetId] = useState<
+    string | null
+  >("hmac-header-injection");
+  const [pythonRunnerStatus, setPythonRunnerStatus] =
+    useState<PythonRunnerStatus | null>(null);
+  const [scriptConsoleLogs, setScriptConsoleLogs] = useState<
+    ScriptConsoleLogEvent[]
+  >([]);
+  const [isApplyingScript, setIsApplyingScript] = useState(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] =
     useState<SettingsModalTab>("general");
@@ -750,6 +768,203 @@ export const App: React.FC = () => {
     };
   }, [persistAutoResponderStorage, showToast]);
 
+  const persistPythonScriptStorage = useCallback(
+    (enabledVal: boolean, codeVal: string, presetIdVal: string | null) => {
+      try {
+        window.localStorage.setItem(
+          SETTINGS_STORAGE_KEYS.pythonScript,
+          JSON.stringify({
+            enabled: enabledVal,
+            code: codeVal,
+            activePresetId: presetIdVal,
+          })
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+    },
+    []
+  );
+
+  const handleApplyPythonScript = useCallback(
+    async (nextCode: string, nextEnabled: boolean) => {
+      setIsApplyingScript(true);
+      try {
+        const nextStatus = await proxyBridge.setPythonScript(
+          nextCode,
+          nextEnabled
+        );
+        setPythonRunnerStatus(nextStatus);
+        const appliedEnabled = nextStatus.isSimulator
+          ? nextEnabled
+          : nextStatus.enabled;
+        setScriptCode(nextCode);
+        setScriptEnabled(appliedEnabled);
+        persistPythonScriptStorage(
+          appliedEnabled,
+          nextCode,
+          scriptActivePresetId
+        );
+        if (nextStatus.lastError) {
+          showToast("⚠️ Ошибка в Python-скрипте — см. консоль скрипта");
+        } else if (nextStatus.isSimulator) {
+          showToast(
+            appliedEnabled
+              ? "🐍 Скрипт сохранён (Browser Preview Simulator)"
+              : "⏸ Python-скрипт отключён (Simulator)"
+          );
+        } else {
+          showToast(
+            appliedEnabled
+              ? "✅ Python-скрипт применён к MITM-прокси"
+              : "⏸ Python-скрипт отключён"
+          );
+        }
+      } catch (err) {
+        showToast(
+          `⚠️ Не удалось применить Python-скрипт: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      } finally {
+        setIsApplyingScript(false);
+      }
+    },
+    [persistPythonScriptStorage, scriptActivePresetId, showToast]
+  );
+
+  const handleTogglePythonScript = useCallback(
+    async (nextEnabled: boolean) => {
+      await handleApplyPythonScript(scriptCode, nextEnabled);
+    },
+    [handleApplyPythonScript, scriptCode]
+  );
+
+  const handleRefreshPythonStatus = useCallback(async () => {
+    try {
+      const nextStatus = await proxyBridge.getPythonRunnerStatus();
+      setPythonRunnerStatus(nextStatus);
+    } catch (err) {
+      showToast(
+        `⚠️ Не удалось проверить Python: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  }, [showToast]);
+
+  const handleSelectPythonPreset = useCallback(
+    (preset: PythonScriptPreset) => {
+      setScriptCode(preset.code);
+      setScriptActivePresetId(preset.id);
+      persistPythonScriptStorage(scriptEnabled, preset.code, preset.id);
+      showToast(`Загружен шаблон «${preset.name}» — нажмите Apply Script`);
+    },
+    [persistPythonScriptStorage, scriptEnabled, showToast]
+  );
+
+  useEffect(() => {
+    let active = true;
+    let unlistenLogs: (() => void) | null = null;
+
+    const initScripting = async () => {
+      let initialCode = DEFAULT_PYTHON_SCRIPT_CODE;
+      let initialEnabled = false;
+      let initialPresetId: string | null = "hmac-header-injection";
+      try {
+        const rawStored = window.localStorage.getItem(
+          SETTINGS_STORAGE_KEYS.pythonScript
+        );
+        if (rawStored) {
+          const parsed = JSON.parse(rawStored) as {
+            enabled?: unknown;
+            code?: unknown;
+            activePresetId?: unknown;
+          };
+          if (parsed && typeof parsed === "object") {
+            if (typeof parsed.code === "string") {
+              initialCode = parsed.code;
+            }
+            if (typeof parsed.enabled === "boolean") {
+              initialEnabled = parsed.enabled;
+            }
+            if (
+              parsed.activePresetId === null ||
+              typeof parsed.activePresetId === "string"
+            ) {
+              initialPresetId = parsed.activePresetId;
+            }
+          }
+        }
+      } catch {
+        // fallback to default script
+      }
+
+      if (!active) return;
+      setScriptCode(initialCode);
+      setScriptEnabled(initialEnabled);
+      setScriptActivePresetId(initialPresetId);
+
+      try {
+        const nextStatus = await proxyBridge.setPythonScript(
+          initialCode,
+          initialEnabled
+        );
+        if (!active) return;
+        setPythonRunnerStatus(nextStatus);
+        if (!nextStatus.isSimulator) {
+          setScriptEnabled(nextStatus.enabled);
+        }
+      } catch {
+        try {
+          const fallbackStatus = await proxyBridge.getPythonRunnerStatus();
+          if (active) setPythonRunnerStatus(fallbackStatus);
+        } catch {
+          // ignore status fallback error on boot
+        }
+      }
+    };
+
+    void proxyBridge
+      .subscribeScriptConsoleLogs((entry) => {
+        if (!active) return;
+        setScriptConsoleLogs((prev) => {
+          const next = [...prev, entry];
+          return next.length > 500 ? next.slice(next.length - 500) : next;
+        });
+      })
+      .then((fn) => {
+        if (active) {
+          unlistenLogs = fn;
+        } else {
+          fn();
+        }
+      });
+
+    void initScripting();
+
+    const onSettingsApplied = (event: Event) => {
+      const detail = (event as CustomEvent<FluxUserSettingsProfile>).detail;
+      if (!detail?.scripting) return;
+      setScriptEnabled(Boolean(detail.scripting.enabled));
+      setScriptCode(detail.scripting.code);
+      setScriptActivePresetId(detail.scripting.activePresetId ?? null);
+      void proxyBridge
+        .getPythonRunnerStatus()
+        .then((st) => {
+          if (active) setPythonRunnerStatus(st);
+        })
+        .catch(() => undefined);
+    };
+
+    window.addEventListener(SETTINGS_APPLIED_EVENT, onSettingsApplied);
+    return () => {
+      active = false;
+      if (unlistenLogs) unlistenLogs();
+      window.removeEventListener(SETTINGS_APPLIED_EVENT, onSettingsApplied);
+    };
+  }, []);
+
   // Register live snapshot getter so `exportCurrentSettingsProfile()` captures live React state
   const liveSnapshotRef = useRef<() => Partial<FluxUserSettingsProfile>>(
     () => ({})
@@ -809,6 +1024,11 @@ export const App: React.FC = () => {
       rules,
     },
     breakpoints: breakpointConfig,
+    scripting: {
+      enabled: scriptEnabled,
+      code: scriptCode,
+      activePresetId: scriptActivePresetId,
+    },
   });
 
   useEffect(() => {
@@ -1189,6 +1409,12 @@ export const App: React.FC = () => {
         (keyLower === "s" || e.code === "KeyS") &&
         !hasOpenModal()
       ) {
+        const inMonaco =
+          e.target instanceof HTMLElement &&
+          Boolean(e.target.closest(".monaco-editor"));
+        if (inMonaco && activeSection === "scripts") {
+          return;
+        }
         e.preventDefault();
         void exportAllSessionsAs();
         return;
@@ -1391,7 +1617,7 @@ export const App: React.FC = () => {
         return;
       }
 
-      // Alt+1..4 -> Primary views
+      // Alt+1..5 -> Primary views
       if (e.altKey && !ctrlOrMeta && !e.shiftKey) {
         if (e.key === "1") {
           e.preventDefault();
@@ -1411,6 +1637,11 @@ export const App: React.FC = () => {
         if (e.key === "4") {
           e.preventDefault();
           setFilterDrawerOpen((prev) => !prev);
+          return;
+        }
+        if (e.key === "5") {
+          e.preventDefault();
+          setActiveSection("scripts");
           return;
         }
       }
@@ -1922,6 +2153,22 @@ export const App: React.FC = () => {
         perform: () => setActiveSection("rules"),
       },
       {
+        id: "view-scripts",
+        category: "Scripting",
+        label: "Open Python Scripting Engine (on_request / on_response)",
+        shortcut: "Alt+5",
+        keywords: ["python", "script", "hmac", "mock", "on_request", "on_response"],
+        perform: () => setActiveSection("scripts"),
+      },
+      {
+        id: "toggle-python-script",
+        category: "Scripting",
+        label: scriptEnabled
+          ? "Disable Python Scripting Engine"
+          : "Enable Python Scripting Engine",
+        perform: () => void handleTogglePythonScript(!scriptEnabled),
+      },
+      {
         id: "root-ca",
         category: "TLS / CA",
         label: "Inspect or Install HTTPS MITM Root CA Certificate",
@@ -2107,6 +2354,7 @@ export const App: React.FC = () => {
       handleResetAllSettings,
       handleResetPanelLayout,
       handleSelectAllSessions,
+      handleTogglePythonScript,
       importArchiveDialog,
       inspectorCollapsed,
       isForceNoCacheActive,
@@ -2123,6 +2371,7 @@ export const App: React.FC = () => {
       resetAdvancedFilters,
       resetColumns,
       saveToSqlite,
+      scriptEnabled,
       selectedId,
       setInspectorPosition,
       setQuickCategory,
@@ -2458,6 +2707,10 @@ export const App: React.FC = () => {
             resolvedTheme={resolvedTheme}
             onToggleTheme={toggleLightDark}
             activeRulesCount={activeRulesCount}
+            pythonScriptEnabled={Boolean(
+              scriptEnabled &&
+                (pythonRunnerStatus?.running || pythonRunnerStatus?.isSimulator)
+            )}
             onCollapseSidebar={toggleSidebar}
           />
         )}
@@ -2743,6 +2996,31 @@ export const App: React.FC = () => {
                   persistAutoResponderStorage(autoResponderEnabled, next);
                   showToast("Deleted AutoResponder rule");
                 }}
+              />
+            )}
+
+            {activeSection === "scripts" && (
+              <ScriptingPanel
+                code={scriptCode}
+                enabled={scriptEnabled}
+                activePresetId={scriptActivePresetId}
+                status={pythonRunnerStatus}
+                logs={scriptConsoleLogs}
+                resolvedTheme={resolvedTheme}
+                isApplying={isApplyingScript}
+                onChangeCode={(nextCode) => {
+                  setScriptCode(nextCode);
+                  persistPythonScriptStorage(
+                    scriptEnabled,
+                    nextCode,
+                    scriptActivePresetId
+                  );
+                }}
+                onSelectPreset={handleSelectPythonPreset}
+                onApplyScript={handleApplyPythonScript}
+                onToggleEnabled={handleTogglePythonScript}
+                onRefreshStatus={handleRefreshPythonStatus}
+                onClearLogs={() => setScriptConsoleLogs([])}
               />
             )}
           </main>

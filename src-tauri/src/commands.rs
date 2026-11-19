@@ -8,8 +8,8 @@ use crate::models::{
     AutoResponderRule, BindHostMode, BreakpointAction, BreakpointConfig, BreakpointResolution,
     CaCertificateInfo, CodecOperation, CodecTransformResult, ComposedRequest, DoctorCheckResult,
     LoadedSessionBody, NetworkInterfaceInfo, PausedBreakpointItem, ProxyError,
-    ProxyFilterBackendConfig, ProxyStatus, SanitizationOptions, SessionDetail, SessionSummary,
-    StorageStats,
+    ProxyFilterBackendConfig, ProxyStatus, PythonRunnerStatus, SanitizationOptions, SessionDetail,
+    SessionSummary, StorageStats,
 };
 use crate::proxy::client_certs::{AddClientCertificateRequest, ClientCertificateEntry};
 use crate::proxy::codec::execute_codec_transform;
@@ -772,6 +772,27 @@ pub async fn import_settings_file(file_path: String) -> Result<String, ProxyErro
     })
     .await
     .map_err(|e| ProxyError::Custom(format!("Import settings task join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn set_python_script(
+    code: String,
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<PythonRunnerStatus, ProxyError> {
+    state
+        .controller
+        .context
+        .script_runner
+        .set_script(code, enabled)
+        .await
+}
+
+#[tauri::command]
+pub async fn get_python_runner_status(
+    state: State<'_, AppState>,
+) -> Result<PythonRunnerStatus, ProxyError> {
+    Ok(state.controller.context.script_runner.get_status().await)
 }
 
 #[tauri::command]

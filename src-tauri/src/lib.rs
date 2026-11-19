@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod models;
 pub mod proxy;
+pub mod scripting;
 pub mod storage;
 
 use std::sync::Arc;
@@ -149,6 +150,8 @@ pub fn run() {
             commands::import_settings_file,
             commands::pick_save_file_dialog,
             commands::pick_open_file_dialog,
+            commands::set_python_script,
+            commands::get_python_runner_status,
             commands::generate_stress_sessions,
         ])
         .build(tauri::generate_context!())
