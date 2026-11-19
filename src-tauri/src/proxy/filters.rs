@@ -381,12 +381,9 @@ impl ProxyFilterEngine {
 
         // 5. Built-in OS Background Noise Guard (`svchost`, Windows/macOS telemetry & connectivity probes)
         // Dropped automatically when `Drop Non-Matching` is active unless explicitly whitelisted/included.
-        if !explicitly_whitelisted && !explicitly_included && is_background_os_noise(summary, &host_clean)
-        {
-            return false;
-        }
-
-        true
+        explicitly_whitelisted
+            || explicitly_included
+            || !is_background_os_noise(summary, &host_clean)
     }
 
     /// Evaluates how an incoming `CONNECT host:port` tunnel should be handled according to

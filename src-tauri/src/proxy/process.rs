@@ -1,5 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::net::SocketAddr;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -82,7 +81,8 @@ fn resolve_process_name_cached(pid: u32) -> Option<String> {
 mod imp {
     use super::*;
     use std::ffi::c_void;
-    use std::net::Ipv6Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::path::Path;
 
     const AF_INET: u32 = 2;
     const AF_INET6: u32 = 23;
@@ -400,43 +400,19 @@ mod imp {
 }
 
 // ============================================================================
-// macOS Implementation (`libproc` `proc_listpids` + `proc_name`)
+// macOS Implementation (`lsof` + `libproc` `proc_name`)
 // ============================================================================
 #[cfg(target_os = "macos")]
 mod imp {
     use super::*;
     use std::ffi::c_void;
 
-    const PROC_ALL_PIDS: u32 = 1;
-    const PROC_PIDLISTFDS: i32 = 1;
-    const PROX_FDTYPE_SOCKET: u32 = 2;
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    struct ProcFdInfo {
-        proc_fd: i32,
-        proc_fdtype: u32,
-    }
-
     extern "C" {
-        fn proc_listpids(
-            kind: u32,
-            typeinfo: u32,
-            buffer: *mut c_void,
-            buffersize: i32,
-        ) -> i32;
-        fn proc_pidinfo(
-            pid: i32,
-            flavor: i32,
-            arg: u64,
-            buffer: *mut c_void,
-            buffersize: i32,
-        ) -> i32;
         fn proc_name(pid: i32, buffer: *mut c_void, buffersize: u32) -> i32;
     }
 
     pub fn lookup_owning_pid(client_addr: SocketAddr, _proxy_port: Option<u16>) -> Option<u32> {
-        // Use lsof fast port lookup or libproc fallback on macOS
+        // Use lsof fast port lookup on macOS
         let port = client_addr.port();
         let output = std::process::Command::new("lsof")
             .args(["-n", "-P", "-F", "p", "-i", &format!("TCP:{port}")])
@@ -445,9 +421,6 @@ mod imp {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let self_pid = std::process::id();
         let mut candidate: Option<u32> = None;
-
-        // Suppress unused warnings on FFI symbols kept ready for proc_name
-        let _ = (PROC_ALL_PIDS, PROC_PIDLISTFDS, PROX_FDTYPE_SOCKET, proc_listpids as usize, proc_pidinfo as usize);
 
         for line in stdout.lines() {
             if let Some(rest) = line.strip_prefix('p') {
@@ -459,13 +432,12 @@ mod imp {
                 }
             }
         }
-        let _ = ProcFdInfo::default();
         candidate
     }
 
     pub fn query_os_process_name(pid: u32) -> Option<String> {
         let mut buf = [0u8; 256];
-        let len = unsafe { proc_name(pid as i32, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
+        let len = unsafe { proc_name(pid as i32, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u32) };
         if len <= 0 {
             return None;
         }
