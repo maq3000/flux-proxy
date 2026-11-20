@@ -676,8 +676,14 @@ async fn shutdown_listeners(
     if let Some(tx) = shutdown_tx {
         let _ = tx.send(true);
     }
-    for handle in handles {
-        let _ = tokio::time::timeout(Duration::from_millis(500), handle).await;
+    for mut handle in handles {
+        if tokio::time::timeout(Duration::from_secs(2), &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 }
 

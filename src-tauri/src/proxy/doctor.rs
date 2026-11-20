@@ -1078,17 +1078,14 @@ mod tests {
     async fn doctor_detects_stopped_port_and_fixes_listener_plus_e2e_health() {
         let (controller, _backend, tmp_dir) = make_test_controller("stopped_and_e2e");
 
-        // Allocate an ephemeral free port first
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let test_port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        // Start & stop once so controller remembers `test_port` in stopped state
+        // Start & stop once on an OS-assigned free port so controller remembers `test_port` in stopped state
         let started = controller
-            .start("127.0.0.1".to_string(), test_port)
+            .start("127.0.0.1".to_string(), 0)
             .await
             .unwrap();
         assert!(started.running);
+        let test_port = started.port;
+        assert!(test_port > 0);
         let stopped = controller.stop().await;
         assert!(!stopped.running);
         assert_eq!(stopped.port, test_port);
@@ -1131,18 +1128,13 @@ mod tests {
     async fn doctor_detects_occupied_port_and_recovers_on_fix() {
         let (controller, _backend, tmp_dir) = make_test_controller("occupied_port");
 
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let conflict_port = probe.local_addr().unwrap().port();
-        drop(probe);
+        // External process occupies `conflict_port` continuously (eliminates drop-and-rebind race)
+        let blocker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let conflict_port = blocker.local_addr().unwrap().port();
 
-        controller
-            .start("127.0.0.1".to_string(), conflict_port)
-            .await
-            .unwrap();
-        controller.stop().await;
-
-        // External process occupies `conflict_port`
-        let blocker = TcpListener::bind(("127.0.0.1", conflict_port)).await.unwrap();
+        let configured = controller.set_port(conflict_port).await.unwrap();
+        assert!(!configured.running);
+        assert_eq!(configured.port, conflict_port);
 
         let port_check = check_port_binding(&controller.status().await).await;
         assert_eq!(port_check.status, "error");
@@ -1167,12 +1159,8 @@ mod tests {
     async fn doctor_detects_and_repairs_system_proxy_hijack() {
         let (controller, backend, tmp_dir) = make_test_controller("sysproxy_hijack");
 
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
         controller
-            .start("127.0.0.1".to_string(), port)
+            .start("127.0.0.1".to_string(), 0)
             .await
             .unwrap();
 
