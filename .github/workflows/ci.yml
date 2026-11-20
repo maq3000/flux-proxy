@@ -25,6 +25,7 @@ jobs:
 
     env:
       CARGO_TERM_COLOR: always
+      NODE_OPTIONS: --max-old-space-size=4096
 
     steps:
       - name: Checkout repository
