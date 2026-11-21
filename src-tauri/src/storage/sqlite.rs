@@ -512,6 +512,7 @@ mod tests {
                 comment: comment.map(str::to_owned),
                 marked_color: color.map(str::to_owned),
                 client_ip: Some("127.0.0.1".into()),
+                remapped_to: None,
             },
             request_headers: vec![HeaderPair {
                 name: "Authorization".into(),

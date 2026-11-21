@@ -13,10 +13,13 @@ import type {
   FilterPreset,
   HeaderMutationRule,
   HostListFilterConfig,
+  HostRemapRule,
   InspectorDockPosition,
   InspectorSplitDirection,
   NoiseThresholdsConfig,
   SanitizationOptions,
+  ThrottleConfig,
+  ThrottlePreset,
   TlsBypassRule,
   TlsInterceptMode,
   ToolbarGroupId,
@@ -82,6 +85,10 @@ export interface FluxUserProxySettings {
   sanitizationOptions?: SanitizationOptions;
   /** Optional breakpoints alias accepted during profile import/migration; canonically stored at top-level `breakpoints` */
   breakpoints?: BreakpointConfig;
+  /** Virtual DNS (HOSTS Remapping) rules */
+  hostRemapRules?: HostRemapRule[];
+  /** Bandwidth Throttling profile & custom limits */
+  throttleConfig?: ThrottleConfig;
 }
 
 export interface FluxUserAutoResponderSettings {
@@ -137,6 +144,8 @@ export interface SettingsImportPreviewSummary {
   tlsTargetRulesCount: number;
   headerMutationsCount: number;
   autoResponderRulesCount: number;
+  hostRemapCount?: number;
+  throttlePreset?: ThrottlePreset;
   autoResponderEnabled: boolean;
   totalRulesCount: number;
   currentTotalRulesCount: number;

@@ -384,6 +384,7 @@ fn make_summary_for_filter(
         comment: None,
         marked_color: None,
         client_ip: Some("127.0.0.1".into()),
+        remapped_to: None,
     }
 }
 

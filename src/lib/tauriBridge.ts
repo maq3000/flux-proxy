@@ -16,6 +16,7 @@ import type {
   CodecTransformResult,
   ComposedRequest,
   DoctorCheckResult,
+  HostRemapRule,
   LoadedSessionBody,
   NetworkInterfaceInfo,
   PausedBreakpointItem,
@@ -27,8 +28,14 @@ import type {
   SessionDetail,
   SessionSummary,
   StorageStats,
+  ThrottleConfig,
+  ThrottlePreset,
 } from "../types/proxy";
-import { DEFAULT_SESSION_RETENTION_LIMIT } from "../types/proxy";
+import {
+  DEFAULT_SESSION_RETENTION_LIMIT,
+  DEFAULT_THROTTLE_CONFIG,
+  THROTTLE_PRESET_DEFINITIONS,
+} from "../types/proxy";
 import {
   applyHeaderMutationsInPreview,
   DEFAULT_BACKEND_FILTER_CONFIG,
@@ -50,13 +57,16 @@ import {
   buildSimulatedSession,
   DEFAULT_AUTORESPONDER_RULES,
   DEFAULT_CLEAR_DB_ON_EXIT,
+  DEFAULT_HOST_REMAP_RULES,
   DEFAULT_PYTHON_SCRIPT_CODE,
   getSimulatedTwoPhaseDelayMs,
   PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
   PREVIEW_CLIENT_CERTS_STORAGE_KEY,
+  PREVIEW_HOST_REMAP_RULES_STORAGE_KEY,
   PREVIEW_PYTHON_SCRIPT_STORAGE_KEY,
   PREVIEW_SQLITE_ARCHIVE_STORAGE_KEY,
   PREVIEW_SQLITE_COUNT_STORAGE_KEY,
+  PREVIEW_THROTTLE_CONFIG_STORAGE_KEY,
   sanitizeSessionsInPreview,
 } from "./mockTraffic";
 import { browserPreviewCodecTransform } from "./textWizard";
@@ -148,6 +158,204 @@ interface ParkedPreviewEntry {
 // ============================================================================
 // Browser Preview Fallback Engine (active when running via `npm run dev` without Tauri)
 // ============================================================================
+// ============================================================================
+// Virtual DNS (HOSTS Remapping) & Throttling helpers (Browser Preview)
+// ============================================================================
+function stripSchemeAndPathPreview(raw: string): string {
+  const s = raw.trim().replace(/^(https?|wss?):\/\//i, "");
+  const slashIdx = s.indexOf("/");
+  return slashIdx >= 0 ? s.slice(0, slashIdx) : s;
+}
+
+function stripOptionalPortPreview(authority: string): string {
+  const trimmed = authority.trim();
+  if (trimmed.startsWith("[")) {
+    const closeIdx = trimmed.indexOf("]");
+    if (closeIdx >= 0) {
+      return trimmed.slice(1, closeIdx);
+    }
+  }
+  const firstColon = trimmed.indexOf(":");
+  if (firstColon >= 0 && firstColon === trimmed.lastIndexOf(":")) {
+    const portPart = trimmed.slice(firstColon + 1);
+    if (portPart.length > 0 && /^\d+$/.test(portPart)) {
+      return trimmed.slice(0, firstColon);
+    }
+  }
+  return trimmed;
+}
+
+function normalizeHostForMatchPreview(host: string): string {
+  return stripOptionalPortPreview(stripSchemeAndPathPreview(host))
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.+$/, "")
+    .toLowerCase();
+}
+
+function normalizeHostRemapRulePreview(
+  rule: HostRemapRule,
+  idx: number
+): HostRemapRule {
+  const rawSource = (rule.sourcePattern ?? "").trim();
+  if (!rawSource || /[\s\u0000-\u001f]/.test(rawSource)) {
+    throw new Error("Исходный домен или маска не может быть пустой.");
+  }
+  const source = normalizeHostForMatchPreview(rawSource);
+  if (!source || source === "*" || source === "*.") {
+    throw new Error(
+      "Укажите конкретный домен или маску (например, *.example.com) вместо '*'."
+    );
+  }
+
+  const rawTarget = (rule.targetHost ?? "").trim();
+  if (
+    !rawTarget ||
+    /[\s\u0000-\u001f]/.test(rawTarget) ||
+    /[\\/?#]/.test(rawTarget)
+  ) {
+    throw new Error("Целевой хост или IP содержит недопустимые символы.");
+  }
+  const target = rawTarget
+    .replace(/^(https?|wss?):\/\//i, "")
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.+$/, "")
+    .toLowerCase();
+  if (!target) {
+    throw new Error("Целевой хост или IP не может быть пустым.");
+  }
+  if (/^[^:]+:\d+$/.test(target)) {
+    throw new Error(
+      "Укажите порт в отдельном поле Target Port, а не в Target Host."
+    );
+  }
+
+  let targetPort: number | null = null;
+  if (rule.targetPort !== undefined && rule.targetPort !== null) {
+    const p = Number(rule.targetPort);
+    if (!Number.isInteger(p) || p < 1 || p > 65535) {
+      throw new Error(
+        "Целевой порт (Target Port) должен быть в диапазоне 1..65535."
+      );
+    }
+    targetPort = p;
+  }
+
+  return {
+    id: (rule.id ?? "").trim() || `remap-${idx + 1}`,
+    enabled: Boolean(rule.enabled),
+    sourcePattern: source,
+    targetHost: target,
+    targetPort,
+    preserveHostHeader:
+      typeof rule.preserveHostHeader === "boolean"
+        ? rule.preserveHostHeader
+        : true,
+    comment: (rule.comment ?? "").trim(),
+  };
+}
+
+function sourcePatternMatchesHostPreview(
+  pattern: string,
+  host: string
+): boolean {
+  const normHost = normalizeHostForMatchPreview(host);
+  const normPattern = pattern
+    .trim()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.+$/, "")
+    .toLowerCase();
+  if (!normHost || !normPattern) return false;
+  if (!normPattern.includes("*") && !normPattern.includes("?")) {
+    return normHost === normPattern;
+  }
+  if (normPattern.startsWith("*.")) {
+    const suffix = normPattern.slice(2);
+    if (suffix && !suffix.includes("*") && !suffix.includes("?")) {
+      return (
+        normHost.length > suffix.length + 1 &&
+        normHost.endsWith(`.${suffix}`)
+      );
+    }
+  }
+  const escaped = normPattern
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".");
+  return new RegExp(`^${escaped}$`, "i").test(normHost);
+}
+
+function matchHostRemapPreview(
+  rules: HostRemapRule[],
+  host: string
+): HostRemapRule | null {
+  const normHost = normalizeHostForMatchPreview(host);
+  if (!normHost) return null;
+  let bestRule: HostRemapRule | null = null;
+  let bestTier = -1;
+  let bestLen = -1;
+  for (const rule of rules) {
+    if (!rule.enabled) continue;
+    if (!sourcePatternMatchesHostPreview(rule.sourcePattern, normHost)) continue;
+    const normPat = rule.sourcePattern.trim().replace(/\.+$/, "");
+    let tier = 0;
+    let len = normPat.length;
+    if (!normPat.includes("*") && !normPat.includes("?")) {
+      tier = 2;
+    } else if (
+      normPat.startsWith("*.") &&
+      !normPat.slice(2).includes("*") &&
+      !normPat.slice(2).includes("?")
+    ) {
+      tier = 1;
+      len = normPat.length - 2;
+    }
+    if (tier > bestTier || (tier === bestTier && len > bestLen)) {
+      bestTier = tier;
+      bestLen = len;
+      bestRule = rule;
+    }
+  }
+  return bestRule;
+}
+
+function formatRemapTargetPreview(rule: HostRemapRule): string {
+  const cleanHost = rule.targetHost.trim().replace(/^\[|\]$/g, "");
+  const formatted = cleanHost.includes(":") ? `[${cleanHost}]` : cleanHost;
+  return rule.targetPort ? `${formatted}:${rule.targetPort}` : formatted;
+}
+
+function normalizeThrottleConfigPreview(cfg: ThrottleConfig): ThrottleConfig {
+  const validPresets = new Set<ThrottlePreset>([
+    "none",
+    "gprs",
+    "slow3g",
+    "fast3g",
+    "lte",
+    "offline",
+    "custom",
+  ]);
+  const preset: ThrottlePreset = validPresets.has(cfg.preset)
+    ? cfg.preset
+    : "none";
+  if (preset === "custom") {
+    return {
+      preset: "custom",
+      downloadKbps: Math.max(0, Math.round(Number(cfg.downloadKbps) || 0)),
+      uploadKbps: Math.max(0, Math.round(Number(cfg.uploadKbps) || 0)),
+      latencyMs: Math.max(0, Math.round(Number(cfg.latencyMs) || 0)),
+    };
+  }
+  const def = THROTTLE_PRESET_DEFINITIONS.find((d) => d.id === preset);
+  return def
+    ? {
+        preset: def.id,
+        downloadKbps: def.downloadKbps,
+        uploadKbps: def.uploadKbps,
+        latencyMs: def.latencyMs,
+      }
+    : { ...DEFAULT_THROTTLE_CONFIG };
+}
+
 class BrowserPreviewEngine {
   private running = true;
   private bindMode: BindHostMode = "loopback";
@@ -183,6 +391,8 @@ class BrowserPreviewEngine {
   private pausedBreakpoints = new Map<string, ParkedPreviewEntry>();
   private clientCertificates: ClientCertificateEntry[] =
     buildDefaultPreviewClientCertificates();
+  private hostRemapRules: HostRemapRule[] = [...DEFAULT_HOST_REMAP_RULES];
+  private throttleConfig: ThrottleConfig = { ...DEFAULT_THROTTLE_CONFIG };
   private listeners = new Set<(batch: SessionSummary[]) => void>();
   private removedListeners = new Set<(ids: number[]) => void>();
   private bpListeners = new Set<(items: PausedBreakpointItem[]) => void>();
@@ -326,6 +536,28 @@ class BrowserPreviewEngine {
             if (typeof parsedScript.code === "string") {
               this.scriptCode = parsedScript.code;
             }
+          }
+        }
+        const rawHostRemap = window.localStorage.getItem(
+          PREVIEW_HOST_REMAP_RULES_STORAGE_KEY
+        );
+        if (rawHostRemap !== null) {
+          const parsedRemap = JSON.parse(rawHostRemap);
+          if (Array.isArray(parsedRemap)) {
+            this.hostRemapRules = (parsedRemap as HostRemapRule[]).map(
+              (r, idx) => normalizeHostRemapRulePreview(r, idx)
+            );
+          }
+        }
+        const rawThrottle = window.localStorage.getItem(
+          PREVIEW_THROTTLE_CONFIG_STORAGE_KEY
+        );
+        if (rawThrottle !== null) {
+          const parsedThrottle = JSON.parse(rawThrottle);
+          if (parsedThrottle && typeof parsedThrottle === "object") {
+            this.throttleConfig = normalizeThrottleConfigPreview(
+              parsedThrottle as ThrottleConfig
+            );
           }
         }
       } catch {
@@ -515,6 +747,32 @@ class BrowserPreviewEngine {
   }
 
   private applyPipelineToDetail(rawDetail: SessionDetail): SessionDetail {
+    const remapRule = matchHostRemapPreview(
+      this.hostRemapRules,
+      rawDetail.summary.host
+    );
+    const remappedTo = remapRule ? formatRemapTargetPreview(remapRule) : null;
+    const throttleCfg = this.throttleConfig;
+
+    if (throttleCfg.preset === "offline") {
+      const offlineMsg = "Network Offline (Bandwidth Throttling: Offline)";
+      return {
+        ...rawDetail,
+        summary: {
+          ...rawDetail.summary,
+          status: 503,
+          contentType: "text/plain; charset=utf-8",
+          bodySize: offlineMsg.length,
+          isMocked: false,
+          error: offlineMsg,
+          remappedTo,
+        },
+        responseHeaders: [{ name: "Content-Type", value: "text/plain; charset=utf-8" }],
+        responseBodyBase64: encodeTextToBase64(offlineMsg),
+        responseBodyText: offlineMsg,
+      };
+    }
+
     // 1. Check Selective TLS / MITM Pass-Through (`interceptAll` Bypass list vs `targetedOnly` Allowlist)
     if (rawDetail.summary.scheme === "https" || rawDetail.summary.scheme === "wss") {
       const decision = evaluateTlsConnectInPreview(
@@ -560,6 +818,19 @@ class BrowserPreviewEngine {
           tlsVersionLabel = `SSL Passthrough (${decision.rule.category})`;
         }
 
+        const passthroughHeaders = [
+          {
+            name: "X-FluxProxy-TLS-Mode",
+            value: modeHeaderValue,
+          },
+          ...(remappedTo
+            ? [{ name: "X-FluxProxy-Host-Remap", value: remappedTo }]
+            : []),
+        ];
+        const finalNote = remappedTo
+          ? `${note}\nHOSTS Remapped Target: ${remappedTo}`
+          : note;
+
         return {
           ...rawDetail,
           summary: {
@@ -570,23 +841,21 @@ class BrowserPreviewEngine {
             path: `Tunnel to ${rawDetail.summary.host}:443`,
             url: `https://${rawDetail.summary.host}:443/`,
             contentType: "tls/passthrough",
+            durationMs:
+              rawDetail.summary.durationMs + (throttleCfg.latencyMs || 0),
             tlsBypassed: true,
             isMocked: false,
+            remappedTo,
           },
           requestHeaders: [
             { name: "Host", value: `${rawDetail.summary.host}:443` },
             { name: "Proxy-Connection", value: "keep-alive" },
           ],
-          responseHeaders: [
-            {
-              name: "X-FluxProxy-TLS-Mode",
-              value: modeHeaderValue,
-            },
-          ],
+          responseHeaders: passthroughHeaders,
           requestBodyBase64: "",
           requestBodyText: null,
-          responseBodyBase64: encodeTextToBase64(note),
-          responseBodyText: note,
+          responseBodyBase64: encodeTextToBase64(finalNote),
+          responseBodyText: finalNote,
           tlsVersion: tlsVersionLabel,
         };
       }
@@ -705,6 +974,10 @@ class BrowserPreviewEngine {
     );
     detail.responseHeaders = respMut.headers;
     detail.summary.headersMutated = reqMut.mutated || respMut.mutated;
+    detail.summary.remappedTo = remappedTo;
+    if (throttleCfg.latencyMs > 0) {
+      detail.summary.durationMs += throttleCfg.latencyMs;
+    }
 
     return detail;
   }
@@ -1778,6 +2051,61 @@ class BrowserPreviewEngine {
         websocketFrames: [],
       };
     } else {
+      const composerRemap = matchHostRemapPreview(
+        this.hostRemapRules,
+        parsedUrl.hostname
+      );
+      const composerRemappedTo = composerRemap
+        ? formatRemapTargetPreview(composerRemap)
+        : null;
+      if (this.throttleConfig.preset === "offline") {
+        const offMsg = "Network Offline (Bandwidth Throttling: Offline)";
+        const offlineDetail: SessionDetail = {
+          summary: {
+            id,
+            status: 503,
+            protocol: parsedUrl.protocol === "https:" ? "HTTPS/2" : "HTTP/1.1",
+            scheme: parsedUrl.protocol.replace(":", ""),
+            method: effectiveMethod,
+            host: parsedUrl.host,
+            path: `${parsedUrl.pathname}${parsedUrl.search}`,
+            url: effectiveUrl,
+            contentType: "text/plain; charset=utf-8",
+            bodySize: offMsg.length,
+            durationMs: Math.round(performance.now() - start),
+            timestamp: new Date().toISOString(),
+            isMocked: false,
+            matchedRuleId: null,
+            error: offMsg,
+            processName: "flux-proxy (Composer)",
+            processPid: 9001,
+            tlsBypassed: false,
+            headersMutated: reqMut.mutated,
+            breakpointPaused: null,
+            breakpointModified: bpModified,
+            remappedTo: composerRemappedTo,
+          },
+          requestHeaders: effectiveReqHeaders,
+          responseHeaders: [
+            { name: "Content-Type", value: "text/plain; charset=utf-8" },
+          ],
+          requestBodyBase64: effectiveBodyBase64,
+          responseBodyBase64: encodeTextToBase64(offMsg),
+          requestBodyText: effectiveBody || null,
+          responseBodyText: offMsg,
+          tlsVersion: null,
+          clientAddr: "Composer (Local)",
+          websocketFrames: [],
+        };
+        return this.commitCompletedSession(offlineDetail) ?? offlineDetail;
+      }
+
+      if (this.throttleConfig.latencyMs > 0) {
+        await new Promise((r) =>
+          window.setTimeout(r, Math.min(this.throttleConfig.latencyMs, 600))
+        );
+      }
+
       this.commitInFlightSession({
         summary: {
           id,
@@ -1801,6 +2129,7 @@ class BrowserPreviewEngine {
           headersMutated: reqMut.mutated,
           breakpointPaused: null,
           breakpointModified: bpModified,
+          remappedTo: composerRemappedTo,
         },
         requestHeaders: effectiveReqHeaders,
         responseHeaders: [],
@@ -1943,6 +2272,15 @@ class BrowserPreviewEngine {
           websocketFrames: [],
         };
       }
+    }
+
+    const composerRemapFinal = matchHostRemapPreview(
+      this.hostRemapRules,
+      parsedUrl.hostname
+    );
+    if (composerRemapFinal && !finalDetail.summary.remappedTo) {
+      finalDetail.summary.remappedTo =
+        formatRemapTargetPreview(composerRemapFinal);
     }
 
     // Live Breakpoint: After Response
@@ -2485,6 +2823,48 @@ class BrowserPreviewEngine {
     return () => {
       this.scriptLogListeners.delete(cb);
     };
+  }
+
+  getHostRemapRules(): HostRemapRule[] {
+    return this.hostRemapRules.map((r) => ({ ...r }));
+  }
+
+  updateHostRemapRules(rules: HostRemapRule[]): HostRemapRule[] {
+    const normalized = rules.map((r, idx) =>
+      normalizeHostRemapRulePreview(r, idx)
+    );
+    this.hostRemapRules = normalized;
+    if (typeof window !== "undefined") {
+      try {
+        window.localStorage.setItem(
+          PREVIEW_HOST_REMAP_RULES_STORAGE_KEY,
+          JSON.stringify(normalized)
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+    }
+    return this.getHostRemapRules();
+  }
+
+  getThrottleConfig(): ThrottleConfig {
+    return { ...this.throttleConfig };
+  }
+
+  setThrottleConfig(config: ThrottleConfig): ThrottleConfig {
+    const normalized = normalizeThrottleConfigPreview(config);
+    this.throttleConfig = normalized;
+    if (typeof window !== "undefined") {
+      try {
+        window.localStorage.setItem(
+          PREVIEW_THROTTLE_CONFIG_STORAGE_KEY,
+          JSON.stringify(normalized)
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+    }
+    return { ...normalized };
   }
 }
 
@@ -3355,6 +3735,36 @@ export const proxyBridge = {
       return invoke<number>("generate_stress_sessions", { count });
     }
     return getPreviewEngine().generateBulkStressSessions(count).length;
+  },
+
+  async getHostRemapRules(): Promise<HostRemapRule[]> {
+    if (isTauriRuntime()) {
+      return invoke<HostRemapRule[]>("get_host_remap_rules");
+    }
+    return getPreviewEngine().getHostRemapRules();
+  },
+
+  async updateHostRemapRules(
+    rules: HostRemapRule[]
+  ): Promise<HostRemapRule[]> {
+    if (isTauriRuntime()) {
+      return invoke<HostRemapRule[]>("update_host_remap_rules", { rules });
+    }
+    return getPreviewEngine().updateHostRemapRules(rules);
+  },
+
+  async getThrottleConfig(): Promise<ThrottleConfig> {
+    if (isTauriRuntime()) {
+      return invoke<ThrottleConfig>("get_throttle_config");
+    }
+    return getPreviewEngine().getThrottleConfig();
+  },
+
+  async setThrottleConfig(config: ThrottleConfig): Promise<ThrottleConfig> {
+    if (isTauriRuntime()) {
+      return invoke<ThrottleConfig>("set_throttle_config", { config });
+    }
+    return getPreviewEngine().setThrottleConfig(config);
   },
 
   triggerSimulatedTrafficHit(): void {

@@ -37,6 +37,7 @@ import {
 import {
   DEFAULT_AUTORESPONDER_RULES,
   DEFAULT_CLEAR_DB_ON_EXIT,
+  DEFAULT_HOST_REMAP_RULES,
   DEFAULT_PYTHON_SCRIPT_CODE,
   PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
   PREVIEW_PYTHON_SCRIPT_STORAGE_KEY,
@@ -49,6 +50,8 @@ import {
   DEFAULT_SANITIZATION_REPLACEMENT,
   DEFAULT_SESSION_RETENTION_LIMIT,
   DEFAULT_STRIP_QUERY_PARAMS,
+  DEFAULT_THROTTLE_CONFIG,
+  THROTTLE_PRESET_DEFINITIONS,
 } from "../types/proxy";
 import type {
   AutoResponderRule,
@@ -69,6 +72,7 @@ import type {
   HeaderPair,
   HostListFilterConfig,
   HostListFilterMode,
+  HostRemapRule,
   InspectorDockPosition,
   NoiseThresholdsConfig,
   ProxyFilterBackendConfig,
@@ -76,6 +80,8 @@ import type {
   RuleActionType,
   RuleMatchTarget,
   SanitizationOptions,
+  ThrottleConfig,
+  ThrottlePreset,
   TlsBypassRule,
   TlsInterceptMode,
   ToolbarGroupId,
@@ -120,6 +126,8 @@ export const SETTINGS_STORAGE_KEYS = {
   clearDbOnExit: PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
   sanitizationOptions: PREVIEW_SANITIZATION_OPTIONS_STORAGE_KEY,
   pythonScript: PREVIEW_PYTHON_SCRIPT_STORAGE_KEY,
+  hostRemapRules: "fluxproxy-host-remap-rules-v1",
+  throttleConfig: "fluxproxy-throttle-config-v1",
 } as const;
 
 const VALID_THEMES = new Set<ThemePreference>(["dark", "light", "system"]);
@@ -301,6 +309,8 @@ export function createDefaultSettingsProfile(): FluxUserSettingsProfile {
       dropNonMatching: false,
       clearDbOnExit: DEFAULT_CLEAR_DB_ON_EXIT,
       sanitizationOptions: structuredClone(DEFAULT_SANITIZATION_OPTIONS),
+      hostRemapRules: structuredClone(DEFAULT_HOST_REMAP_RULES),
+      throttleConfig: { ...DEFAULT_THROTTLE_CONFIG },
     },
     autoResponder: {
       enabled: true,
@@ -797,6 +807,121 @@ function sanitizeTlsRuleList(
     });
   });
   return out;
+}
+
+const VALID_THROTTLE_PRESETS = new Set<ThrottlePreset>([
+  "none",
+  "gprs",
+  "slow3g",
+  "fast3g",
+  "lte",
+  "offline",
+  "custom",
+]);
+
+function normalizeThrottlePresetValue(raw: unknown): ThrottlePreset | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim().toLowerCase() as ThrottlePreset;
+  return VALID_THROTTLE_PRESETS.has(trimmed) ? trimmed : null;
+}
+
+function sanitizeHostRemapRules(
+  raw: unknown,
+  fallback: HostRemapRule[],
+  warnings: string[]
+): HostRemapRule[] {
+  if (raw === undefined) return structuredClone(fallback);
+  if (!Array.isArray(raw)) {
+    warnings.push(
+      "Список «proxy.hostRemapRules» повреждён — восстановлены правила по умолчанию."
+    );
+    return structuredClone(fallback);
+  }
+  const out: HostRemapRule[] = [];
+  raw.forEach((item, idx) => {
+    if (
+      !isPlainObject(item) ||
+      typeof item.sourcePattern !== "string" ||
+      typeof item.targetHost !== "string"
+    ) {
+      warnings.push(
+        `Правило HOSTS «proxy.hostRemapRules[${idx}]» пропущено (отсутствует sourcePattern/targetHost).`
+      );
+      return;
+    }
+    const sourcePattern = item.sourcePattern.trim().toLowerCase();
+    const targetHost = item.targetHost.trim().toLowerCase();
+    if (!sourcePattern || sourcePattern === "*" || sourcePattern === "*." || !targetHost) {
+      warnings.push(
+        `Правило HOSTS «proxy.hostRemapRules[${idx}]» пропущено (некорректный шаблон/цель).`
+      );
+      return;
+    }
+    let targetPort: number | null = null;
+    if (item.targetPort !== undefined && item.targetPort !== null) {
+      const n = Number(item.targetPort);
+      if (Number.isInteger(n) && n >= 1 && n <= 65535) {
+        targetPort = n;
+      } else {
+        warnings.push(
+          `Порт в «proxy.hostRemapRules[${idx}].targetPort» некорректен — сброшен.`
+        );
+      }
+    }
+    out.push({
+      id:
+        typeof item.id === "string" && item.id.trim()
+          ? item.id.trim()
+          : `remap-${idx + 1}`,
+      enabled: typeof item.enabled === "boolean" ? item.enabled : true,
+      sourcePattern,
+      targetHost,
+      targetPort,
+      preserveHostHeader:
+        typeof item.preserveHostHeader === "boolean"
+          ? item.preserveHostHeader
+          : true,
+      comment: typeof item.comment === "string" ? item.comment.trim() : "",
+    });
+  });
+  return out;
+}
+
+function sanitizeThrottleConfig(
+  raw: unknown,
+  warnings: string[]
+): ThrottleConfig {
+  if (raw === undefined) return { ...DEFAULT_THROTTLE_CONFIG };
+  if (!isPlainObject(raw)) {
+    warnings.push(
+      "Секция «proxy.throttleConfig» повреждена — сброшена на No Throttling."
+    );
+    return { ...DEFAULT_THROTTLE_CONFIG };
+  }
+  const preset = normalizeThrottlePresetValue(raw.preset);
+  if (!preset) {
+    warnings.push(
+      "Поле «proxy.throttleConfig.preset» некорректно — установлено none."
+    );
+    return { ...DEFAULT_THROTTLE_CONFIG };
+  }
+  if (preset === "custom") {
+    return {
+      preset: "custom",
+      downloadKbps: Math.max(0, Math.round(Number(raw.downloadKbps) || 0)),
+      uploadKbps: Math.max(0, Math.round(Number(raw.uploadKbps) || 0)),
+      latencyMs: Math.max(0, Math.round(Number(raw.latencyMs) || 0)),
+    };
+  }
+  const def = THROTTLE_PRESET_DEFINITIONS.find((d) => d.id === preset);
+  return def
+    ? {
+        preset: def.id,
+        downloadKbps: def.downloadKbps,
+        uploadKbps: def.uploadKbps,
+        latencyMs: def.latencyMs,
+      }
+    : { ...DEFAULT_THROTTLE_CONFIG };
 }
 
 function sanitizeHeaderMutations(
@@ -1844,6 +1969,12 @@ export function validateAndMigrateSettingsProfileWithReport(
         rawProxy.sanitizationOptions,
         warnings
       ),
+      hostRemapRules: sanitizeHostRemapRules(
+        rawProxy.hostRemapRules,
+        defaults.proxy.hostRemapRules ?? [],
+        warnings
+      ),
+      throttleConfig: sanitizeThrottleConfig(rawProxy.throttleConfig, warnings),
     },
     autoResponder: {
       enabled: sanitizeBoolean(
@@ -1997,6 +2128,14 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
   const storedBreakpoints = readLocalStorageJson<Partial<BreakpointConfig>>(
     SETTINGS_STORAGE_KEYS.breakpointConfig,
     structuredClone(DEFAULT_BREAKPOINT_CONFIG)
+  );
+  const storedHostRemapRules = readLocalStorageJson<HostRemapRule[]>(
+    SETTINGS_STORAGE_KEYS.hostRemapRules,
+    structuredClone(DEFAULT_HOST_REMAP_RULES)
+  );
+  const storedThrottleConfig = readLocalStorageJson<ThrottleConfig>(
+    SETTINGS_STORAGE_KEYS.throttleConfig,
+    { ...DEFAULT_THROTTLE_CONFIG }
   );
   const storedScripting = readLocalStorageJson<Partial<FluxUserScriptingSettings>>(
     SETTINGS_STORAGE_KEYS.pythonScript,
@@ -2162,6 +2301,12 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
       sanitizationOptions: structuredClone(
         live.proxy?.sanitizationOptions ?? storedSanitizationOptions
       ),
+      hostRemapRules: structuredClone(
+        live.proxy?.hostRemapRules ?? storedHostRemapRules
+      ),
+      throttleConfig: structuredClone(
+        live.proxy?.throttleConfig ?? storedThrottleConfig
+      ),
     },
     autoResponder: {
       enabled:
@@ -2305,6 +2450,8 @@ export function buildSettingsImportPreview(
     tlsTargetRulesCount,
     headerMutationsCount,
     autoResponderRulesCount,
+    hostRemapCount: incoming.proxy.hostRemapRules?.length ?? 0,
+    throttlePreset: incoming.proxy.throttleConfig?.preset ?? "none",
     autoResponderEnabled: incoming.autoResponder.enabled,
     totalRulesCount,
     currentTotalRulesCount,
@@ -2503,6 +2650,14 @@ function atomicWriteProfileToLocalStorage(
         }
       ),
     ],
+    [
+      SETTINGS_STORAGE_KEYS.hostRemapRules,
+      JSON.stringify(profile.proxy.hostRemapRules ?? DEFAULT_HOST_REMAP_RULES),
+    ],
+    [
+      SETTINGS_STORAGE_KEYS.throttleConfig,
+      JSON.stringify(profile.proxy.throttleConfig ?? DEFAULT_THROTTLE_CONFIG),
+    ],
   ];
 
   // Capture rollback snapshot for atomic recovery if quota is exceeded mid-batch
@@ -2580,6 +2735,12 @@ export async function applySettingsProfile(
   const clearDbOnExit = Boolean(
     normalizedWithBreakpoints.proxy.clearDbOnExit ?? false
   );
+  const nextHostRemapRules: HostRemapRule[] = structuredClone(
+    normalizedWithBreakpoints.proxy.hostRemapRules ?? DEFAULT_HOST_REMAP_RULES
+  );
+  const nextThrottleConfig: ThrottleConfig = {
+    ...(normalizedWithBreakpoints.proxy.throttleConfig ?? DEFAULT_THROTTLE_CONFIG),
+  };
 
   // 1. Capture current backend state snapshot for transactional rollback
   const [
@@ -2591,6 +2752,8 @@ export async function applySettingsProfile(
     prevStats,
     prevClearOnExit,
     prevPythonScript,
+    prevHostRemapRules,
+    prevThrottleConfig,
   ] = await Promise.all([
     proxyBridge.getStatus(),
     proxyBridge.getFilterBackendConfig(),
@@ -2600,6 +2763,8 @@ export async function applySettingsProfile(
     proxyBridge.getMemoryStorageStats(),
     proxyBridge.getClearDbOnExit(),
     proxyBridge.getPythonRunnerStatus(),
+    proxyBridge.getHostRemapRules(),
+    proxyBridge.getThrottleConfig(),
   ]);
 
   let latestStatus: ProxyStatus = prevStatus;
@@ -2621,6 +2786,8 @@ export async function applySettingsProfile(
       proxyBridge.setDropNonMatching(dropNonMatching),
       proxyBridge.setClearDbOnExit(clearDbOnExit),
       proxyBridge.setPythonScript(nextScripting.code, nextScripting.enabled),
+      proxyBridge.updateHostRemapRules(nextHostRemapRules),
+      proxyBridge.setThrottleConfig(nextThrottleConfig),
     ]);
 
     if (
@@ -2707,6 +2874,8 @@ export async function applySettingsProfile(
         prevPythonScript.code,
         prevPythonScript.enabled
       ),
+      proxyBridge.updateHostRemapRules(prevHostRemapRules),
+      proxyBridge.setThrottleConfig(prevThrottleConfig),
     ]);
     const configLabels = [
       "фильтры прокси",
@@ -2716,6 +2885,8 @@ export async function applySettingsProfile(
       "dropNonMatching",
       "clearDbOnExit",
       "Python Scripting",
+      "HOSTS Remapping",
+      "Bandwidth Throttling",
     ];
     configRollback.forEach((res, idx) => {
       if (res.status === "rejected") {

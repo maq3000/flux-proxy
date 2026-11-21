@@ -1032,6 +1032,7 @@ pub(super) fn har_entry_to_session(entry: &HarEntry, fallback_id: u64) -> Sessio
             comment: entry.comment.clone(),
             marked_color: ext.and_then(|x| x.marked_color.clone()),
             client_ip: ext.and_then(|x| x.client_ip.clone()),
+            remapped_to: None,
         },
         request_headers,
         response_headers,

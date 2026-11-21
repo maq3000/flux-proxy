@@ -69,6 +69,8 @@ pub struct SessionSummary {
     pub marked_color: Option<String>,
     #[serde(default)]
     pub client_ip: Option<String>,
+    #[serde(default)]
+    pub remapped_to: Option<String>,
 }
 
 /// Full session payload fetched on-demand when inspecting a row or dragging into Composer.
@@ -558,6 +560,131 @@ pub struct ScriptConsoleLogEvent {
     pub hook: Option<String>,
     pub session_id: Option<u64>,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostRemapRule {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub source_pattern: String,
+    pub target_host: String,
+    #[serde(default)]
+    pub target_port: Option<u16>,
+    #[serde(default = "default_true")]
+    pub preserve_host_header: bool,
+    #[serde(default)]
+    pub comment: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ThrottlePreset {
+    #[default]
+    None,
+    Gprs,
+    Slow3g,
+    Fast3g,
+    Lte,
+    Offline,
+    Custom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ThrottleConfig {
+    #[serde(default)]
+    pub preset: ThrottlePreset,
+    #[serde(default)]
+    pub download_kbps: u64,
+    #[serde(default)]
+    pub upload_kbps: u64,
+    #[serde(default)]
+    pub latency_ms: u64,
+}
+
+impl ThrottleConfig {
+    pub fn from_preset(preset: ThrottlePreset) -> Self {
+        match preset {
+            ThrottlePreset::None => Self {
+                preset,
+                download_kbps: 0,
+                upload_kbps: 0,
+                latency_ms: 0,
+            },
+            ThrottlePreset::Gprs => Self {
+                preset,
+                download_kbps: 50,
+                upload_kbps: 50,
+                latency_ms: 500,
+            },
+            ThrottlePreset::Slow3g => Self {
+                preset,
+                download_kbps: 400,
+                upload_kbps: 400,
+                latency_ms: 400,
+            },
+            ThrottlePreset::Fast3g => Self {
+                preset,
+                download_kbps: 1600,
+                upload_kbps: 1600,
+                latency_ms: 150,
+            },
+            ThrottlePreset::Lte => Self {
+                preset,
+                download_kbps: 30_000,
+                upload_kbps: 30_000,
+                latency_ms: 40,
+            },
+            ThrottlePreset::Offline => Self {
+                preset,
+                download_kbps: 0,
+                upload_kbps: 0,
+                latency_ms: 0,
+            },
+            ThrottlePreset::Custom => Self {
+                preset,
+                download_kbps: 1000,
+                upload_kbps: 500,
+                latency_ms: 100,
+            },
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        match self.preset {
+            ThrottlePreset::Custom => self,
+            preset => Self::from_preset(preset),
+        }
+    }
+
+    pub fn is_offline(&self) -> bool {
+        matches!(self.preset, ThrottlePreset::Offline)
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.is_offline()
+            || self.latency_ms > 0
+            || self.download_kbps > 0
+            || self.upload_kbps > 0
+    }
+
+    pub fn download_bytes_per_sec(&self) -> Option<u64> {
+        if self.is_offline() || self.download_kbps == 0 {
+            None
+        } else {
+            Some((self.download_kbps.saturating_mul(1000) / 8).max(1))
+        }
+    }
+
+    pub fn upload_bytes_per_sec(&self) -> Option<u64> {
+        if self.is_offline() || self.upload_kbps == 0 {
+            None
+        } else {
+            Some((self.upload_kbps.saturating_mul(1000) / 8).max(1))
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -138,6 +138,7 @@ pub(super) async fn handle_websocket_intercept(
                 comment: None,
                 marked_color: None,
                 client_ip: Some(normalize_client_ip(client_addr)),
+                remapped_to: None,
             };
 
             let capped = &resp_bytes[..resp_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
@@ -261,6 +262,7 @@ pub(super) async fn handle_websocket_intercept(
         comment: None,
         marked_color: None,
         client_ip: Some(normalize_client_ip(client_addr)),
+        remapped_to: None,
     };
 
     let initial_detail = SessionDetail {

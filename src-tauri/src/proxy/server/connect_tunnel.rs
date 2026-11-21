@@ -17,14 +17,16 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::models::{HeaderPair, SessionDetail, SessionSummary};
 use crate::proxy::filters::{ConnectTunnelDecision, PassthroughReason};
+use crate::proxy::hosts::HostRemapRegistry;
 use crate::proxy::network::normalize_client_ip;
 use crate::proxy::process::ClientProcessInfo;
+use crate::proxy::throttle::ThrottledStream;
 
 use super::http_handler::handle_intercepted_request;
 use super::mobile_portal::{is_builtin_portal_target, is_virtual_portal_domain};
 use super::{
     boxed_full, extract_hyper_headers, is_loopback_ip, is_loopback_or_unspecified_host,
-    plain_response, record_and_return_error, record_completed_session, split_authority,
+    plain_response, record_and_return_error_with_opts, record_completed_session, split_authority,
     ProxyBoxBody, SharedProxyContext,
 };
 
@@ -68,10 +70,39 @@ pub(super) async fn handle_outer_proxy_request(
             );
         }
 
-        // Selective MITM Pass-Through:
+        // Selective MITM Pass-Through & Offline Throttling:
         // - Mode 1 (`InterceptAll`): passthrough if matched by `tls_bypass_rules`
         // - Mode 2 (`TargetedOnly`): pure TCP passthrough (`copy_bidirectional`) for EVERYTHING except `tls_target_rules`
         if !is_portal_connect {
+            if ctx.throttle.is_offline() {
+                let start = Instant::now();
+                let timestamp = Utc::now().to_rfc3339();
+                let session_id = ctx.store.allocate_id();
+                let connect_headers = extract_hyper_headers(req.headers());
+                let target_url = format!("https://{authority}/");
+                let tunnel_path = format!("Tunnel to {host}:{port}");
+                return record_and_return_error_with_opts(
+                    &ctx,
+                    session_id,
+                    "https",
+                    "CONNECT",
+                    &host,
+                    &tunnel_path,
+                    &target_url,
+                    connect_headers,
+                    Bytes::new(),
+                    start,
+                    timestamp,
+                    client_addr,
+                    client_proc.as_ref(),
+                    false,
+                    false,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    None,
+                    "Network Offline (Bandwidth Throttling: Offline)".to_string(),
+                );
+            }
+
             if let ConnectTunnelDecision::Passthrough(reason) =
                 ctx.filters.evaluate_connect_tunnel(&host, port)
             {
@@ -82,10 +113,43 @@ pub(super) async fn handle_outer_proxy_request(
             let target_url = format!("https://{authority}/");
             let tunnel_path = format!("Tunnel to {host}:{port}");
 
-            let mut upstream_tcp = match TcpStream::connect((host.as_str(), port)).await {
+            let remapped_connect = ctx.host_remap.resolve_connect_target(&host, port);
+            let (connect_host, connect_port, remapped_to) = match &remapped_connect {
+                Some((target_host, target_port, rule)) => (
+                    target_host.clone(),
+                    *target_port,
+                    Some(HostRemapRegistry::format_remap_target(rule, rule.target_port)),
+                ),
+                None => (host.clone(), port, None),
+            };
+
+            if let Err(err) = ctx.throttle.apply_latency().await {
+                return record_and_return_error_with_opts(
+                    &ctx,
+                    session_id,
+                    "https",
+                    "CONNECT",
+                    &host,
+                    &tunnel_path,
+                    &target_url,
+                    connect_headers,
+                    Bytes::new(),
+                    start,
+                    timestamp,
+                    client_addr,
+                    client_proc.as_ref(),
+                    true,
+                    false,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    remapped_to,
+                    err.to_string(),
+                );
+            }
+
+            let upstream_tcp = match TcpStream::connect((connect_host.as_str(), connect_port)).await {
                 Ok(stream) => stream,
                 Err(err) => {
-                    return record_and_return_error(
+                    return record_and_return_error_with_opts(
                         &ctx,
                         session_id,
                         "https",
@@ -101,12 +165,16 @@ pub(super) async fn handle_outer_proxy_request(
                         client_proc.as_ref(),
                         true,
                         false,
-                        format!("TLS Passthrough TCP connect failed for {host}:{port}: {err}"),
+                        StatusCode::BAD_GATEWAY,
+                        remapped_to,
+                        format!(
+                            "TLS Passthrough TCP connect failed for {connect_host}:{connect_port}: {err}"
+                        ),
                     );
                 }
             };
 
-            let (protocol_label, passthrough_note, mode_header_val, tls_version_label) =
+            let (protocol_label, mut passthrough_note, mode_header_val, tls_version_label) =
                 match &reason {
                     PassthroughReason::BypassRule(bypass_rule) => (
                         "TLS-BYPASS".to_string(),
@@ -144,6 +212,20 @@ pub(super) async fn handle_outer_proxy_request(
                     ),
                 };
 
+            let mut resp_headers = vec![HeaderPair {
+                name: "X-FluxProxy-TLS-Mode".into(),
+                value: mode_header_val,
+            }];
+            if let Some(ref target_label) = remapped_to {
+                passthrough_note.push_str(&format!(
+                    "\nHOSTS Remapped Target: {connect_host}:{connect_port} (label: {target_label})"
+                ));
+                resp_headers.push(HeaderPair {
+                    name: "X-FluxProxy-Host-Remap".into(),
+                    value: format!("{connect_host}:{connect_port}"),
+                });
+            }
+
             let summary = SessionSummary {
                 id: session_id,
                 status: 200,
@@ -169,15 +251,13 @@ pub(super) async fn handle_outer_proxy_request(
                 comment: None,
                 marked_color: None,
                 client_ip: Some(normalize_client_ip(client_addr)),
+                remapped_to,
             };
 
             let detail = SessionDetail {
                 summary: summary.clone(),
                 request_headers: connect_headers,
-                response_headers: vec![HeaderPair {
-                    name: "X-FluxProxy-TLS-Mode".into(),
-                    value: mode_header_val,
-                }],
+                response_headers: resp_headers,
                 request_body_base64: String::new(),
                 response_body_base64: base64::engine::general_purpose::STANDARD
                     .encode(passthrough_note.as_bytes()),
@@ -197,7 +277,9 @@ pub(super) async fn handle_outer_proxy_request(
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {
                         let mut client_io = TokioIo::new(upgraded);
-                        match tokio::io::copy_bidirectional(&mut client_io, &mut upstream_tcp).await
+                        let mut throttled_upstream =
+                            ThrottledStream::new_without_initial_delay(upstream_tcp, ctx.throttle.clone());
+                        match tokio::io::copy_bidirectional(&mut client_io, &mut throttled_upstream).await
                         {
                             Ok((tx_bytes, rx_bytes)) => {
                                 if let Some(mut existing) = ctx.store.get(session_id) {

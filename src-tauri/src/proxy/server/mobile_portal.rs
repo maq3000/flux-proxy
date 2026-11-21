@@ -228,6 +228,7 @@ pub(super) fn handle_builtin_portal_request(
         comment: None,
         marked_color: None,
         client_ip: Some(client_ip_str),
+        remapped_to: None,
     };
 
     let detail = SessionDetail {

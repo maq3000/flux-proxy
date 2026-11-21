@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Database, Stethoscope, Trash2, Upload, X } from "lucide-react";
+import { Database, Gauge, Globe, Stethoscope, Trash2, Upload, WifiOff, X } from "lucide-react";
 import {
   Panel,
   PanelGroup,
@@ -10,6 +10,7 @@ import { AutoResponderPanel } from "./components/AutoResponderPanel";
 import { BreakpointBanner } from "./components/BreakpointBanner";
 import { CertificateModal } from "./components/CertificateModal";
 import { ClientCertificatesModal } from "./components/ClientCertificatesModal";
+import { HostRemapModal } from "./components/HostRemapModal";
 import { CodeSnippetModal } from "./components/CodeSnippetModal";
 import {
   CommandPalette,
@@ -117,12 +118,14 @@ import { isTauriRuntime, proxyBridge } from "./lib/tauriBridge";
 import { useProxyStore } from "./stores/proxyStore";
 import { useUiStore } from "./stores/uiStore";
 import { THEME_PRESETS } from "./lib/themePresets";
+import { THROTTLE_PRESET_DEFINITIONS } from "./types/proxy";
 import type {
   AutoResponderRule,
   ComposedRequest,
   FilterDrawerTab,
   PythonScriptPreset,
   SessionSummary,
+  ThrottleConfig,
 } from "./types/proxy";
 import type {
   FluxUserSettingsProfile,
@@ -324,6 +327,14 @@ export const App: React.FC = () => {
   const setScriptConsoleLogs = useProxyStore((s) => s.setScriptConsoleLogs);
   const isApplyingScript = useProxyStore((s) => s.isApplyingScript);
   const setIsApplyingScript = useProxyStore((s) => s.setIsApplyingScript);
+  const hostRemapRules = useProxyStore((s) => s.hostRemapRules);
+  const setHostRemapRules = useProxyStore((s) => s.setHostRemapRules);
+  const throttleConfig = useProxyStore((s) => s.throttleConfig);
+  const setThrottleConfig = useProxyStore((s) => s.setThrottleConfig);
+  const activeHostRemapCount = useMemo(
+    () => hostRemapRules.filter((r) => r.enabled).length,
+    [hostRemapRules]
+  );
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] =
     useState<SettingsModalTab>("general");
@@ -333,6 +344,74 @@ export const App: React.FC = () => {
   } | null>(null);
   const [certModalOpen, setCertModalOpen] = useState(false);
   const [clientCertsModalOpen, setClientCertsModalOpen] = useState(false);
+  const [hostRemapModalOpen, setHostRemapModalOpen] = useState(false);
+
+  const handleChangeThrottleConfig = useCallback(
+    async (nextCfg: ThrottleConfig) => {
+      try {
+        const saved = await proxyBridge.setThrottleConfig(nextCfg);
+        setThrottleConfig(saved);
+        if (saved.preset === "offline") {
+          showToast("⛔ Сеть переведена в режим Offline (HTTP 503)");
+        } else if (saved.preset === "none") {
+          showToast("⚡ Bandwidth Throttling отключён (полная скорость)");
+        } else {
+          const def = THROTTLE_PRESET_DEFINITIONS.find(
+            (d) => d.id === saved.preset
+          );
+          const label = def ? def.label : saved.preset;
+          showToast(
+            `🐢 Профиль сети: ${label} (↓${saved.downloadKbps} / ↑${saved.uploadKbps} Kbps · ${saved.latencyMs} ms)`
+          );
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        showToast(`⚠️ Не удалось применить Bandwidth Throttling: ${msg}`);
+      }
+    },
+    [setThrottleConfig, showToast]
+  );
+
+  // Sync persisted Virtual DNS (HOSTS Remapping) & Bandwidth Throttling to backend on boot
+  useEffect(() => {
+    let active = true;
+    const syncNetworkSimulationOnBoot = async () => {
+      try {
+        const currentRules = useProxyStore.getState().hostRemapRules;
+        if (currentRules.length > 0) {
+          const savedRules = await proxyBridge.updateHostRemapRules(
+            currentRules
+          );
+          if (active) setHostRemapRules(savedRules);
+        } else {
+          const backendRules = await proxyBridge.getHostRemapRules();
+          if (active && backendRules.length > 0) {
+            setHostRemapRules(backendRules);
+          }
+        }
+      } catch {
+        // best-effort sync on boot
+      }
+      try {
+        const currentThrottle = useProxyStore.getState().throttleConfig;
+        if (currentThrottle.preset !== "none") {
+          const savedCfg = await proxyBridge.setThrottleConfig(currentThrottle);
+          if (active) setThrottleConfig(savedCfg);
+        } else {
+          const backendCfg = await proxyBridge.getThrottleConfig();
+          if (active && backendCfg.preset !== "none") {
+            setThrottleConfig(backendCfg);
+          }
+        }
+      } catch {
+        // best-effort sync on boot
+      }
+    };
+    void syncNetworkSimulationOnBoot();
+    return () => {
+      active = false;
+    };
+  }, [setHostRemapRules, setThrottleConfig]);
   const [mobileModalOpen, setMobileModalOpen] = useState(false);
   const [proxyDoctorModalOpen, setProxyDoctorModalOpen] = useState(false);
   const [sanitizedExportModalOpen, setSanitizedExportModalOpen] =
@@ -1090,6 +1169,8 @@ export const App: React.FC = () => {
       dropNonMatching,
       clearDbOnExit,
       sanitizationOptions: loadPersistedSanitizationOptions(),
+      hostRemapRules,
+      throttleConfig,
     },
     autoResponder: {
       enabled: autoResponderEnabled,
@@ -1610,6 +1691,22 @@ export const App: React.FC = () => {
         return;
       }
 
+      // Ctrl+Shift+H / Cmd+Shift+H -> Virtual DNS (HOSTS Remapping…)
+      if (
+        ctrlOrMeta &&
+        !e.altKey &&
+        e.shiftKey &&
+        (keyLower === "h" || e.code === "KeyH")
+      ) {
+        e.preventDefault();
+        if (hostRemapModalOpen) {
+          setHostRemapModalOpen(false);
+        } else if (!hasOpenModal()) {
+          setHostRemapModalOpen(true);
+        }
+        return;
+      }
+
       // Ctrl+Shift+D / Cmd+Shift+D -> Run Proxy Doctor
       if (
         ctrlOrMeta &&
@@ -1842,6 +1939,7 @@ export const App: React.FC = () => {
     exportAllSessionsAs,
     filteredSessions,
     handleFocusSearch,
+    hostRemapModalOpen,
     importArchiveDialog,
     openAnnotationFor,
     openDiffWithPairSmart,
@@ -2352,6 +2450,49 @@ export const App: React.FC = () => {
         perform: () => setClientCertsModalOpen(true),
       },
       {
+        id: "host-remap",
+        category: "DNS / Routing",
+        label: "HOSTS Remapping… (Virtual DNS перенаправление доменов)",
+        shortcut: "Ctrl+Shift+H",
+        keywords: [
+          "hosts",
+          "dns",
+          "remap",
+          "virtual",
+          "redirect",
+          "sni",
+          "перенаправление",
+          "хост",
+        ],
+        perform: () => setHostRemapModalOpen(true),
+      },
+      ...THROTTLE_PRESET_DEFINITIONS.filter((d) => d.id !== "custom").map(
+        (presetDef) => ({
+          id: `throttle-preset-${presetDef.id}`,
+          category: "Throttling",
+          label: `Network Throttling: ${presetDef.label} (${presetDef.summary})`,
+          keywords: [
+            "throttle",
+            "bandwidth",
+            "network",
+            "speed",
+            "latency",
+            "slow",
+            presetDef.id,
+            presetDef.shortLabel.toLowerCase(),
+            "скорость",
+            "троттлинг",
+          ],
+          perform: () =>
+            void handleChangeThrottleConfig({
+              preset: presetDef.id,
+              downloadKbps: presetDef.downloadKbps,
+              uploadKbps: presetDef.uploadKbps,
+              latencyMs: presetDef.latencyMs,
+            }),
+        })
+      ),
+      {
         id: "save-all-archive",
         category: "Storage",
         label: "Save All Sessions As... (.har, .saz, .json)",
@@ -2545,6 +2686,7 @@ export const App: React.FC = () => {
       exportAllSessionsAs,
       exportSelectedSessionsAs,
       generateStress10k,
+      handleChangeThrottleConfig,
       handleExportSettingsProfile,
       handleImportSettingsProfileDialog,
       handleInspectInHex,
@@ -2879,6 +3021,8 @@ export const App: React.FC = () => {
         onOpenMobileSetup={() => setMobileModalOpen(true)}
         onOpenCertificates={() => setCertModalOpen(true)}
         onOpenClientCertificates={() => setClientCertsModalOpen(true)}
+        onOpenHostRemap={() => setHostRemapModalOpen(true)}
+        activeHostRemapCount={activeHostRemapCount}
         sessionRetentionLimit={sessionRetentionLimit}
         onSetSessionRetentionLimit={(limit) =>
           void setSessionRetentionLimit(limit)
@@ -3018,6 +3162,10 @@ export const App: React.FC = () => {
             onLoadSqlite={() => void loadFromSqlite()}
             onOpenCertificates={() => setCertModalOpen(true)}
             onOpenMobileSetup={() => setMobileModalOpen(true)}
+            throttleConfig={throttleConfig}
+            onChangeThrottleConfig={(cfg) => void handleChangeThrottleConfig(cfg)}
+            onOpenHostRemap={() => setHostRemapModalOpen(true)}
+            activeHostRemapCount={activeHostRemapCount}
             onNotify={showToast}
           />
 
@@ -3367,6 +3515,60 @@ export const App: React.FC = () => {
               ? `MITM: Targeted (${activeTargetHostsCount})`
               : "MITM: All"}
           </button>
+          {activeHostRemapCount > 0 && (
+            <>
+              <span className="hidden text-subtle md:inline">•</span>
+              <button
+                type="button"
+                onClick={() => setHostRemapModalOpen(true)}
+                title={`Активных правил HOSTS Remapping: ${activeHostRemapCount}. Нажмите для управления (Ctrl+Shift+H)`}
+                className="inline-flex shrink-0 items-center gap-1 text-accent hover:underline"
+              >
+                <Globe className="h-3 w-3" aria-hidden="true" />
+                <span>HOSTS: {activeHostRemapCount}</span>
+              </button>
+            </>
+          )}
+          {throttleConfig.preset !== "none" && (
+            <>
+              <span className="text-subtle">•</span>
+              {(() => {
+                const def = THROTTLE_PRESET_DEFINITIONS.find(
+                  (d) => d.id === throttleConfig.preset
+                );
+                const isOffline = throttleConfig.preset === "offline";
+                const label = isOffline
+                  ? "OFFLINE (503)"
+                  : `${def ? def.shortLabel : throttleConfig.preset}: ↓${throttleConfig.downloadKbps} Kbps · ${throttleConfig.latencyMs}ms`;
+                return (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void handleChangeThrottleConfig({
+                        preset: "none",
+                        downloadKbps: 0,
+                        uploadKbps: 0,
+                        latencyMs: 0,
+                      })
+                    }
+                    title={`Активен Bandwidth Throttling (${label}). Нажмите, чтобы сбросить на No Throttling (полная скорость).`}
+                    className={`inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold transition-colors hover:brightness-110 ${
+                      isOffline
+                        ? "bg-status5xx-bg text-status5xx-fg"
+                        : "bg-status4xx-bg text-status4xx-fg"
+                    }`}
+                  >
+                    {isOffline ? (
+                      <WifiOff className="h-3 w-3" aria-hidden="true" />
+                    ) : (
+                      <Gauge className="h-3 w-3" aria-hidden="true" />
+                    )}
+                    <span>{label}</span>
+                  </button>
+                );
+              })()}
+            </>
+          )}
           {activeFilterBadgeCount > 0 && (
             <>
               <span className="text-subtle">•</span>
@@ -3681,6 +3883,12 @@ export const App: React.FC = () => {
       <ClientCertificatesModal
         open={clientCertsModalOpen}
         onClose={() => setClientCertsModalOpen(false)}
+        onNotify={showToast}
+      />
+
+      <HostRemapModal
+        open={hostRemapModalOpen}
+        onClose={() => setHostRemapModalOpen(false)}
         onNotify={showToast}
       />
 

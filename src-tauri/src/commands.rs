@@ -7,9 +7,9 @@ use tauri::State;
 use crate::models::{
     AutoResponderRule, BindHostMode, BreakpointAction, BreakpointConfig, BreakpointResolution,
     CaCertificateInfo, CodecOperation, CodecTransformResult, ComposedRequest, DoctorCheckResult,
-    LoadedSessionBody, NetworkInterfaceInfo, PausedBreakpointItem, ProxyError,
+    HostRemapRule, LoadedSessionBody, NetworkInterfaceInfo, PausedBreakpointItem, ProxyError,
     ProxyFilterBackendConfig, ProxyStatus, PythonRunnerStatus, SanitizationOptions, SessionDetail,
-    SessionSummary, StorageStats,
+    SessionSummary, StorageStats, ThrottleConfig,
 };
 use crate::proxy::client_certs::{AddClientCertificateRequest, ClientCertificateEntry};
 use crate::proxy::codec::execute_codec_transform;
@@ -930,6 +930,36 @@ pub async fn generate_stress_sessions(
     .await?;
     state.controller.context.emit_storage_stats_changed();
     Ok(generated)
+}
+
+#[tauri::command]
+pub async fn get_host_remap_rules(
+    state: State<'_, AppState>,
+) -> Result<Vec<HostRemapRule>, ProxyError> {
+    Ok(state.controller.context.host_remap.list_rules())
+}
+
+#[tauri::command]
+pub async fn update_host_remap_rules(
+    rules: Vec<HostRemapRule>,
+    state: State<'_, AppState>,
+) -> Result<Vec<HostRemapRule>, ProxyError> {
+    let saved = state.controller.context.host_remap.set_rules(rules)?;
+    state.controller.context.rebuild_upstream_clients();
+    Ok(saved)
+}
+
+#[tauri::command]
+pub async fn get_throttle_config(state: State<'_, AppState>) -> Result<ThrottleConfig, ProxyError> {
+    Ok(state.controller.context.throttle.get_config())
+}
+
+#[tauri::command]
+pub async fn set_throttle_config(
+    config: ThrottleConfig,
+    state: State<'_, AppState>,
+) -> Result<ThrottleConfig, ProxyError> {
+    Ok(state.controller.context.throttle.set_config(config))
 }
 
 #[cfg(test)]

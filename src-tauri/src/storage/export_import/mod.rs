@@ -229,6 +229,7 @@ mod tests {
                     comment: Some("Auth login checkpoint".into()),
                     marked_color: Some("green".into()),
                     client_ip: Some("127.0.0.1".into()),
+                    remapped_to: None,
                 },
                 request_headers: vec![
                     HeaderPair {
@@ -291,6 +292,7 @@ mod tests {
                     comment: None,
                     marked_color: Some("blue".into()),
                     client_ip: Some("127.0.0.1".into()),
+                    remapped_to: None,
                 },
                 request_headers: vec![HeaderPair {
                     name: "Host".into(),

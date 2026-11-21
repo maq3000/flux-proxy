@@ -674,6 +674,7 @@ pub(super) fn build_session_from_saz_parts(
             comment,
             marked_color,
             client_ip,
+            remapped_to: None,
         },
         request_headers,
         response_headers,

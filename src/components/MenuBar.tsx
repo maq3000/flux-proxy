@@ -112,6 +112,8 @@ interface MenuBarProps {
   onOpenMobileSetup: () => void;
   onOpenCertificates: () => void;
   onOpenClientCertificates: () => void;
+  onOpenHostRemap?: () => void;
+  activeHostRemapCount?: number;
   onGenerateStress10k: () => void;
   // Help
   onOpenCommandPalette: () => void;
@@ -352,6 +354,8 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onOpenMobileSetup,
   onOpenCertificates,
   onOpenClientCertificates,
+  onOpenHostRemap,
+  activeHostRemapCount = 0,
   onGenerateStress10k,
   onOpenCommandPalette,
   onOpenShortcutsModal,
@@ -1899,6 +1903,22 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                   Ctrl+Shift+C
                 </span>
               </button>
+              {onOpenHostRemap && (
+                <button
+                  type="button"
+                  onClick={(e) => activateCommand(e, onOpenHostRemap)}
+                >
+                  <span>
+                    HOSTS Remapping…
+                    {activeHostRemapCount > 0
+                      ? ` (${activeHostRemapCount})`
+                      : ""}
+                  </span>
+                  <span className="hint" aria-hidden="true">
+                    Ctrl+Shift+H
+                  </span>
+                </button>
+              )}
               <hr />
               <button
                 type="button"

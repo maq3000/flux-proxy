@@ -9,6 +9,7 @@ import {
   Columns3,
   Copy,
   Database,
+  Gauge,
   GitCompareArrows,
   Globe,
   ListFilter,
@@ -30,19 +31,25 @@ import {
   Terminal,
   Trash2,
   Wand2,
+  WifiOff,
   X,
 } from "lucide-react";
 import {
   TOOLBAR_GROUP_DEFINITIONS,
   TRAFFIC_COLUMNS,
 } from "../hooks/useUiPreferences";
-import { SESSION_RETENTION_PRESETS } from "../types/proxy";
+import {
+  SESSION_RETENTION_PRESETS,
+  THROTTLE_PRESET_DEFINITIONS,
+} from "../types/proxy";
 import type {
   BreakpointConfig,
   ColumnId,
   InspectorDockPosition,
   ProxyStatus,
   QuickFilterCategory,
+  ThrottleConfig,
+  ThrottlePreset,
   TlsInterceptMode,
   ToolbarGroupId,
 } from "../types/proxy";
@@ -124,6 +131,10 @@ interface TopToolbarProps {
   onLoadSqlite: () => void;
   onOpenCertificates: () => void;
   onOpenMobileSetup: () => void;
+  throttleConfig: ThrottleConfig;
+  onChangeThrottleConfig: (cfg: ThrottleConfig) => void;
+  onOpenHostRemap: () => void;
+  activeHostRemapCount: number;
   onNotify?: (msg: string) => void;
 }
 
@@ -267,10 +278,18 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   onLoadSqlite,
   onOpenCertificates,
   onOpenMobileSetup,
+  throttleConfig,
+  onChangeThrottleConfig,
+  onOpenHostRemap,
+  activeHostRemapCount,
   onNotify,
 }) => {
   const sysProxyPopoverId = useId();
   const mitmPopoverId = useId();
+  const throttlePopoverId = useId();
+  const throttleDownInputId = useId();
+  const throttleUpInputId = useId();
+  const throttleLatencyInputId = useId();
   const columnsPopoverId = useId();
   const overflowTriggerId = useId();
   const overflowMenuId = useId();
@@ -285,6 +304,8 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   const sysPopoverRef = useRef<HTMLDivElement>(null);
   const mitmChevronRef = useRef<HTMLButtonElement>(null);
   const mitmPopoverRef = useRef<HTMLDivElement>(null);
+  const throttleBtnRef = useRef<HTMLButtonElement>(null);
+  const throttlePopoverRef = useRef<HTMLDivElement>(null);
   const columnsBtnRef = useRef<HTMLButtonElement>(null);
   const columnsPopoverRef = useRef<HTMLDivElement>(null);
   const overflowBtnRef = useRef<HTMLButtonElement>(null);
@@ -298,6 +319,16 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   const [quickTargetDraft, setQuickTargetDraft] = useState("");
   const [overflowExpanded, setOverflowExpanded] = useState(false);
   const [keepExpanded, setKeepExpanded] = useState(false);
+  const [throttleExpanded, setThrottleExpanded] = useState(false);
+  const [customDownDraft, setCustomDownDraft] = useState(() =>
+    String(throttleConfig.downloadKbps || 1000)
+  );
+  const [customUpDraft, setCustomUpDraft] = useState(() =>
+    String(throttleConfig.uploadKbps || 500)
+  );
+  const [customLatencyDraft, setCustomLatencyDraft] = useState(() =>
+    String(throttleConfig.latencyMs || 100)
+  );
   const [customInlineOpen, setCustomInlineOpen] = useState(false);
   const [customLimitDraft, setCustomLimitDraft] = useState(() =>
     String(sessionRetentionLimit ?? 1000)
@@ -408,6 +439,72 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
       menu.classList.remove(":popover-open");
     }
     setOverflowExpanded(false);
+  };
+
+  const closeThrottlePopover = () => {
+    const panel = throttlePopoverRef.current;
+    if (!panel) return;
+    if ("popover" in HTMLElement.prototype) {
+      if (panel.matches(":popover-open")) panel.hidePopover();
+    } else {
+      panel.classList.remove(":popover-open");
+    }
+    setThrottleExpanded(false);
+  };
+
+  useEffect(() => {
+    const panel = throttlePopoverRef.current;
+    const trigger = throttleBtnRef.current;
+    if (!panel || !trigger) return;
+    const onToggle = () => {
+      const open =
+        ("popover" in HTMLElement.prototype && panel.matches(":popover-open")) ||
+        panel.classList.contains(":popover-open");
+      setThrottleExpanded(open);
+      if (open) {
+        positionToolbarPopoverFallback(trigger, panel);
+      }
+    };
+    panel.addEventListener("toggle", onToggle);
+    return () => panel.removeEventListener("toggle", onToggle);
+  }, []);
+
+  useEffect(() => {
+    if (throttleConfig.preset === "custom") {
+      setCustomDownDraft(String(throttleConfig.downloadKbps));
+      setCustomUpDraft(String(throttleConfig.uploadKbps));
+      setCustomLatencyDraft(String(throttleConfig.latencyMs));
+    }
+  }, [throttleConfig]);
+
+  const activeThrottleDef =
+    THROTTLE_PRESET_DEFINITIONS.find((d) => d.id === throttleConfig.preset) ??
+    THROTTLE_PRESET_DEFINITIONS[0];
+
+  const handleSelectThrottlePreset = (presetId: ThrottlePreset) => {
+    const def = THROTTLE_PRESET_DEFINITIONS.find((d) => d.id === presetId);
+    if (!def) return;
+    onChangeThrottleConfig({
+      preset: def.id,
+      downloadKbps: def.downloadKbps,
+      uploadKbps: def.uploadKbps,
+      latencyMs: def.latencyMs,
+    });
+    closeThrottlePopover();
+  };
+
+  const handleApplyCustomThrottle = (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const down = Math.max(0, Math.round(Number(customDownDraft) || 0));
+    const up = Math.max(0, Math.round(Number(customUpDraft) || 0));
+    const lat = Math.max(0, Math.round(Number(customLatencyDraft) || 0));
+    onChangeThrottleConfig({
+      preset: "custom",
+      downloadKbps: down,
+      uploadKbps: up,
+      latencyMs: lat,
+    });
+    closeThrottlePopover();
   };
 
   const closeKeepMenu = () => {
@@ -1101,6 +1198,191 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
           </div>
         )}
 
+        {/* Network Bandwidth Throttling Selector */}
+        {(!compactToolbar || throttleConfig.preset !== "none") && (
+          <div className="flex items-center border-l border-hairline pl-1.5">
+            <button
+              ref={throttleBtnRef}
+              type="button"
+              aria-label={`Network Throttling: ${activeThrottleDef.label}`}
+              aria-expanded={throttleExpanded}
+              aria-controls={throttlePopoverId}
+              title={
+                throttleConfig.preset === "offline"
+                  ? "Bandwidth Throttling: Offline (все запросы отклоняются с HTTP 503)"
+                  : throttleConfig.preset === "none"
+                    ? "Bandwidth Throttling: No Throttling (полная скорость)"
+                    : `Bandwidth Throttling: ${activeThrottleDef.label} (↓${throttleConfig.downloadKbps} Kbps / ↑${throttleConfig.uploadKbps} Kbps / ${throttleConfig.latencyMs} ms)`
+              }
+              onClick={(e) =>
+                toggleInvokerFallback(
+                  e,
+                  throttleBtnRef.current,
+                  throttlePopoverRef.current
+                )
+              }
+              {...({
+                commandfor: throttlePopoverId,
+                command: "toggle-popover",
+              } as Record<string, string>)}
+              className={`inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs transition-colors ${
+                throttleConfig.preset === "offline"
+                  ? "border-status5xx-fg/50 bg-status5xx-bg text-status5xx-fg hover:brightness-110"
+                  : throttleConfig.preset !== "none"
+                    ? "border-status4xx-fg/45 bg-status4xx-bg text-status4xx-fg hover:brightness-110"
+                    : "border-hairline bg-elevated text-muted hover:border-strong hover:text-fg"
+              }`}
+            >
+              {throttleConfig.preset === "offline" ? (
+                <WifiOff className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              ) : (
+                <Gauge className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              )}
+              {(!compactToolbar || throttleConfig.preset !== "none") && (
+                <span className="whitespace-nowrap font-mono text-[11px] font-medium">
+                  {throttleConfig.preset === "custom"
+                    ? `Custom (${throttleConfig.latencyMs}ms)`
+                    : activeThrottleDef.shortLabel}
+                </span>
+              )}
+              <ChevronDown className="h-3 w-3 opacity-75" aria-hidden="true" />
+            </button>
+
+            <div
+              ref={throttlePopoverRef}
+              id={throttlePopoverId}
+              {...({ popover: "auto" } as Record<string, string>)}
+              className="toolbar-popover z-50 hidden w-80 rounded-lg border border-strong bg-surface p-3 text-xs text-fg shadow-popover"
+            >
+              <div className="flex items-center justify-between border-b border-hairline pb-2">
+                <span className="font-semibold">
+                  Bandwidth Throttling &amp; Latency
+                </span>
+                {throttleConfig.preset !== "none" && (
+                  <button
+                    type="button"
+                    onClick={() => handleSelectThrottlePreset("none")}
+                    className="text-[11px] text-accent hover:underline"
+                  >
+                    Reset to Full
+                  </button>
+                )}
+              </div>
+
+              <div className="mt-2 space-y-1">
+                {THROTTLE_PRESET_DEFINITIONS.filter((d) => d.id !== "custom").map(
+                  (presetDef) => {
+                    const isSelected = throttleConfig.preset === presetDef.id;
+                    return (
+                      <button
+                        key={presetDef.id}
+                        type="button"
+                        onClick={() => handleSelectThrottlePreset(presetDef.id)}
+                        className={`flex w-full items-center justify-between rounded-md border px-2.5 py-1.5 text-left transition-colors ${
+                          isSelected
+                            ? presetDef.id === "offline"
+                              ? "border-status5xx-fg/50 bg-status5xx-bg text-status5xx-fg"
+                              : "border-accent/50 bg-selected text-fg"
+                            : "border-hairline bg-canvas text-muted hover:border-strong hover:text-fg"
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          {isSelected ? (
+                            <Check className="h-3.5 w-3.5 shrink-0 text-accent" />
+                          ) : (
+                            <span className="inline-block h-3.5 w-3.5 shrink-0" />
+                          )}
+                          <span className="font-medium text-fg">
+                            {presetDef.label}
+                          </span>
+                        </div>
+                        <span className="font-mono text-[10px] text-subtle">
+                          {presetDef.summary}
+                        </span>
+                      </button>
+                    );
+                  }
+                )}
+              </div>
+
+              <form
+                onSubmit={handleApplyCustomThrottle}
+                className="mt-3 space-y-2 border-t border-hairline pt-2.5"
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-semibold text-fg">
+                    Custom Profile
+                  </span>
+                  {throttleConfig.preset === "custom" && (
+                    <span className="rounded bg-status4xx-bg px-1.5 py-0.5 font-mono text-[10px] font-semibold text-status4xx-fg">
+                      Active
+                    </span>
+                  )}
+                </div>
+                <div className="grid grid-cols-3 gap-1.5">
+                  <div className="flex flex-col gap-0.5">
+                    <label
+                      htmlFor={throttleDownInputId}
+                      className="text-[10px] text-subtle"
+                    >
+                      ↓ Kbps
+                    </label>
+                    <input
+                      id={throttleDownInputId}
+                      type="number"
+                      min={0}
+                      inputMode="numeric"
+                      value={customDownDraft}
+                      onChange={(e) => setCustomDownDraft(e.target.value)}
+                      className="h-7 w-full rounded border border-strong bg-canvas px-2 font-mono text-[11px] text-fg focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-0.5">
+                    <label
+                      htmlFor={throttleUpInputId}
+                      className="text-[10px] text-subtle"
+                    >
+                      ↑ Kbps
+                    </label>
+                    <input
+                      id={throttleUpInputId}
+                      type="number"
+                      min={0}
+                      inputMode="numeric"
+                      value={customUpDraft}
+                      onChange={(e) => setCustomUpDraft(e.target.value)}
+                      className="h-7 w-full rounded border border-strong bg-canvas px-2 font-mono text-[11px] text-fg focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-0.5">
+                    <label
+                      htmlFor={throttleLatencyInputId}
+                      className="text-[10px] text-subtle"
+                    >
+                      RTT ms
+                    </label>
+                    <input
+                      id={throttleLatencyInputId}
+                      type="number"
+                      min={0}
+                      inputMode="numeric"
+                      value={customLatencyDraft}
+                      onChange={(e) => setCustomLatencyDraft(e.target.value)}
+                      className="h-7 w-full rounded border border-strong bg-canvas px-2 font-mono text-[11px] text-fg focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                    />
+                  </div>
+                </div>
+                <button
+                  type="submit"
+                  className="flex h-7 w-full items-center justify-center rounded border border-strong bg-elevated text-[11px] font-medium text-fg hover:bg-hover"
+                >
+                  Apply Custom Limits
+                </button>
+              </form>
+            </div>
+          </div>
+        )}
+
         {/* Optional Group: Breakpoints (or alert pill when paused packets exist) */}
         {(toolbarGroups.breakpoints || pausedBreakpointCount > 0) &&
           (!compactToolbar ||
@@ -1731,6 +2013,21 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
               }}
             >
               <span>Breakpoint Rules (bpu / bpafter)…</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                closeOverflow();
+                onOpenHostRemap();
+              }}
+            >
+              <span>
+                HOSTS Remapping…
+                {activeHostRemapCount > 0 ? ` (${activeHostRemapCount})` : ""}
+              </span>
+              <span className="hint" aria-hidden="true">
+                Ctrl+Shift+H
+              </span>
             </button>
             <hr />
             <button

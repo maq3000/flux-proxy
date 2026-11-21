@@ -26,10 +26,12 @@ use crate::proxy::breakpoints::{BreakpointEngine, PendingBreakpointGuard};
 use crate::proxy::ca::CertificateAuthority;
 use crate::proxy::client_certs::ClientCertificateStore;
 use crate::proxy::filters::ProxyFilterEngine;
+use crate::proxy::hosts::HostRemapRegistry;
 use crate::proxy::network::normalize_client_ip;
 use crate::proxy::process::{resolve_client_process_async, ClientProcessInfo};
 use crate::proxy::rules::RuleEngine;
 use crate::proxy::sysproxy::{resolve_sysproxy_host_for_bind, SystemProxyManager};
+use crate::proxy::throttle::ThrottleEngine;
 use crate::scripting::PythonScriptRunner;
 use crate::storage::{TrafficStore, BODY_OFFLOAD_THRESHOLD_BYTES};
 
@@ -49,11 +51,14 @@ pub mod http_handler;
 pub mod mobile_portal;
 pub mod websocket_relay;
 
-pub use http_handler::{build_upstream_client_with_identity, parse_sse_events_from_bytes};
+pub use http_handler::{
+    build_upstream_client_with_identity, build_upstream_client_with_options,
+    parse_sse_events_from_bytes,
+};
 pub type ProxyController = ProxyEngineController;
 
 use connect_tunnel::handle_outer_proxy_request;
-use http_handler::build_upstream_client;
+use http_handler::build_upstream_client_with_resolver;
 
 #[inline]
 fn evaluate_should_store_session(ctx: &SharedProxyContext, summary: &SessionSummary) -> bool {
@@ -106,7 +111,7 @@ fn record_completed_session(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_in_flight_session(
+pub(super) fn record_in_flight_session_with_remap(
     ctx: &SharedProxyContext,
     session_id: u64,
     timestamp: String,
@@ -125,6 +130,7 @@ fn record_in_flight_session(
     tls_version: Option<String>,
     request_headers: Vec<HeaderPair>,
     req_body_bytes: &[u8],
+    remapped_to: Option<String>,
 ) -> bool {
     let existing = ctx.store.get_in_ram(session_id);
     let comment = existing.as_ref().and_then(|d| d.summary.comment.clone());
@@ -157,6 +163,7 @@ fn record_in_flight_session(
         comment,
         marked_color,
         client_ip,
+        remapped_to,
     };
 
     if !evaluate_should_store_session(ctx, &summary) {
@@ -213,9 +220,60 @@ fn record_error_session(
     client_addr: String,
     err_msg: &str,
 ) {
+    record_error_session_with_opts(
+        ctx,
+        session_id,
+        protocol,
+        scheme,
+        method,
+        host,
+        path,
+        url,
+        req_headers,
+        req_body,
+        duration_ms,
+        timestamp,
+        process_name,
+        process_pid,
+        tls_bypassed,
+        headers_mutated,
+        breakpoint_modified,
+        client_ip,
+        client_addr,
+        502,
+        None,
+        err_msg,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_error_session_with_opts(
+    ctx: &SharedProxyContext,
+    session_id: u64,
+    protocol: String,
+    scheme: &str,
+    method: &str,
+    host: &str,
+    path: &str,
+    url: &str,
+    req_headers: Vec<HeaderPair>,
+    req_body: &[u8],
+    duration_ms: u64,
+    timestamp: String,
+    process_name: Option<String>,
+    process_pid: Option<u32>,
+    tls_bypassed: bool,
+    headers_mutated: bool,
+    breakpoint_modified: bool,
+    client_ip: Option<String>,
+    client_addr: String,
+    status_code: u16,
+    remapped_to: Option<String>,
+    err_msg: &str,
+) {
     let summary = SessionSummary {
         id: session_id,
-        status: 502,
+        status: status_code,
         protocol,
         scheme: scheme.to_string(),
         method: method.to_string(),
@@ -238,6 +296,7 @@ fn record_error_session(
         comment: None,
         marked_color: None,
         client_ip,
+        remapped_to,
     };
 
     let capped_req = &req_body[..req_body.len().min(MAX_CAPTURED_BODY_BYTES)];
@@ -269,9 +328,11 @@ pub struct SharedProxyContext {
     pub rules: Arc<RuleEngine>,
     pub filters: Arc<ProxyFilterEngine>,
     pub breakpoints: Arc<BreakpointEngine>,
+    pub host_remap: Arc<HostRemapRegistry>,
+    pub throttle: Arc<ThrottleEngine>,
     pub store: Arc<TrafficStore>,
-    pub upstream_client: reqwest::Client,
-    pub upstream_redirect_client: reqwest::Client,
+    pub upstream_client: std::sync::RwLock<reqwest::Client>,
+    pub upstream_redirect_client: std::sync::RwLock<reqwest::Client>,
     pub client_certs: Arc<ClientCertificateStore>,
     pub script_runner: Arc<PythonScriptRunner>,
     pub event_tx: mpsc::UnboundedSender<SessionSummary>,
@@ -313,6 +374,47 @@ fn make_breakpoint_guard(
 }
 
 impl SharedProxyContext {
+    pub fn upstream_client(&self) -> reqwest::Client {
+        self.upstream_client
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn upstream_redirect_client(&self) -> reqwest::Client {
+        self.upstream_redirect_client
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn rebuild_upstream_clients(&self) {
+        let resolver = Arc::clone(&self.host_remap);
+        match build_upstream_client_with_resolver(false, Some(Arc::clone(&resolver))) {
+            Ok(client) => {
+                *self
+                    .upstream_client
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = client;
+            }
+            Err(err) => {
+                tracing::warn!("Failed rebuilding upstream_client: {err}");
+            }
+        }
+        match build_upstream_client_with_resolver(true, Some(resolver)) {
+            Ok(client) => {
+                *self
+                    .upstream_redirect_client
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = client;
+            }
+            Err(err) => {
+                tracing::warn!("Failed rebuilding upstream_redirect_client: {err}");
+            }
+        }
+        self.client_certs.invalidate_client_cache();
+    }
+
     pub fn current_storage_stats(&self) -> StorageStats {
         let drop_enabled = self.filters.is_drop_non_matching_enabled();
         self.store.storage_stats(drop_enabled)
@@ -699,9 +801,14 @@ impl ProxyEngineController {
         app_handle: Option<AppHandle>,
         stats_dirty: Arc<AtomicBool>,
     ) -> Result<Self, ProxyError> {
+        let host_remap = Arc::new(HostRemapRegistry::new());
+        let throttle = Arc::new(ThrottleEngine::new());
+        let dns_resolver = Arc::clone(&host_remap);
         // CRITICAL: `.no_proxy()` prevents infinite recursion when OS system proxy points to us!
-        let upstream_client = build_upstream_client(false)?;
-        let upstream_redirect_client = build_upstream_client(true)?;
+        let upstream_client =
+            build_upstream_client_with_resolver(false, Some(Arc::clone(&dns_resolver)))?;
+        let upstream_redirect_client =
+            build_upstream_client_with_resolver(true, Some(dns_resolver))?;
 
         let breakpoints = Arc::new(BreakpointEngine::new(Some(bp_tx)));
         let script_runner = Arc::new(PythonScriptRunner::new(app_handle.clone()));
@@ -712,9 +819,11 @@ impl ProxyEngineController {
             rules,
             filters,
             breakpoints,
+            host_remap,
+            throttle,
             store,
-            upstream_client,
-            upstream_redirect_client,
+            upstream_client: std::sync::RwLock::new(upstream_client),
+            upstream_redirect_client: std::sync::RwLock::new(upstream_redirect_client),
             client_certs,
             script_runner,
             event_tx,
@@ -1419,12 +1528,55 @@ fn record_and_return_error(
     breakpoint_modified: bool,
     err_msg: String,
 ) -> Response<ProxyBoxBody> {
+    record_and_return_error_with_opts(
+        ctx,
+        session_id,
+        scheme,
+        method,
+        host,
+        path,
+        url,
+        req_headers,
+        req_body,
+        start,
+        timestamp,
+        client_addr,
+        client_proc,
+        tls_bypassed,
+        breakpoint_modified,
+        StatusCode::BAD_GATEWAY,
+        None,
+        err_msg,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_and_return_error_with_opts(
+    ctx: &SharedProxyContext,
+    session_id: u64,
+    scheme: &str,
+    method: &str,
+    host: &str,
+    path: &str,
+    url: &str,
+    req_headers: Vec<HeaderPair>,
+    req_body: Bytes,
+    start: Instant,
+    timestamp: String,
+    client_addr: SocketAddr,
+    client_proc: Option<&ClientProcessInfo>,
+    tls_bypassed: bool,
+    breakpoint_modified: bool,
+    status_code: StatusCode,
+    remapped_to: Option<String>,
+    err_msg: String,
+) -> Response<ProxyBoxBody> {
     let protocol = if tls_bypassed {
         "TLS-BYPASS".into()
     } else {
         scheme.to_ascii_uppercase()
     };
-    record_error_session(
+    record_error_session_with_opts(
         ctx,
         session_id,
         protocol,
@@ -1444,9 +1596,11 @@ fn record_and_return_error(
         breakpoint_modified,
         Some(normalize_client_ip(client_addr)),
         client_addr.to_string(),
+        status_code.as_u16(),
+        remapped_to,
         &err_msg,
     );
-    plain_response(StatusCode::BAD_GATEWAY, &err_msg)
+    plain_response(status_code, &err_msg)
 }
 
 fn boxed_full(bytes: Bytes) -> ProxyBoxBody {
@@ -1721,9 +1875,15 @@ mod tests {
             rules,
             filters,
             breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
-            upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            upstream_client: std::sync::RwLock::new(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            ),
+            upstream_redirect_client: std::sync::RwLock::new(
+                build_upstream_client(true).unwrap(),
+            ),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
@@ -1837,9 +1997,15 @@ mod tests {
             rules,
             filters,
             breakpoints: breakpoints.clone(),
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
-            upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            upstream_client: std::sync::RwLock::new(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            ),
+            upstream_redirect_client: std::sync::RwLock::new(
+                build_upstream_client(true).unwrap(),
+            ),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
@@ -2087,9 +2253,15 @@ mod tests {
             rules,
             filters,
             breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
-            upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            upstream_client: std::sync::RwLock::new(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            ),
+            upstream_redirect_client: std::sync::RwLock::new(
+                build_upstream_client(true).unwrap(),
+            ),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
@@ -2232,9 +2404,15 @@ mod tests {
             rules: rules.clone(),
             filters,
             breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
-            upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            upstream_client: std::sync::RwLock::new(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            ),
+            upstream_redirect_client: std::sync::RwLock::new(
+                build_upstream_client(true).unwrap(),
+            ),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
@@ -2369,9 +2547,15 @@ mod tests {
             rules,
             filters,
             breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
-            upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            upstream_client: std::sync::RwLock::new(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            ),
+            upstream_redirect_client: std::sync::RwLock::new(
+                build_upstream_client(true).unwrap(),
+            ),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
@@ -2573,9 +2757,15 @@ mod tests {
             rules,
             filters: filters.clone(),
             breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
-            upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            upstream_client: std::sync::RwLock::new(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            ),
+            upstream_redirect_client: std::sync::RwLock::new(
+                build_upstream_client(true).unwrap(),
+            ),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
@@ -2738,9 +2928,15 @@ mod tests {
             rules,
             filters,
             breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
-            upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            upstream_client: std::sync::RwLock::new(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            ),
+            upstream_redirect_client: std::sync::RwLock::new(
+                build_upstream_client(true).unwrap(),
+            ),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
@@ -2956,9 +3152,15 @@ mod tests {
             rules,
             filters,
             breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
-            upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            upstream_client: std::sync::RwLock::new(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            ),
+            upstream_redirect_client: std::sync::RwLock::new(
+                build_upstream_client(true).unwrap(),
+            ),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
@@ -3233,9 +3435,15 @@ mod tests {
             rules,
             filters,
             breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
-            upstream_client: reqwest::Client::builder().no_proxy().build().unwrap(),
-            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            upstream_client: std::sync::RwLock::new(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            ),
+            upstream_redirect_client: std::sync::RwLock::new(
+                build_upstream_client(true).unwrap(),
+            ),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
@@ -3771,9 +3979,13 @@ mod tests {
             rules,
             filters,
             breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
-            upstream_client: build_upstream_client(false).unwrap(),
-            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            upstream_client: std::sync::RwLock::new(build_upstream_client(false).unwrap()),
+            upstream_redirect_client: std::sync::RwLock::new(
+                build_upstream_client(true).unwrap(),
+            ),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
@@ -4130,9 +4342,13 @@ def on_response(response, request):
             rules,
             filters,
             breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
-            upstream_client: build_upstream_client(false).unwrap(),
-            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            upstream_client: std::sync::RwLock::new(build_upstream_client(false).unwrap()),
+            upstream_redirect_client: std::sync::RwLock::new(
+                build_upstream_client(true).unwrap(),
+            ),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: script_runner.clone(),
             event_tx,
@@ -4345,9 +4561,13 @@ def on_response(response, request):
             rules,
             filters,
             breakpoints: Arc::new(BreakpointEngine::new(None)),
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
             store,
-            upstream_client: build_upstream_client(false).unwrap(),
-            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            upstream_client: std::sync::RwLock::new(build_upstream_client(false).unwrap()),
+            upstream_redirect_client: std::sync::RwLock::new(
+                build_upstream_client(true).unwrap(),
+            ),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
@@ -4510,9 +4730,13 @@ def on_response(response, request):
             rules: rules.clone(),
             filters: filters.clone(),
             breakpoints: breakpoints.clone(),
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
-            upstream_client: build_upstream_client(false).unwrap(),
-            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            upstream_client: std::sync::RwLock::new(build_upstream_client(false).unwrap()),
+            upstream_redirect_client: std::sync::RwLock::new(
+                build_upstream_client(true).unwrap(),
+            ),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
@@ -4713,9 +4937,13 @@ def on_response(response, request):
             rules,
             filters,
             breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
-            upstream_client: build_upstream_client(false).unwrap(),
-            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            upstream_client: std::sync::RwLock::new(build_upstream_client(false).unwrap()),
+            upstream_redirect_client: std::sync::RwLock::new(
+                build_upstream_client(true).unwrap(),
+            ),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
@@ -4908,9 +5136,13 @@ def on_response(response, request):
             rules,
             filters,
             breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
             store,
-            upstream_client: build_upstream_client(false).unwrap(),
-            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            upstream_client: std::sync::RwLock::new(build_upstream_client(false).unwrap()),
+            upstream_redirect_client: std::sync::RwLock::new(
+                build_upstream_client(true).unwrap(),
+            ),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             event_tx,
@@ -5072,6 +5304,407 @@ def on_response(response, request):
             "OS system proxy must be rolled back on double bind failure"
         );
         assert!(os_backend.active.lock().unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn hosts_remap_redirects_http_request_to_local_test_server_and_marks_session() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp_stream, _)) = upstream_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let svc = service_fn(|req: Request<Incoming>| async move {
+                        let host_hdr = req
+                            .headers()
+                            .get(http::header::HOST)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let path = req
+                            .uri()
+                            .path_and_query()
+                            .map(|pq| pq.as_str())
+                            .unwrap_or("/")
+                            .to_string();
+                        let body = format!("host={host_hdr};path={path}");
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("Content-Type", "text/plain")
+                                .body(Full::new(Bytes::from(body)))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-hosts-http-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let host_remap = Arc::new(HostRemapRegistry::new());
+        let throttle = Arc::new(ThrottleEngine::new());
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("hosts-http.sqlite")).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+
+        host_remap
+            .set_rules(vec![crate::models::HostRemapRule {
+                id: "http-remap".into(),
+                enabled: true,
+                source_pattern: "api.virtual-prod.invalid".into(),
+                target_host: "127.0.0.1".into(),
+                target_port: Some(upstream_addr.port()),
+                preserve_host_header: true,
+                comment: "redirect prod API to local upstream".into(),
+            }])
+            .unwrap();
+
+        let resolver = Arc::clone(&host_remap);
+        let upstream_client =
+            build_upstream_client_with_resolver(false, Some(Arc::clone(&resolver))).unwrap();
+        let upstream_redirect_client =
+            build_upstream_client_with_resolver(true, Some(resolver)).unwrap();
+
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            host_remap: host_remap.clone(),
+            throttle,
+            store: store.clone(),
+            upstream_client: std::sync::RwLock::new(upstream_client),
+            upstream_redirect_client: std::sync::RwLock::new(upstream_redirect_client),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(0),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_ctx = ctx.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await else {
+                    break;
+                };
+                let c = proxy_ctx.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let inner_ctx = c.clone();
+                        async move {
+                            Ok::<_, Infallible>(
+                                handle_outer_proxy_request(req, client_addr, None, inner_ctx).await,
+                            )
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, service)
+                        .await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap();
+
+        // 1. preserve_host_header = true -> upstream receives virtual Host header
+        let resp1 = client
+            .get("http://api.virtual-prod.invalid/v1/items?page=1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+        let body1 = resp1.text().await.unwrap();
+        assert_eq!(body1, "host=api.virtual-prod.invalid;path=/v1/items?page=1");
+
+        // 2. preserve_host_header = false -> upstream receives target host:port as Host header
+        host_remap
+            .set_rules(vec![crate::models::HostRemapRule {
+                id: "http-remap".into(),
+                enabled: true,
+                source_pattern: "api.virtual-prod.invalid".into(),
+                target_host: "127.0.0.1".into(),
+                target_port: Some(upstream_addr.port()),
+                preserve_host_header: false,
+                comment: "rewrite Host header".into(),
+            }])
+            .unwrap();
+        ctx.rebuild_upstream_clients();
+
+        let resp2 = client
+            .get("http://api.virtual-prod.invalid/v1/override")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let body2 = resp2.text().await.unwrap();
+        assert_eq!(
+            body2,
+            format!("host=127.0.0.1:{};path=/v1/override", upstream_addr.port())
+        );
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let summaries = store.list_summaries();
+        assert_eq!(summaries.len(), 2);
+        let expected_remap = Some(format!("127.0.0.1:{}", upstream_addr.port()));
+        for s in &summaries {
+            assert_eq!(s.remapped_to, expected_remap);
+            let detail = store.get(s.id).unwrap();
+            assert_eq!(detail.summary.remapped_to, expected_remap);
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn hosts_remap_preserves_tls_sni_for_https_upstream() {
+        let tls_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls_addr = tls_listener.local_addr().unwrap();
+        let (sni_tx, sni_rx) = tokio::sync::oneshot::channel::<Option<String>>();
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = tls_listener.accept().await {
+                let acceptor =
+                    tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream);
+                tokio::pin!(acceptor);
+                let sni = match acceptor.as_mut().await {
+                    Ok(start) => start.client_hello().server_name().map(str::to_owned),
+                    Err(_) => None,
+                };
+                let _ = sni_tx.send(sni);
+            }
+        });
+
+        let host_remap = Arc::new(HostRemapRegistry::new());
+        host_remap
+            .set_rules(vec![crate::models::HostRemapRule {
+                id: "sni-test".into(),
+                enabled: true,
+                source_pattern: "sni-check.virtual-prod.invalid".into(),
+                target_host: "127.0.0.1".into(),
+                target_port: Some(tls_addr.port()),
+                preserve_host_header: true,
+                comment: "SNI verification".into(),
+            }])
+            .unwrap();
+
+        let resolver = Arc::clone(&host_remap);
+        let client = build_upstream_client_with_resolver(false, Some(resolver)).unwrap();
+
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3),
+            client
+                .get("https://sni-check.virtual-prod.invalid/ping")
+                .send(),
+        )
+        .await;
+
+        let captured_sni = tokio::time::timeout(Duration::from_secs(3), sni_rx)
+            .await
+            .expect("TLS listener should accept ClientHello within timeout")
+            .expect("SNI sender should not drop before sending");
+
+        assert_eq!(
+            captured_sni.as_deref(),
+            Some("sni-check.virtual-prod.invalid"),
+            "HTTPS upstream TLS handshake must keep original domain as SNI even when remapped to 127.0.0.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosts_remap_redirects_connect_passthrough_and_offline_throttle_blocks() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = upstream_listener.accept().await {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = sock.read(&mut buf).await {
+                    let _ = sock.write_all(&buf[..n]).await;
+                }
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-remap-connect-offline-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let host_remap = Arc::new(HostRemapRegistry::new());
+        let throttle = Arc::new(ThrottleEngine::new());
+        let store = Arc::new(
+            TrafficStore::new(tmp_dir.join("remap-connect-offline.sqlite")).unwrap(),
+        );
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+
+        filters.update_config(ProxyFilterBackendConfig {
+            tls_intercept_mode: TlsInterceptMode::InterceptAll,
+            tls_bypass_enabled: true,
+            tls_bypass_rules: vec![TlsBypassRule {
+                id: "bypass-pinned-remap".into(),
+                enabled: true,
+                pattern: "pinned.virtual-prod.invalid".into(),
+                category: "Test".into(),
+                description: "Pinned virtual host".into(),
+            }],
+            tls_target_rules: Vec::new(),
+            header_mutations_enabled: true,
+            header_mutations: Vec::new(),
+            strip_alt_svc: true,
+            host_list_sync: Default::default(),
+            ..crate::proxy::filters::default_backend_config()
+        });
+
+        host_remap
+            .set_rules(vec![crate::models::HostRemapRule {
+                id: "connect-remap".into(),
+                enabled: true,
+                source_pattern: "pinned.virtual-prod.invalid".into(),
+                target_host: "127.0.0.1".into(),
+                target_port: Some(upstream_addr.port()),
+                preserve_host_header: true,
+                comment: "redirect CONNECT passthrough".into(),
+            }])
+            .unwrap();
+
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            host_remap,
+            throttle: throttle.clone(),
+            store: store.clone(),
+            upstream_client: std::sync::RwLock::new(build_upstream_client(false).unwrap()),
+            upstream_redirect_client: std::sync::RwLock::new(build_upstream_client(true).unwrap()),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(0),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_ctx = ctx.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await else {
+                    break;
+                };
+                let c = proxy_ctx.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let inner_ctx = c.clone();
+                        async move {
+                            Ok::<_, Infallible>(
+                                handle_outer_proxy_request(req, client_addr, None, inner_ctx).await,
+                            )
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, service)
+                        .await;
+                });
+            }
+        });
+
+        // 1. CONNECT passthrough redirects to local echo server on upstream_addr.port()
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let connect_req = "CONNECT pinned.virtual-prod.invalid:443 HTTP/1.1\r\nHost: pinned.virtual-prod.invalid:443\r\n\r\n";
+        client.write_all(connect_req.as_bytes()).await.unwrap();
+
+        let mut resp_buf = [0u8; 256];
+        let n = client.read(&mut resp_buf).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp_buf[..n]);
+        assert!(resp_str.starts_with("HTTP/1.1 200"));
+
+        let payload = b"PING_REMAP_CONNECT";
+        client.write_all(payload).await.unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, payload);
+        drop(client);
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let expected_target = format!("127.0.0.1:{}", upstream_addr.port());
+        let first_detail = store.get(1).unwrap();
+        assert_eq!(first_detail.summary.remapped_to, Some(expected_target.clone()));
+        assert!(first_detail
+            .response_headers
+            .iter()
+            .any(|h| h.name == "X-FluxProxy-Host-Remap" && h.value == expected_target));
+
+        // 2. Switch throttle preset to Offline -> CONNECT and HTTP both return 503
+        throttle.set_config(crate::models::ThrottleConfig::from_preset(
+            crate::models::ThrottlePreset::Offline,
+        ));
+
+        let mut offline_connect = TcpStream::connect(proxy_addr).await.unwrap();
+        offline_connect
+            .write_all(connect_req.as_bytes())
+            .await
+            .unwrap();
+        let mut offline_buf = [0u8; 256];
+        let n_off = offline_connect.read(&mut offline_buf).await.unwrap();
+        let off_str = String::from_utf8_lossy(&offline_buf[..n_off]);
+        assert!(
+            off_str.starts_with("HTTP/1.1 503"),
+            "expected CONNECT under Offline throttle to return 503, got: {off_str}"
+        );
+
+        let http_client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap();
+        let http_off_resp = http_client
+            .get("http://127.0.0.1/offline-check")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(http_off_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

@@ -48,6 +48,7 @@ export interface SessionSummary {
   comment?: string | null;
   markedColor?: string | null;
   clientIp?: string | null;
+  remappedTo?: string | null;
 }
 
 export interface SessionDetail {
@@ -601,3 +602,115 @@ export const DEFAULT_SANITIZATION_OPTIONS: SanitizationOptions = {
   anonymizeClientInfo: false,
   replacementText: DEFAULT_SANITIZATION_REPLACEMENT,
 };
+
+// ============================================================================
+// Virtual DNS (HOSTS Remapping) & Bandwidth Throttling
+// ============================================================================
+export interface HostRemapRule {
+  id: string;
+  enabled: boolean;
+  sourcePattern: string;
+  targetHost: string;
+  targetPort?: number | null;
+  preserveHostHeader: boolean;
+  comment: string;
+}
+
+export type ThrottlePreset =
+  | "none"
+  | "gprs"
+  | "slow3g"
+  | "fast3g"
+  | "lte"
+  | "offline"
+  | "custom";
+
+export interface ThrottleConfig {
+  preset: ThrottlePreset;
+  downloadKbps: number;
+  uploadKbps: number;
+  latencyMs: number;
+}
+
+export const DEFAULT_THROTTLE_CONFIG: ThrottleConfig = {
+  preset: "none",
+  downloadKbps: 0,
+  uploadKbps: 0,
+  latencyMs: 0,
+};
+
+export interface ThrottlePresetDefinition {
+  id: ThrottlePreset;
+  label: string;
+  shortLabel: string;
+  summary: string;
+  downloadKbps: number;
+  uploadKbps: number;
+  latencyMs: number;
+}
+
+export const THROTTLE_PRESET_DEFINITIONS: readonly ThrottlePresetDefinition[] = [
+  {
+    id: "none",
+    label: "No Throttling",
+    shortLabel: "No Throttle",
+    summary: "Full speed",
+    downloadKbps: 0,
+    uploadKbps: 0,
+    latencyMs: 0,
+  },
+  {
+    id: "gprs",
+    label: "GPRS",
+    shortLabel: "GPRS",
+    summary: "50 Kbps · 500 ms",
+    downloadKbps: 50,
+    uploadKbps: 50,
+    latencyMs: 500,
+  },
+  {
+    id: "slow3g",
+    label: "Slow 3G",
+    shortLabel: "Slow 3G",
+    summary: "400 Kbps · 400 ms",
+    downloadKbps: 400,
+    uploadKbps: 400,
+    latencyMs: 400,
+  },
+  {
+    id: "fast3g",
+    label: "Fast 3G",
+    shortLabel: "Fast 3G",
+    summary: "1.6 Mbps · 150 ms",
+    downloadKbps: 1600,
+    uploadKbps: 1600,
+    latencyMs: 150,
+  },
+  {
+    id: "lte",
+    label: "LTE / 4G",
+    shortLabel: "LTE",
+    summary: "30 Mbps · 40 ms",
+    downloadKbps: 30000,
+    uploadKbps: 30000,
+    latencyMs: 40,
+  },
+  {
+    id: "offline",
+    label: "Offline",
+    shortLabel: "Offline",
+    summary: "HTTP 503",
+    downloadKbps: 0,
+    uploadKbps: 0,
+    latencyMs: 0,
+  },
+  {
+    id: "custom",
+    label: "Custom…",
+    shortLabel: "Custom",
+    summary: "Manual limits",
+    downloadKbps: 1000,
+    uploadKbps: 500,
+    latencyMs: 100,
+  },
+] as const;

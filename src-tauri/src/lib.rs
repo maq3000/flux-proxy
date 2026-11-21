@@ -153,6 +153,10 @@ pub fn run() {
             commands::set_python_script,
             commands::get_python_runner_status,
             commands::generate_stress_sessions,
+            commands::get_host_remap_rules,
+            commands::update_host_remap_rules,
+            commands::get_throttle_config,
+            commands::set_throttle_config,
         ])
         .build(tauri::generate_context!())
         .expect("error while building FluxProxy Tauri application");

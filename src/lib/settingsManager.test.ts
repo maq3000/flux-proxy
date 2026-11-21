@@ -2,10 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   AutoResponderRule,
   BreakpointConfig,
+  HostRemapRule,
   ProxyFilterBackendConfig,
   ProxyStatus,
   PythonRunnerStatus,
   StorageStats,
+  ThrottleConfig,
 } from "../types/proxy";
 import {
   CURRENT_SETTINGS_SCHEMA_VERSION,
@@ -68,6 +70,13 @@ const { mockState, mockProxyBridge, mockDefaultBpConfig } = vi.hoisted(() => {
       isSimulator: true,
       code: "",
     } as PythonRunnerStatus,
+    hostRemapRules: [] as HostRemapRule[],
+    throttleConfig: {
+      preset: "none",
+      downloadKbps: 0,
+      uploadKbps: 0,
+      latencyMs: 0,
+    } as ThrottleConfig,
   };
 
   const bridge = {
@@ -79,6 +88,16 @@ const { mockState, mockProxyBridge, mockDefaultBpConfig } = vi.hoisted(() => {
     getMemoryStorageStats: vi.fn(async () => structuredClone(state.stats)),
     getClearDbOnExit: vi.fn(async () => state.clearOnExit),
     getPythonRunnerStatus: vi.fn(async () => structuredClone(state.pythonStatus)),
+    getHostRemapRules: vi.fn(async () => structuredClone(state.hostRemapRules)),
+    updateHostRemapRules: vi.fn(async (rules: HostRemapRule[]) => {
+      state.hostRemapRules = structuredClone(rules);
+      return structuredClone(rules);
+    }),
+    getThrottleConfig: vi.fn(async () => structuredClone(state.throttleConfig)),
+    setThrottleConfig: vi.fn(async (cfg: ThrottleConfig) => {
+      state.throttleConfig = structuredClone(cfg);
+      return structuredClone(cfg);
+    }),
     updateProxyFilterConfig: vi.fn(async (cfg: ProxyFilterBackendConfig) => {
       state.filterCfg = structuredClone(cfg);
       return structuredClone(cfg);
@@ -238,6 +257,13 @@ function resetMockState(): void {
     timeoutCount: 0,
     isSimulator: true,
     code: DEFAULT_PYTHON_SCRIPT_CODE,
+  };
+  mockState.hostRemapRules = [];
+  mockState.throttleConfig = {
+    preset: "none",
+    downloadKbps: 0,
+    uploadKbps: 0,
+    latencyMs: 0,
   };
 }
 
@@ -764,5 +790,101 @@ describe("settingsManager — applySettingsProfile & transactional rollback", ()
     } finally {
       window.removeEventListener(SETTINGS_APPLIED_EVENT, onApplied);
     }
+  });
+
+  it("validates, persists, previews, and rolls back hostRemapRules and throttleConfig", async () => {
+    const incoming = createDefaultSettingsProfile();
+    incoming.proxy.hostRemapRules = [
+      {
+        id: "remap-api",
+        enabled: true,
+        sourcePattern: "API.Prod.Example.com",
+        targetHost: "127.0.0.1",
+        targetPort: 9443,
+        preserveHostHeader: true,
+        comment: "local mock",
+      },
+      {
+        id: "bad-wildcard",
+        enabled: true,
+        sourcePattern: "*",
+        targetHost: "127.0.0.1",
+        targetPort: null,
+        preserveHostHeader: true,
+        comment: "must be dropped",
+      },
+    ];
+    incoming.proxy.throttleConfig = {
+      preset: "Slow3G" as unknown as ThrottleConfig["preset"],
+      downloadKbps: 123,
+      uploadKbps: 456,
+      latencyMs: 999,
+    };
+
+    const report = validateAndMigrateSettingsProfileWithReport(incoming);
+    expect(report.profile.proxy.hostRemapRules).toHaveLength(1);
+    expect(report.profile.proxy.hostRemapRules?.[0].sourcePattern).toBe(
+      "api.prod.example.com"
+    );
+    expect(report.profile.proxy.throttleConfig).toEqual({
+      preset: "slow3g",
+      downloadKbps: 400,
+      uploadKbps: 400,
+      latencyMs: 400,
+    });
+    expect(report.warnings.length).toBeGreaterThan(0);
+
+    const preview = buildSettingsImportPreview(report.profile);
+    expect(preview.hostRemapCount).toBe(1);
+    expect(preview.throttlePreset).toBe("slow3g");
+
+    vi.useFakeTimers();
+    const applied = await applySettingsProfile(report.profile);
+    vi.runOnlyPendingTimers();
+
+    expect(mockProxyBridge.updateHostRemapRules).toHaveBeenCalledWith(
+      report.profile.proxy.hostRemapRules
+    );
+    expect(mockProxyBridge.setThrottleConfig).toHaveBeenCalledWith(
+      report.profile.proxy.throttleConfig
+    );
+    expect(applied.proxy.throttleConfig?.preset).toBe("slow3g");
+    expect(
+      JSON.parse(
+        window.localStorage.getItem(SETTINGS_STORAGE_KEYS.hostRemapRules) ?? "[]"
+      )
+    ).toHaveLength(1);
+    expect(
+      JSON.parse(
+        window.localStorage.getItem(SETTINGS_STORAGE_KEYS.throttleConfig) ?? "{}"
+      )
+    ).toEqual(report.profile.proxy.throttleConfig);
+
+    // Transactional rollback when a later bridge call fails
+    const failingProfile = createDefaultSettingsProfile();
+    failingProfile.proxy.hostRemapRules = [
+      {
+        id: "new-rule",
+        enabled: true,
+        sourcePattern: "failing.local",
+        targetHost: "10.0.0.2",
+        targetPort: 8080,
+        preserveHostHeader: false,
+        comment: "",
+      },
+    ];
+    failingProfile.proxy.throttleConfig = {
+      preset: "offline",
+      downloadKbps: 0,
+      uploadKbps: 0,
+      latencyMs: 0,
+    };
+    mockProxyBridge.setPythonScript.mockRejectedValueOnce(
+      new Error("boom")
+    );
+
+    await expect(applySettingsProfile(failingProfile)).rejects.toThrow("boom");
+    expect(mockState.hostRemapRules).toEqual(report.profile.proxy.hostRemapRules);
+    expect(mockState.throttleConfig).toEqual(report.profile.proxy.throttleConfig);
   });
 });

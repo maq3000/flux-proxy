@@ -4,6 +4,7 @@ import {
   type ClientCertificateEntry,
   type DoctorCheckResult,
   type HeaderPair,
+  type HostRemapRule,
   type ProxyStatus,
   type PythonScriptPreset,
   type SanitizationOptions,
@@ -845,6 +846,12 @@ export const PREVIEW_CLIENT_CERTS_STORAGE_KEY =
   "fluxproxy.previewClientCerts.v1";
 export const PREVIEW_PYTHON_SCRIPT_STORAGE_KEY =
   "fluxproxy.pythonScript.v1";
+export const PREVIEW_HOST_REMAP_RULES_STORAGE_KEY =
+  "fluxproxy.previewHostRemapRules.v1";
+export const PREVIEW_THROTTLE_CONFIG_STORAGE_KEY =
+  "fluxproxy.previewThrottleConfig.v1";
+
+export const DEFAULT_HOST_REMAP_RULES: HostRemapRule[] = [];
 
 export const PYTHON_SCRIPT_PRESETS: PythonScriptPreset[] = [
   {

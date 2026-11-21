@@ -7,17 +7,18 @@ use crate::models::{
     BreakpointStage, ComposedRequest, HeaderMutationDirection, ProxyError, RuleActionType,
     SessionDetail, SessionSummary,
 };
+use crate::proxy::throttle::BandwidthPacer;
 
 use super::http_handler::{
     build_autoresponder_mock_detail, format_error_chain, maybe_decompress_content_encodings,
-    parse_sse_events_from_bytes, run_request_breakpoint_stage, run_response_breakpoint_stage,
-    send_upstream_with_retry, AutoResponderMockInput, RequestBreakpointStageInput,
-    ResponseBreakpointStageInput,
+    parse_sse_events_from_bytes, prepare_remapped_upstream_target, run_request_breakpoint_stage,
+    run_response_breakpoint_stage, send_upstream_with_retry, AutoResponderMockInput,
+    RequestBreakpointStageInput, ResponseBreakpointStageInput,
 };
 use super::{
     encode_inline_or_offload, extract_reqwest_headers, format_http_version,
-    record_completed_session, record_error_session, record_in_flight_session,
-    ProxyEngineController, MAX_CAPTURED_BODY_BYTES,
+    record_completed_session, record_error_session, record_error_session_with_opts,
+    record_in_flight_session_with_remap, ProxyEngineController, MAX_CAPTURED_BODY_BYTES,
 };
 
 impl ProxyEngineController {
@@ -192,26 +193,66 @@ impl ProxyEngineController {
         } else {
             "HTTP/1.1".to_string()
         };
+
+        if self.context.throttle.is_offline() {
+            let err_msg = "Network Offline (Bandwidth Throttling: Offline)".to_string();
+            record_error_session_with_opts(
+                &self.context,
+                session_id,
+                in_flight_proto,
+                &scheme,
+                &method_str,
+                &host,
+                &path,
+                &full_url,
+                req_headers,
+                &req_bytes,
+                start.elapsed().as_millis() as u64,
+                timestamp,
+                Some("flux-proxy (Composer)".into()),
+                Some(self_pid),
+                false,
+                req_mutated,
+                bp_modified,
+                Some("127.0.0.1".into()),
+                "Composer (Local)".into(),
+                503,
+                None,
+                &err_msg,
+            );
+            return Err(ProxyError::Custom(err_msg));
+        }
+
         let target_host = parsed_url.host_str().unwrap_or(&host).to_string();
+        let host_for_remap = req_headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("host"))
+            .map(|h| h.value.clone())
+            .unwrap_or_else(|| target_host.clone());
+        let upstream_target =
+            prepare_remapped_upstream_target(&self.context, &full_url, &host_for_remap, &scheme);
+        let upstream_parsed_url = reqwest::Url::parse(&upstream_target.upstream_url)
+            .unwrap_or_else(|_| parsed_url.clone());
+
         let (client, mtls_cn) = if scheme.eq_ignore_ascii_case("https") {
-            match self
-                .context
-                .client_certs
-                .get_or_build_client(&target_host, composed.follow_redirects)
-            {
+            match self.context.client_certs.get_or_build_client_with_resolver(
+                &target_host,
+                composed.follow_redirects,
+                Some(self.context.host_remap.clone()),
+            ) {
                 Ok(Some((mtls_client, entry))) => (mtls_client, Some(entry.common_name)),
                 Ok(None) => (
                     if composed.follow_redirects {
-                        self.context.upstream_redirect_client.clone()
+                        self.context.upstream_redirect_client()
                     } else {
-                        self.context.upstream_client.clone()
+                        self.context.upstream_client()
                     },
                     None,
                 ),
                 Err(err) => {
                     let err_msg =
                         format!("Client certificate (mTLS) error for '{target_host}': {err}");
-                    record_error_session(
+                    record_error_session_with_opts(
                         &self.context,
                         session_id,
                         in_flight_proto,
@@ -231,15 +272,17 @@ impl ProxyEngineController {
                         bp_modified,
                         Some("127.0.0.1".into()),
                         "Composer (Local)".into(),
+                        502,
+                        upstream_target.remapped_to.clone(),
                         &err_msg,
                     );
                     return Err(ProxyError::Custom(err_msg));
                 }
             }
         } else if composed.follow_redirects {
-            (self.context.upstream_redirect_client.clone(), None)
+            (self.context.upstream_redirect_client(), None)
         } else {
-            (self.context.upstream_client.clone(), None)
+            (self.context.upstream_client(), None)
         };
 
         let in_flight_tls = if scheme == "https" {
@@ -250,7 +293,7 @@ impl ProxyEngineController {
         } else {
             None
         };
-        record_in_flight_session(
+        record_in_flight_session_with_remap(
             &self.context,
             session_id,
             timestamp.clone(),
@@ -269,26 +312,46 @@ impl ProxyEngineController {
             in_flight_tls,
             req_headers.clone(),
             &req_bytes,
+            upstream_target.remapped_to.clone(),
         );
 
-        let upstream_resp = match send_upstream_with_retry(&client, &method, |c| {
-            let mut builder = c.request(method.clone(), parsed_url.clone());
-            for h in &req_headers {
-                if !h.name.trim().is_empty() && !h.name.eq_ignore_ascii_case("content-length") {
-                    builder = builder.header(&h.name, &h.value);
-                }
-            }
-            if !req_bytes.is_empty() {
-                builder = builder.body(req_bytes.clone());
-            }
-            builder
-        })
-        .await
-        {
-            Ok(resp) => resp,
-            Err(err) => {
-                let chain = format_error_chain(&err);
-                record_error_session(
+        if let Err(err) = self.context.throttle.apply_latency().await {
+            let err_msg = err.to_string();
+            record_error_session_with_opts(
+                &self.context,
+                session_id,
+                in_flight_proto,
+                &scheme,
+                &method_str,
+                &host,
+                &path,
+                &full_url,
+                req_headers,
+                &req_bytes,
+                start.elapsed().as_millis() as u64,
+                timestamp,
+                Some("flux-proxy (Composer)".into()),
+                Some(self_pid),
+                false,
+                req_mutated,
+                bp_modified,
+                Some("127.0.0.1".into()),
+                "Composer (Local)".into(),
+                503,
+                upstream_target.remapped_to.clone(),
+                &err_msg,
+            );
+            return Err(ProxyError::Custom(err_msg));
+        }
+        if !req_bytes.is_empty() {
+            if let Err(err) = self
+                .context
+                .throttle
+                .throttle_bytes(req_bytes.len(), false)
+                .await
+            {
+                let err_msg = err.to_string();
+                record_error_session_with_opts(
                     &self.context,
                     session_id,
                     in_flight_proto,
@@ -308,6 +371,61 @@ impl ProxyEngineController {
                     bp_modified,
                     Some("127.0.0.1".into()),
                     "Composer (Local)".into(),
+                    503,
+                    upstream_target.remapped_to.clone(),
+                    &err_msg,
+                );
+                return Err(ProxyError::Custom(err_msg));
+            }
+        }
+
+        let mut upstream_resp = match send_upstream_with_retry(&client, &method, |c| {
+            let mut builder = c.request(method.clone(), upstream_parsed_url.clone());
+            for h in &req_headers {
+                if !h.name.trim().is_empty() && !h.name.eq_ignore_ascii_case("content-length") {
+                    if upstream_target.host_header_override.is_some()
+                        && h.name.eq_ignore_ascii_case("host")
+                    {
+                        continue;
+                    }
+                    builder = builder.header(&h.name, &h.value);
+                }
+            }
+            if let Some(ref host_override) = upstream_target.host_header_override {
+                builder = builder.header(reqwest::header::HOST, host_override);
+            }
+            if !req_bytes.is_empty() {
+                builder = builder.body(req_bytes.clone());
+            }
+            builder
+        })
+        .await
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                let chain = format_error_chain(&err);
+                record_error_session_with_opts(
+                    &self.context,
+                    session_id,
+                    in_flight_proto,
+                    &scheme,
+                    &method_str,
+                    &host,
+                    &path,
+                    &full_url,
+                    req_headers,
+                    &req_bytes,
+                    start.elapsed().as_millis() as u64,
+                    timestamp,
+                    Some("flux-proxy (Composer)".into()),
+                    Some(self_pid),
+                    false,
+                    req_mutated,
+                    bp_modified,
+                    Some("127.0.0.1".into()),
+                    "Composer (Local)".into(),
+                    502,
+                    upstream_target.remapped_to.clone(),
                     &format!("Upstream connection error: {chain}"),
                 );
                 return Err(err.into());
@@ -322,33 +440,112 @@ impl ProxyEngineController {
             &full_url,
             &mut resp_headers,
         );
-        let raw_resp_bytes = match upstream_resp.bytes().await {
-            Ok(b) => b,
-            Err(err) => {
-                let chain = format_error_chain(&err);
-                record_error_session(
-                    &self.context,
-                    session_id,
-                    version_str,
-                    &scheme,
-                    &method_str,
-                    &host,
-                    &path,
-                    &full_url,
-                    req_headers,
-                    &req_bytes,
-                    start.elapsed().as_millis() as u64,
-                    timestamp,
-                    Some("flux-proxy (Composer)".into()),
-                    Some(self_pid),
-                    false,
-                    req_mutated || resp_mutated,
-                    bp_modified,
-                    Some("127.0.0.1".into()),
-                    "Composer (Local)".into(),
-                    &format!("Failed reading upstream response body: {chain}"),
-                );
-                return Err(err.into());
+        let raw_resp_bytes = if self
+            .context
+            .throttle
+            .get_config()
+            .download_bytes_per_sec()
+            .is_some()
+            || self.context.throttle.is_offline()
+        {
+            let mut collected = Vec::new();
+            let mut pacer = BandwidthPacer::new();
+            loop {
+                match upstream_resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if let Err(err) = pacer.pace(&self.context.throttle, chunk.len(), true).await {
+                            let err_msg = err.to_string();
+                            record_error_session_with_opts(
+                                &self.context,
+                                session_id,
+                                version_str,
+                                &scheme,
+                                &method_str,
+                                &host,
+                                &path,
+                                &full_url,
+                                req_headers,
+                                &req_bytes,
+                                start.elapsed().as_millis() as u64,
+                                timestamp,
+                                Some("flux-proxy (Composer)".into()),
+                                Some(self_pid),
+                                false,
+                                req_mutated || resp_mutated,
+                                bp_modified,
+                                Some("127.0.0.1".into()),
+                                "Composer (Local)".into(),
+                                503,
+                                upstream_target.remapped_to.clone(),
+                                &err_msg,
+                            );
+                            return Err(ProxyError::Custom(err_msg));
+                        }
+                        collected.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        let chain = format_error_chain(&err);
+                        record_error_session_with_opts(
+                            &self.context,
+                            session_id,
+                            version_str,
+                            &scheme,
+                            &method_str,
+                            &host,
+                            &path,
+                            &full_url,
+                            req_headers,
+                            &req_bytes,
+                            start.elapsed().as_millis() as u64,
+                            timestamp,
+                            Some("flux-proxy (Composer)".into()),
+                            Some(self_pid),
+                            false,
+                            req_mutated || resp_mutated,
+                            bp_modified,
+                            Some("127.0.0.1".into()),
+                            "Composer (Local)".into(),
+                            502,
+                            upstream_target.remapped_to.clone(),
+                            &format!("Failed reading upstream response body: {chain}"),
+                        );
+                        return Err(err.into());
+                    }
+                }
+            }
+            bytes::Bytes::from(collected)
+        } else {
+            match upstream_resp.bytes().await {
+                Ok(b) => b,
+                Err(err) => {
+                    let chain = format_error_chain(&err);
+                    record_error_session_with_opts(
+                        &self.context,
+                        session_id,
+                        version_str,
+                        &scheme,
+                        &method_str,
+                        &host,
+                        &path,
+                        &full_url,
+                        req_headers,
+                        &req_bytes,
+                        start.elapsed().as_millis() as u64,
+                        timestamp,
+                        Some("flux-proxy (Composer)".into()),
+                        Some(self_pid),
+                        false,
+                        req_mutated || resp_mutated,
+                        bp_modified,
+                        Some("127.0.0.1".into()),
+                        "Composer (Local)".into(),
+                        502,
+                        upstream_target.remapped_to.clone(),
+                        &format!("Failed reading upstream response body: {chain}"),
+                    );
+                    return Err(err.into());
+                }
             }
         };
         let mut resp_bytes = if method_str.eq_ignore_ascii_case("HEAD") {
@@ -464,6 +661,7 @@ impl ProxyEngineController {
             comment: None,
             marked_color: None,
             client_ip: Some("127.0.0.1".into()),
+            remapped_to: upstream_target.remapped_to.clone(),
         };
 
         let capped_req = &req_bytes[..req_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];

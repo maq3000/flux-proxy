@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,23 +18,27 @@ use crate::models::{
     PausedBreakpointItem, RuleActionType, SessionDetail, SessionSummary, SseEventRecord,
 };
 use crate::proxy::filters::is_alt_svc_header;
+use crate::proxy::hosts::HostRemapRegistry;
 use crate::proxy::network::normalize_client_ip;
 use crate::proxy::process::ClientProcessInfo;
+use crate::proxy::throttle::BandwidthPacer;
 use crate::scripting::{
     apply_header_diff, ScriptRequestEdits, ScriptRequestOutcome, ScriptResponseOutcome,
 };
-use crate::storage::BODY_OFFLOAD_THRESHOLD_BYTES;
+use crate::storage::{BODY_OFFLOAD_THRESHOLD_BYTES};
 
 use super::mobile_portal::{handle_builtin_portal_request, is_builtin_portal_target};
 use super::websocket_relay::handle_websocket_intercept;
 use super::{
     boxed_full, encode_inline_or_offload, extract_hyper_headers, extract_reqwest_headers,
     format_http_version, is_hop_by_hop_header, is_loopback_ip, make_breakpoint_guard,
-    parse_host_and_optional_port, plain_response, record_and_return_error, record_completed_session,
-    record_in_flight_session, request_targets_loopback_or_unspecified, resolve_protocol_label,
-    should_use_host_mtls_for_peer, ProxyBoxBody, SharedProxyContext, DEFAULT_UPSTREAM_TIMEOUT_SEC,
-    MAX_CAPTURED_BODY_BYTES, MAX_CAPTURED_REQUEST_BODY_BYTES, MAX_CONTENT_ENCODING_LAYERS,
-    STREAM_TEXT_PREVIEW_MAX_BYTES, ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES,
+    parse_host_and_optional_port, plain_response, record_and_return_error,
+    record_and_return_error_with_opts, record_completed_session,
+    record_in_flight_session_with_remap, request_targets_loopback_or_unspecified,
+    resolve_protocol_label, should_use_host_mtls_for_peer, ProxyBoxBody, SharedProxyContext,
+    DEFAULT_UPSTREAM_TIMEOUT_SEC, MAX_CAPTURED_BODY_BYTES, MAX_CAPTURED_REQUEST_BODY_BYTES,
+    MAX_CONTENT_ENCODING_LAYERS, STREAM_TEXT_PREVIEW_MAX_BYTES,
+    ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES,
 };
 
 #[derive(Debug)]
@@ -64,10 +68,12 @@ where
 }
 
 /// Builds the shared upstream HTTP/HTTPS `reqwest::Client` with keep-alive, pool timeouts,
-/// native root CAs (`rustls-tls-native-roots`), optional mTLS `Identity`, and `.no_proxy()` to prevent loopback recursion.
-pub fn build_upstream_client_with_identity(
+/// native root CAs (`rustls-tls-native-roots`), optional mTLS `Identity`, optional custom DNS
+/// resolver (`HostRemapRegistry`), and `.no_proxy()` to prevent loopback recursion.
+pub fn build_upstream_client_with_options(
     follow_redirects: bool,
     identity: Option<reqwest::Identity>,
+    dns_resolver: Option<Arc<HostRemapRegistry>>,
 ) -> Result<reqwest::Client, reqwest::Error> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let redirect_policy = if follow_redirects {
@@ -87,14 +93,129 @@ pub fn build_upstream_client_with_identity(
     if let Some(id) = identity {
         builder = builder.identity(id);
     }
+    if let Some(resolver) = dns_resolver {
+        builder = builder.dns_resolver(resolver);
+    }
     builder.build()
 }
 
+pub fn build_upstream_client_with_identity(
+    follow_redirects: bool,
+    identity: Option<reqwest::Identity>,
+) -> Result<reqwest::Client, reqwest::Error> {
+    build_upstream_client_with_options(follow_redirects, identity, None)
+}
+
+pub(crate) fn build_upstream_client_with_resolver(
+    follow_redirects: bool,
+    dns_resolver: Option<Arc<HostRemapRegistry>>,
+) -> Result<reqwest::Client, reqwest::Error> {
+    build_upstream_client_with_options(follow_redirects, None, dns_resolver)
+}
+
 /// Builds the shared upstream HTTP/HTTPS `reqwest::Client` without a client mTLS identity.
+#[cfg(test)]
 pub(crate) fn build_upstream_client(
     follow_redirects: bool,
 ) -> Result<reqwest::Client, reqwest::Error> {
-    build_upstream_client_with_identity(follow_redirects, None)
+    build_upstream_client_with_options(follow_redirects, None, None)
+}
+
+pub(super) struct PreparedUpstreamTarget {
+    pub upstream_url: String,
+    pub host_header_override: Option<String>,
+    pub remapped_to: Option<String>,
+}
+
+fn default_port_for_scheme(scheme: &str) -> u16 {
+    if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss") {
+        443
+    } else {
+        80
+    }
+}
+
+pub(super) fn prepare_remapped_upstream_target(
+    ctx: &SharedProxyContext,
+    full_url: &str,
+    host_header: &str,
+    scheme_str: &str,
+) -> PreparedUpstreamTarget {
+    let Ok(mut parsed) = reqwest::Url::parse(full_url) else {
+        return PreparedUpstreamTarget {
+            upstream_url: full_url.to_string(),
+            host_header_override: None,
+            remapped_to: None,
+        };
+    };
+
+    let Some(url_host_raw) = parsed.host_str().map(str::to_owned) else {
+        return PreparedUpstreamTarget {
+            upstream_url: full_url.to_string(),
+            host_header_override: None,
+            remapped_to: None,
+        };
+    };
+
+    let Some(rule) = ctx.host_remap.match_host(&url_host_raw) else {
+        return PreparedUpstreamTarget {
+            upstream_url: full_url.to_string(),
+            host_header_override: None,
+            remapped_to: None,
+        };
+    };
+
+    let url_port = parsed.port();
+    let remapped_to = Some(HostRemapRegistry::format_remap_target(&rule, rule.target_port));
+    let clean_source = url_host_raw.trim_matches(['[', ']']);
+    let is_ip_source = clean_source.parse::<IpAddr>().is_ok();
+    let formatted_target = HostRemapRegistry::format_host_for_authority(&rule.target_host);
+
+    if is_ip_source {
+        let _ = parsed.set_host(Some(&formatted_target));
+        if let Some(tp) = rule.target_port {
+            let _ = parsed.set_port(Some(tp));
+        }
+        let host_header_override = if rule.preserve_host_header {
+            Some(host_header.to_string())
+        } else {
+            None
+        };
+        return PreparedUpstreamTarget {
+            upstream_url: parsed.to_string(),
+            host_header_override,
+            remapped_to,
+        };
+    }
+
+    // Domain source: keep original hostname in URL so reqwest::dns::Resolve & rustls TLS SNI
+    // preserve the original domain name!
+    let mut stripped_explicit_port = false;
+    if url_port.is_some() && rule.target_port.is_some() {
+        let _ = parsed.set_port(None);
+        stripped_explicit_port = true;
+    }
+
+    let host_header_override = if rule.preserve_host_header {
+        if stripped_explicit_port {
+            Some(host_header.to_string())
+        } else {
+            None
+        }
+    } else {
+        let effective_port = rule.target_port.or(url_port);
+        let default_port = default_port_for_scheme(scheme_str);
+        Some(match effective_port {
+            Some(p) if p != default_port => format!("{formatted_target}:{p}"),
+            _ => formatted_target,
+        })
+    };
+
+    PreparedUpstreamTarget {
+        upstream_url: parsed.to_string(),
+        host_header_override,
+        remapped_to,
+    }
 }
 
 /// Traverses the full `std::error::Error::source()` chain and formats all causes joined with `" -> "`.
@@ -479,6 +600,32 @@ pub(super) async fn handle_intercepted_request(
         );
     }
 
+    // 0a. Bandwidth Throttling: Offline mode blocks outbound HTTP/HTTPS/WS traffic immediately
+    if ctx.throttle.is_offline() {
+        let method_preview = req.method().as_str().to_string();
+        let req_headers = extract_hyper_headers(req.headers());
+        return record_and_return_error_with_opts(
+            &ctx,
+            session_id,
+            &scheme_str,
+            &method_preview,
+            &host_header,
+            &path_and_query,
+            &full_url,
+            req_headers,
+            Bytes::new(),
+            start,
+            timestamp,
+            client_addr,
+            client_proc.as_ref(),
+            false,
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            None,
+            "Network Offline (Bandwidth Throttling: Offline)".to_string(),
+        );
+    }
+
     // 0b. Enforce TargetedOnly allowlist against inner Host / HTTP/2 :authority when inside CONNECT MITM
     if let Some(tunnel_auth) = default_authority {
         if ctx.filters.is_targeted_only_mode() {
@@ -586,6 +733,7 @@ pub(super) async fn handle_intercepted_request(
                 comment: None,
                 marked_color: None,
                 client_ip: Some(normalize_client_ip(client_addr)),
+                remapped_to: None,
             };
             let detail = SessionDetail {
                 summary,
@@ -770,6 +918,7 @@ pub(super) async fn handle_intercepted_request(
                     comment: None,
                     marked_color: None,
                     client_ip: Some(normalize_client_ip(client_addr)),
+                    remapped_to: None,
                 };
 
                 let capped_req = &body_bytes[..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
@@ -899,14 +1048,20 @@ pub(super) async fn handle_intercepted_request(
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned))
         .unwrap_or_else(|| host_header.clone());
+    let upstream_target = prepare_remapped_upstream_target(&ctx, &full_url, &host_header, &scheme_str);
+
     let (upstream_client, mtls_cn) = if should_use_host_mtls_for_peer(client_addr, &scheme_str) {
-        match ctx.client_certs.get_or_build_client(&target_host, false) {
+        match ctx.client_certs.get_or_build_client_with_resolver(
+            &target_host,
+            false,
+            Some(ctx.host_remap.clone()),
+        ) {
             Ok(Some((mtls_client, entry))) => (mtls_client, Some(entry.common_name)),
-            Ok(None) => (ctx.upstream_client.clone(), None),
+            Ok(None) => (ctx.upstream_client(), None),
             Err(err) => {
                 let msg = format!("Client certificate (mTLS) error for '{target_host}': {err}");
                 tracing::warn!("{msg}");
-                return record_and_return_error(
+                return record_and_return_error_with_opts(
                     &ctx,
                     session_id,
                     &scheme_str,
@@ -922,15 +1077,17 @@ pub(super) async fn handle_intercepted_request(
                     client_proc.as_ref(),
                     false,
                     bp_modified,
+                    StatusCode::BAD_GATEWAY,
+                    upstream_target.remapped_to.clone(),
                     msg,
                 );
             }
         }
     } else {
-        (ctx.upstream_client.clone(), None)
+        (ctx.upstream_client(), None)
     };
 
-    record_in_flight_session(
+    record_in_flight_session_with_remap(
         &ctx,
         session_id,
         timestamp.clone(),
@@ -956,10 +1113,59 @@ pub(super) async fn handle_intercepted_request(
         },
         req_headers.clone(),
         &body_bytes,
+        upstream_target.remapped_to.clone(),
     );
 
+    // Apply Bandwidth Throttling RTT latency & upload bandwidth pacing before upstream send
+    if let Err(err) = ctx.throttle.apply_latency().await {
+        return record_and_return_error_with_opts(
+            &ctx,
+            session_id,
+            &scheme_str,
+            &method_str,
+            &host_header,
+            &path_and_query,
+            &full_url,
+            req_headers,
+            body_bytes,
+            start,
+            timestamp,
+            client_addr,
+            client_proc.as_ref(),
+            false,
+            bp_modified,
+            StatusCode::SERVICE_UNAVAILABLE,
+            upstream_target.remapped_to.clone(),
+            err.to_string(),
+        );
+    }
+    if !body_bytes.is_empty() {
+        if let Err(err) = ctx.throttle.throttle_bytes(body_bytes.len(), false).await {
+            return record_and_return_error_with_opts(
+                &ctx,
+                session_id,
+                &scheme_str,
+                &method_str,
+                &host_header,
+                &path_and_query,
+                &full_url,
+                req_headers,
+                body_bytes,
+                start,
+                timestamp,
+                client_addr,
+                client_proc.as_ref(),
+                false,
+                bp_modified,
+                StatusCode::SERVICE_UNAVAILABLE,
+                upstream_target.remapped_to.clone(),
+                err.to_string(),
+            );
+        }
+    }
+
     let mut upstream_resp = match send_upstream_with_retry(&upstream_client, &reqwest_method, |client| {
-        let mut upstream_req = client.request(reqwest_method.clone(), &full_url);
+        let mut upstream_req = client.request(reqwest_method.clone(), &upstream_target.upstream_url);
         for h in &req_headers {
             if !is_hop_by_hop_header(&h.name)
                 && !h.name.eq_ignore_ascii_case("host")
@@ -967,6 +1173,9 @@ pub(super) async fn handle_intercepted_request(
             {
                 upstream_req = upstream_req.header(&h.name, &h.value);
             }
+        }
+        if let Some(ref host_override) = upstream_target.host_header_override {
+            upstream_req = upstream_req.header(reqwest::header::HOST, host_override);
         }
         if !body_bytes.is_empty() {
             upstream_req = upstream_req.body(body_bytes.clone());
@@ -984,7 +1193,7 @@ pub(super) async fn handle_intercepted_request(
                 full_url,
                 chain
             );
-            return record_and_return_error(
+            return record_and_return_error_with_opts(
                 &ctx,
                 session_id,
                 &scheme_str,
@@ -1000,6 +1209,8 @@ pub(super) async fn handle_intercepted_request(
                 client_proc.as_ref(),
                 false,
                 bp_modified,
+                StatusCode::BAD_GATEWAY,
+                upstream_target.remapped_to.clone(),
                 format!("Upstream connection error: {chain}"),
             );
         }
@@ -1085,6 +1296,7 @@ pub(super) async fn handle_intercepted_request(
             comment: None,
             marked_color: None,
             client_ip: Some(normalize_client_ip(client_addr)),
+            remapped_to: upstream_target.remapped_to.clone(),
         };
 
         let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
@@ -1150,6 +1362,7 @@ pub(super) async fn handle_intercepted_request(
             let mut pending_parse_buf: Vec<u8> = Vec::new();
             let mut total_parsed_events = 0usize;
             let mut total_bytes = 0usize;
+            let mut download_pacer = BandwidthPacer::new();
             let mut zstd_decoder = if sse_has_zstd {
                 match zstd::stream::write::Decoder::new(BoundedSseZstdSink {
                     buf: Vec::new(),
@@ -1167,6 +1380,9 @@ pub(super) async fn handle_intercepted_request(
             };
 
             while let Ok(Some(chunk)) = upstream_resp.chunk().await {
+                if download_pacer.pace(&sse_ctx.throttle, chunk.len(), true).await.is_err() {
+                    break;
+                }
                 let effective_chunk = if let Some(dec) = zstd_decoder.as_mut() {
                     if let Err(err) = dec.write_all(&chunk).and_then(|()| dec.flush()) {
                         tracing::warn!("SSE zstd stream decode error: {err}");
@@ -1320,6 +1536,7 @@ pub(super) async fn handle_intercepted_request(
             comment: None,
             marked_color: None,
             client_ip: Some(normalize_client_ip(client_addr)),
+            remapped_to: upstream_target.remapped_to.clone(),
         };
 
         let initial_detail = SessionDetail {
@@ -1362,10 +1579,15 @@ pub(super) async fn handle_intercepted_request(
             let mut preview_accum: Vec<u8> = Vec::new();
             let mut stream_error: Option<String> = None;
             let mut last_emit = Instant::now() - Duration::from_secs(1);
+            let mut download_pacer = BandwidthPacer::new();
 
             loop {
                 match upstream_resp.chunk().await {
                     Ok(Some(chunk)) => {
+                        if let Err(err) = download_pacer.pace(&stream_ctx.throttle, chunk.len(), true).await {
+                            stream_error = Some(err.to_string());
+                            break;
+                        }
                         total_bytes = total_bytes.saturating_add(chunk.len());
 
                         if capture_text_preview
@@ -1456,11 +1678,34 @@ pub(super) async fn handle_intercepted_request(
     }
 
     // 4c. Standard Buffered Upstream Response (+ Optional Live Breakpoint After Response)
-    let raw_resp_bytes = match upstream_resp.bytes().await {
-        Ok(b) => b,
-        Err(err) => {
-            let chain = format_error_chain(&err);
-            return record_and_return_error(
+    let raw_resp_bytes = if ctx.throttle.get_config().download_bytes_per_sec().is_some()
+        || ctx.throttle.is_offline()
+    {
+        let mut collected = Vec::new();
+        let mut download_pacer = BandwidthPacer::new();
+        let mut stream_err: Option<(StatusCode, String)> = None;
+        loop {
+            match upstream_resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    if let Err(err) = download_pacer.pace(&ctx.throttle, chunk.len(), true).await {
+                        stream_err = Some((StatusCode::SERVICE_UNAVAILABLE, err.to_string()));
+                        break;
+                    }
+                    collected.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    let chain = format_error_chain(&err);
+                    stream_err = Some((
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed reading upstream response body: {chain}"),
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some((err_status, err_msg)) = stream_err {
+            return record_and_return_error_with_opts(
                 &ctx,
                 session_id,
                 &scheme_str,
@@ -1476,8 +1721,38 @@ pub(super) async fn handle_intercepted_request(
                 client_proc.as_ref(),
                 false,
                 bp_modified,
-                format!("Failed reading upstream response body: {chain}"),
+                err_status,
+                upstream_target.remapped_to.clone(),
+                err_msg,
             );
+        }
+        Bytes::from(collected)
+    } else {
+        match upstream_resp.bytes().await {
+            Ok(b) => b,
+            Err(err) => {
+                let chain = format_error_chain(&err);
+                return record_and_return_error_with_opts(
+                    &ctx,
+                    session_id,
+                    &scheme_str,
+                    &method_str,
+                    &host_header,
+                    &path_and_query,
+                    &full_url,
+                    req_headers,
+                    body_bytes,
+                    start,
+                    timestamp,
+                    client_addr,
+                    client_proc.as_ref(),
+                    false,
+                    bp_modified,
+                    StatusCode::BAD_GATEWAY,
+                    upstream_target.remapped_to.clone(),
+                    format!("Failed reading upstream response body: {chain}"),
+                );
+            }
         }
     };
 
@@ -1594,7 +1869,7 @@ pub(super) async fn handle_intercepted_request(
         )
         .await;
         if bp_outcome.aborted {
-            return record_and_return_error(
+            return record_and_return_error_with_opts(
                 &ctx,
                 session_id,
                 &scheme_str,
@@ -1610,6 +1885,8 @@ pub(super) async fn handle_intercepted_request(
                 client_proc.as_ref(),
                 false,
                 true,
+                StatusCode::BAD_GATEWAY,
+                upstream_target.remapped_to.clone(),
                 "Aborted at Live Breakpoint (After Response)".to_string(),
             );
         }
@@ -1669,6 +1946,7 @@ pub(super) async fn handle_intercepted_request(
         comment: None,
         marked_color: None,
         client_ip: Some(normalize_client_ip(client_addr)),
+        remapped_to: upstream_target.remapped_to.clone(),
     };
 
     let capped_req = &body_bytes[..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
@@ -2099,6 +2377,7 @@ pub(super) async fn run_request_breakpoint_stage(
         comment: None,
         marked_color: None,
         client_ip: input.client_ip,
+        remapped_to: None,
     };
     ctx.store.insert(SessionDetail {
         summary: paused_summary.clone(),
@@ -2255,6 +2534,7 @@ pub(super) async fn run_response_breakpoint_stage(
             comment: None,
             marked_color: None,
             client_ip: input.client_ip,
+            remapped_to: None,
         };
         ctx.store.insert(SessionDetail {
             summary: paused_summary.clone(),
@@ -2425,6 +2705,7 @@ pub(super) fn build_autoresponder_mock_detail(
         comment: None,
         marked_color: None,
         client_ip: input.client_ip,
+        remapped_to: None,
     };
 
     let capped_req = &input.req_bytes[..input.req_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];

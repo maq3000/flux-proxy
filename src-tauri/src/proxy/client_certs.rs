@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
@@ -9,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use x509_parser::extensions::GeneralName;
 
 use crate::models::ProxyError;
-use crate::proxy::server::build_upstream_client_with_identity;
+use crate::proxy::hosts::HostRemapRegistry;
+use crate::proxy::server::{build_upstream_client_with_identity, build_upstream_client_with_options};
 
 const CLIENT_CERTS_DIR_NAME: &str = "client_certs";
 const REGISTRY_FILE_NAME: &str = "registry.json";
@@ -900,6 +902,10 @@ impl ClientCertificateStore {
         best.map(|(_, e)| e.clone())
     }
 
+    pub fn invalidate_client_cache(&self) {
+        self.client_cache.invalidate_all();
+    }
+
     /// Returns a cached or freshly constructed `reqwest::Client` configured with the matching
     /// mTLS client certificate for `host`, or `Ok(None)` if no enabled certificate matches.
     pub fn get_or_build_client(
@@ -907,11 +913,21 @@ impl ClientCertificateStore {
         host: &str,
         follow_redirects: bool,
     ) -> Result<Option<(reqwest::Client, ClientCertificateEntry)>, ProxyError> {
+        self.get_or_build_client_with_resolver(host, follow_redirects, None)
+    }
+
+    pub fn get_or_build_client_with_resolver(
+        &self,
+        host: &str,
+        follow_redirects: bool,
+        dns_resolver: Option<Arc<HostRemapRegistry>>,
+    ) -> Result<Option<(reqwest::Client, ClientCertificateEntry)>, ProxyError> {
         let Some(entry) = self.match_certificate_for_host(host) else {
             return Ok(None);
         };
 
-        let cache_key = format!("{}:redirect={follow_redirects}", entry.id);
+        let resolver_tag = if dns_resolver.is_some() { "remap" } else { "sys" };
+        let cache_key = format!("{}:redirect={follow_redirects}:dns={resolver_tag}", entry.id);
         if let Some(cached) = self.client_cache.get(&cache_key) {
             return Ok(Some((cached, entry)));
         }
@@ -929,13 +945,14 @@ impl ClientCertificateStore {
                 entry.domain_pattern
             ))
         })?;
-        let client = build_upstream_client_with_identity(follow_redirects, Some(identity))
-            .map_err(|e| {
-                ProxyError::Custom(format!(
-                    "Ошибка сборки mTLS-клиента для '{}': {e}",
-                    entry.domain_pattern
-                ))
-            })?;
+        let client =
+            build_upstream_client_with_options(follow_redirects, Some(identity), dns_resolver)
+                .map_err(|e| {
+                    ProxyError::Custom(format!(
+                        "Ошибка сборки mTLS-клиента для '{}': {e}",
+                        entry.domain_pattern
+                    ))
+                })?;
 
         self.client_cache.insert(cache_key, client.clone());
         Ok(Some((client, entry)))

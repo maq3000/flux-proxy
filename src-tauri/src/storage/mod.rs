@@ -1060,6 +1060,7 @@ impl TrafficStore {
                 comment: None,
                 marked_color: None,
                 client_ip: Some("127.0.0.1".to_string()),
+                remapped_to: None,
             };
 
             if !filters.evaluate_should_store_session(&summary) {
@@ -1224,6 +1225,7 @@ mod tests {
                 comment: None,
                 marked_color: None,
                 client_ip: Some("127.0.0.1".into()),
+                remapped_to: None,
             },
             request_headers: vec![HeaderPair {
                 name: "Host".into(),

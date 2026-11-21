@@ -1343,6 +1343,14 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
                                 HDR
                               </span>
                             )}
+                            {s.remappedTo && (
+                              <span
+                                title={`HOSTS Remapped → ${s.remappedTo}`}
+                                className="shrink-0 rounded bg-accent/20 px-1 text-[9px] font-bold text-accent"
+                              >
+                                REMAP
+                              </span>
+                            )}
                             <span className="truncate">{s.path || s.url}</span>
                             {!visibleColumns.comment && s.comment && (
                               <span

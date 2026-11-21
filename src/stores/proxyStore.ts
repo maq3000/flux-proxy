@@ -1,15 +1,18 @@
 import { create } from "zustand";
 import {
   DEFAULT_CLEAR_DB_ON_EXIT,
+  DEFAULT_HOST_REMAP_RULES,
   DEFAULT_PYTHON_SCRIPT_CODE,
   PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
 } from "../lib/mockTraffic";
 import { DEFAULT_BREAKPOINT_CONFIG } from "../lib/tauriBridge";
 import {
   DEFAULT_SESSION_RETENTION_LIMIT,
+  DEFAULT_THROTTLE_CONFIG,
   type AutoResponderRule,
   type BindHostMode,
   type BreakpointConfig,
+  type HostRemapRule,
   type PausedBreakpointItem,
   type ProxyStatus,
   type PythonRunnerStatus,
@@ -17,6 +20,7 @@ import {
   type SessionDetail,
   type SessionSummary,
   type StorageStats,
+  type ThrottleConfig,
 } from "../types/proxy";
 import type { FluxUserSettingsProfile } from "../types/settings";
 
@@ -31,6 +35,8 @@ export const LS_BREAKPOINT_CFG_KEY = "fluxproxy.breakpointConfig.v1";
 export const LS_RETENTION_LIMIT_KEY = "fluxproxy.sessionRetentionLimit.v1";
 export const LS_DROP_NON_MATCHING_KEY = "fluxproxy.dropNonMatching.v1";
 export const LS_CLEAR_DB_ON_EXIT_KEY = PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY;
+export const LS_HOST_REMAP_RULES_KEY = "fluxproxy-host-remap-rules-v1";
+export const LS_THROTTLE_CONFIG_KEY = "fluxproxy-throttle-config-v1";
 
 export interface PersistedBindConfig {
   bindMode: BindHostMode;
@@ -262,6 +268,24 @@ function readInitialProxySlice() {
   const followTail = Boolean(
     loadProxyJson<boolean>(LS_FOLLOW_TAIL_KEY, false)
   );
+  const savedHostRemap = loadProxyJson<HostRemapRule[]>(
+    LS_HOST_REMAP_RULES_KEY,
+    DEFAULT_HOST_REMAP_RULES
+  );
+  const hostRemapRules = Array.isArray(savedHostRemap)
+    ? savedHostRemap
+    : [...DEFAULT_HOST_REMAP_RULES];
+  const savedThrottle = loadProxyJson<ThrottleConfig>(
+    LS_THROTTLE_CONFIG_KEY,
+    DEFAULT_THROTTLE_CONFIG
+  );
+  const throttleConfig: ThrottleConfig =
+    savedThrottle && typeof savedThrottle === "object"
+      ? {
+          ...DEFAULT_THROTTLE_CONFIG,
+          ...savedThrottle,
+        }
+      : { ...DEFAULT_THROTTLE_CONFIG };
 
   return {
     sessions: [] as SessionSummary[],
@@ -286,6 +310,8 @@ function readInitialProxySlice() {
     } as StorageStats,
     breakpointConfig,
     pausedBreakpoints: [] as PausedBreakpointItem[],
+    hostRemapRules,
+    throttleConfig,
   };
 }
 
@@ -314,6 +340,8 @@ export interface ProxyStoreState {
   storageStats: StorageStats;
   breakpointConfig: BreakpointConfig;
   pausedBreakpoints: PausedBreakpointItem[];
+  hostRemapRules: HostRemapRule[];
+  throttleConfig: ThrottleConfig;
 
   // AutoResponder & Python Scripting state
   autoResponderEnabled: boolean;
@@ -341,6 +369,8 @@ export interface ProxyStoreState {
   setStorageStats: (updater: Updater<StorageStats>) => void;
   setBreakpointConfig: (updater: Updater<BreakpointConfig>) => void;
   setPausedBreakpoints: (updater: Updater<PausedBreakpointItem[]>) => void;
+  setHostRemapRules: (updater: Updater<HostRemapRule[]>) => void;
+  setThrottleConfig: (updater: Updater<ThrottleConfig>) => void;
 
   setAutoResponderEnabled: (updater: Updater<boolean>) => void;
   setRules: (updater: Updater<AutoResponderRule[]>) => void;
@@ -474,6 +504,36 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
     set((state) => ({ rules: resolveUpdater(updater, state.rules) }));
   },
 
+  setHostRemapRules: (updater) => {
+    set((state) => {
+      const hostRemapRules = resolveUpdater(updater, state.hostRemapRules);
+      try {
+        window.localStorage.setItem(
+          LS_HOST_REMAP_RULES_KEY,
+          JSON.stringify(hostRemapRules)
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+      return { hostRemapRules };
+    });
+  },
+
+  setThrottleConfig: (updater) => {
+    set((state) => {
+      const throttleConfig = resolveUpdater(updater, state.throttleConfig);
+      try {
+        window.localStorage.setItem(
+          LS_THROTTLE_CONFIG_KEY,
+          JSON.stringify(throttleConfig)
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+      return { throttleConfig };
+    });
+  },
+
   setScriptCode: (updater) => {
     set((state) => ({ scriptCode: resolveUpdater(updater, state.scriptCode) }));
   },
@@ -563,6 +623,15 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
           }
         : state.breakpointConfig;
 
+      const nextHostRemapRules: HostRemapRule[] = Array.isArray(
+        detail.proxy.hostRemapRules
+      )
+        ? structuredClone(detail.proxy.hostRemapRules)
+        : state.hostRemapRules;
+      const nextThrottleConfig: ThrottleConfig = detail.proxy.throttleConfig
+        ? { ...DEFAULT_THROTTLE_CONFIG, ...detail.proxy.throttleConfig }
+        : { ...DEFAULT_THROTTLE_CONFIG };
+
       return {
         followTail: nextFollowTail,
         sessionRetentionLimit: nextRetention,
@@ -571,6 +640,8 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
         clearDbOnExit: nextClearDbOnExit,
         status: nextStatusOptimistic,
         breakpointConfig: nextBp,
+        hostRemapRules: nextHostRemapRules,
+        throttleConfig: nextThrottleConfig,
       };
     });
   },

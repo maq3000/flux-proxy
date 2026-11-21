@@ -763,6 +763,14 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
               {detail.tlsVersion}
             </span>
           )}
+          {summary.remappedTo && (
+            <span
+              title={`Virtual DNS / HOSTS Remapping: трафик перенаправлен на ${summary.remappedTo}`}
+              className="hidden rounded border border-accent/40 bg-accent/15 px-1.5 py-0.5 font-mono text-[10px] font-medium text-accent lg:inline"
+            >
+              HOSTS → {summary.remappedTo}
+            </span>
+          )}
           {onAnnotateSession && (
             <button
               type="button"
