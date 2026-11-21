@@ -471,6 +471,50 @@ impl ProxyFilterEngine {
         }
     }
 
+    /// Returns `true` when `TlsInterceptMode::TargetedOnly` (allowlist-only MITM) is active.
+    pub fn is_targeted_only_mode(&self) -> bool {
+        self.state
+            .read()
+            .map(|g| g.config.tls_intercept_mode == TlsInterceptMode::TargetedOnly)
+            .unwrap_or(false)
+    }
+
+    /// Evaluates whether TLS MITM interception is permitted for `host_or_authority`
+    /// (`host`, `host:port`, `[ipv6]`, or `[ipv6]:port`), defaulting port to `443`.
+    pub fn should_intercept_tls(&self, host_or_authority: &str) -> bool {
+        let trimmed = host_or_authority.trim();
+        let (raw_host, port) = if let Ok(sock) = trimmed.parse::<std::net::SocketAddr>() {
+            (sock.ip().to_string(), sock.port())
+        } else if let Some(rest) = trimmed.strip_prefix('[') {
+            if let Some((ipv6, tail)) = rest.split_once(']') {
+                let port = tail
+                    .strip_prefix(':')
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .unwrap_or(443);
+                (ipv6.to_string(), port)
+            } else {
+                (trimmed.to_string(), 443)
+            }
+        } else if let Some((h, p)) = trimmed.rsplit_once(':') {
+            if !h.contains(':') {
+                if let Ok(port) = p.parse::<u16>() {
+                    (h.to_string(), port)
+                } else {
+                    (trimmed.to_string(), 443)
+                }
+            } else {
+                (trimmed.to_string(), 443)
+            }
+        } else {
+            (trimmed.to_string(), 443)
+        };
+        let clean_host = raw_host.trim().trim_end_matches('.');
+        matches!(
+            self.evaluate_connect_tunnel(clean_host, port),
+            ConnectTunnelDecision::InterceptMitm
+        )
+    }
+
     /// Checks whether a `CONNECT host:port` tunnel matches an explicit rule in `tls_bypass_rules`.
     pub fn match_tls_bypass(&self, host: &str, port: u16) -> Option<TlsBypassRule> {
         let guard = self.state.read().ok()?;

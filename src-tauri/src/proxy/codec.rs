@@ -7,6 +7,39 @@ use flate2::Compression;
 
 use crate::models::{CodecOperation, CodecTransformResult, ProxyError};
 
+const MAX_CODEC_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug)]
+enum CodecDecompressError {
+    LimitExceeded,
+    InvalidStream(String),
+}
+
+fn read_bounded_codec_output<R: Read>(
+    reader: R,
+    max_bytes: u64,
+    codec_label: &str,
+) -> Result<Vec<u8>, CodecDecompressError> {
+    let mut out = Vec::new();
+    reader
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|e| CodecDecompressError::InvalidStream(format!("{codec_label} decompression failed: {e}")))?;
+    if (out.len() as u64) > max_bytes {
+        return Err(CodecDecompressError::LimitExceeded);
+    }
+    Ok(out)
+}
+
+fn map_codec_decompress_error(err: CodecDecompressError, codec_label: &str, max_bytes: u64) -> ProxyError {
+    match err {
+        CodecDecompressError::LimitExceeded => ProxyError::Custom(format!(
+            "{codec_label} decompressed payload exceeds safety limit ({max_bytes} bytes)"
+        )),
+        CodecDecompressError::InvalidStream(msg) => ProxyError::Custom(msg),
+    }
+}
+
 /// Executes binary compression / decompression transforms (Gzip, Brotli, Deflate, Zstd)
 /// for the built-in TextWizard utility.
 ///
@@ -16,6 +49,15 @@ pub fn execute_codec_transform(
     operation: CodecOperation,
     input: &str,
     input_is_base64: bool,
+) -> Result<CodecTransformResult, ProxyError> {
+    execute_codec_transform_with_limit(operation, input, input_is_base64, MAX_CODEC_DECOMPRESSED_BYTES)
+}
+
+fn execute_codec_transform_with_limit(
+    operation: CodecOperation,
+    input: &str,
+    input_is_base64: bool,
+    max_decompressed_bytes: u64,
 ) -> Result<CodecTransformResult, ProxyError> {
     let raw_bytes = match operation {
         CodecOperation::GzipCompress
@@ -41,13 +83,12 @@ pub fn execute_codec_transform(
             enc.write_all(&raw_bytes)?;
             enc.finish()?
         }
-        CodecOperation::GzipDecompress => {
-            let mut dec = GzDecoder::new(raw_bytes.as_slice());
-            let mut out = Vec::new();
-            dec.read_to_end(&mut out)
-                .map_err(|e| ProxyError::Custom(format!("Gzip decompression failed: {e}")))?;
-            out
-        }
+        CodecOperation::GzipDecompress => read_bounded_codec_output(
+            GzDecoder::new(raw_bytes.as_slice()),
+            max_decompressed_bytes,
+            "Gzip",
+        )
+        .map_err(|e| map_codec_decompress_error(e, "Gzip", max_decompressed_bytes))?,
         CodecOperation::BrotliCompress => {
             let mut out = Vec::new();
             {
@@ -57,13 +98,12 @@ pub fn execute_codec_transform(
             }
             out
         }
-        CodecOperation::BrotliDecompress => {
-            let mut dec = brotli::Decompressor::new(raw_bytes.as_slice(), 4096);
-            let mut out = Vec::new();
-            dec.read_to_end(&mut out)
-                .map_err(|e| ProxyError::Custom(format!("Brotli decompression failed: {e}")))?;
-            out
-        }
+        CodecOperation::BrotliDecompress => read_bounded_codec_output(
+            brotli::Decompressor::new(raw_bytes.as_slice(), 4096),
+            max_decompressed_bytes,
+            "Brotli",
+        )
+        .map_err(|e| map_codec_decompress_error(e, "Brotli", max_decompressed_bytes))?,
         CodecOperation::DeflateCompress => {
             let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
             enc.write_all(&raw_bytes)?;
@@ -71,24 +111,35 @@ pub fn execute_codec_transform(
         }
         CodecOperation::DeflateDecompress => {
             // Try RFC 1950 Zlib wrapper first (HTTP `Content-Encoding: deflate`), then raw RFC 1951 deflate
-            let mut out = Vec::new();
-            if ZlibDecoder::new(raw_bytes.as_slice())
-                .read_to_end(&mut out)
-                .is_err()
-            {
-                out.clear();
-                DeflateDecoder::new(raw_bytes.as_slice())
-                    .read_to_end(&mut out)
-                    .map_err(|e| {
-                        ProxyError::Custom(format!("Deflate decompression failed: {e}"))
-                    })?;
+            match read_bounded_codec_output(
+                ZlibDecoder::new(raw_bytes.as_slice()),
+                max_decompressed_bytes,
+                "Deflate",
+            ) {
+                Ok(out) => out,
+                Err(CodecDecompressError::LimitExceeded) => {
+                    return Err(map_codec_decompress_error(
+                        CodecDecompressError::LimitExceeded,
+                        "Deflate",
+                        max_decompressed_bytes,
+                    ));
+                }
+                Err(CodecDecompressError::InvalidStream(_)) => read_bounded_codec_output(
+                    DeflateDecoder::new(raw_bytes.as_slice()),
+                    max_decompressed_bytes,
+                    "Deflate",
+                )
+                .map_err(|e| map_codec_decompress_error(e, "Deflate", max_decompressed_bytes))?,
             }
-            out
         }
         CodecOperation::ZstdCompress => zstd::encode_all(raw_bytes.as_slice(), 3)
             .map_err(|e| ProxyError::Custom(format!("Zstd compression failed: {e}")))?,
-        CodecOperation::ZstdDecompress => zstd::decode_all(raw_bytes.as_slice())
-            .map_err(|e| ProxyError::Custom(format!("Zstd decompression failed: {e}")))?,
+        CodecOperation::ZstdDecompress => {
+            let dec = zstd::stream::read::Decoder::new(raw_bytes.as_slice())
+                .map_err(|e| ProxyError::Custom(format!("Zstd decompression failed: {e}")))?;
+            read_bounded_codec_output(dec, max_decompressed_bytes, "Zstd")
+                .map_err(|e| map_codec_decompress_error(e, "Zstd", max_decompressed_bytes))?
+        }
     };
 
     let output_len = out_bytes.len();
@@ -193,5 +244,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(from_hex.output_text.as_deref(), Some(sample));
+    }
+
+    #[test]
+    fn sec05_zstd_codec_rejects_decompressed_output_exceeding_limit() {
+        let large_text = "B".repeat(4096);
+        let compressed =
+            execute_codec_transform(CodecOperation::ZstdCompress, &large_text, false).unwrap();
+        let err = execute_codec_transform_with_limit(
+            CodecOperation::ZstdDecompress,
+            &compressed.output_base64,
+            true,
+            1024,
+        )
+        .expect_err("must reject oversized zstd decompression output");
+        assert!(err.to_string().contains("exceeds safety limit"));
     }
 }

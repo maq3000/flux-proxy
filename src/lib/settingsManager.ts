@@ -85,6 +85,7 @@ import {
   DEFAULT_SETTINGS_EXPORT_FILENAME,
   PROXY_STATUS_SYNCED_EVENT,
   SETTINGS_APPLIED_EVENT,
+  type ApplySettingsProfileOptions,
   type FluxUserScriptingSettings,
   type FluxUserSettingsProfile,
   type SettingsImportPreviewSummary,
@@ -92,6 +93,7 @@ import {
 } from "../types/settings";
 
 export { PROXY_STATUS_SYNCED_EVENT, SETTINGS_APPLIED_EVENT };
+export type { ApplySettingsProfileOptions };
 
 export const SETTINGS_STORAGE_KEYS = {
   theme: THEME_PREFERENCE_STORAGE_KEY,
@@ -2280,6 +2282,15 @@ export function buildSettingsImportPreview(
   const hiddenToolbarGroupsCount =
     TOOLBAR_GROUP_DEFINITIONS.length - visibleToolbarGroupsCount;
 
+  const rawScriptCode = incoming.scripting?.code ?? "";
+  const hasPythonScript = rawScriptCode.trim().length > 0;
+  const pythonScriptEnabledInProfile = Boolean(
+    incoming.scripting?.enabled ?? false
+  );
+  const pythonScriptLineCount = hasPythonScript
+    ? rawScriptCode.replace(/(?:\r?\n)+$/, "").split(/\r?\n/).length
+    : 0;
+
   return {
     fileName: options?.fileName ?? DEFAULT_SETTINGS_EXPORT_FILENAME,
     schemaVersion: incoming.schemaVersion,
@@ -2312,6 +2323,9 @@ export function buildSettingsImportPreview(
     inspectorSplitDirection: incoming.ui.inspectorSplitDirection,
     proxyPort: incoming.proxy.port,
     tlsInterceptMode: incoming.proxy.tlsInterceptMode,
+    hasPythonScript,
+    pythonScriptEnabledInProfile,
+    pythonScriptLineCount,
     warnings: options?.warnings ?? [],
   };
 }
@@ -2528,15 +2542,22 @@ function atomicWriteProfileToLocalStorage(
  * synchronized React hook state.
  */
 export async function applySettingsProfile(
-  profile: FluxUserSettingsProfile
+  profile: FluxUserSettingsProfile,
+  options?: ApplySettingsProfileOptions
 ): Promise<FluxUserSettingsProfile> {
   const normalized = validateAndMigrateSettingsProfile(profile);
   const backendConfig = buildBackendFilterConfigFromProfile(normalized);
   const nextBreakpoints: BreakpointConfig = structuredClone(
     normalized.breakpoints ?? DEFAULT_BREAKPOINT_CONFIG
   );
+  const trustImportedPythonScript = Boolean(
+    options?.trustImportedPythonScript
+  );
+  const effectiveScriptEnabled = trustImportedPythonScript
+    ? Boolean(normalized.scripting?.enabled ?? false)
+    : false;
   const nextScripting: FluxUserScriptingSettings = {
-    enabled: Boolean(normalized.scripting?.enabled ?? false),
+    enabled: effectiveScriptEnabled,
     code: normalized.scripting?.code ?? DEFAULT_PYTHON_SCRIPT_CODE,
     activePresetId:
       normalized.scripting?.activePresetId !== undefined

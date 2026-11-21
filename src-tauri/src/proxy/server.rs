@@ -210,6 +210,25 @@ pub(crate) fn has_zstd_content_encoding(headers: &[HeaderPair]) -> bool {
     })
 }
 
+pub(crate) const MAX_ZSTD_DECOMPRESSED_BYTES: u64 = MAX_CAPTURED_BODY_BYTES as u64;
+
+pub(crate) fn decode_zstd_bounded(input: &[u8], max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read;
+
+    let decoder = zstd::stream::read::Decoder::new(input)?;
+    let mut out = Vec::new();
+    decoder
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut out)?;
+    if (out.len() as u64) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("zstd decompressed payload exceeds limit of {max_bytes} bytes"),
+        ));
+    }
+    Ok(out)
+}
+
 pub(crate) async fn maybe_decompress_zstd(headers: &[HeaderPair], body: Bytes) -> (Bytes, bool) {
     if !has_zstd_content_encoding(headers) {
         return (body, false);
@@ -220,7 +239,11 @@ pub(crate) async fn maybe_decompress_zstd(headers: &[HeaderPair], body: Bytes) -
 
     let decode_res = if body.len() > ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES {
         let body_for_task = body.clone();
-        match tokio::task::spawn_blocking(move || zstd::decode_all(body_for_task.as_ref())).await {
+        match tokio::task::spawn_blocking(move || {
+            decode_zstd_bounded(body_for_task.as_ref(), MAX_ZSTD_DECOMPRESSED_BYTES)
+        })
+        .await
+        {
             Ok(res) => res,
             Err(join_err) => {
                 tracing::warn!(
@@ -231,7 +254,7 @@ pub(crate) async fn maybe_decompress_zstd(headers: &[HeaderPair], body: Bytes) -
             }
         }
     } else {
-        zstd::decode_all(body.as_ref())
+        decode_zstd_bounded(body.as_ref(), MAX_ZSTD_DECOMPRESSED_BYTES)
     };
 
     match decode_res {
@@ -2151,13 +2174,30 @@ async fn handle_outer_proxy_request(
         };
 
         let (host, port) = split_authority(&authority);
+        let is_remote_peer = !is_loopback_ip(client_addr.ip());
+        if is_remote_peer && is_loopback_or_unspecified_host(&host) {
+            return plain_response(
+                StatusCode::FORBIDDEN,
+                "Forbidden: remote LAN clients cannot open CONNECT tunnels to loopback or unspecified hosts",
+            );
+        }
+
+        let active_port = ctx.active_port.load(Ordering::Relaxed);
+        let is_portal_connect = is_builtin_portal_target(&authority, false, active_port);
+        if is_portal_connect && !is_virtual_portal_domain(&host) {
+            return plain_response(
+                StatusCode::FORBIDDEN,
+                "Forbidden: CONNECT tunnel to the proxy listener itself is not permitted",
+            );
+        }
 
         // Selective MITM Pass-Through:
         // - Mode 1 (`InterceptAll`): passthrough if matched by `tls_bypass_rules`
         // - Mode 2 (`TargetedOnly`): pure TCP passthrough (`copy_bidirectional`) for EVERYTHING except `tls_target_rules`
-        if let ConnectTunnelDecision::Passthrough(reason) =
-            ctx.filters.evaluate_connect_tunnel(&host, port)
-        {
+        if !is_portal_connect {
+            if let ConnectTunnelDecision::Passthrough(reason) =
+                ctx.filters.evaluate_connect_tunnel(&host, port)
+            {
             let start = Instant::now();
             let timestamp = Utc::now().to_rfc3339();
             let session_id = ctx.store.allocate_id();
@@ -2308,6 +2348,7 @@ async fn handle_outer_proxy_request(
                 .status(StatusCode::OK)
                 .body(boxed_full(Bytes::new()))
                 .unwrap();
+            }
         }
 
         let mut filter_updates_rx = ctx.filters.subscribe_config_updates();
@@ -2472,6 +2513,17 @@ async fn handle_intercepted_request(
         format!("{scheme_str}://{host_header}{path_and_query}")
     };
 
+    let is_remote_peer = !is_loopback_ip(client_addr.ip());
+    if is_remote_peer
+        && (req.headers().get(HOST).is_some() || !is_direct_origin_http)
+        && request_targets_loopback_or_unspecified(&host_header, &full_url)
+    {
+        return plain_response(
+            StatusCode::FORBIDDEN,
+            "Forbidden: remote LAN clients cannot access loopback or unspecified hosts",
+        );
+    }
+
     // 0. Built-in Mobile Onboarding Portal & Root CA Certificate Endpoints
     // Triggered on `http(s)://flux.proxy/*` OR direct HTTP browser connections to `<proxy-ip>:<port>/*`
     if is_builtin_portal_target(
@@ -2493,6 +2545,39 @@ async fn handle_intercepted_request(
             client_proc.as_ref(),
             &ctx,
         );
+    }
+
+    // 0b. Enforce TargetedOnly allowlist against inner Host / HTTP/2 :authority when inside CONNECT MITM
+    if let Some(tunnel_auth) = default_authority {
+        if ctx.filters.is_targeted_only_mode() {
+            let normalize_auth = |raw: &str| -> (String, u16) {
+                let (h, maybe_p) = parse_host_and_optional_port(raw);
+                (h.trim_end_matches('.').to_string(), maybe_p.unwrap_or(443))
+            };
+            let tunnel_norm = normalize_auth(tunnel_auth);
+            let host_hdr_raw = req
+                .headers()
+                .get(HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(tunnel_auth);
+            let uri_auth_raw = req.uri().authority().map(|a| a.as_str());
+
+            let differs_from_tunnel = normalize_auth(host_hdr_raw) != tunnel_norm
+                || uri_auth_raw.is_some_and(|ua| normalize_auth(ua) != tunnel_norm);
+
+            if differs_from_tunnel {
+                let host_allowed = ctx.filters.should_intercept_tls(host_hdr_raw);
+                let uri_allowed = uri_auth_raw
+                    .map(|ua| ctx.filters.should_intercept_tls(ua))
+                    .unwrap_or(true);
+                if !host_allowed || !uri_allowed {
+                    return plain_response(
+                        StatusCode::FORBIDDEN,
+                        "Forbidden: Host header differs from CONNECT authority and is outside TargetedOnly TLS allowlist",
+                    );
+                }
+            }
+        }
     }
 
     // 1. Check for WebSocket Upgrade (`ws://` or decrypted `wss://`)
@@ -3002,7 +3087,7 @@ async fn handle_intercepted_request(
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned))
         .unwrap_or_else(|| host_header.clone());
-    let (upstream_client, mtls_cn) = if scheme_str.eq_ignore_ascii_case("https") {
+    let (upstream_client, mtls_cn) = if should_use_host_mtls_for_peer(client_addr, &scheme_str) {
         match ctx.client_certs.get_or_build_client(&target_host, false) {
             Ok(Some((mtls_client, entry))) => (mtls_client, Some(entry.common_name)),
             Ok(None) => (ctx.upstream_client.clone(), None),
@@ -3209,12 +3294,43 @@ async fn handle_intercepted_request(
         tokio::spawn(async move {
             use std::io::Write;
 
+            struct BoundedSseZstdSink {
+                buf: Vec<u8>,
+                total_written: usize,
+                max_total: usize,
+            }
+
+            impl Write for BoundedSseZstdSink {
+                fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                    if self.total_written.saturating_add(data.len()) > self.max_total {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "SSE zstd decompressed output exceeds limit of {} bytes",
+                                self.max_total
+                            ),
+                        ));
+                    }
+                    self.total_written = self.total_written.saturating_add(data.len());
+                    self.buf.extend_from_slice(data);
+                    Ok(data.len())
+                }
+
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+
             const MAX_SSE_EVENTS: usize = 1024;
             let mut pending_parse_buf: Vec<u8> = Vec::new();
             let mut total_parsed_events = 0usize;
             let mut total_bytes = 0usize;
             let mut zstd_decoder = if sse_has_zstd {
-                match zstd::stream::write::Decoder::new(Vec::<u8>::new()) {
+                match zstd::stream::write::Decoder::new(BoundedSseZstdSink {
+                    buf: Vec::new(),
+                    total_written: 0,
+                    max_total: MAX_CAPTURED_BODY_BYTES,
+                }) {
                     Ok(dec) => Some(dec),
                     Err(err) => {
                         tracing::warn!("Failed to initialize SSE zstd stream decoder: {err}");
@@ -3231,7 +3347,7 @@ async fn handle_intercepted_request(
                         tracing::warn!("SSE zstd stream decode error: {err}");
                         break;
                     }
-                    let decoded = std::mem::take(dec.get_mut());
+                    let decoded = std::mem::take(&mut dec.get_mut().buf);
                     if decoded.is_empty() {
                         continue;
                     }
@@ -3260,7 +3376,7 @@ async fn handle_intercepted_request(
 
             if let Some(mut dec) = zstd_decoder {
                 let _ = dec.flush();
-                let tail_decoded = std::mem::take(dec.get_mut());
+                let tail_decoded = std::mem::take(&mut dec.get_mut().buf);
                 if !tail_decoded.is_empty() {
                     let chunk_offset_ms = start.elapsed().as_millis() as u64;
                     total_bytes += tail_decoded.len();
@@ -4769,6 +4885,9 @@ fn parse_host_and_optional_port(raw_host: &str) -> (String, Option<u16>) {
     if let Ok(sock) = trimmed.parse::<SocketAddr>() {
         return (sock.ip().to_string(), Some(sock.port()));
     }
+    if trimmed.parse::<IpAddr>().is_ok() {
+        return (trimmed.to_ascii_lowercase(), None);
+    }
     if let Some(rest) = trimmed.strip_prefix('[') {
         if let Some((ipv6, tail)) = rest.split_once(']') {
             let port = tail.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
@@ -4776,13 +4895,110 @@ fn parse_host_and_optional_port(raw_host: &str) -> (String, Option<u16>) {
         }
     }
     if let Some((h, p)) = trimmed.rsplit_once(':') {
-        if !h.contains(':') {
+        if !h.contains(':') || h.parse::<IpAddr>().is_ok() {
             if let Ok(port) = p.parse::<u16>() {
                 return (h.to_ascii_lowercase(), Some(port));
             }
         }
     }
     (trimmed.to_ascii_lowercase(), None)
+}
+
+fn extract_mapped_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let segs = v6.segments();
+    if segs[0..6] == [0; 6] && !v6.is_loopback() && !v6.is_unspecified() {
+        return Some(std::net::Ipv4Addr::new(
+            (segs[6] >> 8) as u8,
+            segs[6] as u8,
+            (segs[7] >> 8) as u8,
+            segs[7] as u8,
+        ));
+    }
+    None
+}
+
+fn is_loopback_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || extract_mapped_ipv4(v6).is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+fn is_unspecified_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            v6.is_unspecified() || extract_mapped_ipv4(v6).is_some_and(|v4| v4.is_unspecified())
+        }
+    }
+}
+
+fn is_virtual_portal_domain(host: &str) -> bool {
+    let clean = host
+        .trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    matches!(
+        clean.as_str(),
+        "flux.proxy" | "cert.flux.proxy" | "fluxproxy.local"
+    )
+}
+
+fn parse_ip_including_mapped_and_shorthand(host_clean: &str) -> Option<IpAddr> {
+    if let Ok(ip) = host_clean.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    let bracketed = if host_clean.contains(':') && !host_clean.starts_with('[') {
+        format!("[{host_clean}]")
+    } else {
+        host_clean.to_string()
+    };
+    let parsed = reqwest::Url::parse(&format!("http://{bracketed}/")).ok()?;
+    let h = parsed.host_str()?.trim_matches(['[', ']']);
+    h.parse::<IpAddr>().ok()
+}
+
+fn is_loopback_or_unspecified_host(raw_host: &str) -> bool {
+    let (host_only, _) = parse_host_and_optional_port(raw_host);
+    let clean = host_only.trim_end_matches('.');
+    if clean.is_empty() {
+        return false;
+    }
+    if clean == "localhost"
+        || clean.ends_with(".localhost")
+        || clean == "ip6-localhost"
+        || clean == "ip6-loopback"
+    {
+        return true;
+    }
+    if let Some(ip) = parse_ip_including_mapped_and_shorthand(clean) {
+        return is_loopback_ip(ip) || is_unspecified_ip(ip);
+    }
+    false
+}
+
+fn request_targets_loopback_or_unspecified(host_header: &str, full_url: &str) -> bool {
+    if is_loopback_or_unspecified_host(host_header) {
+        return true;
+    }
+    if let Ok(parsed) = reqwest::Url::parse(full_url) {
+        if let Some(url_host) = parsed.host_str() {
+            if is_loopback_or_unspecified_host(url_host) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn should_use_host_mtls_for_peer(peer_addr: SocketAddr, scheme: &str) -> bool {
+    scheme.eq_ignore_ascii_case("https") && is_loopback_ip(peer_addr.ip())
 }
 
 fn is_builtin_portal_target(
@@ -4794,18 +5010,16 @@ fn is_builtin_portal_target(
         return true;
     }
     let (host_only, maybe_port) = parse_host_and_optional_port(host_header);
-    if matches!(
-        host_only.as_str(),
-        "flux.proxy" | "cert.flux.proxy" | "fluxproxy.local"
-    ) {
+    let host_clean = host_only.trim_end_matches('.');
+    if is_virtual_portal_domain(host_clean) {
         return true;
     }
     if active_listener_port > 0 && maybe_port == Some(active_listener_port) {
-        if host_only == "localhost" {
+        if host_clean == "localhost" || host_clean.ends_with(".localhost") {
             return true;
         }
-        if let Ok(ip) = host_only.parse::<IpAddr>() {
-            if ip.is_loopback() || ip.is_unspecified() || is_host_own_ip(ip) {
+        if let Some(ip) = parse_ip_including_mapped_and_shorthand(host_clean) {
+            if is_loopback_ip(ip) || is_unspecified_ip(ip) || is_host_own_ip(ip) {
                 return true;
             }
         }
@@ -7761,5 +7975,231 @@ def on_response(response, request):
 
         script_runner.shutdown_sync();
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn sec03_portal_target_loopback_unspecified_and_mtls_peer_guards() {
+        // Portal target detects IPv6-mapped loopback & unspecified addresses on active port
+        assert!(is_builtin_portal_target("[::ffff:127.0.0.1]:8888", false, 8888));
+        assert!(is_builtin_portal_target("::ffff:127.0.0.1:8888", false, 8888));
+        assert!(is_builtin_portal_target("[::1]:8888", false, 8888));
+        assert!(is_builtin_portal_target("0.0.0.0:8888", false, 8888));
+        assert!(is_builtin_portal_target("flux.proxy", false, 8888));
+        assert!(!is_builtin_portal_target("[::ffff:127.0.0.1]:9999", false, 8888));
+
+        // Loopback & unspecified host checks for LAN SSRF protection
+        for blocked in [
+            "localhost",
+            "api.localhost:8080",
+            "127.0.0.1",
+            "127.42.0.1:9000",
+            "::1",
+            "[::1]:443",
+            "::ffff:127.0.0.1",
+            "[::ffff:127.5.6.7]:8443",
+            "0.0.0.0:80",
+            "::",
+            "[::ffff:0.0.0.0]:80",
+            "127.1",
+            "2130706433",
+        ] {
+            assert!(
+                is_loopback_or_unspecified_host(blocked),
+                "expected loopback/unspecified host to be blocked: {blocked}"
+            );
+        }
+
+        for allowed in ["api.example.com", "192.168.1.50:8443", "8.8.8.8", "2606:4700:4700::1111"] {
+            assert!(
+                !is_loopback_or_unspecified_host(allowed),
+                "expected external host to be allowed: {allowed}"
+            );
+        }
+
+        assert!(request_targets_loopback_or_unspecified(
+            "example.com",
+            "http://127.0.0.1:8080/admin"
+        ));
+        assert!(request_targets_loopback_or_unspecified(
+            "127.0.0.1:8080",
+            "http://example.com/"
+        ));
+        assert!(!request_targets_loopback_or_unspecified(
+            "example.com",
+            "https://example.com/api"
+        ));
+
+        // mTLS client cert lookup must be disabled for external LAN peers
+        assert!(!should_use_host_mtls_for_peer(
+            "192.168.1.50:55555".parse().unwrap(),
+            "https"
+        ));
+        assert!(!should_use_host_mtls_for_peer(
+            "[::ffff:192.168.1.50]:55555".parse().unwrap(),
+            "https"
+        ));
+        assert!(should_use_host_mtls_for_peer(
+            "127.0.0.1:55555".parse().unwrap(),
+            "https"
+        ));
+        assert!(should_use_host_mtls_for_peer(
+            "[::1]:55555".parse().unwrap(),
+            "https"
+        ));
+        assert!(should_use_host_mtls_for_peer(
+            "[::ffff:127.0.0.1]:55555".parse().unwrap(),
+            "https"
+        ));
+        assert!(!should_use_host_mtls_for_peer(
+            "127.0.0.1:55555".parse().unwrap(),
+            "http"
+        ));
+    }
+
+    #[tokio::test]
+    async fn sec03_blocks_self_connect_and_targeted_only_host_header_bypass() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-sec03-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        filters.update_config(ProxyFilterBackendConfig {
+            tls_intercept_mode: TlsInterceptMode::TargetedOnly,
+            tls_bypass_enabled: true,
+            tls_bypass_rules: Vec::new(),
+            tls_target_rules: vec![TlsBypassRule {
+                id: "only-allowed".into(),
+                enabled: true,
+                pattern: "allowed.test".into(),
+                category: "Target".into(),
+                description: "Allow only allowed.test".into(),
+            }],
+            header_mutations_enabled: false,
+            header_mutations: Vec::new(),
+            strip_alt_svc: true,
+            host_list_sync: Default::default(),
+            ..crate::proxy::filters::default_backend_config()
+        });
+
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("sec03.sqlite")).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        let ctx = Arc::new(SharedProxyContext {
+            ca: ca.clone(),
+            rules,
+            filters,
+            breakpoints: Arc::new(BreakpointEngine::new(None)),
+            store,
+            upstream_client: build_upstream_client(false).unwrap(),
+            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(proxy_addr.port()),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let proxy_ctx = ctx.clone();
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                if let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await {
+                    let io = TokioIo::new(tcp_stream);
+                    let c = proxy_ctx.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req: Request<Incoming>| {
+                            let inner_c = c.clone();
+                            async move {
+                                Ok::<_, Infallible>(
+                                    handle_outer_proxy_request(req, client_addr, None, inner_c)
+                                        .await,
+                                )
+                            }
+                        });
+                        let _ = AutoConnBuilder::new(TokioExecutor::new())
+                            .serve_connection_with_upgrades(io, service)
+                            .await;
+                    });
+                }
+            }
+        });
+
+        // 1. Self-CONNECT in TargetedOnly mode (including IPv6-mapped ::ffff:127.0.0.1) must be 403 Forbidden
+        for self_auth in [
+            format!("127.0.0.1:{}", proxy_addr.port()),
+            format!("[::ffff:127.0.0.1]:{}", proxy_addr.port()),
+        ] {
+            let mut sock = TcpStream::connect(proxy_addr).await.unwrap();
+            let req = format!("CONNECT {self_auth} HTTP/1.1\r\nHost: {self_auth}\r\n\r\n");
+            sock.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = [0u8; 512];
+            let n = sock.read(&mut buf).await.unwrap();
+            let resp = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                resp.starts_with("HTTP/1.1 403"),
+                "expected 403 for self-CONNECT {self_auth}, got: {resp}"
+            );
+        }
+
+        // 2. Spoofed Host inside TargetedOnly CONNECT MITM tunnel must be rejected with 403 Forbidden
+        let mut sock = TcpStream::connect(proxy_addr).await.unwrap();
+        sock.write_all(b"CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut connect_buf = [0u8; 256];
+        let n = sock.read(&mut connect_buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&connect_buf[..n]).starts_with("HTTP/1.1 200"));
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store
+            .add(rustls::pki_types::CertificateDer::from(
+                ca.root_ca_der().to_vec(),
+            ))
+            .unwrap();
+        let tls_cfg = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+        let connector = tokio_rustls::TlsConnector::from(tls_cfg);
+        let server_name = rustls::pki_types::ServerName::try_from("allowed.test").unwrap();
+        let mut tls_stream = connector.connect(server_name, sock).await.unwrap();
+
+        tls_stream
+            .write_all(
+                b"GET /secret HTTP/1.1\r\nHost: non-allowlisted.example.com\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut resp_bytes = Vec::new();
+        let _ = tls_stream.read_to_end(&mut resp_bytes).await;
+        let inner_resp = String::from_utf8_lossy(&resp_bytes);
+        assert!(
+            inner_resp.starts_with("HTTP/1.1 403"),
+            "expected 403 for spoofed Host inside TargetedOnly tunnel, got: {inner_resp}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn sec05_decode_zstd_bounded_enforces_limit_and_decodes_within_limit() {
+        let plain = vec![b'A'; 4096];
+        let compressed = zstd::encode_all(plain.as_slice(), 1).unwrap();
+
+        let ok = decode_zstd_bounded(&compressed, 4096).expect("within exact limit");
+        assert_eq!(ok.len(), 4096);
+
+        let err = decode_zstd_bounded(&compressed, 2048).expect_err("must reject oversized output");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

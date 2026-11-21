@@ -571,10 +571,14 @@ export const DEFAULT_MASK_JSON_KEYS: readonly string[] = [
   "access_token",
   "refresh_token",
   "api_key",
+  "client_secret",
+  "id_token",
+  "private_key",
   "cvv",
   "pan",
   "card_number",
   "pin",
+  "session_id",
 ] as const;
 
 export const DEFAULT_STRIP_QUERY_PARAMS: readonly string[] = [

@@ -474,10 +474,14 @@ fn default_mask_json_keys() -> Vec<String> {
         "access_token",
         "refresh_token",
         "api_key",
+        "client_secret",
+        "id_token",
+        "private_key",
         "cvv",
         "pan",
         "card_number",
         "pin",
+        "session_id",
     ]
     .into_iter()
     .map(str::to_string)

@@ -119,6 +119,10 @@ export interface SettingsProfileValidationReport {
   migratedFromVersion: number | null;
 }
 
+export interface ApplySettingsProfileOptions {
+  trustImportedPythonScript?: boolean;
+}
+
 export interface SettingsImportPreviewSummary {
   fileName: string;
   schemaVersion: number;
@@ -149,5 +153,8 @@ export interface SettingsImportPreviewSummary {
   inspectorSplitDirection: InspectorSplitDirection;
   proxyPort: number;
   tlsInterceptMode: TlsInterceptMode;
+  hasPythonScript: boolean;
+  pythonScriptEnabledInProfile: boolean;
+  pythonScriptLineCount: number;
   warnings: string[];
 }

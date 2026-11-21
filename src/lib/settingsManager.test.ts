@@ -690,4 +690,79 @@ describe("settingsManager — applySettingsProfile & transactional rollback", ()
     vi.runOnlyPendingTimers();
     expect(mockProxyBridge.updateBreakpointConfig).toHaveBeenCalledTimes(1);
   });
+
+  it("SEC-01: computes Python script preview metadata and forces enabled=false unless explicitly trusted", async () => {
+    vi.useFakeTimers();
+
+    const emptyScriptProfile = createDefaultSettingsProfile();
+    emptyScriptProfile.scripting = {
+      enabled: false,
+      code: "   \n  ",
+      activePresetId: null,
+    };
+    const emptyPreview = buildSettingsImportPreview(emptyScriptProfile);
+    expect(emptyPreview.hasPythonScript).toBe(false);
+    expect(emptyPreview.pythonScriptEnabledInProfile).toBe(false);
+    expect(emptyPreview.pythonScriptLineCount).toBe(0);
+
+    const maliciousCode =
+      "import os\nos.system('whoami')\ndef on_request(req):\n    pass\n";
+    const untrustedProfile = createDefaultSettingsProfile();
+    untrustedProfile.scripting = {
+      enabled: true,
+      code: maliciousCode,
+      activePresetId: null,
+    };
+
+    const preview = buildSettingsImportPreview(untrustedProfile);
+    expect(preview.hasPythonScript).toBe(true);
+    expect(preview.pythonScriptEnabledInProfile).toBe(true);
+    expect(preview.pythonScriptLineCount).toBe(4);
+
+    const appliedEvents: FluxUserSettingsProfile[] = [];
+    const onApplied = (e: Event) => {
+      appliedEvents.push((e as CustomEvent<FluxUserSettingsProfile>).detail);
+    };
+    window.addEventListener(SETTINGS_APPLIED_EVENT, onApplied);
+
+    try {
+      // Default import without trust flag must force enabled=false while keeping code intact
+      const appliedUntrusted = await applySettingsProfile(untrustedProfile);
+      vi.runOnlyPendingTimers();
+
+      expect(mockProxyBridge.setPythonScript).toHaveBeenLastCalledWith(
+        maliciousCode,
+        false
+      );
+      expect(appliedUntrusted.scripting?.enabled).toBe(false);
+      expect(appliedUntrusted.scripting?.code).toBe(maliciousCode);
+      expect(appliedEvents[0]?.scripting?.enabled).toBe(false);
+      expect(appliedEvents[0]?.scripting?.code).toBe(maliciousCode);
+      expect(
+        JSON.parse(
+          window.localStorage.getItem(SETTINGS_STORAGE_KEYS.pythonScript) ??
+            "null"
+        )
+      ).toEqual({
+        enabled: false,
+        code: maliciousCode,
+        activePresetId: null,
+      });
+
+      // Explicit trust flag permits enabling the script when profile had enabled=true
+      const appliedTrusted = await applySettingsProfile(untrustedProfile, {
+        trustImportedPythonScript: true,
+      });
+      vi.runOnlyPendingTimers();
+
+      expect(mockProxyBridge.setPythonScript).toHaveBeenLastCalledWith(
+        maliciousCode,
+        true
+      );
+      expect(appliedTrusted.scripting?.enabled).toBe(true);
+      expect(appliedTrusted.scripting?.code).toBe(maliciousCode);
+    } finally {
+      window.removeEventListener(SETTINGS_APPLIED_EVENT, onApplied);
+    }
+  });
 });

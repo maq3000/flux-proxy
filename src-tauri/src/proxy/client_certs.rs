@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
@@ -448,29 +448,88 @@ pub fn parse_pem_identity(
     })
 }
 
+fn is_safe_cert_entry_id(id: &str) -> bool {
+    !id.is_empty()
+        && id != "."
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains("..")
+        && !id.contains(':')
+        && !id.contains('\0')
+}
+
+fn resolve_path_strictly_inside_dir(
+    storage_dir: &Path,
+    candidate: &Path,
+) -> Result<PathBuf, ProxyError> {
+    if candidate.as_os_str().is_empty() {
+        return Err(ProxyError::Custom(
+            "Путь к файлу клиентского сертификата пуст.".into(),
+        ));
+    }
+    if candidate
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(ProxyError::Custom(format!(
+            "Путь к клиентскому сертификату содержит недопустимый переход '..': {}",
+            candidate.display()
+        )));
+    }
+    let canon_dir = fs::canonicalize(storage_dir).map_err(|e| {
+        ProxyError::Custom(format!(
+            "Не удалось канонизировать каталог хранилища сертификатов '{}': {e}",
+            storage_dir.display()
+        ))
+    })?;
+
+    let resolved = if candidate.exists() {
+        fs::canonicalize(candidate).map_err(|e| {
+            ProxyError::Custom(format!(
+                "Не удалось канонизировать путь сертификата '{}': {e}",
+                candidate.display()
+            ))
+        })?
+    } else {
+        let parent = candidate.parent().ok_or_else(|| {
+            ProxyError::Custom(format!(
+                "Некорректный путь сертификата без родительского каталога: {}",
+                candidate.display()
+            ))
+        })?;
+        let file_name = candidate.file_name().ok_or_else(|| {
+            ProxyError::Custom(format!(
+                "Некорректный путь сертификата без имени файла: {}",
+                candidate.display()
+            ))
+        })?;
+        let canon_parent = fs::canonicalize(parent).map_err(|e| {
+            ProxyError::Custom(format!(
+                "Каталог сертификата '{}' недоступен: {e}",
+                parent.display()
+            ))
+        })?;
+        canon_parent.join(file_name)
+    };
+
+    if resolved == canon_dir || !resolved.starts_with(&canon_dir) {
+        return Err(ProxyError::Custom(format!(
+            "Доступ запрещён: путь '{}' выходит за пределы хранилища mTLS '{}'.",
+            candidate.display(),
+            storage_dir.display()
+        )));
+    }
+
+    Ok(resolved)
+}
+
 fn validate_cert_source_path(
     raw_path: &str,
     allowed_exts: &[&str],
     field_label: &str,
 ) -> Result<(PathBuf, String), ProxyError> {
-    if raw_path.contains('\0') {
-        return Err(ProxyError::Custom(format!(
-            "Путь к файлу ({field_label}) содержит недопустимый символ."
-        )));
-    }
-    let trimmed = raw_path.trim();
-    if trimmed.is_empty() {
-        return Err(ProxyError::Custom(format!(
-            "Не указан путь к файлу ({field_label})."
-        )));
-    }
-    let path = PathBuf::from(trimmed);
-    if !path.is_file() {
-        return Err(ProxyError::Custom(format!(
-            "Файл не найден или недоступен ({field_label}): {}",
-            path.display()
-        )));
-    }
+    let path = crate::commands::validate_user_file_path(raw_path, Some(allowed_exts), true)
+        .map_err(|e| ProxyError::Custom(format!("Некорректный путь ({field_label}): {e}")))?;
     let metadata = fs::metadata(&path)?;
     if metadata.len() > MAX_CERT_FILE_BYTES {
         return Err(ProxyError::Custom(format!(
@@ -482,12 +541,6 @@ fn validate_cert_source_path(
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
-    if !allowed_exts.iter().any(|allowed| *allowed == ext) {
-        return Err(ProxyError::Custom(format!(
-            "Неподдерживаемое расширение '.{ext}' для {field_label}. Допустимы: {}",
-            allowed_exts.join(", ")
-        )));
-    }
     Ok((path, ext))
 }
 
@@ -518,10 +571,31 @@ impl ClientCertificateStore {
                 })?;
             for entry in &parsed {
                 let stored = Path::new(&entry.stored_cert_path);
-                let _ = enforce_secure_file_permissions(stored);
+                match resolve_path_strictly_inside_dir(&dir, stored) {
+                    Ok(safe_stored) => {
+                        let _ = enforce_secure_file_permissions(&safe_stored);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Client certificate '{}' has stored_cert_path outside vault: {err}",
+                            entry.id
+                        );
+                    }
+                }
                 if entry.format == ClientCertificateFormat::Pkcs12 {
-                    let identity_path = dir.join(format!("{}.identity.pem", entry.id));
-                    let _ = enforce_secure_file_permissions(&identity_path);
+                    if is_safe_cert_entry_id(&entry.id) {
+                        let identity_path = dir.join(format!("{}.identity.pem", entry.id));
+                        if let Ok(safe_identity) =
+                            resolve_path_strictly_inside_dir(&dir, &identity_path)
+                        {
+                            let _ = enforce_secure_file_permissions(&safe_identity);
+                        }
+                    } else {
+                        tracing::warn!(
+                            "Client certificate entry '{}' contains unsafe ID characters",
+                            entry.id
+                        );
+                    }
                 }
             }
             parsed
@@ -582,6 +656,24 @@ impl ClientCertificateStore {
                 }
             }
         }
+    }
+
+    fn resolve_identity_pem_path(
+        &self,
+        entry: &ClientCertificateEntry,
+    ) -> Result<PathBuf, ProxyError> {
+        let candidate = self.identity_pem_path_for_entry(entry);
+        let Some(ref dir) = self.storage_dir else {
+            return Ok(candidate);
+        };
+        if !is_safe_cert_entry_id(&entry.id) {
+            return Err(ProxyError::Custom(format!(
+                "Некорректный идентификатор клиентского сертификата '{}'.",
+                entry.id
+            )));
+        }
+        resolve_path_strictly_inside_dir(dir, Path::new(&entry.stored_cert_path))?;
+        resolve_path_strictly_inside_dir(dir, &candidate)
     }
 
     pub fn list(&self) -> Vec<ClientCertificateEntry> {
@@ -731,29 +823,52 @@ impl ClientCertificateStore {
             (removed, next)
         };
 
-        if self.storage_dir.is_some() {
+        if let Some(ref dir) = self.storage_dir {
             let stored_path = Path::new(&removed.stored_cert_path);
-            match fs::remove_file(stored_path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            match resolve_path_strictly_inside_dir(dir, stored_path) {
+                Ok(safe_stored) => match fs::remove_file(&safe_stored) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to remove stored client certificate {}: {err}",
+                            safe_stored.display()
+                        );
+                    }
+                },
                 Err(err) => {
                     tracing::warn!(
-                        "Failed to remove stored client certificate {}: {err}",
+                        "Refusing to remove client certificate path outside vault ({}): {err}",
                         stored_path.display()
                     );
                 }
             }
             if removed.format == ClientCertificateFormat::Pkcs12 {
-                let identity_path = self.identity_pem_path_for_entry(&removed);
-                match fs::remove_file(&identity_path) {
-                    Ok(()) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            "Failed to remove cached mTLS PEM identity {}: {err}",
-                            identity_path.display()
-                        );
+                if is_safe_cert_entry_id(&removed.id) {
+                    let identity_path = self.identity_pem_path_for_entry(&removed);
+                    match resolve_path_strictly_inside_dir(dir, &identity_path) {
+                        Ok(safe_identity) => match fs::remove_file(&safe_identity) {
+                            Ok(()) => {}
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(err) => {
+                                tracing::warn!(
+                                    "Failed to remove cached mTLS PEM identity {}: {err}",
+                                    safe_identity.display()
+                                );
+                            }
+                        },
+                        Err(err) => {
+                            tracing::warn!(
+                                "Refusing to remove mTLS identity path outside vault ({}): {err}",
+                                identity_path.display()
+                            );
+                        }
                     }
+                } else {
+                    tracing::warn!(
+                        "Refusing to remove mTLS identity for unsafe entry ID '{}'",
+                        removed.id
+                    );
                 }
             }
         }
@@ -801,7 +916,7 @@ impl ClientCertificateStore {
             return Ok(Some((cached, entry)));
         }
 
-        let identity_path = self.identity_pem_path_for_entry(&entry);
+        let identity_path = self.resolve_identity_pem_path(&entry)?;
         let pem_bytes = fs::read(&identity_path).map_err(|e| {
             ProxyError::Custom(format!(
                 "Не удалось прочитать файл mTLS-идентичности '{}': {e}",
@@ -1111,6 +1226,111 @@ mod tests {
         assert_eq!(store.cache_entry_count(), 0);
         assert!(!Path::new(&added.stored_cert_path).exists());
         assert!(!identity_pem.exists());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sec06_confines_stored_cert_paths_strictly_inside_storage_dir() {
+        let tmp = unique_test_dir("sec06_vault_confinement");
+        let app_data = tmp.join("app_data");
+        let outside_dir = tmp.join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let (cert_der, cert_pem, key_der, key_pem) =
+            mint_self_signed_client_cert("victim.internal.corp", 60);
+        let external_pem = outside_dir.join("external-secret.pem");
+        fs::write(&external_pem, format!("{cert_pem}{key_pem}")).unwrap();
+
+        let external_p12 = outside_dir.join("external.p12");
+        fs::write(&external_p12, build_pkcs12_bytes(&cert_der, &key_der, "pw")).unwrap();
+
+        let vault_dir = app_data.join(CLIENT_CERTS_DIR_NAME);
+        fs::create_dir_all(&vault_dir).unwrap();
+
+        let traversal_path = vault_dir
+            .join("..")
+            .join("..")
+            .join("outside")
+            .join("external-secret.pem");
+
+        let tampered_entries = vec![
+            ClientCertificateEntry {
+                id: "tampered-direct".into(),
+                domain_pattern: "direct.internal.corp".into(),
+                label: "Direct Escape".into(),
+                format: ClientCertificateFormat::Pem,
+                stored_cert_path: external_pem.display().to_string(),
+                common_name: "victim".into(),
+                expires_at: "2030-01-01T00:00:00Z".into(),
+                enabled: true,
+            },
+            ClientCertificateEntry {
+                id: "tampered-traversal".into(),
+                domain_pattern: "traversal.internal.corp".into(),
+                label: "Traversal Escape".into(),
+                format: ClientCertificateFormat::Pem,
+                stored_cert_path: traversal_path.display().to_string(),
+                common_name: "victim".into(),
+                expires_at: "2030-01-01T00:00:00Z".into(),
+                enabled: true,
+            },
+            ClientCertificateEntry {
+                id: "../../outside/external".into(),
+                domain_pattern: "p12id.internal.corp".into(),
+                label: "Tampered ID".into(),
+                format: ClientCertificateFormat::Pkcs12,
+                stored_cert_path: external_p12.display().to_string(),
+                common_name: "victim".into(),
+                expires_at: "2030-01-01T00:00:00Z".into(),
+                enabled: true,
+            },
+        ];
+
+        fs::write(
+            vault_dir.join(REGISTRY_FILE_NAME),
+            serde_json::to_vec_pretty(&tampered_entries).unwrap(),
+        )
+        .unwrap();
+
+        let store = ClientCertificateStore::init_or_load(&app_data).unwrap();
+
+        // 1. Reading external cert/key via tampered registry entries MUST fail
+        assert!(store
+            .get_or_build_client("direct.internal.corp", false)
+            .is_err());
+        assert!(store
+            .get_or_build_client("traversal.internal.corp", false)
+            .is_err());
+        assert!(store
+            .get_or_build_client("p12id.internal.corp", false)
+            .is_err());
+
+        // 2. Removing tampered entries MUST NOT delete external files outside storage_dir
+        store.remove_certificate("tampered-direct").unwrap();
+        store.remove_certificate("tampered-traversal").unwrap();
+        store.remove_certificate("../../outside/external").unwrap();
+        assert!(external_pem.exists(), "external PEM file must not be deleted");
+        assert!(external_p12.exists(), "external P12 file must not be deleted");
+
+        // 3. Adding cert with '..' path must also be rejected
+        let parent_ref = format!(
+            "{}{}{}{}{}",
+            vault_dir.display(),
+            std::path::MAIN_SEPARATOR,
+            "..",
+            std::path::MAIN_SEPARATOR,
+            "outside"
+        );
+        let bad_req = AddClientCertificateRequest {
+            domain_pattern: "ok.internal.corp".into(),
+            label: None,
+            cert_path: format!("{parent_ref}{}external-secret.pem", std::path::MAIN_SEPARATOR),
+            key_path: None,
+            password: None,
+            enabled: Some(true),
+        };
+        assert!(store.add_certificate(bad_req).is_err());
 
         let _ = fs::remove_dir_all(&tmp);
     }

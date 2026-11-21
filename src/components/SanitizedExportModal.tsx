@@ -52,16 +52,18 @@ const STRICT_CUSTOM_HEADERS = [
   "X-Session-Id",
 ];
 
-const STRICT_MASK_JSON_KEYS = [
-  ...DEFAULT_MASK_JSON_KEYS,
-  "email",
-  "phone",
-  "ssn",
-  "client_secret",
-  "private_key",
-  "session_id",
-  "user_id",
-];
+const STRICT_MASK_JSON_KEYS = Array.from(
+  new Set([
+    ...DEFAULT_MASK_JSON_KEYS,
+    "email",
+    "phone",
+    "ssn",
+    "client_secret",
+    "private_key",
+    "session_id",
+    "user_id",
+  ])
+);
 
 const STRICT_STRIP_QUERY_PARAMS = [
   ...DEFAULT_STRIP_QUERY_PARAMS,

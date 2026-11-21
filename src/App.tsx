@@ -384,23 +384,35 @@ export const App: React.FC = () => {
     }
   }, [openImportPreviewFromJsonText, showToast]);
 
-  const handleConfirmImportSettingsProfile = useCallback(async () => {
-    if (!pendingImportState) return;
-    const { profile, preview } = pendingImportState;
-    try {
-      await applySettingsProfile(profile);
-      setPendingImportState(null);
-      showToast(
-        `✅ Профиль настроек применён: пресетов ${preview.userPresetsCount}, правил ${preview.totalRulesCount}, колонок ${preview.visibleColumnsCount}/${preview.totalColumnsCount}`
-      );
-    } catch (err) {
-      showToast(
-        `⚠️ Ошибка применения профиля настроек: ${
-          err instanceof Error ? err.message : String(err)
-        }`
-      );
-    }
-  }, [pendingImportState, showToast]);
+  const handleConfirmImportSettingsProfile = useCallback(
+    async (options?: { trustImportedPythonScript?: boolean }) => {
+      if (!pendingImportState) return;
+      const { profile, preview } = pendingImportState;
+      const trustScript = Boolean(options?.trustImportedPythonScript);
+      try {
+        await applySettingsProfile(profile, {
+          trustImportedPythonScript: trustScript,
+        });
+        setPendingImportState(null);
+        const scriptNotice =
+          preview.hasPythonScript &&
+          preview.pythonScriptEnabledInProfile &&
+          !trustScript
+            ? " (Python-скрипт загружен выключенным в целях безопасности)"
+            : "";
+        showToast(
+          `✅ Профиль настроек применён: пресетов ${preview.userPresetsCount}, правил ${preview.totalRulesCount}, колонок ${preview.visibleColumnsCount}/${preview.totalColumnsCount}${scriptNotice}`
+        );
+      } catch (err) {
+        showToast(
+          `⚠️ Ошибка применения профиля настроек: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
+    },
+    [pendingImportState, showToast]
+  );
 
   const handleResetAllSettings = useCallback(
     async (skipConfirm = true) => {

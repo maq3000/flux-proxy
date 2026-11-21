@@ -3380,7 +3380,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 export interface SettingsImportPreviewModalProps {
   preview: SettingsImportPreviewSummary | null;
   onCancel: () => void;
-  onConfirm: () => Promise<void> | void;
+  onConfirm: (options?: {
+    trustImportedPythonScript?: boolean;
+  }) => Promise<void> | void;
 }
 
 export const SettingsImportPreviewModal: React.FC<
@@ -3388,6 +3390,12 @@ export const SettingsImportPreviewModal: React.FC<
 > = ({ preview, onCancel, onConfirm }) => {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const titleId = useId();
+  const trustCheckboxId = useId();
+  const [trustPythonScript, setTrustPythonScript] = useState(false);
+
+  useEffect(() => {
+    setTrustPythonScript(false);
+  }, [preview]);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -3540,6 +3548,52 @@ export const SettingsImportPreviewModal: React.FC<
               </div>
             </div>
 
+            {preview.hasPythonScript && (
+              <div
+                className={
+                  preview.pythonScriptEnabledInProfile
+                    ? "space-y-2 rounded-lg border border-status5xx-fg/50 bg-status5xx-bg p-3 text-[11px] text-status5xx-fg"
+                    : "space-y-1.5 rounded-lg border border-status4xx-fg/40 bg-status4xx-bg p-3 text-[11px] text-status4xx-fg"
+                }
+              >
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <div className="font-semibold">
+                      {preview.pythonScriptEnabledInProfile
+                        ? `Профиль содержит активный Python-скрипт (${preview.pythonScriptLineCount} строк)`
+                        : `Профиль содержит Python-скрипт (${preview.pythonScriptLineCount} строк, выключен)`}
+                    </div>
+                    <p className="leading-relaxed opacity-90">
+                      {preview.pythonScriptEnabledInProfile
+                        ? "Python-скрипты выполняются локально с правами текущего пользователя ОС. Для защиты от скрытого RCE скрипт будет загружен в редактор в выключенном состоянии (enabled = false)."
+                        : "Проверьте код в редакторе Scripting перед его ручным включением."}
+                    </p>
+                    {preview.pythonScriptEnabledInProfile && (
+                      <label
+                        htmlFor={trustCheckboxId}
+                        className="flex cursor-pointer items-start gap-2 pt-1 font-medium text-fg select-none"
+                      >
+                        <input
+                          id={trustCheckboxId}
+                          type="checkbox"
+                          checked={trustPythonScript}
+                          onChange={(e) =>
+                            setTrustPythonScript(e.target.checked)
+                          }
+                          className="checkbox-native mt-0.5"
+                        />
+                        <span>
+                          Я проверил код и доверяю источнику профиля — сразу
+                          включить Python-скрипт после импорта
+                        </span>
+                      </label>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
             {preview.warnings.length > 0 && (
               <div className="space-y-1 rounded-lg border border-status4xx-fg/40 bg-status4xx-bg p-3 text-[11px] text-status4xx-fg">
                 <div className="flex items-center gap-1.5 font-semibold">
@@ -3571,7 +3625,13 @@ export const SettingsImportPreviewModal: React.FC<
             </button>
             <button
               type="button"
-              onClick={() => void onConfirm()}
+              onClick={() =>
+                void onConfirm({
+                  trustImportedPythonScript: Boolean(
+                    preview.pythonScriptEnabledInProfile && trustPythonScript
+                  ),
+                })
+              }
               className="inline-flex h-8 items-center gap-1.5 rounded-md bg-sky-600 px-3.5 text-xs font-semibold text-white hover:bg-sky-500"
             >
               <Upload className="h-3.5 w-3.5" />

@@ -2,10 +2,12 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, Write};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use base64::Engine as _;
-use chrono::{DateTime, Duration, SecondsFormat, TimeZone, Utc};
+use chrono::{DateTime, SecondsFormat, TimeDelta, TimeZone, Utc};
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
+use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -23,6 +25,9 @@ pub const MAX_SAZ_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Maximum cumulative uncompressed bytes across all entries in a `.saz` ZIP archive (512 MiB).
 pub const MAX_SAZ_TOTAL_UNCOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Maximum number of stacked `Content-Encoding` layers decoded per HTTP message during `.saz` import.
+pub const MAX_SAZ_CONTENT_ENCODING_LAYERS: usize = 2;
 
 /// Initial buffer allocation cap when reading an untrusted ZIP entry whose header size could be spoofed.
 const MAX_SAZ_INITIAL_PREALLOC_BYTES: usize = 64 * 1024;
@@ -736,6 +741,7 @@ pub fn read_saz_from_reader<R: Read + Seek>(reader: R) -> Result<Vec<SessionDeta
     }
 
     let mut sessions = Vec::with_capacity(grouped.len());
+    let mut total_http_decompressed_bytes: u64 = 0;
     for (idx, ((_, _), parts)) in grouped.into_iter().enumerate() {
         if parts.client_bytes.is_none() && parts.server_bytes.is_none() {
             continue;
@@ -751,7 +757,8 @@ pub fn read_saz_from_reader<R: Read + Seek>(reader: R) -> Result<Vec<SessionDeta
             parts.server_bytes.as_deref().unwrap_or(&[]),
             parts.meta_xml.as_deref(),
             parts.ws_text.as_deref(),
-        );
+            &mut total_http_decompressed_bytes,
+        )?;
         sessions.push(detail);
     }
 
@@ -859,7 +866,7 @@ pub fn export_sessions_to_path(
 }
 
 /// Reads up to `max_bytes` from `path` after verifying file metadata length to avoid unbounded allocation.
-fn read_bounded_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, ProxyError> {
+pub(crate) fn read_bounded_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, ProxyError> {
     let meta = std::fs::metadata(path)?;
     if meta.len() > max_bytes {
         return Err(ProxyError::Custom(format!(
@@ -968,12 +975,61 @@ const BUILTIN_REDACTED_AUTH_HEADERS: &[&str] = &[
     "x-auth-token",
 ];
 
+fn normalize_sensitive_key(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|&c| c != '_' && c != '-')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
 fn normalize_sanitization_tokens(items: &[String]) -> Vec<String> {
     items
         .iter()
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+fn normalize_sanitization_keys(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .map(|s| normalize_sensitive_key(s))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn bearer_token_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9\-._~+/]+=*")
+            .expect("valid bearer regex")
+    })
+}
+
+fn jwt_token_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*")
+            .expect("valid jwt regex")
+    })
+}
+
+fn redact_bearer_and_jwt_in_text(text: &str, replacement: &str) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    let after_bearer = bearer_token_regex()
+        .replace_all(text, format!("Bearer {replacement}").as_str())
+        .into_owned();
+    let after_jwt = jwt_token_regex()
+        .replace_all(&after_bearer, replacement)
+        .into_owned();
+    if after_jwt != text {
+        Some(after_jwt)
+    } else {
+        None
+    }
 }
 
 fn sanitize_url_component_replacement(replacement: &str) -> String {
@@ -1011,20 +1067,26 @@ fn redact_headers_in_place(
     }
 }
 
-fn sanitize_json_value_in_place(
+fn mask_sensitive_json_value(
     value: &mut serde_json::Value,
-    mask_keys_lower: &[String],
+    mask_keys_normalized: &[String],
     replacement: &str,
+    redact_string_tokens: bool,
 ) -> bool {
     match value {
         serde_json::Value::Object(map) => {
             let mut modified = false;
             for (k, v) in map.iter_mut() {
-                let k_lower = k.trim().to_ascii_lowercase();
-                if mask_keys_lower.iter().any(|mk| mk == &k_lower) {
+                let k_norm = normalize_sensitive_key(k);
+                if mask_keys_normalized.iter().any(|mk| mk == &k_norm) {
                     *v = serde_json::Value::String(replacement.to_string());
                     modified = true;
-                } else if sanitize_json_value_in_place(v, mask_keys_lower, replacement) {
+                } else if mask_sensitive_json_value(
+                    v,
+                    mask_keys_normalized,
+                    replacement,
+                    redact_string_tokens,
+                ) {
                     modified = true;
                 }
             }
@@ -1033,11 +1095,24 @@ fn sanitize_json_value_in_place(
         serde_json::Value::Array(arr) => {
             let mut modified = false;
             for item in arr.iter_mut() {
-                if sanitize_json_value_in_place(item, mask_keys_lower, replacement) {
+                if mask_sensitive_json_value(
+                    item,
+                    mask_keys_normalized,
+                    replacement,
+                    redact_string_tokens,
+                ) {
                     modified = true;
                 }
             }
             modified
+        }
+        serde_json::Value::String(s) if redact_string_tokens => {
+            if let Some(updated) = redact_bearer_and_jwt_in_text(s, replacement) {
+                *s = updated;
+                true
+            } else {
+                false
+            }
         }
         _ => false,
     }
@@ -1045,11 +1120,17 @@ fn sanitize_json_value_in_place(
 
 fn sanitize_json_text(
     text: &str,
-    mask_keys_lower: &[String],
+    mask_keys_normalized: &[String],
     replacement: &str,
+    redact_string_tokens: bool,
 ) -> Option<String> {
     let mut parsed: serde_json::Value = serde_json::from_str(text).ok()?;
-    if !sanitize_json_value_in_place(&mut parsed, mask_keys_lower, replacement) {
+    if !mask_sensitive_json_value(
+        &mut parsed,
+        mask_keys_normalized,
+        replacement,
+        redact_string_tokens,
+    ) {
         return None;
     }
     if text.contains('\n') {
@@ -1088,7 +1169,7 @@ fn is_likely_urlencoded_form(text: &str) -> bool {
 
 fn sanitize_urlencoded_text(
     text: &str,
-    mask_keys_lower: &[String],
+    mask_keys_normalized: &[String],
     replacement: &str,
 ) -> Option<String> {
     if text.is_empty() {
@@ -1099,8 +1180,8 @@ fn sanitize_urlencoded_text(
     let mut parts: Vec<String> = Vec::new();
     for seg in text.split('&') {
         if let Some((raw_k, _raw_v)) = seg.split_once('=') {
-            let decoded_k = url_decode_component(raw_k).trim().to_ascii_lowercase();
-            if mask_keys_lower.iter().any(|mk| mk == &decoded_k) {
+            let decoded_norm = normalize_sensitive_key(&url_decode_component(raw_k));
+            if mask_keys_normalized.iter().any(|mk| mk == &decoded_norm) {
                 parts.push(format!("{raw_k}={safe_rep}"));
                 modified = true;
                 continue;
@@ -1118,10 +1199,11 @@ fn sanitize_urlencoded_text(
 fn sanitize_body_payload(
     text: &str,
     content_type_hint: Option<&str>,
-    mask_keys_lower: &[String],
+    mask_keys_normalized: &[String],
     replacement: &str,
+    redact_string_tokens: bool,
 ) -> Option<String> {
-    if mask_keys_lower.is_empty() || text.trim().is_empty() {
+    if (mask_keys_normalized.is_empty() && !redact_string_tokens) || text.trim().is_empty() {
         return None;
     }
     let trimmed = text.trim_start();
@@ -1130,18 +1212,160 @@ fn sanitize_body_payload(
         ct_lower.contains("json") || trimmed.starts_with('{') || trimmed.starts_with('[');
 
     if is_json_hint {
-        if let Some(updated) = sanitize_json_text(text, mask_keys_lower, replacement) {
+        if let Some(updated) = sanitize_json_text(
+            text,
+            mask_keys_normalized,
+            replacement,
+            redact_string_tokens,
+        ) {
             return Some(updated);
         }
     }
 
     let is_form_hint = ct_lower.contains("application/x-www-form-urlencoded")
         || is_likely_urlencoded_form(text);
-    if is_form_hint {
-        return sanitize_urlencoded_text(text, mask_keys_lower, replacement);
+    if is_form_hint && !mask_keys_normalized.is_empty() {
+        return sanitize_urlencoded_text(text, mask_keys_normalized, replacement);
     }
 
     None
+}
+
+fn split_socketio_prefix(payload: &str) -> Option<(&str, &str)> {
+    let json_start = payload.find(['[', '{'])?;
+    if json_start == 0 {
+        return None;
+    }
+    let prefix = &payload[..json_start];
+    let bytes = prefix.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    let mut rest = &prefix[i..];
+    if rest.starts_with('/') {
+        let comma_idx = rest.find(',')?;
+        let ns = &rest[..comma_idx];
+        if ns.chars().any(char::is_whitespace) {
+            return None;
+        }
+        rest = &rest[comma_idx + 1..];
+    }
+    if !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((prefix, &payload[json_start..]))
+}
+
+fn sanitize_single_ws_record(
+    record: &str,
+    mask_keys_normalized: &[String],
+    replacement: &str,
+    redact_tokens: bool,
+) -> Option<String> {
+    if record.is_empty() {
+        return None;
+    }
+    if let Some((prefix, json_part)) = split_socketio_prefix(record) {
+        if let Some(sanitized_json) = sanitize_json_text(
+            json_part,
+            mask_keys_normalized,
+            replacement,
+            redact_tokens,
+        ) {
+            return Some(format!("{prefix}{sanitized_json}"));
+        }
+    }
+    if let Some(sanitized_json) = sanitize_json_text(
+        record,
+        mask_keys_normalized,
+        replacement,
+        redact_tokens,
+    ) {
+        return Some(sanitized_json);
+    }
+    if redact_tokens {
+        return redact_bearer_and_jwt_in_text(record, replacement);
+    }
+    None
+}
+
+fn sanitize_ws_frame_payload(
+    payload: &str,
+    mask_keys_normalized: &[String],
+    replacement: &str,
+    redact_tokens: bool,
+) -> Option<String> {
+    if payload.is_empty() || (mask_keys_normalized.is_empty() && !redact_tokens) {
+        return None;
+    }
+    if payload.contains('\x1e') {
+        let mut modified = false;
+        let parts: Vec<String> = payload
+            .split('\x1e')
+            .map(|segment| {
+                if let Some(updated) = sanitize_single_ws_record(
+                    segment,
+                    mask_keys_normalized,
+                    replacement,
+                    redact_tokens,
+                ) {
+                    modified = true;
+                    updated
+                } else {
+                    segment.to_string()
+                }
+            })
+            .collect();
+        if modified {
+            return Some(parts.join("\x1e"));
+        }
+        return None;
+    }
+
+    sanitize_single_ws_record(payload, mask_keys_normalized, replacement, redact_tokens)
+}
+
+fn rebuild_sse_response_body(events: &[SseEventRecord]) -> String {
+    let mut out = String::new();
+    for ev in events {
+        if ev.event == ":comment" {
+            for line in ev.data.lines() {
+                out.push_str(": ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push('\n');
+            continue;
+        }
+        if let Some(ref id) = ev.id {
+            out.push_str("id: ");
+            out.push_str(id);
+            out.push('\n');
+        }
+        if !ev.event.is_empty() && ev.event != "message" {
+            out.push_str("event: ");
+            out.push_str(&ev.event);
+            out.push('\n');
+        }
+        if let Some(retry) = ev.retry {
+            out.push_str(&format!("retry: {retry}\n"));
+        }
+        if ev.data.is_empty() {
+            out.push_str("data:\n");
+        } else {
+            for line in ev.data.split('\n') {
+                out.push_str("data: ");
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+    }
+    out
 }
 
 fn update_content_length_header(headers: &mut [HeaderPair], byte_len: usize) {
@@ -1153,58 +1377,105 @@ fn update_content_length_header(headers: &mut [HeaderPair], byte_len: usize) {
     }
 }
 
-fn sanitize_query_string_in_url_or_path(
+fn sanitize_url_query(
     input: &str,
-    strip_params_lower: &[String],
+    strip_params_normalized: &[String],
     replacement: &str,
 ) -> String {
-    if strip_params_lower.is_empty() || !input.contains('?') {
-        return input.to_string();
-    }
-    let (base_and_query, fragment) = match input.split_once('#') {
-        Some((b, f)) => (b, Some(f)),
-        None => (input, None),
-    };
-    let Some((base, query)) = base_and_query.split_once('?') else {
-        return input.to_string();
-    };
-    if query.is_empty() {
+    if input.trim().is_empty() {
         return input.to_string();
     }
 
     let safe_rep = sanitize_url_component_replacement(replacement);
     let mut modified = false;
-    let mut rebuilt = Vec::new();
 
-    for seg in query.split('&') {
-        if seg.is_empty() {
-            rebuilt.push(String::new());
-            continue;
-        }
-        if let Some((raw_k, _raw_v)) = seg.split_once('=') {
-            let decoded_k = url_decode_component(raw_k).trim().to_ascii_lowercase();
-            if strip_params_lower.iter().any(|p| p == &decoded_k) {
-                rebuilt.push(format!("{raw_k}={safe_rep}"));
-                modified = true;
-                continue;
+    // 1. Strip `username[:password]@` from authority when input carries `scheme://` or `//`
+    let (prefix_and_host, remainder) = if let Some(scheme_pos) = input.find("://") {
+        let after_scheme_idx = scheme_pos + 3;
+        let rest = &input[after_scheme_idx..];
+        let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let authority = &rest[..auth_end];
+        let cleaned_auth = if let Some((_, host_port)) = authority.rsplit_once('@') {
+            modified = true;
+            host_port
+        } else {
+            authority
+        };
+        (
+            format!("{}{}", &input[..after_scheme_idx], cleaned_auth),
+            &rest[auth_end..],
+        )
+    } else if let Some(rest) = input.strip_prefix("//") {
+        let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let authority = &rest[..auth_end];
+        let cleaned_auth = if let Some((_, host_port)) = authority.rsplit_once('@') {
+            modified = true;
+            host_port
+        } else {
+            authority
+        };
+        (format!("//{cleaned_auth}"), &rest[auth_end..])
+    } else {
+        (String::new(), input)
+    };
+
+    // 2. Split fragment `#...` and redact non-empty fragment payloads
+    let (before_fragment, sanitized_fragment) = match remainder.split_once('#') {
+        Some((before, frag)) => {
+            if !frag.is_empty() {
+                if frag != safe_rep {
+                    modified = true;
+                }
+                (before, Some(safe_rep.clone()))
+            } else {
+                (before, Some(String::new()))
             }
         }
-        rebuilt.push(seg.to_string());
-    }
+        None => (remainder, None),
+    };
+
+    // 3. Redact matching query parameters
+    let sanitized_base_and_query = if let Some((base, query)) = before_fragment.split_once('?') {
+        if query.is_empty() || strip_params_normalized.is_empty() {
+            before_fragment.to_string()
+        } else {
+            let mut rebuilt = Vec::new();
+            for seg in query.split('&') {
+                if seg.is_empty() {
+                    rebuilt.push(String::new());
+                    continue;
+                }
+                if let Some((raw_k, _raw_v)) = seg.split_once('=') {
+                    let decoded_norm = normalize_sensitive_key(&url_decode_component(raw_k));
+                    if strip_params_normalized.iter().any(|p| p == &decoded_norm) {
+                        rebuilt.push(format!("{raw_k}={safe_rep}"));
+                        modified = true;
+                        continue;
+                    }
+                }
+                rebuilt.push(seg.to_string());
+            }
+            format!("{base}?{}", rebuilt.join("&"))
+        }
+    } else {
+        before_fragment.to_string()
+    };
 
     if !modified {
         return input.to_string();
     }
 
-    let joined = format!("{base}?{}", rebuilt.join("&"));
-    match fragment {
-        Some(f) => format!("{joined}#{f}"),
-        None => joined,
+    let mut out = format!("{prefix_and_host}{sanitized_base_and_query}");
+    if let Some(frag) = sanitized_fragment {
+        out.push('#');
+        out.push_str(&frag);
     }
+    out
 }
 
 /// Pure transformation that clones `sessions` and masks sensitive headers, JSON/form bodies,
-/// query parameters, and client/process metadata according to `SanitizationOptions`.
+/// query parameters, URL credentials/fragments, SSE/WebSocket payloads, and client/process metadata
+/// according to `SanitizationOptions`.
 pub fn sanitize_sessions(
     sessions: &[SessionDetail],
     opts: &SanitizationOptions,
@@ -1215,8 +1486,9 @@ pub fn sanitize_sessions(
         opts.replacement_text.as_str()
     };
     let custom_headers_lower = normalize_sanitization_tokens(&opts.custom_redacted_headers);
-    let mask_keys_lower = normalize_sanitization_tokens(&opts.mask_json_keys);
-    let strip_params_lower = normalize_sanitization_tokens(&opts.strip_query_params);
+    let mask_keys_normalized = normalize_sanitization_keys(&opts.mask_json_keys);
+    let strip_params_normalized = normalize_sanitization_keys(&opts.strip_query_params);
+    let redact_string_tokens = opts.redact_auth_headers || !mask_keys_normalized.is_empty();
 
     sessions
         .iter()
@@ -1239,8 +1511,8 @@ pub fn sanitize_sessions(
                 );
             }
 
-            // 2. Mask sensitive keys in request & response JSON / form-urlencoded bodies
-            if !mask_keys_lower.is_empty() {
+            // 2. Mask sensitive keys & embedded tokens in request/response bodies, SSE events, and WS frames
+            if redact_string_tokens {
                 let req_bytes = decode_detail_body_bytes(&detail, false);
                 if let Ok(req_text) = std::str::from_utf8(&req_bytes) {
                     let req_ct = find_header_value(&detail.request_headers, "content-type")
@@ -1248,8 +1520,9 @@ pub fn sanitize_sessions(
                     if let Some(sanitized_req) = sanitize_body_payload(
                         req_text,
                         req_ct.as_deref(),
-                        &mask_keys_lower,
+                        &mask_keys_normalized,
                         replacement,
+                        redact_string_tokens,
                     ) {
                         let new_len = sanitized_req.len();
                         detail.request_body_base64 =
@@ -1260,18 +1533,18 @@ pub fn sanitize_sessions(
                 }
 
                 let resp_bytes = decode_detail_body_bytes(&detail, true);
+                let resp_ct = if !detail.summary.content_type.trim().is_empty() {
+                    Some(detail.summary.content_type.clone())
+                } else {
+                    find_header_value(&detail.response_headers, "content-type").map(str::to_string)
+                };
                 if let Ok(resp_text) = std::str::from_utf8(&resp_bytes) {
-                    let resp_ct = if !detail.summary.content_type.trim().is_empty() {
-                        Some(detail.summary.content_type.clone())
-                    } else {
-                        find_header_value(&detail.response_headers, "content-type")
-                            .map(str::to_string)
-                    };
                     if let Some(sanitized_resp) = sanitize_body_payload(
                         resp_text,
                         resp_ct.as_deref(),
-                        &mask_keys_lower,
+                        &mask_keys_normalized,
                         replacement,
+                        redact_string_tokens,
                     ) {
                         let new_len = sanitized_resp.len();
                         detail.response_body_base64 =
@@ -1282,37 +1555,89 @@ pub fn sanitize_sessions(
                     }
                 }
 
+                let mut sse_modified = false;
                 for ev in detail.sse_events.iter_mut() {
-                    if let Some(sanitized_data) =
-                        sanitize_json_text(&ev.data, &mask_keys_lower, replacement)
-                    {
+                    let sanitized_ev = sanitize_json_text(
+                        &ev.data,
+                        &mask_keys_normalized,
+                        replacement,
+                        redact_string_tokens,
+                    )
+                    .or_else(|| redact_bearer_and_jwt_in_text(&ev.data, replacement));
+                    if let Some(sanitized_data) = sanitized_ev {
                         ev.byte_length = sanitized_data.len();
                         ev.data = sanitized_data;
+                        sse_modified = true;
                     }
                 }
 
+                let is_sse_response = resp_ct
+                    .as_deref()
+                    .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"));
+                if !detail.sse_events.is_empty() && (sse_modified || is_sse_response) {
+                    let rebuilt_sse = rebuild_sse_response_body(&detail.sse_events);
+                    let new_len = rebuilt_sse.len();
+                    detail.response_body_base64 =
+                        base64::engine::general_purpose::STANDARD.encode(rebuilt_sse.as_bytes());
+                    detail.response_body_text = Some(rebuilt_sse);
+                    detail.summary.body_size = new_len;
+                    update_content_length_header(&mut detail.response_headers, new_len);
+                }
+
+                let mut ws_modified = false;
                 for frame in detail.websocket_frames.iter_mut() {
-                    if let Some(sanitized_payload) =
-                        sanitize_json_text(&frame.payload_preview, &mask_keys_lower, replacement)
-                    {
+                    if let Some(sanitized_payload) = sanitize_ws_frame_payload(
+                        &frame.payload_preview,
+                        &mask_keys_normalized,
+                        replacement,
+                        redact_string_tokens,
+                    ) {
                         frame.byte_length = sanitized_payload.len();
                         frame.payload_preview = sanitized_payload;
+                        ws_modified = true;
+                    }
+                }
+
+                let is_ws_session = detail.summary.status == 101
+                    || detail.summary.scheme.eq_ignore_ascii_case("ws")
+                    || detail.summary.scheme.eq_ignore_ascii_case("wss")
+                    || detail.summary.protocol.to_ascii_uppercase().contains("WS");
+                if !detail.websocket_frames.is_empty() && (ws_modified || is_ws_session) {
+                    if let Ok(rebuilt_ws) = serde_json::to_string_pretty(&detail.websocket_frames) {
+                        let new_len = rebuilt_ws.len();
+                        detail.response_body_base64 =
+                            base64::engine::general_purpose::STANDARD.encode(rebuilt_ws.as_bytes());
+                        detail.response_body_text = Some(rebuilt_ws);
+                        detail.summary.body_size = new_len;
+                        update_content_length_header(&mut detail.response_headers, new_len);
                     }
                 }
             }
 
-            // 3. Redact sensitive query parameters in `summary.url` and `summary.path`
-            if !strip_params_lower.is_empty() {
-                detail.summary.url = sanitize_query_string_in_url_or_path(
+            // 3. Redact userinfo, sensitive query parameters, and fragments in URL, path, Location & Referer
+            if opts.redact_auth_headers || !strip_params_normalized.is_empty() {
+                detail.summary.url = sanitize_url_query(
                     &detail.summary.url,
-                    &strip_params_lower,
+                    &strip_params_normalized,
                     replacement,
                 );
-                detail.summary.path = sanitize_query_string_in_url_or_path(
+                detail.summary.path = sanitize_url_query(
                     &detail.summary.path,
-                    &strip_params_lower,
+                    &strip_params_normalized,
                     replacement,
                 );
+                for hdr in detail
+                    .request_headers
+                    .iter_mut()
+                    .chain(detail.response_headers.iter_mut())
+                {
+                    if hdr.name.trim().eq_ignore_ascii_case("location")
+                        || hdr.name.trim().eq_ignore_ascii_case("referer")
+                    {
+                        hdr.value =
+                            sanitize_url_query(&hdr.value, &strip_params_normalized, replacement);
+                    }
+                }
             }
 
             // 4. Anonymize client address, IP, and local process info
@@ -1996,7 +2321,9 @@ fn build_raw_http_response_bytes(detail: &SessionDetail) -> Vec<u8> {
 fn build_saz_metadata_xml(detail: &SessionDetail, sid: usize) -> String {
     let s = &detail.summary;
     let start_dt = parse_timestamp_utc(&s.timestamp).unwrap_or_else(Utc::now);
-    let end_dt = start_dt + Duration::milliseconds(s.duration_ms as i64);
+    let delta =
+        TimeDelta::try_milliseconds(s.duration_ms.min(86_400_000 * 365) as i64).unwrap_or_default();
+    let end_dt = start_dt.checked_add_signed(delta).unwrap_or(start_dt);
 
     let start_str = start_dt.to_rfc3339_opts(SecondsFormat::Micros, true);
     let end_str = end_dt.to_rfc3339_opts(SecondsFormat::Micros, true);
@@ -2193,14 +2520,17 @@ fn build_session_from_saz_parts(
     server_bytes: &[u8],
     meta_xml: Option<&str>,
     ws_text: Option<&str>,
-) -> SessionDetail {
+    cumulative_http_bytes: &mut u64,
+) -> Result<SessionDetail, ProxyError> {
     let meta = meta_xml.map(parse_saz_metadata_xml).unwrap_or_default();
 
     let (req_start_line, request_headers, raw_req_body) = split_raw_http_message(client_bytes);
     let (resp_status_line, response_headers, raw_resp_body) = split_raw_http_message(server_bytes);
 
-    let decoded_req_body = decode_http_body(raw_req_body, &request_headers);
-    let decoded_resp_body = decode_http_body(raw_resp_body, &response_headers);
+    let decoded_req_body =
+        decode_http_body(raw_req_body, &request_headers, cumulative_http_bytes)?;
+    let decoded_resp_body =
+        decode_http_body(raw_resp_body, &response_headers, cumulative_http_bytes)?;
 
     let (method, raw_target, req_http_ver) = parse_http_request_line(&req_start_line);
     let (resp_http_ver, status) = parse_http_status_line(&resp_status_line);
@@ -2342,7 +2672,7 @@ fn build_session_from_saz_parts(
             }
         });
 
-    SessionDetail {
+    Ok(SessionDetail {
         summary: SessionSummary {
             id,
             status,
@@ -2390,7 +2720,7 @@ fn build_session_from_saz_parts(
         sse_events,
         body_offloaded: false,
         request_body_offloaded: false,
-    }
+    })
 }
 
 // ============================================================================
@@ -2431,9 +2761,41 @@ fn split_raw_http_message(raw: &[u8]) -> (String, Vec<HeaderPair>, &[u8]) {
     (start_line, headers, body_bytes)
 }
 
-fn decode_http_body(raw_body: &[u8], headers: &[HeaderPair]) -> Vec<u8> {
+enum BoundedDecodeResult {
+    Ok(Vec<u8>),
+    LimitExceeded,
+    InvalidFormat,
+}
+
+fn has_zstd_magic(input: &[u8]) -> bool {
+    if input.len() < 4 {
+        return false;
+    }
+    input[0..4] == [0x28, 0xB5, 0x2F, 0xFD]
+        || ((input[0] & 0xF0) == 0x50 && input[1..4] == [0x2A, 0x4D, 0x18])
+}
+
+fn decode_http_body(
+    raw_body: &[u8],
+    headers: &[HeaderPair],
+    cumulative_http_bytes: &mut u64,
+) -> Result<Vec<u8>, ProxyError> {
+    decode_http_body_with_limit(
+        raw_body,
+        headers,
+        cumulative_http_bytes,
+        MAX_SAZ_TOTAL_UNCOMPRESSED_BYTES,
+    )
+}
+
+fn decode_http_body_with_limit(
+    raw_body: &[u8],
+    headers: &[HeaderPair],
+    cumulative_http_bytes: &mut u64,
+    total_limit: u64,
+) -> Result<Vec<u8>, ProxyError> {
     if raw_body.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let is_chunked = headers.iter().any(|h| {
@@ -2458,48 +2820,95 @@ fn decode_http_body(raw_body: &[u8], headers: &[HeaderPair]) -> Vec<u8> {
         .collect();
 
     if encodings.is_empty() {
-        return unchunked;
+        return Ok(unchunked);
+    }
+
+    if encodings.len() > MAX_SAZ_CONTENT_ENCODING_LAYERS {
+        return Err(ProxyError::Custom(format!(
+            "Слишком много слоёв Content-Encoding в HTTP-сообщении ({} > лимит {MAX_SAZ_CONTENT_ENCODING_LAYERS})",
+            encodings.len()
+        )));
     }
 
     let mut current = unchunked.clone();
     for enc in encodings.iter().rev() {
-        let Some(next) = decode_single_content_encoding(&current, enc) else {
-            return unchunked;
-        };
-        current = next;
+        let remaining = total_limit.saturating_sub(*cumulative_http_bytes);
+        let layer_limit = MAX_SAZ_ENTRY_BYTES.min(remaining);
+        match decode_single_content_encoding(&current, enc, layer_limit) {
+            BoundedDecodeResult::Ok(next) => {
+                let next_len = next.len() as u64;
+                let new_total = cumulative_http_bytes.saturating_add(next_len);
+                if new_total > total_limit {
+                    return Err(ProxyError::Custom(format!(
+                        "Суммарный распакованный размер HTTP-тел в SAZ превышает лимит {total_limit} байт"
+                    )));
+                }
+                *cumulative_http_bytes = new_total;
+                current = next;
+            }
+            BoundedDecodeResult::LimitExceeded => {
+                return Err(ProxyError::Custom(format!(
+                    "Распакованное HTTP-тело ({enc}) превышает допустимый лимит ({layer_limit} байт / общий лимит {total_limit} байт)"
+                )));
+            }
+            BoundedDecodeResult::InvalidFormat => {
+                return Ok(unchunked);
+            }
+        }
     }
 
-    current
+    Ok(current)
 }
 
-fn read_bounded_decoder_output<R: Read>(decoder: R, max_bytes: u64) -> Option<Vec<u8>> {
+fn read_bounded_decoder_output<R: Read>(decoder: R, max_bytes: u64) -> BoundedDecodeResult {
     let mut out = Vec::new();
-    decoder.take(max_bytes.saturating_add(1)).read_to_end(&mut out).ok()?;
-    if (out.len() as u64) > max_bytes {
-        return None;
+    if decoder
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut out)
+        .is_err()
+    {
+        return BoundedDecodeResult::InvalidFormat;
     }
-    Some(out)
+    if (out.len() as u64) > max_bytes {
+        return BoundedDecodeResult::LimitExceeded;
+    }
+    BoundedDecodeResult::Ok(out)
 }
 
-fn decode_single_content_encoding(input: &[u8], encoding: &str) -> Option<Vec<u8>> {
+fn decode_single_content_encoding(
+    input: &[u8],
+    encoding: &str,
+    max_bytes: u64,
+) -> BoundedDecodeResult {
     match encoding {
         "gzip" | "x-gzip" => {
             if input.len() >= 2 && input[0] == 0x1f && input[1] == 0x8b {
-                read_bounded_decoder_output(GzDecoder::new(input), MAX_SAZ_ENTRY_BYTES)
+                read_bounded_decoder_output(GzDecoder::new(input), max_bytes)
             } else {
-                None
+                BoundedDecodeResult::InvalidFormat
             }
         }
-        "br" | "brotli" => read_bounded_decoder_output(
-            brotli::Decompressor::new(input, 4096),
-            MAX_SAZ_ENTRY_BYTES,
-        ),
-        "deflate" | "x-deflate" => {
-            read_bounded_decoder_output(ZlibDecoder::new(input), MAX_SAZ_ENTRY_BYTES).or_else(|| {
-                read_bounded_decoder_output(DeflateDecoder::new(input), MAX_SAZ_ENTRY_BYTES)
-            })
+        "br" | "brotli" => {
+            read_bounded_decoder_output(brotli::Decompressor::new(input, 4096), max_bytes)
         }
-        _ => None,
+        "deflate" | "x-deflate" => {
+            match read_bounded_decoder_output(ZlibDecoder::new(input), max_bytes) {
+                BoundedDecodeResult::InvalidFormat => {
+                    read_bounded_decoder_output(DeflateDecoder::new(input), max_bytes)
+                }
+                other => other,
+            }
+        }
+        "zstd" | "x-zstd" => {
+            if !has_zstd_magic(input) {
+                return BoundedDecodeResult::InvalidFormat;
+            }
+            match zstd::stream::read::Decoder::new(input) {
+                Ok(dec) => read_bounded_decoder_output(dec, max_bytes),
+                Err(_) => BoundedDecodeResult::InvalidFormat,
+            }
+        }
+        _ => BoundedDecodeResult::InvalidFormat,
     }
 }
 
@@ -2569,18 +2978,33 @@ fn is_matching_compressed_magic(encoding_val: &str, body: &[u8]) -> bool {
         "gzip" | "x-gzip" => body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b,
         "deflate" | "x-deflate" => {
             if has_valid_zlib_header(body)
-                && read_bounded_decoder_output(ZlibDecoder::new(body), MAX_SAZ_ENTRY_BYTES)
-                    .is_some()
+                && matches!(
+                    read_bounded_decoder_output(ZlibDecoder::new(body), MAX_SAZ_ENTRY_BYTES),
+                    BoundedDecodeResult::Ok(_)
+                )
             {
                 return true;
             }
-            read_bounded_decoder_output(DeflateDecoder::new(body), MAX_SAZ_ENTRY_BYTES).is_some()
+            matches!(
+                read_bounded_decoder_output(DeflateDecoder::new(body), MAX_SAZ_ENTRY_BYTES),
+                BoundedDecodeResult::Ok(_)
+            )
         }
-        "br" | "brotli" => read_bounded_decoder_output(
-            brotli::Decompressor::new(body, 4096),
-            MAX_SAZ_ENTRY_BYTES,
-        )
-        .is_some(),
+        "br" | "brotli" => matches!(
+            read_bounded_decoder_output(brotli::Decompressor::new(body, 4096), MAX_SAZ_ENTRY_BYTES),
+            BoundedDecodeResult::Ok(_)
+        ),
+        "zstd" | "x-zstd" => {
+            has_zstd_magic(body)
+                && zstd::stream::read::Decoder::new(body)
+                    .ok()
+                    .is_some_and(|dec| {
+                        matches!(
+                            read_bounded_decoder_output(dec, MAX_SAZ_ENTRY_BYTES),
+                            BoundedDecodeResult::Ok(_)
+                        )
+                    })
+        }
         _ => false,
     }
 }
@@ -3840,8 +4264,10 @@ mod tests {
             name: "Content-Encoding".into(),
             value: "gzip, br".into(),
         }];
-        let decoded = decode_http_body(&br_out, &headers);
+        let mut cumulative = 0u64;
+        let decoded = decode_http_body(&br_out, &headers, &mut cumulative).unwrap();
         assert_eq!(decoded, plain);
+        assert_eq!(cumulative, (gzipped.len() + plain.len()) as u64);
 
         // `is_matching_compressed_magic` must detect genuine brotli and deflate, and reject plain text
         assert!(is_matching_compressed_magic("br", &br_out));
@@ -4049,5 +4475,241 @@ mod tests {
         assert_eq!(saz_req_json["Password"], "[REDACTED]");
         assert_eq!(saz_req_json["nested"][0]["access_token"], "[REDACTED]");
         assert_eq!(saz_req_json["nested"][0]["cvv"], "[REDACTED]");
+    }
+
+    #[test]
+    fn sec04_sanitizes_camelcase_keys_sse_and_ws_bodies_signalr_socketio_jwt_and_url_headers() {
+        let mut sessions = sample_sessions();
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTEifQ.sigpart123";
+
+        // Session 0: camelCase JSON secrets + credentials/fragment in URL, Location, Referer + SSE stream
+        let camel_req = serde_json::json!({
+            "accessToken": "camel-access-secret",
+            "refreshToken": "camel-refresh-secret",
+            "apiKey": "camel-apikey-secret",
+            "clientSecret": "camel-client-secret",
+            "idToken": "camel-idtoken-secret",
+            "privateKey": "camel-privkey-secret",
+            "cardNumber": "4111222233334444",
+            "sessionId": "camel-sessid-secret",
+            "note": format!("Bearer header-inline-secret {jwt}")
+        })
+        .to_string();
+        let raw_sse_body = format!(
+            "id: 1\nevent: auth\ndata: {{\"accessToken\":\"sse-access-secret\",\"jwt\":\"{jwt}\"}}\n\n"
+        );
+        sessions[0].summary.content_type = "text/event-stream; charset=utf-8".into();
+        sessions[0].summary.url =
+            "https://alice:topsecretpass@auth.fluxproxy.dev/users/@alice?apiKey=qtok-secret&lang=en#id_token=frag-secret"
+                .into();
+        sessions[0].summary.path = "/users/@alice?apiKey=qtok-secret&lang=en#id_token=frag-secret".into();
+        sessions[0].request_headers = vec![
+            HeaderPair { name: "Host".into(), value: "auth.fluxproxy.dev".into() },
+            HeaderPair { name: "Content-Type".into(), value: "application/json".into() },
+            HeaderPair {
+                name: "Referer".into(),
+                value: "https://bob:refpass@portal.fluxproxy.dev/cb?apiKey=ref-apikey#access_token=ref-frag".into(),
+            },
+        ];
+        sessions[0].response_headers = vec![
+            HeaderPair { name: "Content-Type".into(), value: "text/event-stream; charset=utf-8".into() },
+            HeaderPair {
+                name: "Location".into(),
+                value: "https://carol:locpass@app.fluxproxy.dev/done?token=loc-tok#state=loc-frag".into(),
+            },
+        ];
+        sessions[0].request_body_base64 =
+            base64::engine::general_purpose::STANDARD.encode(camel_req.as_bytes());
+        sessions[0].request_body_text = Some(camel_req);
+        sessions[0].response_body_base64 =
+            base64::engine::general_purpose::STANDARD.encode(raw_sse_body.as_bytes());
+        sessions[0].response_body_text = Some(raw_sse_body);
+        sessions[0].sse_events = vec![SseEventRecord {
+            index: 1,
+            id: Some("1".into()),
+            event: "auth".into(),
+            data: format!("{{\"accessToken\":\"sse-access-secret\",\"jwt\":\"{jwt}\"}}"),
+            retry: None,
+            byte_length: 80,
+            offset_ms: 5,
+            timestamp: "2026-11-09T09:15:30.300Z".into(),
+        }];
+
+        // Session 1: WebSocket session with SignalR (\x1e), Socket.IO, and plain Bearer/JWT frames
+        sessions[1].summary.status = 101;
+        sessions[1].summary.protocol = "WSS".into();
+        sessions[1].summary.scheme = "wss".into();
+        sessions[1].summary.content_type = "application/json".into();
+        sessions[1].websocket_frames = vec![
+            WebSocketFrameRecord {
+                index: 1,
+                direction: "outbound".into(),
+                opcode: "text".into(),
+                payload_preview: "{\"type\":1,\"arguments\":[{\"accessToken\":\"signalr-secret\",\"bearer\":\"Bearer signalr-bearer\"}]}\x1e".to_string(),
+                byte_length: 100,
+                timestamp: "2026-11-09T09:15:31.010Z".into(),
+            },
+            WebSocketFrameRecord {
+                index: 2,
+                direction: "outbound".into(),
+                opcode: "text".into(),
+                payload_preview: "42/chat,[\"auth\",{\"apiKey\":\"socketio-apikey\",\"clientSecret\":\"socketio-csecret\"}]".into(),
+                byte_length: 82,
+                timestamp: "2026-11-09T09:15:31.020Z".into(),
+            },
+            WebSocketFrameRecord {
+                index: 3,
+                direction: "inbound".into(),
+                opcode: "text".into(),
+                payload_preview: format!("AUTH Bearer plain-ws-bearer TOKEN {jwt}"),
+                byte_length: 90,
+                timestamp: "2026-11-09T09:15:31.030Z".into(),
+            },
+        ];
+        let stale_ws_body = serde_json::to_string_pretty(&sessions[1].websocket_frames).unwrap();
+        sessions[1].response_body_text = Some(stale_ws_body.clone());
+        sessions[1].response_body_base64 =
+            base64::engine::general_purpose::STANDARD.encode(stale_ws_body.as_bytes());
+
+        let sanitized = sanitize_sessions(&sessions, &SanitizationOptions::default());
+        let json_dump = serialize_json_archive(&sanitized).unwrap();
+        let har_dump = serialize_har_1_2(&sanitized).unwrap();
+        let raw_dump = String::from_utf8_lossy(&serialize_full_raw_http(&sanitized)).into_owned();
+
+        let forbidden = [
+            "camel-access-secret",
+            "camel-refresh-secret",
+            "camel-apikey-secret",
+            "camel-client-secret",
+            "camel-idtoken-secret",
+            "camel-privkey-secret",
+            "4111222233334444",
+            "camel-sessid-secret",
+            "header-inline-secret",
+            jwt,
+            "sse-access-secret",
+            "topsecretpass",
+            "qtok-secret",
+            "frag-secret",
+            "refpass",
+            "ref-apikey",
+            "ref-frag",
+            "locpass",
+            "loc-tok",
+            "loc-frag",
+            "signalr-secret",
+            "signalr-bearer",
+            "socketio-apikey",
+            "socketio-csecret",
+            "plain-ws-bearer",
+        ];
+        for secret in forbidden {
+            assert!(!json_dump.contains(secret), "JSON leaked secret: {secret}");
+            assert!(!har_dump.contains(secret), "HAR leaked secret: {secret}");
+            assert!(!raw_dump.contains(secret), "Raw HTTP leaked secret: {secret}");
+        }
+
+        // Verify SSE and WS bodies were rebuilt rather than keeping stale pre-sanitization bytes
+        let sse_rebuilt = sanitized[0].response_body_text.as_deref().unwrap();
+        assert!(sse_rebuilt.contains("[REDACTED]"));
+        assert_eq!(
+            decode_detail_body_bytes(&sanitized[0], true),
+            sse_rebuilt.as_bytes()
+        );
+        assert!(sanitized[1].websocket_frames[0].payload_preview.ends_with('\x1e'));
+        assert!(sanitized[1].websocket_frames[1].payload_preview.starts_with("42/chat,["));
+
+        // Verify `@alice` path preserved while userinfo and fragment redacted
+        assert!(sanitized[0].summary.url.starts_with("https://auth.fluxproxy.dev/users/@alice?"));
+        assert!(sanitized[0].summary.url.ends_with("#[REDACTED]"));
+        assert_eq!(
+            find_header_value(&sanitized[0].response_headers, "location").unwrap(),
+            "https://app.fluxproxy.dev/done?token=[REDACTED]#[REDACTED]"
+        );
+        assert_eq!(
+            find_header_value(&sanitized[0].request_headers, "referer").unwrap(),
+            "https://portal.fluxproxy.dev/cb?apiKey=[REDACTED]#[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn sec05_and_bug12_saz_zstd_layer_limits_cumulative_http_cap_and_safe_duration() {
+        let plain = br#"{"codec":"zstd-in-saz","ok":true}"#;
+        let zstd_payload = zstd::encode_all(plain.as_slice(), 1).unwrap();
+
+        // 1. Single-layer zstd and 2-layer gzip+zstd succeed
+        let mut cumulative = 0u64;
+        let zstd_headers = vec![HeaderPair {
+            name: "Content-Encoding".into(),
+            value: "zstd".into(),
+        }];
+        assert_eq!(
+            decode_http_body(&zstd_payload, &zstd_headers, &mut cumulative).unwrap(),
+            plain
+        );
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(plain).unwrap();
+        let gzipped = gz.finish().unwrap();
+        let zstd_over_gzip = zstd::encode_all(gzipped.as_slice(), 1).unwrap();
+        let two_layer_headers = vec![HeaderPair {
+            name: "Content-Encoding".into(),
+            value: "gzip, zstd".into(),
+        }];
+        let mut cumulative2 = 0u64;
+        assert_eq!(
+            decode_http_body(&zstd_over_gzip, &two_layer_headers, &mut cumulative2).unwrap(),
+            plain
+        );
+        assert_eq!(cumulative2, (gzipped.len() + plain.len()) as u64);
+
+        // 2. More than 2 Content-Encoding layers are rejected
+        let three_layer_headers = vec![HeaderPair {
+            name: "Content-Encoding".into(),
+            value: "gzip, br, zstd".into(),
+        }];
+        let mut cumulative3 = 0u64;
+        assert!(decode_http_body(&zstd_over_gzip, &three_layer_headers, &mut cumulative3).is_err());
+
+        // 3. Cumulative HTTP decompression budget across calls rejects when exceeding limit
+        let mut small_budget = 0u64;
+        let big_plain = vec![b'Z'; 1024];
+        let big_zstd = zstd::encode_all(big_plain.as_slice(), 1).unwrap();
+        assert!(
+            decode_http_body_with_limit(&big_zstd, &zstd_headers, &mut small_budget, 512).is_err()
+        );
+
+        // 4. SAZ roundtrip handles raw HTTP response encoded with Content-Encoding: zstd
+        let mut server_raw = Vec::new();
+        server_raw.extend_from_slice(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\n\r\n",
+                zstd_payload.len()
+            )
+            .as_bytes(),
+        );
+        server_raw.extend_from_slice(&zstd_payload);
+        let mut zip_buf = Cursor::new(Vec::new());
+        {
+            let mut zw = ZipWriter::new(&mut zip_buf);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zw.start_file("raw/001_c.txt", opts).unwrap();
+            zw.write_all(b"GET https://example.com/z HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .unwrap();
+            zw.start_file("raw/001_s.txt", opts).unwrap();
+            zw.write_all(&server_raw).unwrap();
+            zw.finish().unwrap();
+        }
+        let imported = import_sessions_from_bytes("zstd.saz", zip_buf.get_ref()).unwrap();
+        assert_eq!(
+            imported[0].response_body_text.as_deref(),
+            Some(std::str::from_utf8(plain).unwrap())
+        );
+
+        // 5. BUG-12: extreme duration_ms (u64::MAX) in export_saz must never panic
+        let mut extreme = sample_sessions();
+        extreme[0].summary.duration_ms = u64::MAX;
+        let mut saz_out = Cursor::new(Vec::new());
+        assert_eq!(write_saz_to_writer(&mut saz_out, &extreme).unwrap(), 2);
     }
 }

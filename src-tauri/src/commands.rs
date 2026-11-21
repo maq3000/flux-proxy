@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::Arc;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -570,6 +570,51 @@ pub async fn pick_open_file_dialog(
     .map_err(|e| ProxyError::Custom(format!("Native open dialog join error: {e}")))?
 }
 
+pub const MAX_SETTINGS_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn is_reserved_dos_device_name(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+fn is_windows_verbatim_disk_prefix(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    bytes.len() >= 7
+        && &bytes[0..4] == br"\\?\"
+        && bytes[4].is_ascii_alphabetic()
+        && bytes[5] == b':'
+        && (bytes[6] == b'\\' || bytes[6] == b'/')
+}
+
 pub(crate) fn validate_user_file_path(
     raw_path: &str,
     allowed_extensions: Option<&[&str]>,
@@ -591,8 +636,57 @@ pub(crate) fn validate_user_file_path(
             "Указан путь к каталогу вместо имени файла.".into(),
         ));
     }
+    if trimmed.starts_with("//")
+        || (trimmed.starts_with(r"\\") && !is_windows_verbatim_disk_prefix(trimmed))
+    {
+        return Err(ProxyError::Custom(
+            "Сетевые UNC-пути и пути к устройствам запрещены.".into(),
+        ));
+    }
+    if trimmed == ".."
+        || trimmed.starts_with(r"..\")
+        || trimmed.ends_with(r"\..")
+        || trimmed.contains(r"\..\")
+    {
+        return Err(ProxyError::Custom(
+            "Путь к файлу не может содержать переходы '..'.".into(),
+        ));
+    }
 
     let path = PathBuf::from(trimmed);
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                return Err(ProxyError::Custom(
+                    "Путь к файлу не может содержать переходы '..'.".into(),
+                ));
+            }
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::UNC(..) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(..) => {
+                    return Err(ProxyError::Custom(
+                        "Сетевые UNC-пути и пространства имён устройств запрещены.".into(),
+                    ));
+                }
+                Prefix::Disk(_) | Prefix::VerbatimDisk(_) | Prefix::Verbatim(_) => {}
+            },
+            Component::Normal(seg) => {
+                let seg_str = seg.to_string_lossy();
+                if seg_str.contains(':') {
+                    return Err(ProxyError::Custom(
+                        "Альтернативные потоки NTFS (:) и двоеточия в имени файла запрещены."
+                            .into(),
+                    ));
+                }
+                if is_reserved_dos_device_name(&seg_str) {
+                    return Err(ProxyError::Custom(format!(
+                        "Использование зарезервированного имени устройства ОС '{seg_str}' запрещено."
+                    )));
+                }
+            }
+            Component::RootDir | Component::CurDir => {}
+        }
+    }
+
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -600,6 +694,16 @@ pub(crate) fn validate_user_file_path(
         .ok_or_else(|| ProxyError::Custom("Некорректное имя файла в пути.".into()))?;
     if file_name.trim().is_empty() {
         return Err(ProxyError::Custom("Некорректное имя файла в пути.".into()));
+    }
+    if file_name.contains(':') {
+        return Err(ProxyError::Custom(
+            "Альтернативные потоки NTFS (:) в имени файла запрещены.".into(),
+        ));
+    }
+    if is_reserved_dos_device_name(file_name) {
+        return Err(ProxyError::Custom(format!(
+            "Использование зарезервированного имени устройства ОС '{file_name}' запрещено."
+        )));
     }
     if path.is_dir() {
         return Err(ProxyError::Custom(format!(
@@ -763,16 +867,31 @@ pub async fn export_settings_file(
     .map_err(|e| ProxyError::Custom(format!("Export settings task join error: {e}")))?
 }
 
+fn read_bounded_settings_file(path: &Path) -> Result<String, ProxyError> {
+    let meta = std::fs::metadata(path)?;
+    if meta.len() > MAX_SETTINGS_FILE_BYTES {
+        return Err(ProxyError::Custom(format!(
+            "Размер файла настроек {} ({} байт) превышает допустимый лимит ({MAX_SETTINGS_FILE_BYTES} байт)",
+            path.display(),
+            meta.len()
+        )));
+    }
+    let bytes = crate::storage::export_import::read_bounded_file(path, MAX_SETTINGS_FILE_BYTES)?;
+    let raw = String::from_utf8(bytes).map_err(|e| {
+        ProxyError::Custom(format!(
+            "Файл настроек {} содержит некорректную UTF-8 кодировку: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(raw.trim_start_matches('\u{feff}').to_owned())
+}
+
 #[tauri::command]
 pub async fn import_settings_file(file_path: String) -> Result<String, ProxyError> {
     let validated_path = validate_user_file_path(&file_path, Some(&["json"]), true)?;
-    tokio::task::spawn_blocking(move || {
-        let raw = std::fs::read_to_string(&validated_path)
-            .map_err(|e| ProxyError::Custom(format!("Не удалось прочитать файл {}: {e}", validated_path.display())))?;
-        Ok(raw.trim_start_matches('\u{feff}').to_owned())
-    })
-    .await
-    .map_err(|e| ProxyError::Custom(format!("Import settings task join error: {e}")))?
+    tokio::task::spawn_blocking(move || read_bounded_settings_file(&validated_path))
+        .await
+        .map_err(|e| ProxyError::Custom(format!("Import settings task join error: {e}")))?
 }
 
 #[tauri::command]
@@ -815,7 +934,7 @@ pub async fn generate_stress_sessions(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_user_file_path;
+    use super::{read_bounded_settings_file, validate_user_file_path, MAX_SETTINGS_FILE_BYTES};
 
     #[test]
     fn validates_user_file_paths_and_extensions() {
@@ -834,5 +953,96 @@ mod tests {
         let valid_body = validate_user_file_path("payload.bin", None, false)
             .expect("unrestricted save body path");
         assert!(valid_body.ends_with("payload.bin"));
+    }
+
+    #[test]
+    fn sec02_rejects_parent_traversal_unc_ntfs_ads_and_dos_device_names() {
+        // 1. Parent directory traversal
+        assert!(validate_user_file_path("a/../../etc/passwd", None, false).is_err());
+        assert!(validate_user_file_path("../a.json", Some(&["json"]), false).is_err());
+        assert!(validate_user_file_path("a/b/../c.json", Some(&["json"]), false).is_err());
+        assert!(validate_user_file_path(r"a\..\b.json", Some(&["json"]), false).is_err());
+
+        // 2. UNC & device namespaces
+        assert!(
+            validate_user_file_path(r"\\attacker\share\a.json", Some(&["json"]), false).is_err()
+        );
+        assert!(
+            validate_user_file_path("//attacker/share/a.json", Some(&["json"]), false).is_err()
+        );
+        assert!(
+            validate_user_file_path(r"\\?\UNC\attacker\share\a.json", Some(&["json"]), false)
+                .is_err()
+        );
+        assert!(validate_user_file_path(r"\\.\pipe\a.json", Some(&["json"]), false).is_err());
+
+        // 3. NTFS Alternate Data Streams (:)
+        assert!(validate_user_file_path("file.json:ads", None, false).is_err());
+        assert!(validate_user_file_path("dir:ads/file.json", Some(&["json"]), false).is_err());
+
+        // 4. Reserved DOS device names
+        for reserved in [
+            "CON.json",
+            "con",
+            "PRN.har",
+            "AUX.saz",
+            "NUL.txt",
+            "COM1.json",
+            "COM9.json",
+            "LPT1.json",
+            "lpt9.har",
+            "dir/CON.json",
+        ] {
+            assert!(
+                validate_user_file_path(reserved, None, false).is_err(),
+                "must reject reserved DOS device path: {reserved}"
+            );
+        }
+
+        // 5. Legitimate lookalike filenames remain accepted
+        for safe in ["config.json", "console.har", "null.json", "com10.json"] {
+            assert!(
+                validate_user_file_path(safe, None, false).is_ok(),
+                "must allow safe lookalike path: {safe}"
+            );
+        }
+    }
+
+    #[test]
+    fn sec02_import_settings_file_enforces_16mib_limit_and_strips_bom() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxproxy_sec02_settings_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let small_path = dir.join("valid-settings.json");
+        std::fs::write(&small_path, "\u{feff}{\"schemaVersion\":1}").unwrap();
+        let validated_small = validate_user_file_path(
+            &small_path.display().to_string(),
+            Some(&["json"]),
+            true,
+        )
+        .unwrap();
+        let content = read_bounded_settings_file(&validated_small).unwrap();
+        assert_eq!(content, "{\"schemaVersion\":1}");
+
+        let huge_path = dir.join("oversized-settings.json");
+        let file = std::fs::File::create(&huge_path).unwrap();
+        file.set_len(MAX_SETTINGS_FILE_BYTES + 1).unwrap();
+        drop(file);
+
+        let validated_huge = validate_user_file_path(
+            &huge_path.display().to_string(),
+            Some(&["json"]),
+            true,
+        )
+        .unwrap();
+        let err = read_bounded_settings_file(&validated_huge)
+            .expect_err("must reject settings file exceeding 16 MiB");
+        assert!(err.to_string().contains("превышает допустимый лимит"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
