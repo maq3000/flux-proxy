@@ -95,14 +95,15 @@
 
 ## 📋 Матрица приоритетов и порядок выполнения
 
-> *Номера этапов (`10–13`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз. Завершенные этапы Спринта 1 (Этапы 14, 15, 20, 21, 25–28) выполнены в релизе `v0.2.0`, этапы Спринта 2 (Этапы 5, 16, 17, 23, 24, 29, 30) выполнены в релизе `v0.3.0`, этапы Спринта 3 (Этапы 6, 7, 8, 9, 18, 19, 22) выполнены в релизе `v0.4.0`, а стабилизационный Спринт 4 (Этапы 31–33) выполнен в релизе `v0.4.1` и перенесен в раздел реализованных этапов выше.*
+> *Номера этапов (`10–13, 34`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз. Завершенные этапы Спринта 1 (Этапы 14, 15, 20, 21, 25–28) выполнены в релизе `v0.2.0`, этапы Спринта 2 (Этапы 5, 16, 17, 23, 24, 29, 30) выполнены в релизе `v0.3.0`, этапы Спринта 3 (Этапы 6, 7, 8, 9, 18, 19, 22) выполнены в релизе `v0.4.0`, а стабилизационный Спринт 4 (Этапы 31–33) выполнен в релизе `v0.4.1` и перенесен в раздел реализованных этапов выше.*
 
 | # | Этап | Приоритет | Спринт | Зависимости | Ключевая ценность |
 | :-: | :--- | :--- | :--- | :--- | :--- |
 | 1 | **[Этап 10](#этап-10-сетевая-инфраструктура-hosts-remapping-и-bandwidth-throttling)** | **P2 (Feature)** | Спринт 5 | Этапы 15 ✅, 25 ✅, 33 ✅ | Виртуальный DNS (`resolve` / `CONNECT`) без правки системного `hosts` и эмуляция медленных сетей |
 | 2 | **[Этап 11](#этап-11-архитектурная-декомпозиция-монолитов-внедрение-zustand-и-оптимизация-бандла)** | **P2 (Architecture / Perf)** | Спринт 5 | Этапы 31–33 ✅ | Разделение крупных Rust/React-модулей (`ARCH-01`), ленивый `BrowserPreviewEngine` и удаление `ts.worker` 7 МБ (`PERF-05`), внедрение `zustand` и `React.lazy()` |
-| 3 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 5 | — | Виртуализированная каскадная диаграмма таймингов и сводный Markdown-отчет (P95, статусы, MIME) |
-| 4 | **[Этап 13](#этап-13-расширенные-протоколы-upstream-proxy-chaining-и-ws-инъекция)** | **P2 (Feature)** | Спринт 5 | Этапы 18 ✅, 25 ✅, 33 ✅ | Каскадирование трафика через внешний HTTP/HTTPS/SOCKS5-прокси и отправка фреймов в открытые WS |
+| 3 | **[Этап 34](#этап-34-статистика-запроса-и-детальные-тайминги-в-стиле-fiddler-sessiontimers-метрики-соединения-и-панель-statistics)** | **P2 (Feature)** | Спринт 5 | Этапы 10, 11 | Детальные тайминги в стиле Fiddler (`DNS`/`TCP`/`TLS`/`TTFB`/`Receive`, `SessionTimers`), учёт wire/decoded-байт, переиспользование сокетов, реальный экспорт/импорт HAR/SAZ и панель `Statistics` |
+| 4 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 5 | Этап 34 | Виртуализированная многофазная каскадная диаграмма (Waterfall) и сводный Markdown-отчет по всей выборке (P95, TTFB, статусы, MIME) |
+| 5 | **[Этап 13](#этап-13-расширенные-протоколы-upstream-proxy-chaining-и-ws-инъекция)** | **P2 (Feature)** | Спринт 5 | Этапы 18 ✅, 25 ✅, 33 ✅ | Каскадирование трафика через внешний HTTP/HTTPS/SOCKS5-прокси и отправка фреймов в открытые WS |
 
 ---
 
@@ -240,36 +241,113 @@
 
 ---
 
+## Этап 34: Статистика запроса и детальные тайминги в стиле Fiddler (SessionTimers, метрики соединения и панель Statistics)
+**Приоритет: P2 (Feature) | Спринт 5 | Зависимости: Этапы 10, 11**
+
+### Цель и контекст
+Сейчас FluxProxy фиксирует только суммарное время `duration_ms`, итоговый размер распакованного тела `body_size` и заглушечную строку `tls_version` (`"TLS 1.3 (MITM)"`), из-за чего невозможно отличить медленный DNS/TCP/TLS-хендшейк от высокого серверного TTFB, медленной скачки тела, задержки в Breakpoint/Python-скрипте или переиспользования keep-alive соединения. Кроме того, при экспорте `.har` (`src-tauri/src/storage/export_import/har.rs`) и `.saz` (`saz.rs`) тайминги фаз (`DNSTime`, `TCPConnectTime`, `HTTPSHandshakeTime`, `timings.dns/connect/ssl/receive`) и `<PipeInfo CltReuse Reused />` заполняются нулями/`-1`.
+
+Задача — реализовать полноценную **статистику запроса и детальные тайминги на уровне Fiddler Classic**: точные метки времени жизненного цикла (`ACTUAL PERFORMANCE` / `SessionTimers`), разбивку длительности по сетевым и прокси-фазам, учёт «сырых» (wire/compressed) и распакованных байт заголовков и тела, реальную телеметрию клиентского и серверного соединений (IP:port, keep-alive reuse, реальный TLS-протокол/шифр/ALPN), полноценный round-trip таймингов в HAR 1.2 / Fiddler `.saz` и встроенную вкладку **`Statistics`** в `SessionInspector` (для 1 или нескольких выделенных сессий).
+
+> **Важные технические нюансы:**
+> - **Ограничение `reqwest 0.12` (black-box транспорт):** `reqwest::Client` скрывает этапы `TcpStream::connect`, `tokio-rustls` handshake, факт переиспользования соединения из пула (`Reused`), реальный upstream TLS cipher/версию и авто-распаковывает `gzip`/`br`/`deflate` до того, как прокси увидит сырой размер тела (`wire_body_size`). При этом в `src-tauri/Cargo.toml` уже подключены `hyper = "1.5"` (`full`), `hyper-util = "0.1"`, `tokio-rustls = "0.26"`, `rustls = "0.23"`, `x509-parser`, `flate2`, `brotli` и `zstd`, а в `http_handler.rs` уже реализована ограниченная декомпрессия `maybe_decompress_content_encodings`. Поэтому для честных Fiddler-таймингов (`DNSTime`, `TCPConnectTime`, `HTTPSHandshakeTime`, `ServerConnReused`, `wire_body_size`, реальный upstream TLS) необходимо вынести upstream-транспорт в отдельный инструментированный коннектор на базе `hyper_util::client::legacy::Client` (`src-tauri/src/proxy/upstream_client.rs`), интегрировав его с `HostRemapRegistry` (Этап 10), `ClientCertificateStore` (mTLS, Этап 18) и `ThrottleConfig` (Этап 10). Этот же коннектор впоследствии упростит Этап 13 (`GatewayTime` и Upstream Proxy Chaining).
+> - **Клиентская сторона (`CltReuse` и реальный MITM TLS):** в `spawn_accept_loop` (`src-tauri/src/proxy/server/mod.rs`) и `connect_tunnel.rs` необходимо передавать `ClientConnContext` (`conn_id`, `connected_at`, `request_seq: AtomicU64`, `client_tls_handshake_ms`, реальные `protocol_version()`, `negotiated_cipher_suite()`, `alpn_protocol()` из `rustls::ServerConnection`), заменив захардкоженную строку `"TLS 1.3 (MITM)"`.
+> - **Отделение прокси-оверхеда от сетевого времени:** время ожидания пользователя на Live Breakpoints (`breakpoint_pause_ms`), работы Python-хуков (`script_hook_ms`) и искусственной задержки AutoResponder (`autoresponder_delay_ms`) должно фиксироваться отдельно от `server_wait_ms` (TTFB) с отображением чистого сетевого времени (`net_elapsed_ms`), чтобы ручная пауза на брейкпоинте не искажала диагностику бэкенда.
+> - **Особые типы сессий:** корректно фиксировать метрики для `SSE` (`text/event-stream` — TTFB до заголовков 200, время до 1-го события, итоговая длительность потока), zero-buffering стриминга (`206` / `video/*` / `> 2 MiB`), `CONNECT` Passthrough (отдельный учёт `tx_bytes` / `rx_bytes` и DNS+TCP), `WebSocket` (время 101-хендшейка + суммарные outbound/inbound байты и фреймы), `Composer` (`composer_exec.rs`) и локальных `Mock`-ответов.
+> - **Спецификация HAR 1.2 и обратная совместимость:** в HAR 1.2 поле `timings.connect` **включает** `timings.ssl` (`connect = tcp_ms + tls_ms`, `ssl = tls_ms`, либо `-1.0` если не применимо); все новые поля в `SessionSummary` и `SessionDetail` должны иметь `#[serde(default, skip_serializing_if = "Option::is_none")]`, чтобы старые базы `sessions.sqlite` и JSON-архивы десериализовались без миграции схемы.
+> - **Приватность при санитизации (`sanitize.rs`):** при включённом `anonymize_client_info` в `SanitizationOptions` очищать/маскировать дублирующиеся сетевые адреса клиента (`client_addr`/`client_ip`) и при необходимости учитывать приватные адреса в экспортируемых метаданных статистики.
+
+### Критерии приемки (DoD)
+- **Модели данных (`src-tauri/src/models.rs` ↔ `src/types/proxy.ts`):**
+  - Добавлены опциональные структуры `SessionTimings` (12 меток жизненного цикла Fiddler `client_connected` … `client_done_response` в RFC 3339 с микросекундами + фазы `client_read_ms`, `client_tls_handshake_ms`, `dns_ms`, `tcp_connect_ms`, `tls_handshake_ms`, `send_request_ms`, `server_wait_ms`, `content_download_ms`, `client_send_ms`, `breakpoint_pause_ms`, `script_hook_ms`, `autoresponder_delay_ms`, `proxy_overhead_ms`, `overall_elapsed_ms`, `net_elapsed_ms`) и `SessionTransferStats` (байты заголовков/тела запроса и ответа, `response_wire_body_bytes` vs `response_body_bytes`, `response_content_encoding`, `client_conn_id`/`client_conn_reused`, `client_tls_version`/`cipher`/`alpn`, `server_addr`/`server_ip`/`server_port`, `server_conn_id`/`server_conn_reused`, `server_http_version`, `server_tls_version`/`cipher`/`alpn`, `server_cert_subject`/`issuer`, `server_mtls_cn`, `remapped_target`).
+  - В `SessionSummary` добавлены лёгкие опциональные поля (`ttfb_ms`, `dns_ms`, `connect_ms`, `tls_ms`, `receive_ms`, `request_size`, `wire_body_size`, `server_ip`, `server_conn_reused`) для мгновенной агрегации по N выделенным строкам, подсказок в таблице и многофазного Waterfall (Этап 12) без лишних IPC-запросов `get_session_detail`.
+- **Инструментированный Rust-транспорт (`src-tauri/src/proxy/upstream_client.rs`, `server/{mod,http_handler,connect_tunnel,composer_exec,websocket_relay}.rs`, `client_certs.rs`):**
+  - Реализован `InstrumentedUpstreamClient` на `hyper_util::client::legacy::Client` с поэтапным замером DNS → TCP Connect → TLS Handshake, определением `server_conn_reused` через `Connected::extra`, сбором `remote_addr`, реальных TLS-параметров и сырых `wire`-байт до распаковки, поддержкой mTLS, `HostRemapRegistry`, `ThrottleConfig`, HTTP/1.1 + HTTP/2 и ретрая устаревшего соединения из пула.
+  - В `server/mod.rs` и `connect_tunnel.rs` добавлен `ClientConnContext` (`CltReuse`, время клиентского TLS-хендшейка, реальные `protocol_version` и `cipher_suite`), а в `http_handler.rs` — замер `client_read_ms`, `breakpoint_pause_ms`, `script_hook_ms`, `autoresponder_delay_ms`, `server_wait_ms` (TTFB), `content_download_ms` и `client_send_ms`.
+- **Реальный экспорт/импорт HAR 1.2 и Fiddler `.saz` (`src-tauri/src/storage/export_import/{har,saz,sanitize}.rs`):**
+  - Экспорт HAR заполняет реальные `timings` (соблюдая правило `connect = tcp + ssl`), `serverIPAddress`, `connection`, `headersSize`, `bodySize` (wire) и `content.compression`; импорт HAR восстанавливает `SessionTimings` и `SessionTransferStats`.
+  - Экспорт `.saz` заполняет все атрибуты `<SessionTimers ... />`, `<PipeInfo CltReuse="..." Reused="..." />` и флаги `x-hostip`/`https-server-cipher`; импорт `.saz` парсит реальные `<SessionTimers>` и `<PipeInfo>` из архивов Fiddler Classic.
+- **Фронтенд: панель `Statistics`, утилиты расчёта и таблица (`src/lib/requestStatistics.ts`, `src/components/SessionStatisticsPanel.tsx`, `src/components/SessionInspector.tsx`, `src/components/TrafficGrid.tsx`, `src/hooks/useUiPreferences.ts`):**
+  - В заголовке `SessionInspector` добавлен переключатель режимов **`Inspectors` | `Statistics`** (плюс быстрый переход по клику на бейдж длительности `size • duration` в шапке инспектора).
+  - Режим **1 сессии**: горизонтальная сегментированная шкала фаз (`DNS`, `TCP`, `TLS`, `Send`, `Wait (TTFB)`, `Download`, `Proxy/Breakpoint`), хронологическая таблица `ACTUAL PERFORMANCE` (`HH:MM:SS.fff` + `+Δ ms`), карточка объёма данных и сжатия (`Bytes Sent / Received`, Headers vs Body, Wire vs Decoded, экономия `%`, скорость `KB/s`), карточка `Connection & TLS` (Client ↔ Server, `Reused`, IP:port, шифр, ALPN, сертификат), сворачиваемый блок **Estimated Worldwide Performance** (как в Fiddler Classic) и кнопки `Copy Fiddler Text` / `Copy Markdown`.
+  - Режим **множественного выделения (2+ сессии)**: сводная статистика по выделенным строкам в стиле Fiddler (`Request Count`, `Bytes Sent/Received` + экономия сжатия, `Overall Elapsed`, `Avg / Median / P95 / P99` Total и TTFB, `% Reused`, распределение статус-кодов и байт по MIME со встроенной SVG-диаграммой, топ медленных/крупных запросов с переходом по клику).
+  - В `TrafficGrid.tsx` добавлен богатый tooltip с разбивкой фаз на ячейке `Time` и две опциональные сортируемые колонки `TTFB` (`ttfb`) и `Server IP` (`serverIp`) (скрытые по умолчанию, с обратной совместимостью `FluxUserSettingsProfile` в `src/types/settings.ts` и `src/lib/settingsManager.ts`).
+  - Реалистичные синтетические тайминги и сетевые метрики добавлены в `src/lib/mockTraffic.ts` и `src/lib/tauriBridge.ts` для Browser Preview.
+- **Тесты и проверки:** unit/интеграционные тесты в Rust (замеры холодного vs переиспользованного соединения, сжатие wire vs decoded, round-trip HAR/SAZ таймингов, обратная совместимость SQLite) и Vitest-тесты для `src/lib/requestStatistics.ts`.
+
+### 📝 Промпт для Antigravity (Этап 34)
+
+```markdown
+Роль: Principal Rust Networking Engineer & Frontend Developer (Tauri v2 + Hyper + Rustls + React 19 + TypeScript).
+Проект: FluxProxy (Tauri v2 + Tokio + Hyper 1.5 + Rustls + React 19 + Zustand).
+
+Задача: Реализовать детальную статистику запроса и пофазные тайминги в стиле Fiddler Classic (`SessionTimers`, метрики байт/сжатия и соединения, реальный HAR/SAZ round-trip и вкладку `Statistics` в `SessionInspector`).
+
+1. Модели данных (`src-tauri/src/models.rs`, `src/types/proxy.ts`):
+   - Добавить структуры `SessionTimings` (RFC 3339 микросекундные метки `client_connected`, `client_begin_request`, `got_request_headers`, `client_done_request`, `proxy_begin_request`, `server_connected`, `server_got_request`, `server_begin_response`, `got_response_headers`, `server_done_response`, `client_begin_response`, `client_done_response` и фазы `Option<f64>` в мс: `client_read_ms`, `client_tls_handshake_ms`, `dns_ms`, `tcp_connect_ms`, `tls_handshake_ms`, `send_request_ms`, `server_wait_ms`, `content_download_ms`, `client_send_ms`, `breakpoint_pause_ms`, `script_hook_ms`, `autoresponder_delay_ms`, `proxy_overhead_ms`, `overall_elapsed_ms`, `net_elapsed_ms`) и `SessionTransferStats` (размеры заголовков/тела запроса и ответа, `request_wire_body_bytes`, `response_wire_body_bytes`, `response_content_encoding`, `client_conn_id`, `client_conn_reused`, `client_http_version`, `client_tls_version`, `client_tls_cipher`, `client_alpn`, `server_addr`, `server_ip`, `server_port`, `server_conn_id`, `server_conn_reused`, `server_http_version`, `server_tls_version`, `server_tls_cipher`, `server_tls_alpn`, `server_cert_subject`, `server_cert_issuer`, `server_mtls_cn`, `remapped_target`, `is_streaming`).
+   - Прикрепить `timings: Option<SessionTimings>` и `transfer_stats: Option<SessionTransferStats>` к `SessionDetail` с `#[serde(default, skip_serializing_if = "Option::is_none")]` (сохраняя 100% обратную совместимость `sessions.sqlite`).
+   - В `SessionSummary` добавить компактные опциональные поля `ttfb_ms`, `dns_ms`, `connect_ms`, `tls_ms`, `receive_ms`, `request_size`, `wire_body_size`, `server_ip`, `server_conn_reused` (`#[serde(default, skip_serializing_if = "Option::is_none")]`).
+
+2. Инструментированный upstream-транспорт и клиентские тайминги (`src-tauri/Cargo.toml`, `src-tauri/src/proxy/upstream_client.rs`, `src-tauri/src/proxy/client_certs.rs`, `src-tauri/src/proxy/server/{mod,http_handler,connect_tunnel,composer_exec,websocket_relay}.rs`):
+   - Включить фичу `client-legacy` у `hyper-util` (и при необходимости `rustls-native-certs` / `tower-service`) в `Cargo.toml`.
+   - Создать модуль `src-tauri/src/proxy/upstream_client.rs`: кастомный `InstrumentedConnector` для `hyper_util::client::legacy::Client` (HTTP/1.1 + HTTP/2 + `tokio-rustls`), замеряющий отдельно DNS (с поддержкой `HostRemapRegistry`), `TcpStream::connect` (`tcp_connect_ms`, `server_addr`), `TlsConnector::connect` (`tls_handshake_ms`, реальные `protocol_version`, `cipher_suite`, `alpn`, `peer_certificates` subject/issuer, опциональный mTLS из `ClientCertificateStore`) и переиспользование соединения из пула (`AtomicBool` в `Connected::extra` → первый запрос забирает DNS/TCP/TLS и `server_conn_reused = false`, последующие получают `server_conn_reused = true` и `0.0 ms`).
+   - Обернуть тело запроса и исходящего ответа лёгкими счётчиками для фиксации `server_got_request` (`send_request_ms`), `wire_response_body_bytes` (до `maybe_decompress_content_encodings`) и `client_done_response` (`client_send_ms`). Сохранить поддержку ретрая stale-соединения для идемпотентных запросов и redirect-цикл для `Composer`.
+   - В `server/mod.rs` (`spawn_accept_loop`) и `connect_tunnel.rs` ввести `ClientConnContext` (`conn_id`, `connected_at`, `request_seq`, `client_tls_handshake_ms`, реальный MITM TLS protocol/cipher/ALPN), заменив хардкод `"TLS 1.3 (MITM)"`.
+   - В `http_handler.rs`, `connect_tunnel.rs`, `websocket_relay.rs` и `composer_exec.rs` заполнить `SessionTimings` и `SessionTransferStats` для всех веток: обычные HTTP/HTTPS, SSE, zero-buffering streaming (`206`/`video/*`/`>2 MiB`), `CONNECT` Passthrough (`tx_bytes` / `rx_bytes`), WebSocket, Live Breakpoints (`breakpoint_pause_ms`), Python hooks (`script_hook_ms`), AutoResponder (`autoresponder_delay_ms` / Mock).
+
+3. HAR 1.2, Fiddler `.saz` и санитизация (`src-tauri/src/storage/export_import/{har,saz,sanitize}.rs`):
+   - В `har.rs` при экспорте записывать реальные `HarTimings` (помня правило HAR 1.2: `connect = tcp_connect_ms + tls_handshake_ms`, `ssl = tls_handshake_ms`, `-1.0` если неприменимо), `serverIPAddress`, `connection`, `headersSize`, `bodySize` (wire), `content.compression` и lossless-поля в `_fluxProxy`; при импорте восстанавливать `SessionTimings` и `SessionTransferStats`.
+   - В `saz.rs` при экспорте записывать реальные метки и длительности в `<SessionTimers ... />`, реальный `<PipeInfo CltReuse="..." Reused="..." />` и `SessionFlag` (`x-hostip`, `https-server-cipher`); при импорте парсить `<SessionTimers>` и `<PipeInfo>` из реальных `.saz` Fiddler Classic.
+   - В `sanitize.rs` при `anonymize_client_info: true` корректно маскировать клиентские адреса в `transfer_stats` / `SessionSummary`.
+
+4. Frontend: расчёт статистики, панель `Statistics` и колонки таблицы (`src/lib/requestStatistics.ts`, `src/components/SessionStatisticsPanel.tsx`, `src/components/SessionInspector.tsx`, `src/components/TrafficGrid.tsx`, `src/hooks/useUiPreferences.ts`, `src/types/settings.ts`, `src/lib/settingsManager.ts`, `src/lib/mockTraffic.ts`, `src/lib/tauriBridge.ts`, `src/App.tsx`):
+   - Вынести чистые вычисления и форматирование в `src/lib/requestStatistics.ts`: нормализация фаз тайминга, расчёт экономии сжатия и скорости передачи, оценка `Estimated Worldwide Performance` по профилям RTT/скорости, агрегация по массиву `SessionSummary[]` (Request Count, Bytes Sent/Received, Overall Elapsed, Avg/P50/P95/P99 Latency & TTFB, Status/MIME breakdown, Top Slowest/Largest), генерация отчётов `formatFiddlerStatisticsText` и `formatStatisticsMarkdown`.
+   - Создать `src/components/SessionStatisticsPanel.tsx` с двумя режимами:
+     - **Single Session:** визуальный горизонтальный Timing Breakdown Bar с тултипами, таблица `ACTUAL PERFORMANCE` (Fiddler timestamps + `+Δ ms`), карточка `Bytes & Compression` (Headers/Body, Wire vs Decoded, Savings %, Throughput), карточка `Connection & TLS` (Client ↔ Server, `Reused`, IP:port, шифр, ALPN, сертификат), сворачиваемый `Estimated Worldwide Performance`, кнопки копирования Text / Markdown.
+     - **Multi-Selection (2+ сессий):** сводные KPI, распределение статус-кодов и байт по MIME (лёгкий inline SVG без сторонних chart-библиотек), топ-5 медленных и крупных URL с кликом перехода к сессии.
+   - Интегрировать переключатель **`Inspectors` | `Statistics`** в шапку `SessionInspector.tsx` (клик по метрике `size • duration` также открывает `Statistics`; при выделении 2+ сессий передавать `selectedSessions` из `App.tsx` для мульти-статистики).
+   - В `TrafficGrid.tsx` добавить tooltip с разбивкой фаз на ячейке `Time` и опциональные сортируемые колонки `ttfb` (`TTFB`) и `serverIp` (`Server IP`) со скрытым дефолтом и обратной совместимостью в `settings.ts` / `settingsManager.ts`.
+   - Обновить `src/lib/mockTraffic.ts` и `src/lib/tauriBridge.ts` реалистичными таймингами (cold connect vs reused) и сетевыми метриками.
+
+5. Верификация и тесты:
+   - Добавить Rust-тесты в `upstream_client.rs` / `server/mod.rs` (холодное vs переиспользованное соединение, gzip/zstd wire vs decoded bytes, тайминги Breakpoint/Mock) и `export_import` (HAR 1.2 + Fiddler `.saz` timers round-trip).
+   - Добавить `src/lib/requestStatistics.test.ts` (Vitest) для расчёта фаз, сжатия, перцентилей, Worldwide Performance и Fiddler/Markdown-форматирования.
+   - Выполнить: `npm run typecheck`, `npm run test`, `npm run build`, `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings`, `cargo test --manifest-path src-tauri/Cargo.toml`.
+```
+
+---
+
 ## Этап 12: Аналитика и визуализация: Waterfall Timeline и статистика трафика
-**Приоритет: P2 (Feature) | Спринт 5 | Зависимости: нет**
+**Приоритет: P2 (Feature) | Спринт 5 | Зависимости: Этап 34**
 
 ### Цель и контекст
 Для поиска узких мест производительности (последовательные «лесенки» запросов, тяжелые эндпоинты, всплески 4xx/5xx и P95-латентность) нужна наглядная временная диаграмма и агрегированная статистика по выборке сессий.
 
 ### Критерии приемки (DoD)
-- Компонент `src/components/WaterfallTimeline.tsx` (вкладка/переключатель режима просмотра в `Traffic Viewer`) с виртуализацией строк (`@tanstack/react-virtual`), горизонтальной шкалой времени (Zoom + линейка мс) на базе `summary.timestamp` и `summary.durationMs` и цветовой кодировкой по статусу/MIME.
+- Компонент `src/components/WaterfallTimeline.tsx` (вкладка/переключатель режима просмотра в `Traffic Viewer`) с виртуализацией строк (`@tanstack/react-virtual`), горизонтальной шкалой времени (Zoom + линейка мс) на базе `summary.timestamp` и `summary.durationMs` и **многофазной разбивкой полос** (`DNS` / `TCP` / `TLS` / `Wait (TTFB)` / `Download`) по полям `summary.dnsMs`, `connectMs`, `tlsMs`, `ttfbMs`, `receiveMs` из Этапа 34 (с плавным fallback на сплошную полосу по статусу/MIME для старых или импортированных сессий без фаз).
 - Клик по полосе таймлайна синхронизирует выбор сессии с `TrafficGrid` и `SessionInspector`.
-- Модальное окно `src/components/TrafficStatisticsModal.tsx` (с расчетом метрик за один проход $O(N)$ в `useMemo`): количество запросов, распределение 2xx/3xx/4xx/5xx, суммарный объем, Average / Median / P95 Latency, распределение по MIME, топ-5 медленных и топ-5 крупных URL + кнопка «Copy Markdown Report».
+- Модальное окно `src/components/TrafficStatisticsModal.tsx` (с расчетом метрик за один проход $O(N)$ в `useMemo` на базе общих утилит `src/lib/requestStatistics.ts` из Этапа 34): количество запросов, распределение 2xx/3xx/4xx/5xx, суммарный объем (wire/decoded), Average / Median / P95 Latency и TTFB, распределение по MIME и хостам, топ-5 медленных и топ-5 крупных URL + кнопка «Copy Markdown Report».
 - Выдерживает 10 000+ сессий без блокировки UI.
 
 ### 📝 Промпт для Antigravity (Этап 12)
 
 ```markdown
-Роль: Senior Frontend & Data Visualization Engineer (React 18 + TypeScript + Tailwind CSS).
-Проект: FluxProxy (Tauri v2 + React 18).
+Роль: Senior Frontend & Data Visualization Engineer (React 19 + TypeScript + Tailwind CSS).
+Проект: FluxProxy (Tauri v2 + React 19).
 
-Задача: Реализовать виртуализированный Waterfall Timeline и панель сводной статистики трафика по текущей выборке или выделенным сессиям.
+Задача: Реализовать виртуализированный многофазный Waterfall Timeline и модальную панель сводной статистики трафика по всей отфильтрованной выборке (переиспользуя фазы таймингов и расчётные утилиты `src/lib/requestStatistics.ts` из Этапа 34).
 
 1. Waterfall Timeline (`src/components/WaterfallTimeline.tsx`, `src/App.tsx`):
    - Построение шкалы относительно минимального `timestamp` выборки (`offsetMs = startMs - minStartMs`, длина полосы = `durationMs`).
-   - Виртуализация списка через `@tanstack/react-virtual`, управление масштабом (Zoom In / Zoom Out / Fit All), тултип с точным началом/длительностью и синхронизация выбора `selectedId` с `SessionInspector`.
+   - Рендеринг многофазных цветных сегментов (`DNS` / `TCP` / `TLS` / `Wait (TTFB)` / `Download`) по компактным полям `SessionSummary` (`dnsMs`, `connectMs`, `tlsMs`, `ttfbMs`, `receiveMs`) с fallback на единую полосу `durationMs` (по статусу/MIME), если детализация фаз отсутствует.
+   - Виртуализация списка через `@tanstack/react-virtual`, управление масштабом (Zoom In / Zoom Out / Fit All), тултип с точным началом/длительностью и разбивкой фаз, синхронизация выбора `selectedId` с `SessionInspector`.
 
-2. Панель статистики (`src/components/TrafficStatisticsModal.tsx`, `src/lib/trafficStats.ts`, `src/components/MenuBar.tsx`, `src/components/CommandPalette.tsx`):
-   - Вынести чистые вычисления в `src/lib/trafficStats.ts` (удобно для тестирования): общее число сессий (выделенных или всех отфильтрованных), доли `2xx/3xx/4xx/5xx/Pending`, суммарный `bodySize`, `avg` / `median` / `p95` `durationMs`, сводка по `contentType`, топ-5 самых медленных и самых тяжелых URL.
+2. Модальная панель статистики выборки (`src/components/TrafficStatisticsModal.tsx`, `src/lib/requestStatistics.ts`, `src/components/MenuBar.tsx`, `src/components/CommandPalette.tsx`):
+   - Переиспользовать и при необходимости расширить чистые вычисления в `src/lib/requestStatistics.ts` (без дублирования расчётов из Этапа 34): общее число сессий (всей отфильтрованной выборки 10 000+ или выделенных), доли `2xx/3xx/4xx/5xx/Pending`, суммарный `bodySize` и `wireBodySize`, `avg` / `median` / `p95` `durationMs` и `ttfbMs`, сводка по `contentType` и хостам, топ-5 самых медленных и самых тяжелых URL.
    - Генерация аккуратного Markdown-отчета в буфер обмена («Copy Markdown Report»).
    - Добавить вызов из `MenuBar.tsx` (`View` / `Tools`), контекстного меню таблицы и `CommandPalette.tsx`.
 
-Проверка: `npm run typecheck`, `npm run test` (если Vitest уже настроен), `npm run build`.
+Проверка: `npm run typecheck`, `npm run test`, `npm run build`.
 ```
 
 ---
