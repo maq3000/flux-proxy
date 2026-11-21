@@ -292,17 +292,18 @@ fn record_completed_session(
     raw_req_body: Option<&[u8]>,
     raw_resp_body: Option<&[u8]>,
 ) -> bool {
-    if let Some(existing) = ctx.store.get(detail.summary.id) {
+    let existing = ctx.store.get_in_ram(detail.summary.id);
+    if let Some(ref existing_detail) = existing {
         if detail.summary.comment.is_none() {
-            detail.summary.comment = existing.summary.comment;
+            detail.summary.comment = existing_detail.summary.comment.clone();
         }
         if detail.summary.marked_color.is_none() {
-            detail.summary.marked_color = existing.summary.marked_color;
+            detail.summary.marked_color = existing_detail.summary.marked_color.clone();
         }
     }
 
     if !evaluate_should_store_session(ctx, &detail.summary) {
-        if ctx.store.get(detail.summary.id).is_some() {
+        if existing.is_some() {
             ctx.store.remove_many(&[detail.summary.id]);
             let _ = ctx.removed_tx.send(vec![detail.summary.id]);
         }
@@ -339,7 +340,7 @@ fn record_in_flight_session(
     request_headers: Vec<HeaderPair>,
     req_body_bytes: &[u8],
 ) -> bool {
-    let existing = ctx.store.get(session_id);
+    let existing = ctx.store.get_in_ram(session_id);
     let comment = existing.as_ref().and_then(|d| d.summary.comment.clone());
     let marked_color = existing
         .as_ref()

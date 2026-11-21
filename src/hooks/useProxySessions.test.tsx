@@ -630,4 +630,126 @@ describe("useProxySessions — Port lifecycle, StrictMode & Replay", () => {
     });
     expect(result.current.toastMessage).toContain("upstream refused");
   });
+
+  it("deduplicates duplicate session IDs even when flushed into an initially empty sessions list (BUG-02)", async () => {
+    const { result } = renderHook(() => useProxySessions());
+    await waitFor(() => expect(listeners.batches.size).toBe(1));
+    expect(result.current.sessions).toHaveLength(0);
+
+    const inFlight = makeSessionSummary(1, { status: 0 });
+    const completed = makeSessionSummary(1, { status: 200, durationMs: 45 });
+    const second = makeSessionSummary(2, { status: 201 });
+
+    await act(async () => {
+      for (const cb of listeners.batches) {
+        cb([inFlight, completed, second]);
+      }
+      await new Promise((r) => setTimeout(r, 40));
+    });
+
+    expect(result.current.sessions).toHaveLength(2);
+    expect(result.current.sessions[0].id).toBe(1);
+    expect(result.current.sessions[0].status).toBe(200);
+    expect(result.current.sessions[0].durationMs).toBe(45);
+    expect(result.current.sessions[1].id).toBe(2);
+    expect(result.current.sessions[1].status).toBe(201);
+  });
+
+  it("does not refetch selected SessionDetail when unrelated sessions are appended, but refetches when selected session updates (PERF-01)", async () => {
+    mockState.details.set(1, makeSessionDetail({ id: 1, status: 0 }));
+    mockState.sessions = [makeSessionSummary(1, { status: 0 })];
+
+    const { result } = renderHook(() => useProxySessions());
+    await waitFor(() => expect(listeners.batches.size).toBe(1));
+    await waitFor(() => expect(result.current.selectedId).toBe(1));
+    await waitFor(() =>
+      expect(mockProxyBridge.getSessionDetail).toHaveBeenCalledWith(1)
+    );
+    expect(mockProxyBridge.getSessionDetail).toHaveBeenCalledTimes(1);
+
+    // Appending unrelated sessions (#2, #3, #4) must not trigger getSessionDetail(1) again
+    await act(async () => {
+      for (const cb of listeners.batches) {
+        cb([
+          makeSessionSummary(2, { status: 200 }),
+          makeSessionSummary(3, { status: 200 }),
+          makeSessionSummary(4, { status: 200 }),
+        ]);
+      }
+      await new Promise((r) => setTimeout(r, 40));
+    });
+
+    expect(result.current.sessions).toHaveLength(4);
+    expect(mockProxyBridge.getSessionDetail).toHaveBeenCalledTimes(1);
+
+    // Updating the selected session (#1) in-place must refetch its detail
+    mockState.details.set(1, makeSessionDetail({ id: 1, status: 200 }));
+    await act(async () => {
+      for (const cb of listeners.batches) {
+        cb([makeSessionSummary(1, { status: 200 })]);
+      }
+      await new Promise((r) => setTimeout(r, 40));
+    });
+
+    await waitFor(() =>
+      expect(mockProxyBridge.getSessionDetail).toHaveBeenCalledTimes(2)
+    );
+    expect(result.current.selectedDetail?.summary.status).toBe(200);
+  });
+
+  it("falls back to 127.0.0.1 and still registers all IPC subscriptions when startup IPC calls fail (BUG-08)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    window.localStorage.setItem("fluxproxy.bindMode.v1", JSON.stringify("specific"));
+    window.localStorage.setItem(
+      "fluxproxy.specificBindIp.v1",
+      JSON.stringify("192.168.99.99")
+    );
+    window.localStorage.setItem("fluxproxy.alsoBindLoopback.v1", JSON.stringify(true));
+
+    mockProxyBridge.setSessionRetentionLimit.mockRejectedValueOnce(
+      new Error("retention IPC failed")
+    );
+    mockProxyBridge.updateFilterBackendConfig.mockRejectedValueOnce(
+      new Error("filter IPC failed")
+    );
+    mockProxyBridge.updateBreakpointConfig.mockRejectedValueOnce(
+      new Error("breakpoint IPC failed")
+    );
+    mockProxyBridge.setDropNonMatching.mockRejectedValueOnce(
+      new Error("dropNonMatching IPC failed")
+    );
+    mockProxyBridge.setBindConfiguration.mockRejectedValueOnce(
+      new Error("bind 192.168.99.99 unavailable")
+    );
+
+    const { result } = renderHook(() => useProxySessions());
+
+    await waitFor(() => {
+      expect(listeners.batches.size).toBe(1);
+      expect(listeners.removed.size).toBe(1);
+      expect(listeners.breakpoints.size).toBe(1);
+      expect(listeners.status.size).toBe(1);
+      expect(listeners.stats.size).toBe(1);
+    });
+
+    expect(mockProxyBridge.setBindConfiguration).toHaveBeenNthCalledWith(
+      1,
+      "specific",
+      "192.168.99.99",
+      true
+    );
+    expect(mockProxyBridge.setBindConfiguration).toHaveBeenNthCalledWith(
+      2,
+      "loopback",
+      null,
+      true
+    );
+    expect(result.current.status.bindMode).toBe("loopback");
+    expect(result.current.status.bindAddr).toBe("127.0.0.1");
+    expect(JSON.parse(window.localStorage.getItem("fluxproxy.bindMode.v1") ?? "null")).toBe(
+      "loopback"
+    );
+    expect(result.current.toastMessage).toContain("127.0.0.1");
+    warnSpy.mockRestore();
+  });
 });

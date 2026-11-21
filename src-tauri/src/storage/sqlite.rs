@@ -33,10 +33,18 @@ impl SqliteArchive {
             }
         }
         let conn = Connection::open(path)?;
+        Self::init_schema(&conn)?;
+
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    fn init_schema(conn: &Connection) -> Result<(), ProxyError> {
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
+            "PRAGMA busy_timeout = 5000;
+             PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA busy_timeout = 5000;
              CREATE TABLE IF NOT EXISTS captured_sessions (
                  id INTEGER PRIMARY KEY,
                  timestamp TEXT NOT NULL,
@@ -48,8 +56,8 @@ impl SqliteArchive {
                  marked_color TEXT,
                  payload_json TEXT NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS idx_sessions_url ON captured_sessions(url);
-             CREATE INDEX IF NOT EXISTS idx_sessions_status ON captured_sessions(status);
+             DROP INDEX IF EXISTS idx_sessions_url;
+             DROP INDEX IF EXISTS idx_sessions_status;
              CREATE TABLE IF NOT EXISTS offloaded_bodies (
                  session_id INTEGER NOT NULL,
                  is_response INTEGER NOT NULL,
@@ -58,11 +66,8 @@ impl SqliteArchive {
              );",
         )?;
 
-        Self::ensure_annotation_columns(&conn)?;
-
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        Self::ensure_annotation_columns(conn)?;
+        Ok(())
     }
 
     /// Idempotent migration for pre-existing `sessions.sqlite` archives created before
@@ -377,14 +382,72 @@ impl SqliteArchive {
         Ok(removed)
     }
 
+    pub fn max_persisted_session_id(&self) -> Result<u64, ProxyError> {
+        let guard = self
+            .conn
+            .lock()
+            .map_err(|_| ProxyError::Custom("SQLite mutex poisoned".into()))?;
+        let max_id: i64 = guard.query_row(
+            "SELECT COALESCE(MAX(m), 0)
+             FROM (
+                 SELECT MAX(id) AS m FROM captured_sessions
+                 UNION ALL
+                 SELECT MAX(session_id) AS m FROM offloaded_bodies
+             )",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(max_id.max(0) as u64)
+    }
+
     pub fn purge_and_vacuum(&self) -> Result<(), ProxyError> {
+        self.purge_and_vacuum_preserving(&[])
+    }
+
+    pub fn purge_and_vacuum_preserving(
+        &self,
+        preserved_offloaded_keys: &[(u64, bool)],
+    ) -> Result<(), ProxyError> {
         let mut guard = self
             .conn
             .lock()
             .map_err(|_| ProxyError::Custom("SQLite mutex poisoned".into()))?;
 
         let tx = guard.transaction()?;
-        tx.execute("DELETE FROM offloaded_bodies;", [])?;
+        if preserved_offloaded_keys.is_empty() {
+            tx.execute("DELETE FROM offloaded_bodies;", [])?;
+        } else {
+            tx.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS _preserve_offloaded (
+                    session_id INTEGER NOT NULL,
+                    is_response INTEGER NOT NULL,
+                    PRIMARY KEY (session_id, is_response)
+                );
+                DELETE FROM _preserve_offloaded;",
+            )?;
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT OR IGNORE INTO _preserve_offloaded (session_id, is_response)
+                     VALUES (?1, ?2)",
+                )?;
+                for &(session_id, is_response) in preserved_offloaded_keys {
+                    stmt.execute(params![
+                        session_id as i64,
+                        if is_response { 1i64 } else { 0i64 }
+                    ])?;
+                }
+            }
+            tx.execute(
+                "DELETE FROM offloaded_bodies
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM _preserve_offloaded p
+                     WHERE p.session_id = offloaded_bodies.session_id
+                       AND p.is_response = offloaded_bodies.is_response
+                 );",
+                [],
+            )?;
+            tx.execute("DROP TABLE _preserve_offloaded;", [])?;
+        }
         tx.execute("DELETE FROM captured_sessions;", [])?;
         tx.commit()?;
 
@@ -655,6 +718,145 @@ mod tests {
             size_after < size_before / 4 && size_after < 256 * 1024,
             "expected compacted DB < min({} / 4, 256 KiB), got size_after={size_after}, size_before={size_before}",
             size_before
+        );
+
+        drop(archive);
+        cleanup(&tmp_path);
+    }
+
+    #[test]
+    fn max_persisted_session_id_and_schema_index_cleanup() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_path = std::env::temp_dir().join(format!(
+            "fluxproxy_max_id_test_{}_{nanos}.sqlite",
+            std::process::id()
+        ));
+        let cleanup = |path: &std::path::Path| {
+            let _ = std::fs::remove_file(path);
+            let base = path.as_os_str();
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = base.to_os_string();
+                sidecar.push(suffix);
+                let _ = std::fs::remove_file(sidecar);
+            }
+        };
+        cleanup(&tmp_path);
+
+        // Pre-populate legacy unused indexes to verify `init_schema` drops them
+        {
+            let legacy = Connection::open(&tmp_path).unwrap();
+            legacy
+                .execute_batch(
+                    "CREATE TABLE captured_sessions (
+                        id INTEGER PRIMARY KEY,
+                        timestamp TEXT NOT NULL,
+                        method TEXT NOT NULL,
+                        url TEXT NOT NULL,
+                        status INTEGER NOT NULL,
+                        duration_ms INTEGER NOT NULL,
+                        payload_json TEXT NOT NULL
+                    );
+                    CREATE INDEX idx_sessions_url ON captured_sessions(url);
+                    CREATE INDEX idx_sessions_status ON captured_sessions(status);",
+                )
+                .unwrap();
+        }
+
+        let archive = SqliteArchive::open(&tmp_path).expect("open & migrate schema");
+        {
+            let guard = archive.conn.lock().unwrap();
+            let timeout: i64 = guard
+                .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(timeout, 5000);
+            let journal_mode: String = guard
+                .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+
+            let idx_count: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'index' AND name IN ('idx_sessions_url', 'idx_sessions_status')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(idx_count, 0, "unused legacy indexes must be dropped");
+        }
+
+        assert_eq!(archive.max_persisted_session_id().unwrap(), 0);
+
+        archive
+            .persist_batch(&[sample_detail(42, None, None)])
+            .unwrap();
+        assert_eq!(archive.max_persisted_session_id().unwrap(), 42);
+
+        archive
+            .save_offloaded_body(77, true, b"large-response")
+            .unwrap();
+        assert_eq!(archive.max_persisted_session_id().unwrap(), 77);
+
+        archive.purge_and_vacuum().unwrap();
+        assert_eq!(archive.max_persisted_session_id().unwrap(), 0);
+
+        drop(archive);
+        cleanup(&tmp_path);
+    }
+
+    #[test]
+    fn purge_and_vacuum_preserving_keeps_only_active_ram_offloaded_keys() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tmp_path = std::env::temp_dir().join(format!(
+            "fluxproxy_preserve_vacuum_{}_{nanos}.sqlite",
+            std::process::id()
+        ));
+        let cleanup = |path: &std::path::Path| {
+            let _ = std::fs::remove_file(path);
+            let base = path.as_os_str();
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = base.to_os_string();
+                sidecar.push(suffix);
+                let _ = std::fs::remove_file(sidecar);
+            }
+        };
+        cleanup(&tmp_path);
+
+        let archive = SqliteArchive::open(&tmp_path).expect("open sqlite archive");
+        archive
+            .persist_batch(&[
+                sample_detail(1, None, None),
+                sample_detail(2, None, None),
+            ])
+            .unwrap();
+        archive.save_offloaded_body(1, true, b"evicted-resp-1").unwrap();
+        archive.save_offloaded_body(2, false, b"evicted-req-2").unwrap();
+        archive.save_offloaded_body(10, true, b"ram-resp-10").unwrap();
+        archive.save_offloaded_body(10, false, b"ram-req-10").unwrap();
+        archive.save_offloaded_body(11, false, b"ram-req-11").unwrap();
+
+        archive
+            .purge_and_vacuum_preserving(&[(10, true), (11, false)])
+            .expect("purge preserving RAM offloaded keys");
+
+        assert_eq!(archive.count_sessions().unwrap(), 0);
+        assert_eq!(archive.count_offloaded_bodies().unwrap(), 2);
+        assert_eq!(archive.load_offloaded_body(1, true).unwrap(), None);
+        assert_eq!(archive.load_offloaded_body(2, false).unwrap(), None);
+        assert_eq!(archive.load_offloaded_body(10, false).unwrap(), None);
+        assert_eq!(
+            archive.load_offloaded_body(10, true).unwrap().as_deref(),
+            Some(b"ram-resp-10".as_slice())
+        );
+        assert_eq!(
+            archive.load_offloaded_body(11, false).unwrap().as_deref(),
+            Some(b"ram-req-11".as_slice())
         );
 
         drop(archive);

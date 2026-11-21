@@ -772,24 +772,20 @@ export function useProxySessions() {
     pendingQueueRef.current = [];
 
     setSessions((prev) => {
-      let next: SessionSummary[];
-      if (prev.length === 0) {
-        next = incoming.slice();
-      } else {
-        // Fast O(N) merge supporting both append of new sessions and in-place updates (e.g. WebSocket frames / TLS Bypass byte totals)
-        const indexById = new Map<number, number>();
-        next = prev.slice();
-        for (let i = 0; i < next.length; i++) {
-          indexById.set(next[i].id, i);
-        }
-        for (const item of incoming) {
-          const existingIdx = indexById.get(item.id);
-          if (existingIdx !== undefined) {
-            next[existingIdx] = item;
-          } else {
-            indexById.set(item.id, next.length);
-            next.push(item);
-          }
+      // Fast O(N) merge supporting both append of new sessions and in-place updates (e.g. WebSocket frames / TLS Bypass byte totals),
+      // including deduplication when multiple events for the same ID arrive in the very first batch.
+      const indexById = new Map<number, number>();
+      const next = prev.slice();
+      for (let i = 0; i < next.length; i++) {
+        indexById.set(next[i].id, i);
+      }
+      for (const item of incoming) {
+        const existingIdx = indexById.get(item.id);
+        if (existingIdx !== undefined) {
+          next[existingIdx] = item;
+        } else {
+          indexById.set(item.id, next.length);
+          next.push(item);
         }
       }
       const limit = sessionRetentionLimitRef.current;
@@ -816,53 +812,114 @@ export function useProxySessions() {
     let unlistenStatusFn: (() => void) | null = null;
     let unlistenStatsFn: (() => void) | null = null;
 
+    async function safeIpc<T>(
+      label: string,
+      fn: () => Promise<T>,
+      fallback: T
+    ): Promise<T> {
+      try {
+        return await fn();
+      } catch (err) {
+        console.warn(`bootstrap: ${label} failed`, err);
+        return fallback;
+      }
+    }
+
     async function bootstrap() {
       // Push persisted retention limit, dropNonMatching, TLS Bypass, Header Mutation & Breakpoint rules into Rust / Preview engine on boot
-      await proxyBridge.setSessionRetentionLimit(
-        sessionRetentionLimitRef.current
+      await safeIpc(
+        "setSessionRetentionLimit",
+        () =>
+          proxyBridge.setSessionRetentionLimit(
+            sessionRetentionLimitRef.current
+          ),
+        undefined
       );
       const [syncedCfg, syncedBpCfg, initialPaused] = await Promise.all([
-        proxyBridge.updateFilterBackendConfig({
-          ...backendFilterConfigRef.current,
-          dropNonMatchingOnCapture: dropNonMatchingRef.current,
-        }),
-        proxyBridge.updateBreakpointConfig(breakpointConfigRef.current),
-        proxyBridge.listPausedBreakpoints(),
+        safeIpc(
+          "updateFilterBackendConfig",
+          () =>
+            proxyBridge.updateFilterBackendConfig({
+              ...backendFilterConfigRef.current,
+              dropNonMatchingOnCapture: dropNonMatchingRef.current,
+            }),
+          backendFilterConfigRef.current
+        ),
+        safeIpc(
+          "updateBreakpointConfig",
+          () => proxyBridge.updateBreakpointConfig(breakpointConfigRef.current),
+          breakpointConfigRef.current
+        ),
+        safeIpc(
+          "listPausedBreakpoints",
+          () => proxyBridge.listPausedBreakpoints(),
+          [] as PausedBreakpointItem[]
+        ),
       ]);
-      await proxyBridge.setDropNonMatching(dropNonMatchingRef.current);
+      await safeIpc(
+        "setDropNonMatching",
+        () => proxyBridge.setDropNonMatching(dropNonMatchingRef.current),
+        undefined
+      );
       if (hasPersistedClearDbOnExitRef.current) {
-        await proxyBridge.setClearDbOnExit(clearDbOnExitRef.current);
-      } else {
-        const backendClearOnExit = await proxyBridge.getClearDbOnExit();
-        const resolvedClearOnExit = await proxyBridge.setClearDbOnExit(
-          backendClearOnExit
+        await safeIpc(
+          "setClearDbOnExit",
+          () => proxyBridge.setClearDbOnExit(clearDbOnExitRef.current),
+          clearDbOnExitRef.current
         );
-        clearDbOnExitRef.current = resolvedClearOnExit;
-        setClearDbOnExitState(resolvedClearOnExit);
+      } else {
         try {
-          window.localStorage.setItem(
-            LS_CLEAR_DB_ON_EXIT_KEY,
-            JSON.stringify(resolvedClearOnExit)
+          const backendClearOnExit = await proxyBridge.getClearDbOnExit();
+          const resolvedClearOnExit = await safeIpc(
+            "setClearDbOnExit",
+            () => proxyBridge.setClearDbOnExit(backendClearOnExit),
+            backendClearOnExit
           );
-        } catch {
-          // ignore storage quota errors
+          clearDbOnExitRef.current = resolvedClearOnExit;
+          setClearDbOnExitState(resolvedClearOnExit);
+          try {
+            window.localStorage.setItem(
+              LS_CLEAR_DB_ON_EXIT_KEY,
+              JSON.stringify(resolvedClearOnExit)
+            );
+          } catch {
+            // ignore storage quota errors
+          }
+        } catch (err) {
+          console.warn("bootstrap: getClearDbOnExit failed", err);
         }
       }
       const [initialStatus, initialSessions, initialStats] = await Promise.all([
-        proxyBridge.getStatus(),
-        proxyBridge.getSessions(),
-        proxyBridge.getMemoryStorageStats(),
+        safeIpc("getStatus", () => proxyBridge.getStatus(), statusRef.current),
+        safeIpc(
+          "getSessions",
+          () => proxyBridge.getSessions(),
+          [] as SessionSummary[]
+        ),
+        safeIpc(
+          "getMemoryStorageStats",
+          () => proxyBridge.getMemoryStorageStats(),
+          null as StorageStats | null
+        ),
       ]);
       let effectiveStatus = initialStatus;
       if (
         initialAutoSysProxy !== null &&
         initialStatus.autoSystemProxy !== initialAutoSysProxy
       ) {
-        effectiveStatus = await proxyBridge.setAutoSystemProxy(
-          initialAutoSysProxy
-        );
-        if (!initialAutoSysProxy && effectiveStatus.systemProxyEnabled) {
-          effectiveStatus = await proxyBridge.setSystemProxy(false);
+        try {
+          effectiveStatus = await proxyBridge.setAutoSystemProxy(
+            initialAutoSysProxy
+          );
+          if (!initialAutoSysProxy && effectiveStatus.systemProxyEnabled) {
+            try {
+              effectiveStatus = await proxyBridge.setSystemProxy(false);
+            } catch (err) {
+              console.warn("bootstrap: setSystemProxy(false) failed", err);
+            }
+          }
+        } catch (err) {
+          console.warn("bootstrap: setAutoSystemProxy failed", err);
         }
       }
       if (initialBindConfig !== null) {
@@ -880,11 +937,53 @@ export function useProxySessions() {
             effSpecificIp !== initialBindConfig.specificBindIp) ||
           effAlsoLoopback !== initialBindConfig.alsoBindLoopback
         ) {
-          effectiveStatus = await proxyBridge.setBindConfiguration(
-            initialBindConfig.bindMode,
-            initialBindConfig.specificBindIp,
-            initialBindConfig.alsoBindLoopback
-          );
+          try {
+            effectiveStatus = await proxyBridge.setBindConfiguration(
+              initialBindConfig.bindMode,
+              initialBindConfig.specificBindIp,
+              initialBindConfig.alsoBindLoopback
+            );
+          } catch (err) {
+            console.warn("bootstrap: setBindConfiguration failed", err);
+            if (initialBindConfig.bindMode === "specific") {
+              try {
+                effectiveStatus = await proxyBridge.setBindConfiguration(
+                  "loopback",
+                  null,
+                  true
+                );
+              } catch (fallbackErr) {
+                console.warn(
+                  "bootstrap: fallback setBindConfiguration(loopback) failed",
+                  fallbackErr
+                );
+                effectiveStatus = {
+                  ...effectiveStatus,
+                  bindAddr: "127.0.0.1",
+                  bindMode: "loopback",
+                  specificBindIp: null,
+                  alsoBindLoopback: true,
+                  allowRemote: false,
+                  boundIps: ["127.0.0.1"],
+                };
+              }
+              if (mounted) {
+                showToast(
+                  `⚠️ Не удалось привязать адрес ${
+                    initialBindConfig.specificBindIp ?? "specific"
+                  } — выполнен откат к 127.0.0.1: ${
+                    err instanceof Error ? err.message : String(err)
+                  }`
+                );
+              }
+            } else if (mounted) {
+              showToast(
+                `⚠️ Не удалось применить конфигурацию сети (${
+                  initialBindConfig.bindMode
+                }): ${err instanceof Error ? err.message : String(err)}`
+              );
+            }
+          }
         }
       }
       if (initialPort !== null && effectiveStatus.port !== initialPort) {
@@ -945,7 +1044,9 @@ export function useProxySessions() {
       setBackendFilterConfig(syncedCfg);
       setBreakpointConfig(syncedBpCfg);
       setPausedBreakpoints(initialPaused);
-      applyStorageStats(initialStats);
+      if (initialStats !== null) {
+        applyStorageStats(initialStats);
+      }
       statusRef.current = effectiveStatus;
       setStatus(effectiveStatus);
       if (effectiveStatus.systemProxyError) {
@@ -961,92 +1062,112 @@ export function useProxySessions() {
         setSelectedId(cappedInitial[0].id);
       }
 
-      const unlistenBatches = await proxyBridge.subscribeSessionBatches(
-        (batch) => {
-          if (!mounted) return;
-          pendingQueueRef.current.push(...batch);
-          if (rafHandleRef.current === null) {
-            rafHandleRef.current = window.requestAnimationFrame(
-              flushPendingSessions
+      try {
+        const unlistenBatches = await proxyBridge.subscribeSessionBatches(
+          (batch) => {
+            if (!mounted) return;
+            pendingQueueRef.current.push(...batch);
+            if (rafHandleRef.current === null) {
+              rafHandleRef.current = window.requestAnimationFrame(
+                flushPendingSessions
+              );
+            }
+          }
+        );
+        if (!mounted) {
+          unlistenBatches();
+          return;
+        }
+        unlistenFn = unlistenBatches;
+      } catch (err) {
+        console.warn("bootstrap: subscribeSessionBatches failed", err);
+      }
+
+      try {
+        const unlistenRemoved = await proxyBridge.subscribeSessionsRemoved(
+          (removedIds) => {
+            if (!mounted || removedIds.length === 0) return;
+            const removedSet = new Set(removedIds);
+            if (pendingQueueRef.current.length > 0) {
+              pendingQueueRef.current = pendingQueueRef.current.filter(
+                (item) => !removedSet.has(item.id)
+              );
+            }
+            setSessions((prev) => {
+              const next = prev.filter((item) => !removedSet.has(item.id));
+              return next.length === prev.length ? prev : next;
+            });
+            setSelectedIds((prev) => {
+              const next = prev.filter((id) => !removedSet.has(id));
+              return next.length === prev.length ? prev : next;
+            });
+            if (
+              selectionAnchorIdRef.current !== null &&
+              removedSet.has(selectionAnchorIdRef.current)
+            ) {
+              selectionAnchorIdRef.current = null;
+            }
+            setSelectedIdState((prev) =>
+              prev !== null && removedSet.has(prev) ? null : prev
             );
           }
+        );
+        if (!mounted) {
+          unlistenRemoved();
+          return;
         }
-      );
-      if (!mounted) {
-        unlistenBatches();
-        return;
+        unlistenRemovedFn = unlistenRemoved;
+      } catch (err) {
+        console.warn("bootstrap: subscribeSessionsRemoved failed", err);
       }
-      unlistenFn = unlistenBatches;
 
-      const unlistenRemoved = await proxyBridge.subscribeSessionsRemoved(
-        (removedIds) => {
-          if (!mounted || removedIds.length === 0) return;
-          const removedSet = new Set(removedIds);
-          if (pendingQueueRef.current.length > 0) {
-            pendingQueueRef.current = pendingQueueRef.current.filter(
-              (item) => !removedSet.has(item.id)
-            );
+      try {
+        const unlistenBp = await proxyBridge.subscribeBreakpointsChanged(
+          (items) => {
+            if (!mounted) return;
+            setPausedBreakpoints(items);
           }
-          setSessions((prev) => {
-            const next = prev.filter((item) => !removedSet.has(item.id));
-            return next.length === prev.length ? prev : next;
-          });
-          setSelectedIds((prev) => {
-            const next = prev.filter((id) => !removedSet.has(id));
-            return next.length === prev.length ? prev : next;
-          });
-          if (
-            selectionAnchorIdRef.current !== null &&
-            removedSet.has(selectionAnchorIdRef.current)
-          ) {
-            selectionAnchorIdRef.current = null;
+        );
+        if (!mounted) {
+          unlistenBp();
+          return;
+        }
+        unlistenBpFn = unlistenBp;
+      } catch (err) {
+        console.warn("bootstrap: subscribeBreakpointsChanged failed", err);
+      }
+
+      try {
+        const unlistenStatus = await proxyBridge.subscribeStatusChanged(
+          (nextStatus) => {
+            if (!mounted) return;
+            applyProxyStatusUpdate(nextStatus);
           }
-          setSelectedIdState((prev) =>
-            prev !== null && removedSet.has(prev) ? null : prev
-          );
+        );
+        if (!mounted) {
+          unlistenStatus();
+          return;
         }
-      );
-      if (!mounted) {
-        unlistenRemoved();
-        return;
+        unlistenStatusFn = unlistenStatus;
+      } catch (err) {
+        console.warn("bootstrap: subscribeStatusChanged failed", err);
       }
-      unlistenRemovedFn = unlistenRemoved;
 
-      const unlistenBp = await proxyBridge.subscribeBreakpointsChanged(
-        (items) => {
-          if (!mounted) return;
-          setPausedBreakpoints(items);
+      try {
+        const unlistenStats = await proxyBridge.subscribeStorageStatsChanged(
+          (nextStats) => {
+            if (!mounted) return;
+            applyStorageStats(nextStats);
+          }
+        );
+        if (!mounted) {
+          unlistenStats();
+          return;
         }
-      );
-      if (!mounted) {
-        unlistenBp();
-        return;
+        unlistenStatsFn = unlistenStats;
+      } catch (err) {
+        console.warn("bootstrap: subscribeStorageStatsChanged failed", err);
       }
-      unlistenBpFn = unlistenBp;
-
-      const unlistenStatus = await proxyBridge.subscribeStatusChanged(
-        (nextStatus) => {
-          if (!mounted) return;
-          applyProxyStatusUpdate(nextStatus);
-        }
-      );
-      if (!mounted) {
-        unlistenStatus();
-        return;
-      }
-      unlistenStatusFn = unlistenStatus;
-
-      const unlistenStats = await proxyBridge.subscribeStorageStatsChanged(
-        (nextStats) => {
-          if (!mounted) return;
-          applyStorageStats(nextStats);
-        }
-      );
-      if (!mounted) {
-        unlistenStats();
-        return;
-      }
-      unlistenStatsFn = unlistenStats;
     }
 
     void bootstrap();
@@ -1153,7 +1274,7 @@ export function useProxySessions() {
     return () => {
       active = false;
     };
-  }, [selectedId, sessions.length, selectedSummarySignature, showToast]);
+  }, [selectedId, selectedSummarySignature, showToast]);
 
   const diffLeftId = selectedIds.length >= 2 ? selectedIds[0] : null;
   const diffRightId = selectedIds.length >= 2 ? selectedIds[1] : null;
