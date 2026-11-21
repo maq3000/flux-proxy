@@ -75,46 +75,50 @@
     - Чистый генератор `src/lib/openApiGenerator.ts` (параметризация числовых ID и UUID в `{id}` / `{uuid}`, объединение статус-кодов и рекурсивное слияние JSON Schema, безопасный вынос `Authorization` / `Cookie` / `X-Api-Key` в `components.securitySchemes` без раскрытия боевых секретов, сериализатор YAML/JSON) и модальное окно `src/components/OpenApiExportModal.tsx` (Monaco Editor, настройка title/version/`Include Examples`, сохранение файла) с вызовом из `MenuBar.tsx` (`File → Export as OpenAPI 3.0 Spec…`), контекстного меню `TrafficGrid.tsx` и `CommandPalette`, плюс unit-тесты `openApiGenerator.test.ts`.
 30. **[Этап 9 — Выполнено] Тестирование фронтенда (Vitest) и кроссплатформенный CI/CD (GitHub Actions):**
     - Настройка `Vitest 3` (`jsdom`) и `@testing-library/react` в `package.json` и `vite.config.ts`, 11 тестовых файлов (80 unit/integration-тестов для `src/lib/*.ts` и `src/hooks/useProxySessions.test.tsx`), а также `.github/workflows/ci.yml` для матрицы `ubuntu-latest`, `windows-latest`, `macos-latest` (`npm ci`, `typecheck`, `test`, `build`, `cargo clippy -- -D warnings`, `cargo test`).
+31. **[Этап 31 — Выполнено] Критическая безопасность: защита импорта профилей (RCE), изоляция файлового IPC, санитизация PII/SSE/WS и защита от OOM-бомб (`SEC-01`..`SEC-06`, `BUG-12`):**
+    - Превью и принудительное отключение импортируемых Python-скриптов по умолчанию (до явного подтверждения доверия пользователем) в `src/types/settings.ts`, `src/lib/settingsManager.ts`, `src/components/SettingsModal.tsx` и `src/App.tsx`.
+    - Жёсткая валидация пользовательских путей `validate_user_file_path` (запрет `..`, UNC, NTFS ADS и DOS-устройств) и лимит `16 MiB` для `import_settings_file` в `src-tauri/src/commands.rs`, изоляция `stored_cert_path` внутри `storage_dir` в `src-tauri/src/proxy/client_certs.rs`.
+    - Блокировка LAN SSRF к loopback/unspecified (включая `::ffff:127.0.0.1`), проверка `is_builtin_portal_target` до `CONNECT`, запрет перенаправления через внутренний заголовок `Host` в `TargetedOnly` и изоляция хозяйских mTLS-сертификатов от внешних LAN-клиентов в `src-tauri/src/proxy/server.rs`.
+    - Нормализация ключей в `mask_sensitive_json_value` (`camelCase`), пересборка санитизированных тел SSE/WebSocket (включая SignalR, Socket.IO, Bearer и JWT), санитизация `userinfo`/`#fragment` и заголовков `Location`/`Referer` в `src-tauri/src/storage/export_import.rs`, `src-tauri/src/models.rs` и `src/components/SanitizedExportModal.tsx`.
+    - Ограниченная потоковая декомпрессия `zstd` (`decode_zstd_bounded`) и кодеков (`src-tauri/src/proxy/codec.rs`), кумулятивный лимит `512 MiB` / `2` слоя `Content-Encoding` и поддержка `zstd` в `.saz`, а также безопасный `chrono::TimeDelta::try_milliseconds` при экспорте `.saz`; покрыто тестами в Rust и `src/lib/settingsManager.test.ts`.
+32. **[Этап 32 — Выполнено] Целостность хранилища `TrafficStore` + SQLite и реактивного состояния UI (`BUG-01`, `BUG-02`, `BUG-03`, `BUG-08`, `BUG-11`, `PERF-01`, `PERF-02`, `PERF-06`):**
+    - Инициализация `next_id` из `SqliteStore::max_persisted_session_id`, добавление `TrafficStore::get_in_ram` (без синхронных обращений к SQLite на `record_in_flight_session`), приоритизация RAM перед `offloaded_bodies` и сохранение выгруженных тел (`> 2 MiB`) активных RAM-сессий при `clear_sqlite_archive` (`purge_and_vacuum_preserving`) в `src-tauri/src/storage/mod.rs`, `sqlite.rs` и `proxy/server.rs`.
+    - Перенос `PRAGMA busy_timeout = 5000` перед `WAL`, удаление неиспользуемых индексов `idx_sessions_url`/`idx_sessions_status`, защита `clear()` и `remove_many()` через `eviction_lock`, а также пакетное вытеснение с гистерезисом (`EVICTION_HYSTERESIS_BATCH = 64`) после успешного `persist_batch`.
+    - Устойчивая регистрация IPC-подписок в `bootstrap()` с откатом к `127.0.0.1` при ошибке бинда, дедупликация батчей в `flushPendingSessions` на пустой таблице и удаление `sessions.length` из зависимостей `getSessionDetail` в `src/hooks/useProxySessions.ts`; покрыто Rust-тестами и `src/hooks/useProxySessions.test.tsx`.
+33. **[Этап 33 — Выполнено] Надежность сетевого ядра, протоколов HTTP/WS/TLS, фильтров и диагностики (`BUG-04`..`BUG-07`, `BUG-09`, `BUG-10`, `BUG-13`, `PERF-03`, `PERF-04`):**
+    - RAII-гард `PendingBreakpointGuard` в `src-tauri/src/proxy/breakpoints.rs` и `server.rs` (статус `499` и `proxy://breakpoints-changed` при разрыве соединения) + запись статуса `502` при `Abort` в Composer; таймаут `connect_async` и неблокирующий двунаправленный релей WebSocket без взаимной блокировки.
+    - Проверка отпечатка SHA-256 активного Root CA в Windows (`certutil`) и macOS (`security`) в `src-tauri/src/proxy/ca.rs`; сохранение `Content-Length` для `HEAD` и точное снятие `Content-Encoding` только для распакованных слоёв в `server.rs`.
+    - Поддержка суффиксных масок `.domain.com`, единый разбор IPv6 `[::1]:port` и полная предкомпиляция Regex в `ProxyFilterEngine` (`src-tauri/src/proxy/filters.rs`) при обновлении конфига; откат `sysproxy` и `proxy://status-changed` в `set_bind_configuration`, стабилизация `ProxyDoctor` (`retry_attempts = 6/3` и отмена timed-out листенеров при shutdown в `doctor.rs`/`server.rs`).
+    - Разделение ожидания очереди мьютекса и таймаута пайпа в `src-tauri/src/scripting/python_runner.rs` (очередь пропускается fail-open без перезапуска живого воркера), лимит кэша `pid_name_cache` (4096 записей) в `process.rs` и стабилизация CI (`.github/workflows/ci.yml`: `NODE_OPTIONS=--max-old-space-size=4096` и фиксы `clippy`).
 
 ---
 
 ## 📋 Матрица приоритетов и порядок выполнения
 
-> *Номера этапов (`31–33`, `10–13`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз. Завершенные этапы Спринта 1 (Этапы 14, 15, 20, 21, 25–28) выполнены в релизе `v0.2.0`, этапы Спринта 2 (Этапы 5, 16, 17, 23, 24, 29, 30) выполнены в релизе `v0.3.0`, а этапы Спринта 3 (Этапы 6, 7, 8, 9, 18, 19, 22) выполнены в релизе `v0.4.0` и перенесены в раздел реализованных этапов выше. По результатам глубокого аудита `v0.4.0` ([PROJECT_CONTEXT_AND_AUDIT.md](PROJECT_CONTEXT_AND_AUDIT.md)) перед разработкой новых фич сформирован стабилизационный **Спринт 4 (Этапы 31–33)**.*
+> *Номера этапов (`10–13`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз. Завершенные этапы Спринта 1 (Этапы 14, 15, 20, 21, 25–28) выполнены в релизе `v0.2.0`, этапы Спринта 2 (Этапы 5, 16, 17, 23, 24, 29, 30) выполнены в релизе `v0.3.0`, этапы Спринта 3 (Этапы 6, 7, 8, 9, 18, 19, 22) выполнены в релизе `v0.4.0`, а стабилизационный Спринт 4 (Этапы 31–33) выполнен в релизе `v0.4.1` и перенесен в раздел реализованных этапов выше.*
 
 | # | Этап | Приоритет | Спринт | Зависимости | Ключевая ценность |
 | :-: | :--- | :--- | :--- | :--- | :--- |
-| 1 | **[Этап 31](#этап-31-критическая-безопасность-защита-импорта-профилей-rce-изоляция-файлового-ipc-санитизация-piissews-и-защита-от-oom-бомб)** | **P0 (Security / Blocker)** | Спринт 4 | Этапы 4 ✅, 7 ✅, 16 ✅, 18 ✅ | Устранение скрытого RCE при импорте настроек (`SEC-01`), Path Traversal в IPC (`SEC-02`), LAN SSRF/mTLS (`SEC-03`), утечек в санитизаторе (`SEC-04`), OOM-бомб (`SEC-05`, `BUG-12`) и защиты ключей (`SEC-06`) |
-| 2 | **[Этап 32](#этап-32-целостность-хранилища-trafficstore--sqlite-и-реактивного-состояния-ui)** | **P0 (Data Integrity / Perf)** | Спринт 4 | Этапы 2 ✅, 20 ✅, 28 ✅, 29 ✅ | Устранение коллизии `next_id = 1` после рестарта (`BUG-01`), потери тел `> 2 MiB` при `VACUUM` (`BUG-03`), срыва IPC-подписок в `bootstrap()` (`BUG-02`), дублей в гриде (`BUG-08`), спама `getSessionDetail` (`PERF-01`) и блокировок SQLite (`BUG-11`, `PERF-02`, `PERF-06`) |
-| 3 | **[Этап 33](#этап-33-надежность-сетевого-ядра-протоколов-httpwstls-фильтров-и-диагностики)** | **P1 (Core Reliability)** | Спринт 4 | Этапы 1 ✅, 6 ✅, 7 ✅, 15 ✅, 17 ✅ | Очистка зависших Breakpoints при дисконнекте (`BUG-04`), устранение deadlock в WebSocket (`BUG-05`), сверка SHA-256 Root CA (`BUG-06`), фикс `HEAD` и `Content-Encoding` (`BUG-07`), `.domain.com`/IPv6 и предкомпиляция Regex в `filters.rs` (`BUG-09`, `PERF-03`), откат `sysproxy` (`BUG-10`), стабилизация `ProxyDoctor` (`BUG-13`) и очереди Python (`PERF-04`) |
-| 4 | **[Этап 10](#этап-10-сетевая-инфраструктура-hosts-remapping-и-bandwidth-throttling)** | **P2 (Feature)** | Спринт 5 | Этапы 15 ✅, 25 ✅, 33 | Виртуальный DNS (`resolve` / `CONNECT`) без правки системного `hosts` и эмуляция медленных сетей |
-| 5 | **[Этап 11](#этап-11-архитектурная-декомпозиция-монолитов-внедрение-zustand-и-оптимизация-бандла)** | **P2 (Architecture / Perf)** | Спринт 5 | Этапы 31–33 | Разделение крупных Rust/React-модулей (`ARCH-01`), ленивый `BrowserPreviewEngine` и удаление `ts.worker` 7 МБ (`PERF-05`), внедрение `zustand` и `React.lazy()` |
-| 6 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 5 | — | Виртуализированная каскадная диаграмма таймингов и сводный Markdown-отчет (P95, статусы, MIME) |
-| 7 | **[Этап 13](#этап-13-расширенные-протоколы-upstream-proxy-chaining-и-ws-инъекция)** | **P2 (Feature)** | Спринт 5 | Этапы 18 ✅, 25 ✅, 33 | Каскадирование трафика через внешний HTTP/HTTPS/SOCKS5-прокси и отправка фреймов в открытые WS |
+| 1 | **[Этап 10](#этап-10-сетевая-инфраструктура-hosts-remapping-и-bandwidth-throttling)** | **P2 (Feature)** | Спринт 5 | Этапы 15 ✅, 25 ✅, 33 ✅ | Виртуальный DNS (`resolve` / `CONNECT`) без правки системного `hosts` и эмуляция медленных сетей |
+| 2 | **[Этап 11](#этап-11-архитектурная-декомпозиция-монолитов-внедрение-zustand-и-оптимизация-бандла)** | **P2 (Architecture / Perf)** | Спринт 5 | Этапы 31–33 ✅ | Разделение крупных Rust/React-модулей (`ARCH-01`), ленивый `BrowserPreviewEngine` и удаление `ts.worker` 7 МБ (`PERF-05`), внедрение `zustand` и `React.lazy()` |
+| 3 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 5 | — | Виртуализированная каскадная диаграмма таймингов и сводный Markdown-отчет (P95, статусы, MIME) |
+| 4 | **[Этап 13](#этап-13-расширенные-протоколы-upstream-proxy-chaining-и-ws-инъекция)** | **P2 (Feature)** | Спринт 5 | Этапы 18 ✅, 25 ✅, 33 ✅ | Каскадирование трафика через внешний HTTP/HTTPS/SOCKS5-прокси и отправка фреймов в открытые WS |
 
 ---
 
 ## ❓ Открытые вопросы и продуктовые неоднозначности (По итогам аудита `v0.4.0`)
 
-> Полный доказательный разбор каждой находки с трассировкой строк кода см. в [PROJECT_CONTEXT_AND_AUDIT.md](PROJECT_CONTEXT_AND_AUDIT.md). Ниже зафиксированы архитектурные и продуктовые развилки (`[Требует проверки]`), требующие принятия решения при реализации Спринта 4:
+> Полный доказательный разбор исходных находок см. в [PROJECT_CONTEXT_AND_AUDIT.md](PROJECT_CONTEXT_AND_AUDIT.md). Вопросы по `VACUUM` (`BUG-03`), SQLite-индексам (`PERF-06`) и macOS Keychain закрыты в `v0.4.1`; ниже сохранены оставшиеся архитектурные и продуктовые развилки (`[Требует проверки]`):
 
-1. **Вызов Python-хуков (`on_request` / `on_response`) для запросов из Request Composer (`src-tauri/src/proxy/server.rs:1544-2122`):**
-   - *Фактическое поведение:* `execute_composed` пропускает запросы через Header Mutations, Live Breakpoints (`Before Request` / `After Response`) и AutoResponder, но полностью обходит `PythonScriptRunner`.Кроме того, в `_normalize_headers_in` (`src-tauri/src/scripting/python_runner.rs:56-65`) дублирующиеся одноимённые заголовки (например, несколько `Set-Cookie`) схлопываются до последнего значения при чтении словаря `headers` в Python.
+1. **Вызов Python-хуков (`on_request` / `on_response`) для запросов из Request Composer (`src-tauri/src/proxy/server.rs`):**
+   - *Фактическое поведение:* `execute_composed` пропускает запросы через Header Mutations, Live Breakpoints (`Before Request` / `After Response`) и AutoResponder, но полностью обходит `PythonScriptRunner`. Кроме того, в `_normalize_headers_in` (`src-tauri/src/scripting/python_runner.rs`) дублирующиеся одноимённые заголовки (например, несколько `Set-Cookie`) схлопываются до последнего значения при чтении словаря `headers` в Python.
    - *Неоднозначность:* Должны ли запросы из Composer проходить через активный Python-скрипт (например, для автоматического расчёта `X-Signature` / HMAC), или необходим отдельный чекбокс в UI Composer *«Run Python script hooks on composed requests»*?
-2. **Политика очистки `Purge SQLite Archive (VACUUM)` для выгруженных тел (`> 2 MiB`) активных RAM-сессий (`[BUG-03]`, `src-tauri/src/storage/mod.rs:162-169`, `src-tauri/src/storage/sqlite.rs:380-397`):**
-   - *Фактическое поведение:* В `USER_GUIDE.md:186` заявлено, что очистка архива SQLite не затрагивает текущие сессии в RAM. Однако `purge_and_vacuum` выполняет `DELETE FROM offloaded_bodies;`, безвозвратно удаляя тела (`> 2 MiB`) всех живых сессий в RAM (`body_offloaded: true`).
-   - *Рекомендуемое решение в Этапе 32:* Удалять из `offloaded_bodies` только записи, чьи `session_id` отсутствуют в `self.sessions` в RAM (`WHERE session_id NOT IN (...)`).
-3. **Хранение приватных ключей mTLS из защищённых паролем `.p12`/`.pfx` (`[SEC-06]`, `src-tauri/src/proxy/client_certs.rs:640-652`):**
-   - *Фактическое поведение:* При импорте `.p12`/`.pfx` архив расшифровывается в памяти, после чего приватный ключ сохраняется на диск **в открытом текстовом виде (unencrypted PEM)** в `app_data_dir/client_certs/{id}.identity.pem`, а на Windows функция `write_bytes_securely` (`client_certs.rs:89-92`) не применяет ни DPAPI, ни ограничивающий NTFS DACL.
+2. **Хранение приватных ключей mTLS из защищённых паролем `.p12`/`.pfx` (`[SEC-06]`, `src-tauri/src/proxy/client_certs.rs`):**
+   - *Фактическое поведение:* При импорте `.p12`/`.pfx` архив расшифровывается в памяти, после чего приватный ключ сохраняется на диск **в открытом текстовом виде (unencrypted PEM)** в `app_data_dir/client_certs/{id}.identity.pem`, а на Windows функция `write_bytes_securely` не применяет ни DPAPI, ни ограничивающий NTFS DACL (в `v0.4.1` пути строго изолированы внутри `storage_dir`).
    - *Неоднозначность:* Должен ли FluxProxy шифровать `{id}.identity.pem` и `fluxproxy-root-ca.key` на диске средствами ОС (Windows DPAPI `CryptProtectData` / OS Keychain), или для парольных корпоративных сертификатов дополнительно нужен режим *«Session-only (In-Memory)»* без записи ключа на диск?
-4. **Контроль доступа для LAN-клиентов в режимах `AllInterfaces` (`0.0.0.0`) и `Specific` (`[SEC-03]`, `src-tauri/src/proxy/server.rs:517-585, 2152-2162, 3000`):**
-   - *Фактическое поведение:* Любое устройство в той же Wi-Fi сети может подключиться к открытому порту прокси без аутентификации, открыть `CONNECT`-туннель к локальным сервисам `127.0.0.1` хост-машины и отправлять запросы во внешние сети с автоматическим прикреплением хозяйских mTLS-сертификатов разработчика.
-   - *Неоднозначность:* Помимо обязательного запрета проксирования на loopback и отключения хозяйских mTLS для внешних IP (включено в Этап 31), какой UX контроля доступа предпочтителен для мобильной отладки: ручной список разрешённых IP (`Client IP Allowlist`), интерактивное подтверждение нового устройства в тосте UI или опциональная `Proxy-Authorization`?
-5. **Судьба неиспользуемых SQLite-индексов `idx_sessions_url` и `idx_sessions_status` (`[PERF-06]`, `src-tauri/src/storage/sqlite.rs:51-52`):**
-   - *Фактическое поведение:* Оба индекса создаются при инициализации БД и обновляются на каждый `INSERT OR REPLACE`, но ни один SQL-запрос в `sqlite.rs` не фильтрует по колонкам `url` или `status`.
-   - *Неоднозначность:* Удалить эти индексы в Этапе 32 (`DROP INDEX IF EXISTS`) для ускорения батч-вытеснения или оставить под будущий полнотекстовый/SQL-поиск по дисковому архиву?
-6. **Актуализация документации (`README.md`, `USER_GUIDE.md`, `PYTHON_SCRIPTING_GUIDE.md`):**
-   - В `README.md:299` указано, что на macOS Root CA устанавливается в *System Keychain*, хотя фактически `src-tauri/src/proxy/ca.rs:522-537` устанавливает его в пользовательский `~/Library/Keychains/login.keychain-db`.
+3. **Расширенный контроль доступа для LAN-клиентов в режимах `AllInterfaces` (`0.0.0.0`) и `Specific` (`[SEC-03]`, `src-tauri/src/proxy/server.rs`):**
+   - *Фактическое поведение:* В `v0.4.1` внешним LAN-клиентам запрещены `CONNECT`/HTTP-запросы на loopback/unspecified хосты (`127.0.0.1`, `localhost`, `::1`, `::ffff:127.0.0.1`) и отключено автоматическое прикрепление хозяйских mTLS-сертификатов. При этом само подключение к открытому порту в доверенной Wi-Fi сети не требует аутентификации.
+   - *Неоднозначность:* Какой дополнительный UX контроля доступа предпочтителен для мобильной отладки: ручной список разрешённых IP (`Client IP Allowlist`), интерактивное подтверждение нового устройства в тосте UI или опциональная `Proxy-Authorization`?
 
 ---
 
@@ -142,197 +146,12 @@
 
 ---
 
-## 🔴 Спринт 4 — P0 / P1 (Audit Remediation): Безопасность, целостность хранилища и стабилизация ядра
-
----
-
-## Этап 31: Критическая безопасность: защита импорта профилей (RCE), изоляция файлового IPC, санитизация PII/SSE/WS и защита от OOM-бомб
-**Приоритет: P0 (Security / Blocker) | Спринт 4 | Зависимости: Этапы 4 ✅, 7 ✅, 16 ✅, 18 ✅ | Находки аудита: `SEC-01`, `SEC-02`, `SEC-03`, `SEC-04`, `SEC-05`, `SEC-06`, `BUG-12`**
-
-### Цель и контекст
-В ходе всестороннего аудита `v0.4.0` ([PROJECT_CONTEXT_AND_AUDIT.md](PROJECT_CONTEXT_AND_AUDIT.md)) выявлены векторы атак и утечек данных:
-1. **`[SEC-01]` Скрытый RCE через Python Scripting при импорте настроек:** `applySettingsProfile` (`src/lib/settingsManager.ts:2538-2545, 2602`) автоматически вызывает `proxyBridge.setPythonScript(nextScripting.code, nextScripting.enabled)` (запуская `exec(compiled, new_ns)` в `src-tauri/src/scripting/python_runner.rs:209`), при этом `buildSettingsImportPreview` (`settingsManager.ts:2237-2317`) и `SettingsImportPreviewSummary` (`src/types/settings.ts:122-153`) вообще не показывают наличие или статус Python-скрипта.
-2. **`[SEC-02]` Path Traversal и перезапись произвольных файлов через IPC:** `validate_user_file_path` (`src-tauri/src/commands.rs:573-638`) проверяет только конечный `path.file_name()` на `.` и `..`, пропуская промежуточные `Component::ParentDir` (`a/../../b`), UNC-пути (`\\server\share\...` с утечкой NTLMv2 при `path.is_dir()`), NTFS ADS и зарезервированные имена DOS-устройств. Кроме того, `save_session_body_file` (`commands.rs:736-750`) передаёт `allowed_extensions: None` и создаёт директории (`export_import.rs:2918-2925`), а `import_settings_file` (`commands.rs:767-776`) читает любой `.json` без лимита размера.
-3. **`[SEC-03]` Открытый прокси, SSRF к `127.0.0.1` и утечка хозяйских mTLS в LAN-режимах:** в `AllInterfaces` (`0.0.0.0`) / `Specific` внешние LAN-клиенты могут открывать `CONNECT`-туннели к `127.0.0.1` хоста (`server.rs:2162`), автоматически используют хозяйские mTLS-сертификаты (`server.rs:3000`), обходят `is_builtin_portal_target` через `CONNECT` Passthrough или `[::ffff:127.0.0.1]`, а внутри `CONNECT allowed.com:443` переопределяют целевой хост заголовком `Host` (`server.rs:2447-2453`), обходя `TargetedOnly`.
-4. **`[SEC-04]` Утечка секретов в санитизированном экспорте (`sanitize: true`):** в `sanitize_sessions` (`src-tauri/src/storage/export_import.rs:1014-1329`) сырые тела SSE (`detail.response_body_text` / `response_body_base64`) остаются полностью нередактированными; после санитизации `websocket_frames` поле `detail.response_body_text` (сформированное в `apply_ws_to_detail`, `storage/mod.rs:1010`) не пересобирается, а не-JSON фреймы SignalR (`\x1e`) / Socket.IO (`42[...]`) не маскируются; в JSON-телах проверка `SENSITIVE_BODY_KEYS` (`models.rs:468-485`, `export_import.rs:1024`) пропускает все `camelCase`-ключи (`accessToken`, `refreshToken`, `apiKey`, `clientSecret`, `idToken`, `privateKey`, `cardNumber`, `sessionId`); не очищаются URL `userinfo`, `#fragment` и query-параметры в заголовках `Location` / `Referer`.
-5. **`[SEC-05]` & `[BUG-12]` Бомбы декомпрессии (OOM) и паника в `.saz`:** `decode_http_body` (`export_import.rs:2434-2504`) допускает до 64 МиБ декомпрессии на каждый файл внутри `.saz` без общего кумулятивного лимита и без поддержки `zstd`; `zstd::decode_all` в `server.rs:213-247, 3223-3273` и `codec.rs:78` не ограничен по выходу; в `export_saz` (`export_import.rs:1999`) `chrono::Duration::milliseconds(s.duration_ms as i64)` паникует при больших `duration_ms`.
-6. **`[SEC-06]` Открытое хранение приватных ключей из парольных `.p12`/`.pfx`:** `ClientCertificateStore::add_certificate` (`src-tauri/src/proxy/client_certs.rs:643-644`) сохраняет расшифрованный приватный ключ в открытый `{id}.identity.pem`, а `stored_cert_path` из `registry.json` (`client_certs.rs:519-526, 735-750`) не проверяется на принадлежность `storage_dir`.
-
-### Критерии приемки (DoD)
-- **`[SEC-01]`:** В `SettingsImportPreviewSummary` (`src/types/settings.ts`) и `buildSettingsImportPreview` (`src/lib/settingsManager.ts`) добавлены поля `hasPythonScript`, `pythonScriptEnabledInFile`, `pythonScriptLines`; при импорте внешнего профиля `scripting.enabled` по умолчанию принудительно сбрасывается в `false` (или требует явного подтверждения в `SettingsModal.tsx` с показом предупреждения безопасности).
-- **`[SEC-02]`:** В `validate_user_file_path` (`src-tauri/src/commands.rs`) запрещены любые `Component::ParentDir` (`..`), UNC-пути (`Prefix::UNC` / `Prefix::VerbatimUNC`), NTFS ADS (`:` в имени файла) и зарезервированные имена DOS-устройств (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`). В `import_settings_file` добавлен лимит размера файла `16 MiB`, а `save_session_body_file` не создаёт произвольные вложенные директории вне родительской папки, одобренной нативным диалогом.
-- **`[SEC-03]`:** В `src-tauri/src/proxy/server.rs` для не-loopback клиентов (`!peer_addr.ip().is_loopback()`) заблокированы `CONNECT` и HTTP-запросы к loopback/unspecified адресам хоста (включая `::1`, `127.0.0.0/8`, `::ffff:127.0.0.0/104` и `localhost`), `is_builtin_portal_target` проверяется до `CONNECT` Passthrough, хозяйские mTLS-сертификаты из `ClientCertificateStore` не прикрепляются к запросам от внешних LAN-клиентов, а в режиме `TargetedOnly` внутренний заголовок `Host` не может перенаправить туннель на неразрешённый домен.
-- **`[SEC-04]`:** В `src-tauri/src/storage/export_import.rs` и `src-tauri/src/models.rs`:
-  - ключи JSON нормализуются (удаляются `_` и `-` перед сверкой с `SENSITIVE_BODY_KEYS`), маскируя `accessToken`, `refreshToken`, `apiKey`, `clientSecret`, `idToken`, `privateKey`, `cardNumber`, `sessionId`;
-  - для SSE-сессий и WebSocket-сессий после санитизации `sse_events` и `websocket_frames` пересобираются `detail.response_body_text` и `detail.response_body_base64`;
-  - `sanitize_ws_frame_payload` маскирует JSON-пейлоады с префиксами/суффиксами SignalR (`\x1e`) и Socket.IO (`42[...]`), а также Bearer/JWT токены в текстовых фреймах;
-  - `sanitize_url_query` очищает `userinfo` (`user:pass@`), редактирует `#fragment` и применяется к заголовкам `Location` и `Referer`.
-- **`[SEC-05]` & `[BUG-12]`:** В `import_saz` введён кумулятивный счётчик распакованных HTTP-тел (`<= 512 MiB`) и лимит `<= 2` вложенных слоёв `Content-Encoding`, добавлена поддержка `zstd` в `decode_single_content_encoding` и `is_matching_compressed_magic`; в `server.rs` и `codec.rs` вызовы `zstd::decode_all` и `read_to_end` заменены на потоковое чтение с `.take(limit)`; в `export_saz` используется безопасный `chrono::TimeDelta::try_milliseconds`.
-- **`[SEC-06]`:** В `src-tauri/src/proxy/client_certs.rs` путь к PEM-файлу вычисляется строго внутри `self.storage_dir` по `id` сертификата (с проверкой канонического префикса), исключая чтение/удаление произвольных файлов через `registry.json`.
-- Добавлены unit-тесты для всех 7 исправлений в Rust и Vitest.
-
-### 📝 Промпт для Antigravity (Этап 31)
-
-```markdown
-Роль: Principal Application Security & Rust/TypeScript Systems Engineer.
-Проект: FluxProxy (Tauri v2 + Rust + React 19).
-
-Задача: Устранить критические и высокоприоритетные уязвимости безопасности, выявленные в аудите v0.4.0 (`SEC-01`..`SEC-06`, `BUG-12`).
-
-1. Защита импорта профиля настроек от скрытого RCE (`[SEC-01]`, `src/types/settings.ts`, `src/lib/settingsManager.ts`, `src/components/SettingsModal.tsx`):
-   - Расширить `SettingsImportPreviewSummary` полями `hasPythonScript: boolean`, `pythonScriptEnabledInProfile: boolean`, `pythonScriptLineCount: number`.
-   - В `buildSettingsImportPreview` вычислять эти поля, а в `SettingsModal.tsx` показывать заметное предупреждение, если импортируемый профиль содержит непустой Python-скрипт.
-   - В `applySettingsProfile` при импорте внешнего JSON-файла принудительно передавать `enabled = false` в `proxyBridge.setPythonScript(nextScripting.code, false)` (если пользователь явно не отметил чекбокс доверия скрипту в превью), сохраняя сам код скрипта в редакторе в выключенном состоянии.
-
-2. Изоляция файлового IPC и закрытие Path Traversal (`[SEC-02]`, `src-tauri/src/commands.rs`, `src-tauri/src/storage/export_import.rs`):
-   - В `validate_user_file_path` запретить любые пути, содержащие `std::path::Component::ParentDir` (`..`), Windows UNC-префиксы (`Prefix::UNC`, `Prefix::VerbatimUNC`), альтернативные потоки NTFS (`:` в `file_name`) и зарезервированные имена DOS-устройств (`CON`, `PRN`, `AUX`, `NUL`, `COM1`..`COM9`, `LPT1`..`LPT9`).
-   - В `import_settings_file` проверять `std::fs::metadata(&path)?.len() <= 16 * 1024 * 1024` до чтения файла.
-   - Покрыть `validate_user_file_path` набором unit-тестов в `commands.rs` (включая `a/../../etc/passwd`, `\\attacker\share\a.json`, `file.json:ads`, `CON.json`).
-
-3. Защита LAN-режимов от SSRF и утечки mTLS (`[SEC-03]`, `src-tauri/src/proxy/server.rs`):
-   - Проверять `is_builtin_portal_target` (включая IPv6-mapped `::ffff:127.0.0.1`) в том числе перед установкой `CONNECT` Passthrough-туннеля.
-   - Если `!peer_addr.ip().is_loopback()`, запрещать `CONNECT` и HTTP-запросы к loopback/unspecified хостам (`localhost`, `127.0.0.0/8`, `::1`, `::ffff:127.0.0.0/104`, `0.0.0.0`) и не использовать хозяйские mTLS-сертификаты (`ctx.client_certs`) для запросов от внешних LAN-клиентов.
-   - В `handle_intercepted_request` при активном режиме `TargetedOnly` проверять `ctx.filters.should_intercept_tls(&host)` после чтения заголовка `Host`, если он отличается от `default_authority`.
-
-4. Полная санитизация экспорта (`[SEC-04]`, `src-tauri/src/storage/export_import.rs`, `src-tauri/src/models.rs`):
-   - В `mask_sensitive_json_value` нормализовать имя ключа (удаляя `_` и `-` в lower-case), чтобы маскировались `camelCase` ключи (`accessToken`, `refreshToken`, `apiKey`, `clientSecret`, `idToken`, `privateKey`, `cardNumber`, `sessionId`).
-   - После санитизации `detail.sse_events` и `detail.websocket_frames` пересобирать `detail.response_body_text` и `detail.response_body_base64` из санитизированных событий/фреймов.
-   - В `sanitize_ws_frame_payload` поддержать SignalR (суффикс `\x1e`) и Socket.IO (числовой префикс перед `[` или `{`), а также редактирование `Bearer`/`eyJ...` JWT в строковых фреймах.
-   - В `sanitize_url_query` очищать `username`/`password`, редактировать `fragment` и применять `sanitize_url_query` к значениям заголовков `Location` и `Referer`.
-
-5. Лимиты декомпрессии, SAZ и ключи mTLS (`[SEC-05]`, `[SEC-06]`, `[BUG-12]`, `export_import.rs`, `server.rs`, `codec.rs`, `client_certs.rs`):
-   - В `import_saz` передавать кумулятивный счётчик распакованных HTTP-байтов в `decode_http_body` (общий лимит `512 MiB`, максимум 2 слоя `Content-Encoding`) и добавить поддержку `zstd`.
-   - Заменить неограниченный `zstd::decode_all` в `server.rs` и `codec.rs` на `zstd::stream::read::Decoder` с `.take(...)`.
-   - В `export_saz` заменить `chrono::Duration::milliseconds(s.duration_ms as i64)` на `chrono::TimeDelta::try_milliseconds(s.duration_ms.min(86_400_000 * 365) as i64).unwrap_or_default()`.
-   - В `client_certs.rs` проверять, что `stored_cert_path` находится строго внутри `self.storage_dir`.
-
-Проверка: `cargo test --manifest-path src-tauri/Cargo.toml`, `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings`, `npm run typecheck`, `npm run test`, `npm run build`.
-```
-
----
-
-## Этап 32: Целостность хранилища TrafficStore + SQLite и реактивного состояния UI
-**Приоритет: P0 (Data Integrity & Performance) | Спринт 4 | Зависимости: Этапы 2 ✅, 20 ✅, 28 ✅, 29 ✅ | Находки аудита: `BUG-01`, `BUG-02`, `BUG-03`, `BUG-08`, `BUG-11`, `PERF-01`, `PERF-02`, `PERF-06`**
-
-### Цель и контекст
-Аудит выявил критические дефекты целостности данных между in-memory индексом `TrafficStore` (`DashMap`), базой `sessions.sqlite` и фронтенд-хуком `useProxySessions.ts`:
-1. **`[BUG-01]` Сброс `next_id = 1` при перезапуске поверх живой `sessions.sqlite`:** `TrafficStore::new` (`src-tauri/src/storage/mod.rs:76`) всегда инициализирует `next_id` единицей. Поскольку `load_session_body` (`mod.rs:380`), `extract_raw_body_bytes` (`mod.rs:812`) и `get_hydrated` (`mod.rs:759, 768`) читают из таблицы `offloaded_bodies` по `id` до проверки флага `detail.body_offloaded`, а `record_in_flight_session` (`server.rs:319`) вызывает `ctx.store.get(new_session_id)`, новые запросы `#1..#N` после перезапуска приложения молча получают чужие многомегабайтные тела и старые заметки из прошлого запуска, а затем перезаписывают архив через `INSERT OR REPLACE`.
-2. **`[BUG-03]` Уничтожение выгруженных тел (`> 2 MiB`) активных RAM-сессий при `VACUUM`:** `clear_sqlite_archive` (`storage/mod.rs:162-169` → `sqlite.rs:380-397`) выполняет `DELETE FROM offloaded_bodies;`, оставляя живые сессии в RAM с `body_offloaded: true` без их тел на диске.
-3. **`[BUG-11]` & `[PERF-02]` & `[PERF-06]` Гонки вытеснения и синхронные блокировки SQLite на потоках Tokio:**
-   - `enforce_retention_limit` (`storage/mod.rs:346-361`) удаляет сессии из `DashMap` до проверки результата `sqlite.persist_batch` и на каждую вставку при заполненном буфере сортирует все 10 000 ключей `DashMap` (`O(N log N)`) прямо на async-воркере Tokio;
-   - `clear()` и `remove_many()` не захватывают `eviction_lock`, конкурируя с вытеснением;
-   - `PRAGMA busy_timeout = 5000;` вызывается после `PRAGMA journal_mode = WAL;` (`sqlite.rs:37-39`);
-   - `record_in_flight_session` (`server.rs:319`) на каждый новый запрос делает синхронный `SELECT` в SQLite;
-   - в `sqlite.rs:51-52` создаются неиспользуемые индексы `idx_sessions_url` и `idx_sessions_status`.
-4. **`[BUG-02]` Отказ всех Tauri Event-подписок при ошибке стартового IPC в `bootstrap()`:** в `src/hooks/useProxySessions.ts:819-1052` отсутствие `try/catch` вокруг `setBindConfiguration` (например, когда сохранённый `specificBindIp` недоступен в новой Wi-Fi сети) прерывает `bootstrap()` до строк `964-1050`, оставляя интерфейс без `subscribeSessionBatches` и остальных подписок.
-5. **`[BUG-08]` Дубликаты `session.id` в React-стейте на пустой таблице:** в `flushPendingSessions` (`useProxySessions.ts:776-777`) ветка `if (prev.length === 0) { next = incoming.slice(); }` пропускает дедупликацию `indexById` внутри батча.
-6. **`[PERF-01]` Повторный IPC-вызов `getSessionDetail(selectedId)` на каждый новый запрос:** массив зависимостей `useEffect` (`useProxySessions.ts:1156`) включает `sessions.length`, перекачивая детали открытой сессии до 60 раз/сек при фоновом трафике.
-
-### Критерии приемки (DoD)
-- **`[BUG-01]`:** `SqliteStore` при открытии БД вычисляет `MAX(id)` из `sessions` и `MAX(session_id)` из `offloaded_bodies`, а `TrafficStore::new` инициализирует `next_id` значением `max_id + 1`. Методы `load_session_body`, `get_hydrated` и `extract_raw_body_bytes` обращаются к `offloaded_bodies` только тогда, когда сессия отсутствует в RAM или у неё установлен `detail.body_offloaded == true`. В `record_in_flight_session` (`server.rs:319`) поиск существующих аннотаций выполняется только в RAM (`get_in_ram`).
-- **`[BUG-03]`:** `clear_sqlite_archive` (`purge_and_vacuum`) принимает список `id` активных сессий в RAM с `body_offloaded == true` и сохраняет их строки в `offloaded_bodies` при очистке архива.
-- **`[BUG-11]` & `[PERF-02]` & `[PERF-06]`:**
-  - `PRAGMA busy_timeout = 5000;` выполняется первой командой в `SqliteStore::init_schema`;
-  - `clear()` и `remove_many()` синхронизированы через `eviction_lock`;
-  - в `enforce_retention_limit` сессии удаляются из `DashMap` только после успешного `sqlite.persist_batch`, а само вытеснение работает батчами (с гистерезисом, например по 64 сессии), исключая сортировку 10 000 ключей на каждый отдельный запрос;
-  - удалены неиспользуемые индексы `idx_sessions_url` и `idx_sessions_status` (`DROP INDEX IF EXISTS`).
-- **`[BUG-02]`, `[BUG-08]`, `[PERF-01]`:** В `src/hooks/useProxySessions.ts`:
-  - подписки `subscribe*` регистрируются независимо от ошибок стартовых конфигурационных команд, а каждый стартовый IPC-вызов в `bootstrap()` обёрнут в `try/catch` с безопасным фолбэком;
-  - `flushPendingSessions` всегда дедуплицирует входящий батч через `indexById`;
-  - `sessions.length` удалён из зависимостей `useEffect` загрузки `selectedSession` (`1156`).
-- Добавлены регрессионные тесты в `storage/mod.rs` (перезапуск `TrafficStore` поверх существующей БД и `clear_sqlite_archive` с живыми оффлоад-телами).
-
-### 📝 Промпт для Antigravity (Этап 32)
-
-```markdown
-Роль: Senior Rust Database/Storage Engineer & React State Architect.
-Проект: FluxProxy (Tauri v2 + Rusqlite + DashMap + React 19).
-
-Задача: Устранить ошибки целостности данных и узкие места производительности в связке `TrafficStore` ↔ `SqliteStore` и `useProxySessions.ts` (`BUG-01`, `BUG-02`, `BUG-03`, `BUG-08`, `BUG-11`, `PERF-01`, `PERF-02`, `PERF-06`).
-
-1. Консистентность ID и оффлоад-тел при рестарте и VACUUM (`[BUG-01]`, `[BUG-03]`, `src-tauri/src/storage/sqlite.rs`, `src-tauri/src/storage/mod.rs`, `src-tauri/src/proxy/server.rs`):
-   - В `SqliteStore` добавить метод `max_persisted_session_id(&self) -> rusqlite::Result<u64>` (`SELECT COALESCE(MAX(m), 0) FROM (SELECT MAX(id) AS m FROM sessions UNION ALL SELECT MAX(session_id) AS m FROM offloaded_bodies)`).
-   - В `TrafficStore::new` инициализировать `next_id: AtomicU64::new(max_id.saturating_add(1))`.
-   - В `load_session_body`, `get_hydrated` и `extract_raw_body_bytes` проверять `self.sessions.get(&id)` в RAM в первую очередь и запрашивать `sqlite.load_offloaded_body` только если `detail.body_offloaded == true` (или сессия уже вытеснена из RAM в SQLite).
-   - В `TrafficStore` добавить метод `get_in_ram(&self, id: u64) -> Option<CapturedSession>` и использовать его в `record_in_flight_session` (`server.rs:319`) вместо `ctx.store.get(new_session_id)`.
-   - В `clear_sqlite_archive` / `purge_and_vacuum` сохранять в `offloaded_bodies` записи тех сессий, которые сейчас находятся в `self.sessions` в RAM с `detail.body_offloaded == true`.
-
-2. Конкурентность `TrafficStore` и оптимизация SQLite (`[BUG-11]`, `[PERF-02]`, `[PERF-06]`, `src-tauri/src/storage/mod.rs`, `src-tauri/src/storage/sqlite.rs`):
-   - В `SqliteStore::init_schema` перенести `PRAGMA busy_timeout = 5000;` перед `PRAGMA journal_mode = WAL;` и заменить создание неиспользуемых индексов `idx_sessions_url` / `idx_sessions_status` на `DROP INDEX IF EXISTS idx_sessions_url; DROP INDEX IF EXISTS idx_sessions_status;`.
-   - Захватывать `self.eviction_lock` в `clear()` и `remove_many()`.
-   - В `enforce_retention_limit` вытеснять сессии пачкой с гистерезисом (например, до `min(overflow + 64, current_len)`) и удалять записи из `self.sessions` только после успешного завершения `sqlite.persist_batch(&evicted_sessions)`.
-
-3. Исправление реактивного стейта фронтенда (`[BUG-02]`, `[BUG-08]`, `[PERF-01]`, `src/hooks/useProxySessions.ts`):
-   - В `flushPendingSessions` убрать ветку `if (prev.length === 0) { next = incoming.slice(); }` и всегда выполнять слияние через `indexById`.
-   - В `useEffect` загрузки деталей выбранной сессии (`getSessionDetail(selectedId)`) удалить `sessions.length` из массива зависимостей.
-   - В `bootstrap()` гарантировать регистрацию всех подписок `proxyBridge.subscribe*` даже при ошибке любого из стартовых IPC-вызовов (`setBindConfiguration`, `setUpstreamTimeout`, `setRetentionLimit`, `updateRules`, `setBreakpoints`, `setCapturing`), обернув каждый вызов в индивидуальный `try/catch` с откатом к `127.0.0.1` при недоступности `specificBindIp`.
-
-Проверка: написать unit-тесты на перезапуск `TrafficStore` с существующей БД и `clear_sqlite_archive`, выполнить `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run typecheck`, `npm run test`, `npm run build`.
-```
-
----
-
-## Этап 33: Надежность сетевого ядра, протоколов HTTP/WS/TLS, фильтров и диагностики
-**Приоритет: P1 (Core Reliability & Hot-Path) | Спринт 4 | Зависимости: Этапы 1 ✅, 6 ✅, 7 ✅, 15 ✅, 17 ✅ | Находки аудита: `BUG-04`, `BUG-05`, `BUG-06`, `BUG-07`, `BUG-09`, `BUG-10`, `BUG-13`, `PERF-03`, `PERF-04`**
-
-### Цель и контекст
-Этап устраняет протокольные, сетевые и алгоритмические дефекты в горячем пути проксирования:
-1. **`[BUG-04]` Утечка `PendingBreakpoint` и зависших сессий `WAIT` при обрыве соединения или `Abort` в Composer:** если клиент разрывает TCP-соединение во время ожидания `bp_rx.await` (`server.rs:2728, 3705`), Hyper дропает future без удаления записи из `BreakpointEngine::pending` (`breakpoints.rs:228-241`), а в `execute_composed` (`server.rs:1659-1663`) действие `BreakpointAction::Abort` возвращает `Err` без завершения in-flight сессии.
-2. **`[BUG-05]` Deadlock двунаправленного релея WebSocket и отсутствие таймаута `wss://`:** в `proxy_websocket_upgrade` (`server.rs:4061-4108`) цикл `tokio::select!` синхронно ждёт `upstream_sink.send(msg).await` и `client_sink.send(msg).await` в одной задаче, что приводит к взаимной блокировке при одновременной встречной передаче крупных фреймов; вызов `tokio_tungstenite::connect_async` (`server.rs:3881`) не имеет таймаута подключения.
-3. **`[BUG-06]` Ложноположительная проверка доверия Root CA на Windows и macOS:** `check_os_trust_uncached` (`src-tauri/src/proxy/ca.rs:317-335`) проверяет только наличие текстового `Common Name` `"FluxProxy Local Debugging Root CA"`, не сверяя отпечаток текущего сертификата (в отличие от Linux на строках `336-341`).
-4. **`[BUG-07]` Искажение `Content-Length` у `HEAD`-ответов и `Content-Encoding` на проводе:** `server.rs:3808-3813` заменяет `Content-Length` на `0` у буферизированных `HEAD`-ответов (`<= 2 MiB`) и безусловно удаляет `Content-Encoding` даже при нераспакованных или многослойных кодировках (`Content-Encoding: gzip, zstd`).
-5. **`[BUG-09]` & `[PERF-03]` Сломанные правила `.example.com`, IPv6 authority и перекомпиляция `Regex::new` на каждом запросе:**
-   - в `compile_backend_host_list` (`filters.rs:990`) и `compile_capture_host_list` (`filters.rs:1465`) `.strip_prefix('.')` находится внутри `if host_has_wildcard(&pattern)` и является мёртвым кодом;
-   - `split_authority` (`server.rs:4693`) и `normalize_host_token` (`filters.rs:620`) некорректно разбирают IPv6 (`[::1]`, `[::1]:8443`);
-   - `ProxyFilterEngine` (`filters.rs:417, 531, 701-754`) компилирует `Regex::new` внутри `state.read()` на каждом `CONNECT` (из-за дефолтного правила `ocsp.*, crl.*`) и каждом HTTP-запросе.
-6. **`[BUG-10]` Отсутствие отката `sysproxy` и события `proxy://status-changed` в `set_bind_configuration`:** при двойной ошибке бинда (`server.rs:1296-1305`) не вызывается `self.sysproxy.rollback_if_dirty()`, а при успешной смене бинда не отправляется `self.emit_status_changed(&status)`.
-7. **`[BUG-13]` Flaky-тест `ProxyDoctor` при параллельном `cargo test`:** `check_port_binding` (`doctor.rs:88`) при `running == false` использует `retry_attempts = 1`, периодически падая в `doctor_detects_stopped_port_and_fixes_listener_plus_e2e_health` (`doctor.rs:1100`).
-8. **`[PERF-04]` Убийство живого Python-воркера из-за очереди на `AsyncMutex`:** в `invoke_worker` (`python_runner.rs:1452`) время ожидания в очереди за мьютексом входит в 1500-мс таймаут исполнения хука, из-за чего всплеск параллельных запросов вызывает ложный `kill_worker_locked` и потерю состояния скрипта.
-
-### Критерии приемки (DoD)
-- **`[BUG-04]`:** Реализован RAII-гард для `PendingBreakpoint`, автоматически удаляющий запись из `BreakpointEngine::pending`, снимающий `breakpoint_paused` в `TrafficStore` и отправляющий `proxy://breakpoints-changed` при дропе задачи; в `execute_composed` при `Abort` на точке останова сессия переводится в статус `502`.
-- **`[BUG-05]`:** В `proxy_websocket_upgrade` чтение и запись клиентского и серверного потоков разделены так, чтобы заполнение TCP-буфера в одну сторону не блокировало вычитывание встречного потока; `connect_async` обёрнут в `tokio::time::timeout`.
-- **`[BUG-06]`:** На Windows и macOS `check_os_trust_uncached` сверяет отпечаток (SHA-1 / SHA-256) сертификата в хранилище ОС с текущим Root CA.
-- **`[BUG-07]`:** Для `HEAD`-запросов сохраняется оригинальный `Content-Length` от upstream; `Content-Encoding` снимается только для реально декодированных слоёв.
-- **`[BUG-09]` & `[PERF-03]`:** В `filters.rs` шаблоны `.example.com` корректно компилируются в суффиксные правила; `split_authority` и `normalize_host_token` корректно обрабатывают IPv6 `[::1]` и `[::1]:port`; все шаблоны `tls_bypass_rules`, `tls_target_rules` и `header_mutations` предкомпилируются при `set_config` без вызова `Regex::new` внутри `state.read()`.
-- **`[BUG-10]` & `[BUG-13]` & `[PERF-04]`:** В `set_bind_configuration` добавлены `rollback_if_dirty()` и `emit_status_changed`; в `doctor.rs:88` `retry_attempts` для остановленного порта увеличен до `3`; в `python_runner.rs` разделены таймаут ожидания очереди мьютекса и таймаут выполнения хука в воркере (без убийства воркера при перегрузке очереди).
-
-### 📝 Промпт для Antigravity (Этап 33)
-
-```markdown
-Роль: Principal Rust Network & Systems Engineer.
-Проект: FluxProxy (Tauri v2 + Tokio + Hyper + Rustls).
-
-Задача: Устранить сетевые, протокольные и алгоритмические дефекты ядра прокси (`BUG-04`, `BUG-05`, `BUG-06`, `BUG-07`, `BUG-09`, `BUG-10`, `BUG-13`, `PERF-03`, `PERF-04`).
-
-1. Точки останова и WebSocket-релей (`[BUG-04]`, `[BUG-05]`, `src-tauri/src/proxy/breakpoints.rs`, `src-tauri/src/proxy/server.rs`):
-   - Реализовать RAII-гард вокруг ожидания `bp_rx`, который при отмене/дропе задачи (дисконнект клиента) очищает `session_id` из `BreakpointEngine::pending`, обновляет сессию в `TrafficStore` (`breakpoint_paused: None`, `status: 499`) и эмитит `proxy://breakpoints-changed`. В `execute_composed` при `BreakpointAction::Abort` вызывать `record_completed_session` со статусом `502`.
-   - В `proxy_websocket_upgrade` обернуть `connect_async` в `tokio::time::timeout(Duration::from_secs(ctx.upstream_timeout_sec), ...)` и устранить deadlock встречной записи в цикле ретрансляции фреймов.
-
-2. Предкомпиляция фильтров, `.domain.com` и IPv6 (`[BUG-09]`, `[PERF-03]`, `src-tauri/src/proxy/filters.rs`, `src-tauri/src/proxy/server.rs`):
-   - В `compile_backend_host_list` и `compile_capture_host_list` обрабатывать ведущую точку `pattern.starts_with('.')` как суффикс домена даже при отсутствии символов `*` и `?`.
-   - Исправить разбор IPv6-хостов `[::1]` и `[::1]:8443` в `split_authority`, `normalize_host_token` и `extract_host_from_url_or_authority`.
-   - Предкомпилировать `tls_bypass_rules`, `tls_target_rules` и `header_mutations` при обновлении конфигурации в `ProxyFilterEngine`, полностью убрав `Regex::new` из `should_intercept_tls` и `apply_header_mutations`.
-
-3. Протокол HTTP, проверка Root CA, биндинг, Doctor и Python-очередь (`[BUG-06]`, `[BUG-07]`, `[BUG-10]`, `[BUG-13]`, `[PERF-04]`, `server.rs`, `ca.rs`, `doctor.rs`, `python_runner.rs`, `process.rs`):
-   - В `server.rs:3808` сохранять исходный `Content-Length` для `HEAD`-запросов (если тело пустое) и удалять `Content-Encoding` только при фактической распаковке всех его слоёв.
-   - В `ca.rs:317-335` сверять отпечаток текущего сертификата Root CA в выводе `certutil` (Windows) и `security find-certificate -Z` (macOS).
-   - В `set_bind_configuration` (`server.rs:1265-1305`) добавить `self.sysproxy.rollback_if_dirty()` при двойной ошибке бинда и `self.emit_status_changed(&status)` при любом изменении состояния.
-   - В `doctor.rs:88` установить `let retry_attempts = if running { 6 } else { 3 };`.
-   - В `python_runner.rs:1452` отделить ожидание `self.worker.lock().await` от таймаута чтения/записи пайпа воркера, чтобы таймаут ожидания очереди не вызывал `kill_worker_locked`.
-   - В `process.rs` ограничить максимальный размер `pid_name_cache` (до 4096 записей).
-
-Проверка: `cargo test --manifest-path src-tauri/Cargo.toml`, `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings`.
-```
-
----
-
 ## 🔵 Спринт 5 — P2 (Feature & Architecture): Сетевая инфраструктура, декомпозиция и аналитика
 
 ---
 
 ## Этап 10: Сетевая инфраструктура: HOSTS Remapping и Bandwidth Throttling
-**Приоритет: P2 (Feature) | Спринт 5 | Зависимости: Этапы 15 ✅, 25 ✅, 33**
+**Приоритет: P2 (Feature) | Спринт 5 | Зависимости: Этапы 15 ✅, 25 ✅, 33 ✅**
 
 ### Цель и контекст
 Разработчикам часто требуется перенаправлять запросы с боевого домена (`api.production.com`) на локальный сервер (`127.0.0.1:3000`) без правки системного файла `hosts` (требующего прав администратора), а также проверять поведение приложений на медленных каналах связи (GPRS, 3G, LTE, Offline).
@@ -374,7 +193,7 @@
 ---
 
 ## Этап 11: Архитектурная декомпозиция монолитов, внедрение Zustand и оптимизация бандла
-**Приоритет: P2 (Architecture & Performance) | Спринт 5 | Зависимости: Этапы 31–33 | Находки аудита: `ARCH-01`, `PERF-05`**
+**Приоритет: P2 (Architecture & Performance) | Спринт 5 | Зависимости: Этапы 31–33 ✅ | Находки аудита: `ARCH-01`, `PERF-05`**
 
 ### Цель и контекст
 Крупнейшие файлы проекта (`server.rs` — 7 759 строк, `export_import.rs` — 4 053, `FilterDrawer.tsx` — 3 820, `App.tsx` — 3 747, `SettingsModal.tsx` — 3 599, `tauriBridge.ts` — 3 371, `useProxySessions.ts` — 3 337, `settingsManager.ts` — 2 859, `filters.rs` — 2 571, `filterEngine.ts` — 2 328, `sysproxy.rs` — 2 276) перегружены и затрудняют параллельную разработку (`[ARCH-01]`), а состояние фронтенда передается десятками пропсов через `App.tsx`.
@@ -456,7 +275,7 @@
 ---
 
 ## Этап 13: Расширенные протоколы: Upstream Proxy Chaining и WS-инъекция
-**Приоритет: P2 (Feature) | Спринт 5 | Зависимости: Этапы 18 ✅, 25 ✅, 33**
+**Приоритет: P2 (Feature) | Спринт 5 | Зависимости: Этапы 18 ✅, 25 ✅, 33 ✅**
 
 ### Цель и контекст
 В корпоративных сетях и при сложной маршрутизации FluxProxy должен уметь работать через вышестоящий прокси (`HTTP`, `HTTPS`, `SOCKS5`), а при отладке real-time протоколов инженеру нужна ручная отправка сообщений в уже открытый WebSocket.
