@@ -1,9 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import {
   BUILT_IN_FILTER_PRESETS,
   compileFilterMatrix,
   compileHostListFilter,
-  DEFAULT_BACKEND_FILTER_CONFIG,
   DEFAULT_HOST_LIST_FILTER_CONFIG,
   DEFAULT_NOISE_THRESHOLDS,
   evaluateSessionAgainstFilters,
@@ -16,15 +15,31 @@ import {
   suggestSessionBodyFileName,
 } from "../lib/formatters";
 import {
-  DEFAULT_CLEAR_DB_ON_EXIT,
-  PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
-} from "../lib/mockTraffic";
-import {
-  DEFAULT_BREAKPOINT_CONFIG,
   type FileDialogFilter,
   isTauriRuntime,
   proxyBridge,
 } from "../lib/tauriBridge";
+import {
+  buildCaptureHostListPayload,
+  buildHostListSyncPayload,
+  buildNoiseThresholdsSyncPayload,
+  LS_BACKEND_FILTER_CFG_KEY,
+  useFilterStore,
+} from "../stores/filterStore";
+import {
+  formatStatusEndpoints,
+  loadPersistedBindConfig,
+  loadPersistedProxyPort,
+  loadProxyJson,
+  LS_AUTO_SYSPROXY_KEY,
+  LS_BREAKPOINT_CFG_KEY,
+  LS_CLEAR_DB_ON_EXIT_KEY,
+  LS_DROP_NON_MATCHING_KEY,
+  LS_PROXY_PORT_KEY,
+  LS_RETENTION_LIMIT_KEY,
+  persistBindConfigToLocalStorage,
+  useProxyStore,
+} from "../stores/proxyStore";
 import { DEFAULT_SESSION_RETENTION_LIMIT } from "../types/proxy";
 import {
   PROXY_STATUS_SYNCED_EVENT,
@@ -39,14 +54,11 @@ import type {
   DetectedProcessItem,
   FilterConditionRule,
   FilterPreset,
-  HostListBackendSyncConfig,
   HostListFilterConfig,
-  NoiseThresholdsBackendSyncConfig,
   NoiseThresholdsConfig,
   PausedBreakpointItem,
   ProxyFilterBackendConfig,
   ProxyStatus,
-  QuickFilterCategory,
   SanitizationOptions,
   SessionDetail,
   SessionSummary,
@@ -55,482 +67,119 @@ import type {
   TlsInterceptMode,
 } from "../types/proxy";
 
-const LS_CUSTOM_PRESETS_KEY = "fluxproxy.customFilterPresets.v1";
-const LS_ACTIVE_FILTER_STATE_KEY = "fluxproxy.activeFilterState.v1";
-const LS_BACKEND_FILTER_CFG_KEY = "fluxproxy.backendFilterConfig.v1";
-const LS_AUTO_SYSPROXY_KEY = "fluxproxy.autoSystemProxy.v1";
-const LS_ALLOW_REMOTE_KEY = "fluxproxy.allowRemote.v1";
-const LS_BIND_MODE_KEY = "fluxproxy.bindMode.v1";
-const LS_SPECIFIC_BIND_IP_KEY = "fluxproxy.specificBindIp.v1";
-const LS_ALSO_BIND_LOOPBACK_KEY = "fluxproxy.alsoBindLoopback.v1";
-const LS_PROXY_PORT_KEY = "fluxproxy.proxyPort.v1";
-const LS_FOLLOW_TAIL_KEY = "fluxproxy.followTail.v1";
-const LS_BREAKPOINT_CFG_KEY = "fluxproxy.breakpointConfig.v1";
-const LS_RETENTION_LIMIT_KEY = "fluxproxy.sessionRetentionLimit.v1";
-const LS_DROP_NON_MATCHING_KEY = "fluxproxy.dropNonMatching.v1";
-const LS_CLEAR_DB_ON_EXIT_KEY = PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY;
-
-interface PersistedBindConfig {
-  bindMode: BindHostMode;
-  specificBindIp: string | null;
-  alsoBindLoopback: boolean;
-}
-
-function loadPersistedBindConfig(): PersistedBindConfig | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const rawMode = window.localStorage.getItem(LS_BIND_MODE_KEY);
-    const rawSpecificIp = window.localStorage.getItem(LS_SPECIFIC_BIND_IP_KEY);
-    const rawAlsoLoopback = window.localStorage.getItem(
-      LS_ALSO_BIND_LOOPBACK_KEY
-    );
-    const rawLegacyRemote = window.localStorage.getItem(LS_ALLOW_REMOTE_KEY);
-
-    if (rawMode === null && rawLegacyRemote === null) {
-      return null;
-    }
-
-    let specificBindIp: string | null = null;
-    if (rawSpecificIp !== null) {
-      const parsedIp = JSON.parse(rawSpecificIp);
-      if (typeof parsedIp === "string" && parsedIp.trim().length > 0) {
-        specificBindIp = parsedIp.trim();
-      }
-    }
-
-    const alsoBindLoopback =
-      rawAlsoLoopback !== null ? Boolean(JSON.parse(rawAlsoLoopback)) : true;
-
-    let bindMode: BindHostMode = "loopback";
-    if (rawMode !== null) {
-      const parsedMode = JSON.parse(rawMode);
-      if (
-        parsedMode === "all" ||
-        parsedMode === "loopback" ||
-        (parsedMode === "specific" && specificBindIp)
-      ) {
-        bindMode = parsedMode;
-      }
-    } else if (rawLegacyRemote !== null) {
-      bindMode = Boolean(JSON.parse(rawLegacyRemote)) ? "all" : "loopback";
-    }
-
-    return { bindMode, specificBindIp, alsoBindLoopback };
-  } catch {
-    return null;
-  }
-}
-
-function computeBoundIpsForState(
-  bindMode: BindHostMode,
-  specificBindIp: string | null,
-  alsoBindLoopback: boolean
-): string[] {
-  if (bindMode === "all") return ["0.0.0.0"];
-  if (bindMode === "specific" && specificBindIp) {
-    if (alsoBindLoopback && specificBindIp !== "127.0.0.1") {
-      return [specificBindIp, "127.0.0.1"];
-    }
-    return [specificBindIp];
-  }
-  return ["127.0.0.1"];
-}
-
-function formatStatusEndpoints(statusObj: ProxyStatus): string {
-  const ips =
-    statusObj.boundIps && statusObj.boundIps.length > 0
-      ? statusObj.boundIps
-      : [statusObj.bindAddr];
-  return ips.map((ip) => `${ip}:${statusObj.port}`).join(" + ");
-}
-
-function persistBindConfigToLocalStorage(statusObj: ProxyStatus): void {
-  if (typeof window === "undefined") return;
-  const resolvedMode: BindHostMode =
-    statusObj.bindMode ??
-    (statusObj.allowRemote || statusObj.bindAddr === "0.0.0.0"
-      ? "all"
-      : "loopback");
-  const resolvedSpecificIp = statusObj.specificBindIp ?? null;
-  const resolvedAlsoLoopback = statusObj.alsoBindLoopback ?? true;
-  const resolvedAllowRemote =
-    resolvedMode === "all"
-      ? true
-      : resolvedMode === "specific" && resolvedSpecificIp
-        ? resolvedSpecificIp !== "127.0.0.1" && resolvedSpecificIp !== "::1"
-        : false;
-  try {
-    window.localStorage.setItem(LS_BIND_MODE_KEY, JSON.stringify(resolvedMode));
-    window.localStorage.setItem(
-      LS_SPECIFIC_BIND_IP_KEY,
-      JSON.stringify(resolvedSpecificIp)
-    );
-    window.localStorage.setItem(
-      LS_ALSO_BIND_LOOPBACK_KEY,
-      JSON.stringify(resolvedAlsoLoopback)
-    );
-    window.localStorage.setItem(
-      LS_ALLOW_REMOTE_KEY,
-      JSON.stringify(resolvedAllowRemote)
-    );
-  } catch {
-    // ignore storage quota errors
-  }
-}
-
-function loadPersistedProxyPort(): number | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const raw = window.localStorage.getItem(LS_PROXY_PORT_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as unknown;
-    if (
-      typeof parsed === "number" &&
-      Number.isInteger(parsed) &&
-      parsed >= 1 &&
-      parsed <= 65535
-    ) {
-      return parsed;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function loadPersistedRetentionLimit(): number | null {
-  if (typeof window === "undefined") return DEFAULT_SESSION_RETENTION_LIMIT;
-  try {
-    const raw = window.localStorage.getItem(LS_RETENTION_LIMIT_KEY);
-    if (raw === null) return DEFAULT_SESSION_RETENTION_LIMIT;
-    const parsed = JSON.parse(raw) as unknown;
-    if (parsed === null) return null;
-    if (typeof parsed === "number" && Number.isInteger(parsed) && parsed > 0) {
-      return parsed;
-    }
-    return DEFAULT_SESSION_RETENTION_LIMIT;
-  } catch {
-    return DEFAULT_SESSION_RETENTION_LIMIT;
-  }
-}
-
-function buildNoiseThresholdsSyncPayload(
-  th: NoiseThresholdsConfig
-): NoiseThresholdsBackendSyncConfig {
-  return {
-    hide304NotModified: th.hide304NotModified,
-    hideOptionsPreflight: th.hideOptionsPreflight,
-    hideConnectTunnels: th.hideConnectTunnels,
-    hideStaticAssets: th.hideStaticAssets,
-    minBodySizeBytes: th.minBodySizeBytes,
-    maxBodySizeBytes: th.maxBodySizeBytes,
-    timeHeatWarningMs: th.timeHeatWarningMs,
-    onlySlowRequests: th.onlySlowRequests,
-  };
-}
-
-function buildCaptureHostListPayload(
-  cfg: HostListFilterConfig,
-  activeCount: number
-): HostListBackendSyncConfig {
-  return {
-    enabled: Boolean(cfg.enabled && activeCount > 0),
-    mode: cfg.mode,
-    rawText: cfg.rawText,
-  };
-}
-
-interface PersistedFilterState {
-  matrixEnabled: boolean;
-  rules: FilterConditionRule[];
-  thresholds: NoiseThresholdsConfig;
-  activePresetId: string | null;
-  hostListFilter?: HostListFilterConfig;
-}
-
-function buildHostListSyncPayload(
-  cfg: HostListFilterConfig,
-  activeCount: number
-): HostListBackendSyncConfig {
-  return {
-    enabled: Boolean(
-      cfg.enabled && cfg.applyToTlsPassthrough && activeCount > 0
-    ),
-    mode: cfg.mode,
-    rawText: cfg.rawText,
-  };
-}
-
-function loadPersistedState<T>(key: string, fallback: T): T {
-  if (typeof window === "undefined") return fallback;
-  try {
-    const raw = window.localStorage.getItem(key);
-    if (!raw) return fallback;
-    return JSON.parse(raw) as T;
-  } catch {
-    return fallback;
-  }
-}
-
 export function useProxySessions() {
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [selectedId, setSelectedIdState] = useState<number | null>(null);
-  const [selectedIds, setSelectedIds] = useState<number[]>([]);
-  const selectionAnchorIdRef = useRef<number | null>(null);
-  const [selectedDetail, setSelectedDetail] = useState<SessionDetail | null>(
-    null
-  );
-  const [diffLeftDetail, setDiffLeftDetail] = useState<SessionDetail | null>(
-    null
-  );
-  const [diffRightDetail, setDiffRightDetail] = useState<SessionDetail | null>(
-    null
-  );
+  const didSyncRef = useRef(false);
+  if (!didSyncRef.current) {
+    didSyncRef.current = true;
+    useProxyStore.getState().syncFromLocalStorage();
+    useFilterStore
+      .getState()
+      .syncFromLocalStorage(useProxyStore.getState().dropNonMatching);
+  }
 
-  const setSelectedId = useCallback((id: number | null) => {
-    selectionAnchorIdRef.current = id;
-    setSelectedIdState(id);
-    setSelectedIds(id !== null ? [id] : []);
-  }, []);
+  const sessions = useProxyStore((s) => s.sessions);
+  const setSessions = useProxyStore((s) => s.setSessions);
+  const selectedId = useProxyStore((s) => s.selectedId);
+  const setSelectedIdState = useProxyStore((s) => s.setSelectedIdState);
+  const selectedIds = useProxyStore((s) => s.selectedIds);
+  const setSelectedIds = useProxyStore((s) => s.setSelectedIds);
+  const selectionAnchorIdRef = useRef<number | null>(null);
+  const selectedDetail = useProxyStore((s) => s.selectedDetail);
+  const setSelectedDetail = useProxyStore((s) => s.setSelectedDetail);
+  const diffLeftDetail = useProxyStore((s) => s.diffLeftDetail);
+  const setDiffLeftDetail = useProxyStore((s) => s.setDiffLeftDetail);
+  const diffRightDetail = useProxyStore((s) => s.diffRightDetail);
+  const setDiffRightDetail = useProxyStore((s) => s.setDiffRightDetail);
+
+  const setSelectedId = useCallback(
+    (id: number | null) => {
+      selectionAnchorIdRef.current = id;
+      setSelectedIdState(id);
+      setSelectedIds(id !== null ? [id] : []);
+    },
+    [setSelectedIdState, setSelectedIds]
+  );
 
   const initialAutoSysProxy = useMemo(
-    () => loadPersistedState<boolean | null>(LS_AUTO_SYSPROXY_KEY, null),
+    () => loadProxyJson<boolean | null>(LS_AUTO_SYSPROXY_KEY, null),
     []
   );
   const initialBindConfig = useMemo(() => loadPersistedBindConfig(), []);
   const initialPort = useMemo(() => loadPersistedProxyPort(), []);
 
-  const initialBindMode: BindHostMode =
-    initialBindConfig?.bindMode ?? "loopback";
-  const initialSpecificBindIp = initialBindConfig?.specificBindIp ?? null;
-  const initialAlsoBindLoopback = initialBindConfig?.alsoBindLoopback ?? true;
-  const initialBindAddr =
-    initialBindMode === "all"
-      ? "0.0.0.0"
-      : initialBindMode === "specific" && initialSpecificBindIp
-        ? initialSpecificBindIp
-        : "127.0.0.1";
-  const initialAllowRemote =
-    initialBindMode === "all" ||
-    (initialBindMode === "specific" &&
-      Boolean(initialSpecificBindIp) &&
-      initialSpecificBindIp !== "127.0.0.1");
-
-  const [status, setStatus] = useState<ProxyStatus>({
-    running: true,
-    bindAddr: initialBindAddr,
-    port: initialPort ?? 8888,
-    activeSessions: 0,
-    systemProxyEnabled: initialAutoSysProxy ?? true,
-    autoSystemProxy: initialAutoSysProxy ?? true,
-    systemProxyError: null,
-    allowRemote: initialAllowRemote,
-    bindMode: initialBindMode,
-    specificBindIp: initialSpecificBindIp,
-    alsoBindLoopback: initialAlsoBindLoopback,
-    boundIps: computeBoundIpsForState(
-      initialBindMode,
-      initialSpecificBindIp,
-      initialAlsoBindLoopback
-    ),
-  });
+  const status = useProxyStore((s) => s.status);
+  const setStatus = useProxyStore((s) => s.setStatus);
   const statusRef = useRef<ProxyStatus>(status);
   statusRef.current = status;
 
   // Quick Search & Regex Filter State (TopToolbar)
-  const [filterQuery, setFilterQuery] = useState("");
-  const [useRegex, setUseRegex] = useState(false);
-  const [quickCategory, setQuickCategory] =
-    useState<QuickFilterCategory>("all");
-  const [followTail, setFollowTail] = useState<boolean>(() =>
-    Boolean(loadPersistedState<boolean>(LS_FOLLOW_TAIL_KEY, false))
-  );
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const filterQuery = useFilterStore((s) => s.filterQuery);
+  const setFilterQuery = useFilterStore((s) => s.setFilterQuery);
+  const useRegex = useFilterStore((s) => s.useRegex);
+  const setUseRegex = useFilterStore((s) => s.setUseRegex);
+  const quickCategory = useFilterStore((s) => s.quickCategory);
+  const setQuickCategory = useFilterStore((s) => s.setQuickCategory);
+  const followTail = useProxyStore((s) => s.followTail);
+  const setFollowTail = useProxyStore((s) => s.setFollowTail);
+  const toastMessage = useProxyStore((s) => s.toastMessage);
+  const setToastMessage = useProxyStore((s) => s.setToastMessage);
 
   // Advanced Filter Matrix, Presets, Thresholds & Backend Config
-  const initialPersisted = useMemo(
-    () =>
-      loadPersistedState<PersistedFilterState>(LS_ACTIVE_FILTER_STATE_KEY, {
-        matrixEnabled: true,
-        rules: [],
-        thresholds: { ...DEFAULT_NOISE_THRESHOLDS },
-        activePresetId: null,
-        hostListFilter: { ...DEFAULT_HOST_LIST_FILTER_CONFIG },
-      }),
-    []
-  );
-
-  const [matrixEnabled, setMatrixEnabled] = useState<boolean>(
-    initialPersisted.matrixEnabled
-  );
-  const [filterRules, setFilterRules] = useState<FilterConditionRule[]>(
-    initialPersisted.rules
-  );
-  const [thresholds, setThresholds] = useState<NoiseThresholdsConfig>({
-    ...DEFAULT_NOISE_THRESHOLDS,
-    ...initialPersisted.thresholds,
-  });
-  const [hostListFilter, setHostListFilterState] =
-    useState<HostListFilterConfig>(() => ({
-      ...DEFAULT_HOST_LIST_FILTER_CONFIG,
-      ...(initialPersisted.hostListFilter ?? {}),
-    }));
-  const [activePresetId, setActivePresetId] = useState<string | null>(
-    initialPersisted.activePresetId
-  );
-  const [customPresets, setCustomPresets] = useState<FilterPreset[]>(() =>
-    loadPersistedState<FilterPreset[]>(LS_CUSTOM_PRESETS_KEY, [])
-  );
+  const matrixEnabled = useFilterStore((s) => s.matrixEnabled);
+  const setMatrixEnabled = useFilterStore((s) => s.setMatrixEnabled);
+  const filterRules = useFilterStore((s) => s.filterRules);
+  const setFilterRules = useFilterStore((s) => s.setFilterRules);
+  const thresholds = useFilterStore((s) => s.thresholds);
+  const setThresholds = useFilterStore((s) => s.setThresholds);
+  const hostListFilter = useFilterStore((s) => s.hostListFilter);
+  const setHostListFilterState = useFilterStore((s) => s.setHostListFilter);
+  const activePresetId = useFilterStore((s) => s.activePresetId);
+  const setActivePresetId = useFilterStore((s) => s.setActivePresetId);
+  const customPresets = useFilterStore((s) => s.customPresets);
+  const setCustomPresets = useFilterStore((s) => s.setCustomPresets);
 
   // Ring Buffer Session Retention Limit (null = All Sessions; default = 10,000) & Drop Non-Matching on Capture
-  const [sessionRetentionLimit, setSessionRetentionLimitState] = useState<
-    number | null
-  >(() => loadPersistedRetentionLimit());
+  const sessionRetentionLimit = useProxyStore((s) => s.sessionRetentionLimit);
+  const setSessionRetentionLimitState = useProxyStore(
+    (s) => s.setSessionRetentionLimitState
+  );
   const sessionRetentionLimitRef = useRef<number | null>(sessionRetentionLimit);
   sessionRetentionLimitRef.current = sessionRetentionLimit;
 
-  const [dropNonMatching, setDropNonMatchingState] = useState<boolean>(() =>
-    loadPersistedState<boolean>(LS_DROP_NON_MATCHING_KEY, false)
+  const dropNonMatching = useProxyStore((s) => s.dropNonMatching);
+  const setDropNonMatchingState = useProxyStore(
+    (s) => s.setDropNonMatchingState
   );
   const dropNonMatchingRef = useRef<boolean>(dropNonMatching);
   dropNonMatchingRef.current = dropNonMatching;
 
   const hasPersistedClearDbOnExitRef = useRef<boolean>(
-    typeof window !== "undefined" &&
-      (() => {
-        try {
-          return window.localStorage.getItem(LS_CLEAR_DB_ON_EXIT_KEY) !== null;
-        } catch {
-          return false;
-        }
-      })()
+    useProxyStore.getState().hasPersistedClearDbOnExit
   );
-  const [clearDbOnExit, setClearDbOnExitState] = useState<boolean>(() =>
-    Boolean(
-      loadPersistedState<boolean>(
-        LS_CLEAR_DB_ON_EXIT_KEY,
-        DEFAULT_CLEAR_DB_ON_EXIT
-      )
-    )
-  );
+  const clearDbOnExit = useProxyStore((s) => s.clearDbOnExit);
+  const setClearDbOnExitState = useProxyStore((s) => s.setClearDbOnExitState);
   const clearDbOnExitRef = useRef<boolean>(clearDbOnExit);
   clearDbOnExitRef.current = clearDbOnExit;
 
-  const [storageStats, setStorageStats] = useState<StorageStats>(() => ({
-    ramSessions: 0,
-    sqliteSizeBytes: 0,
-    droppedSessionsCount: 0,
-    sessionRetentionLimit,
-    dropNonMatching,
-  }));
+  const storageStats = useProxyStore((s) => s.storageStats);
+  const setStorageStats = useProxyStore((s) => s.setStorageStats);
 
-  const [backendFilterConfig, setBackendFilterConfig] =
-    useState<ProxyFilterBackendConfig>(() => {
-      const saved = loadPersistedState<Partial<ProxyFilterBackendConfig>>(
-        LS_BACKEND_FILTER_CFG_KEY,
-        structuredClone(DEFAULT_BACKEND_FILTER_CONFIG)
-      );
-      const bootHostList: HostListFilterConfig = {
-        ...DEFAULT_HOST_LIST_FILTER_CONFIG,
-        ...(initialPersisted.hostListFilter ?? {}),
-      };
-      const bootThresholds: NoiseThresholdsConfig = {
-        ...DEFAULT_NOISE_THRESHOLDS,
-        ...initialPersisted.thresholds,
-      };
-      const bootCompiled = compileHostListFilter(bootHostList);
-      return {
-        ...structuredClone(DEFAULT_BACKEND_FILTER_CONFIG),
-        ...saved,
-        tlsInterceptMode: saved.tlsInterceptMode ?? "interceptAll",
-        tlsTargetRules: Array.isArray(saved.tlsTargetRules)
-          ? saved.tlsTargetRules
-          : [],
-        stripAltSvc: saved.stripAltSvc ?? true,
-        hostListSync: buildHostListSyncPayload(
-          bootHostList,
-          bootCompiled.activeCount
-        ),
-        dropNonMatchingOnCapture: dropNonMatchingRef.current,
-        captureHostList: buildCaptureHostListPayload(
-          bootHostList,
-          bootCompiled.activeCount
-        ),
-        noiseThresholds: buildNoiseThresholdsSyncPayload(bootThresholds),
-        captureMatrixEnabled: initialPersisted.matrixEnabled,
-        captureFilterRules: initialPersisted.rules,
-        quickCategory: "all",
-        filterQuery: "",
-        useRegexQuery: false,
-      };
-    });
+  const backendFilterConfig = useFilterStore((s) => s.backendFilterConfig);
+  const setBackendFilterConfig = useFilterStore(
+    (s) => s.setBackendFilterConfig
+  );
   const backendFilterConfigRef =
     useRef<ProxyFilterBackendConfig>(backendFilterConfig);
   backendFilterConfigRef.current = backendFilterConfig;
 
   // Live Breakpoints Config & Parked Requests Queue
-  const [breakpointConfig, setBreakpointConfig] = useState<BreakpointConfig>(
-    () => {
-      const saved = loadPersistedState<BreakpointConfig>(
-        LS_BREAKPOINT_CFG_KEY,
-        structuredClone(DEFAULT_BREAKPOINT_CONFIG)
-      );
-      return {
-        ...DEFAULT_BREAKPOINT_CONFIG,
-        ...saved,
-        // Never stall traffic silently on cold boot via global flags
-        breakBeforeRequest: false,
-        breakAfterResponse: false,
-      };
-    }
-  );
+  const breakpointConfig = useProxyStore((s) => s.breakpointConfig);
+  const setBreakpointConfig = useProxyStore((s) => s.setBreakpointConfig);
   const breakpointConfigRef = useRef<BreakpointConfig>(breakpointConfig);
   breakpointConfigRef.current = breakpointConfig;
 
-  const [pausedBreakpoints, setPausedBreakpoints] = useState<
-    PausedBreakpointItem[]
-  >([]);
-
-  // Persist UI filter state to localStorage
-  useEffect(() => {
-    try {
-      const payload: PersistedFilterState = {
-        matrixEnabled,
-        rules: filterRules,
-        thresholds,
-        activePresetId,
-        hostListFilter,
-      };
-      window.localStorage.setItem(
-        LS_ACTIVE_FILTER_STATE_KEY,
-        JSON.stringify(payload)
-      );
-    } catch {
-      // ignore storage quota errors
-    }
-  }, [matrixEnabled, filterRules, thresholds, activePresetId, hostListFilter]);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(
-        LS_CUSTOM_PRESETS_KEY,
-        JSON.stringify(customPresets)
-      );
-    } catch {
-      // ignore storage quota errors
-    }
-  }, [customPresets]);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(
-        LS_FOLLOW_TAIL_KEY,
-        JSON.stringify(followTail)
-      );
-    } catch {
-      // ignore storage quota errors
-    }
-  }, [followTail]);
+  const pausedBreakpoints = useProxyStore((s) => s.pausedBreakpoints);
+  const setPausedBreakpoints = useProxyStore((s) => s.setPausedBreakpoints);
 
   // Synchronize React hook state when a settings profile is imported or reset
   useEffect(() => {
@@ -538,119 +187,28 @@ export function useProxySessions() {
       const detail = (event as CustomEvent<FluxUserSettingsProfile>).detail;
       if (!detail) return;
 
-      setFollowTail(Boolean(detail.ui.followTail));
-      setCustomPresets(structuredClone(detail.filters.userPresets));
-      setActivePresetId(detail.filters.activePresetId);
-      const nextMatrixEnabled = detail.filters.matrixEnabled ?? true;
-      const nextFilterRules = structuredClone(detail.filters.filterRules ?? []);
-      const nextThresholds = {
-        ...DEFAULT_NOISE_THRESHOLDS,
-        ...detail.filters.noiseThresholds,
-      };
-      const nextHostList = {
-        ...DEFAULT_HOST_LIST_FILTER_CONFIG,
-        ...detail.filters.hostFilters,
-      };
-      setMatrixEnabled(nextMatrixEnabled);
-      setFilterRules(nextFilterRules);
-      setThresholds(nextThresholds);
-      setHostListFilterState(nextHostList);
-
       const nextRetention =
         detail.proxy.sessionRetentionLimit !== undefined
           ? detail.proxy.sessionRetentionLimit
           : DEFAULT_SESSION_RETENTION_LIMIT;
       sessionRetentionLimitRef.current = nextRetention;
-      setSessionRetentionLimitState(nextRetention);
-      setSessions((prev) => {
-        if (!nextRetention || prev.length <= nextRetention) return prev;
-        const copy = prev.slice();
-        copy.splice(0, copy.length - nextRetention);
-        return copy;
-      });
 
       const nextDropNonMatching = Boolean(
         detail.proxy.dropNonMatching ?? false
       );
       dropNonMatchingRef.current = nextDropNonMatching;
-      setDropNonMatchingState(nextDropNonMatching);
 
-      const nextClearDbOnExit = Boolean(
-        detail.proxy.clearDbOnExit ?? DEFAULT_CLEAR_DB_ON_EXIT
-      );
+      const nextClearDbOnExit = Boolean(detail.proxy.clearDbOnExit ?? true);
       clearDbOnExitRef.current = nextClearDbOnExit;
-      setClearDbOnExitState(nextClearDbOnExit);
 
-      const compiledHl = compileHostListFilter(nextHostList);
-      const nextBackendCfg: ProxyFilterBackendConfig = {
-        tlsInterceptMode: detail.proxy.tlsInterceptMode,
-        tlsBypassEnabled: detail.proxy.tlsBypassEnabled ?? true,
-        tlsBypassRules: structuredClone(detail.proxy.tlsBypassRules),
-        tlsTargetRules: structuredClone(detail.proxy.tlsTargetRules),
-        headerMutationsEnabled: detail.proxy.headerMutationsEnabled ?? true,
-        headerMutations: structuredClone(detail.proxy.headerMutations),
-        stripAltSvc: detail.proxy.stripAltSvc ?? true,
-        hostListSync: buildHostListSyncPayload(
-          nextHostList,
-          compiledHl.activeCount
-        ),
-        dropNonMatchingOnCapture: nextDropNonMatching,
-        captureHostList: buildCaptureHostListPayload(
-          nextHostList,
-          compiledHl.activeCount
-        ),
-        noiseThresholds: buildNoiseThresholdsSyncPayload(nextThresholds),
-        captureMatrixEnabled: nextMatrixEnabled,
-        captureFilterRules: nextFilterRules,
-        quickCategory: "all",
-        filterQuery: "",
-        useRegexQuery: false,
-      };
+      useProxyStore.getState().applySettingsProfileProxy(detail);
+      statusRef.current = useProxyStore.getState().status;
+      breakpointConfigRef.current = useProxyStore.getState().breakpointConfig;
+
+      const nextBackendCfg = useFilterStore
+        .getState()
+        .applySettingsProfileFilters(detail);
       backendFilterConfigRef.current = nextBackendCfg;
-      setBackendFilterConfig(nextBackendCfg);
-      setFilterQuery("");
-      setUseRegex(false);
-      setQuickCategory("all");
-
-      const detailBindMode: BindHostMode =
-        detail.proxy.bindMode ??
-        (detail.proxy.allowRemote ? "all" : "loopback");
-      const detailSpecificIp = detail.proxy.specificBindIp ?? null;
-      const detailAlsoLoopback = detail.proxy.alsoBindLoopback ?? true;
-      const detailBindAddr =
-        detailBindMode === "all"
-          ? "0.0.0.0"
-          : detailBindMode === "specific" && detailSpecificIp
-            ? detailSpecificIp
-            : "127.0.0.1";
-
-      const nextStatusOptimistic: ProxyStatus = {
-        ...statusRef.current,
-        port: detail.proxy.port,
-        autoSystemProxy: detail.proxy.autoSystemProxy,
-        allowRemote: detail.proxy.allowRemote,
-        bindAddr: detailBindAddr,
-        bindMode: detailBindMode,
-        specificBindIp: detailSpecificIp,
-        alsoBindLoopback: detailAlsoLoopback,
-        boundIps: computeBoundIpsForState(
-          detailBindMode,
-          detailSpecificIp,
-          detailAlsoLoopback
-        ),
-      };
-      statusRef.current = nextStatusOptimistic;
-      setStatus(nextStatusOptimistic);
-
-      if (detail.breakpoints) {
-        const nextBp: BreakpointConfig = {
-          ...DEFAULT_BREAKPOINT_CONFIG,
-          ...detail.breakpoints,
-          rules: structuredClone(detail.breakpoints.rules ?? []),
-        };
-        breakpointConfigRef.current = nextBp;
-        setBreakpointConfig(nextBp);
-      }
     };
 
     const handleProxyStatusSynced = (event: Event) => {
@@ -672,7 +230,7 @@ export function useProxySessions() {
         handleProxyStatusSynced
       );
     };
-  }, []);
+  }, [setStatus]);
 
   // Coalesce high-frequency Rust IPC batches to animation frames
   const pendingQueueRef = useRef<SessionSummary[]>([]);

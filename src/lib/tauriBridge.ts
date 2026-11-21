@@ -2488,8 +2488,15 @@ class BrowserPreviewEngine {
   }
 }
 
-const previewEngine = new BrowserPreviewEngine();
+let previewEngineInstance: BrowserPreviewEngine | null = null;
 let previewCaTrusted = false;
+
+export function getPreviewEngine(): BrowserPreviewEngine {
+  if (!previewEngineInstance) {
+    previewEngineInstance = new BrowserPreviewEngine();
+  }
+  return previewEngineInstance;
+}
 
 // ============================================================================
 // Unified Tauri IPC API Bridge
@@ -2499,7 +2506,7 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<ProxyStatus>("get_proxy_status");
     }
-    return previewEngine.getStatus();
+    return getPreviewEngine().getStatus();
   },
 
   async startProxy(host?: string, port = 8888): Promise<ProxyStatus> {
@@ -2509,21 +2516,21 @@ export const proxyBridge = {
         port,
       });
     }
-    return previewEngine.setRunning(true, host, port);
+    return getPreviewEngine().setRunning(true, host, port);
   },
 
   async stopProxy(): Promise<ProxyStatus> {
     if (isTauriRuntime()) {
       return invoke<ProxyStatus>("stop_proxy");
     }
-    return previewEngine.setRunning(false);
+    return getPreviewEngine().setRunning(false);
   },
 
   async setAllowRemote(allow: boolean): Promise<ProxyStatus> {
     if (isTauriRuntime()) {
       return invoke<ProxyStatus>("set_allow_remote", { allow });
     }
-    return previewEngine.setAllowRemote(allow);
+    return getPreviewEngine().setAllowRemote(allow);
   },
 
   async setBindConfiguration(
@@ -2538,7 +2545,7 @@ export const proxyBridge = {
         alsoBindLoopback,
       });
     }
-    return previewEngine.setBindConfiguration(
+    return getPreviewEngine().setBindConfiguration(
       bindMode,
       specificBindIp,
       alsoBindLoopback
@@ -2597,14 +2604,14 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<ProxyStatus>("set_system_proxy", { enabled });
     }
-    return previewEngine.setSystemProxy(enabled);
+    return getPreviewEngine().setSystemProxy(enabled);
   },
 
   async setAutoSystemProxy(auto: boolean): Promise<ProxyStatus> {
     if (isTauriRuntime()) {
       return invoke<ProxyStatus>("set_auto_system_proxy", { auto });
     }
-    return previewEngine.setAutoSystemProxy(auto);
+    return getPreviewEngine().setAutoSystemProxy(auto);
   },
 
   async runProxyDoctor(): Promise<DoctorCheckResult[]> {
@@ -2612,7 +2619,7 @@ export const proxyBridge = {
       return invoke<DoctorCheckResult[]>("run_proxy_doctor");
     }
     return buildPreviewDoctorChecks({
-      status: previewEngine.getStatus(),
+      status: getPreviewEngine().getStatus(),
       caTrusted: previewCaTrusted,
     });
   },
@@ -2621,6 +2628,7 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<DoctorCheckResult[]>("fix_doctor_issue", { issueId });
     }
+    const previewEngine = getPreviewEngine();
     if (issueId === "port_binding" || issueId === "loopback_e2e" || issueId === "all") {
       if (!previewEngine.getStatus().running) {
         previewEngine.setRunning(true);
@@ -2645,21 +2653,21 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<ProxyStatus>("set_proxy_port", { port });
     }
-    return previewEngine.setPort(port);
+    return getPreviewEngine().setPort(port);
   },
 
   async getSessions(): Promise<SessionSummary[]> {
     if (isTauriRuntime()) {
       return invoke<SessionSummary[]>("get_sessions");
     }
-    return previewEngine.getSummaries();
+    return getPreviewEngine().getSummaries();
   },
 
   async getSessionDetail(id: number): Promise<SessionDetail | null> {
     if (isTauriRuntime()) {
       return invoke<SessionDetail | null>("get_session_detail", { id });
     }
-    return previewEngine.getDetail(id);
+    return getPreviewEngine().getDetail(id);
   },
 
   async setSessionRetentionLimit(limit: number | null): Promise<void> {
@@ -2667,7 +2675,7 @@ export const proxyBridge = {
       await invoke("set_session_retention_limit", { limit });
       return;
     }
-    previewEngine.setSessionRetentionLimit(limit);
+    getPreviewEngine().setSessionRetentionLimit(limit);
   },
 
   async setDropNonMatching(enabled: boolean): Promise<void> {
@@ -2675,35 +2683,35 @@ export const proxyBridge = {
       await invoke("set_drop_non_matching", { enabled });
       return;
     }
-    previewEngine.setDropNonMatching(enabled);
+    getPreviewEngine().setDropNonMatching(enabled);
   },
 
   async getMemoryStorageStats(): Promise<StorageStats> {
     if (isTauriRuntime()) {
       return invoke<StorageStats>("get_memory_storage_stats");
     }
-    return previewEngine.getMemoryStorageStats();
+    return getPreviewEngine().getMemoryStorageStats();
   },
 
   async clearSqliteDatabase(): Promise<StorageStats> {
     if (isTauriRuntime()) {
       return invoke<StorageStats>("clear_sqlite_database");
     }
-    return previewEngine.clearSqliteDatabase();
+    return getPreviewEngine().clearSqliteDatabase();
   },
 
   async getClearDbOnExit(): Promise<boolean> {
     if (isTauriRuntime()) {
       return invoke<boolean>("get_clear_db_on_exit");
     }
-    return previewEngine.getClearDbOnExit();
+    return getPreviewEngine().getClearDbOnExit();
   },
 
   async setClearDbOnExit(enabled: boolean): Promise<boolean> {
     if (isTauriRuntime()) {
       return invoke<boolean>("set_clear_db_on_exit", { enabled });
     }
-    return previewEngine.setClearDbOnExit(enabled);
+    return getPreviewEngine().setClearDbOnExit(enabled);
   },
 
   async loadSessionBody(
@@ -2716,7 +2724,7 @@ export const proxyBridge = {
         isResponse,
       });
     }
-    return previewEngine.loadSessionBody(id, isResponse);
+    return getPreviewEngine().loadSessionBody(id, isResponse);
   },
 
   async clearSessions(): Promise<void> {
@@ -2724,7 +2732,7 @@ export const proxyBridge = {
       await invoke("clear_sessions");
       return;
     }
-    previewEngine.clear();
+    getPreviewEngine().clear();
   },
 
   async deleteSessions(ids: number[]): Promise<number> {
@@ -2732,21 +2740,21 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<number>("delete_sessions", { ids });
     }
-    return previewEngine.deleteMany(ids);
+    return getPreviewEngine().deleteMany(ids);
   },
 
   async saveSessionsSqlite(): Promise<number> {
     if (isTauriRuntime()) {
       return invoke<number>("save_sessions_sqlite");
     }
-    return previewEngine.saveArchiveToPreviewStorage();
+    return getPreviewEngine().saveArchiveToPreviewStorage();
   },
 
   async loadSessionsSqlite(): Promise<SessionSummary[]> {
     if (isTauriRuntime()) {
       return invoke<SessionSummary[]>("load_sessions_sqlite");
     }
-    return previewEngine.loadArchiveFromPreviewStorage();
+    return getPreviewEngine().loadArchiveFromPreviewStorage();
   },
 
   async updateSessionAnnotations(
@@ -2761,7 +2769,7 @@ export const proxyBridge = {
         markedColor,
       });
     }
-    return previewEngine.updateAnnotations(ids, comment, markedColor);
+    return getPreviewEngine().updateAnnotations(ids, comment, markedColor);
   },
 
   async getCaInfo(): Promise<CaCertificateInfo> {
@@ -2800,7 +2808,7 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<ClientCertificateEntry[]>("list_client_certificates");
     }
-    return previewEngine.listClientCertificates();
+    return getPreviewEngine().listClientCertificates();
   },
 
   async addClientCertificate(
@@ -2811,7 +2819,7 @@ export const proxyBridge = {
         request,
       });
     }
-    return previewEngine.addClientCertificate(request);
+    return getPreviewEngine().addClientCertificate(request);
   },
 
   async toggleClientCertificate(
@@ -2824,7 +2832,7 @@ export const proxyBridge = {
         enabled,
       });
     }
-    return previewEngine.toggleClientCertificate(id, enabled);
+    return getPreviewEngine().toggleClientCertificate(id, enabled);
   },
 
   async removeClientCertificate(
@@ -2835,32 +2843,30 @@ export const proxyBridge = {
         id,
       });
     }
-    return previewEngine.removeClientCertificate(id);
+    return getPreviewEngine().removeClientCertificate(id);
   },
 
   async listRules(): Promise<AutoResponderRule[]> {
     if (isTauriRuntime()) {
       return invoke<AutoResponderRule[]>("list_rules");
     }
-    return previewEngine.listRules();
+    return getPreviewEngine().listRules();
   },
 
   async getAutoResponderEnabled(): Promise<boolean> {
     if (isTauriRuntime()) {
       return invoke<boolean>("get_autoresponder_enabled");
     }
-    return previewEngine.isAutoResponderEnabled();
+    return getPreviewEngine().isAutoResponderEnabled();
   },
 
   async setAutoResponderEnabled(enabled: boolean): Promise<boolean> {
     if (isTauriRuntime()) {
-      const applied = await invoke<boolean>("set_autoresponder_enabled", {
+      return invoke<boolean>("set_autoresponder_enabled", {
         enabled,
       });
-      previewEngine.setAutoResponderEnabled(applied);
-      return applied;
     }
-    return previewEngine.setAutoResponderEnabled(enabled);
+    return getPreviewEngine().setAutoResponderEnabled(enabled);
   },
 
   async setAutoResponderConfig(
@@ -2868,7 +2874,6 @@ export const proxyBridge = {
     rules: AutoResponderRule[]
   ): Promise<AutoResponderRule[]> {
     const cloned = structuredClone(rules);
-    previewEngine.setAutoResponderConfig(enabled, cloned);
     if (isTauriRuntime()) {
       try {
         return await invoke<AutoResponderRule[]>("set_autoresponder_config", {
@@ -2890,40 +2895,31 @@ export const proxyBridge = {
         return cloned;
       }
     }
+    getPreviewEngine().setAutoResponderConfig(enabled, cloned);
     return cloned;
   },
 
   async upsertRule(rule: AutoResponderRule): Promise<AutoResponderRule[]> {
     if (isTauriRuntime()) {
-      const updated = await invoke<AutoResponderRule[]>("upsert_rule", {
+      return invoke<AutoResponderRule[]>("upsert_rule", {
         rule,
       });
-      previewEngine.setAutoResponderConfig(
-        previewEngine.isAutoResponderEnabled(),
-        updated
-      );
-      return updated;
     }
-    return previewEngine.upsertRule(rule);
+    return getPreviewEngine().upsertRule(rule);
   },
 
   async deleteRule(id: string): Promise<AutoResponderRule[]> {
     if (isTauriRuntime()) {
-      const updated = await invoke<AutoResponderRule[]>("delete_rule", { id });
-      previewEngine.setAutoResponderConfig(
-        previewEngine.isAutoResponderEnabled(),
-        updated
-      );
-      return updated;
+      return invoke<AutoResponderRule[]>("delete_rule", { id });
     }
-    return previewEngine.deleteRule(id);
+    return getPreviewEngine().deleteRule(id);
   },
 
   async getFilterBackendConfig(): Promise<ProxyFilterBackendConfig> {
     if (isTauriRuntime()) {
       return invoke<ProxyFilterBackendConfig>("get_filter_backend_config");
     }
-    return previewEngine.getFilterBackendConfig();
+    return getPreviewEngine().getFilterBackendConfig();
   },
 
   async updateFilterBackendConfig(
@@ -2934,7 +2930,7 @@ export const proxyBridge = {
         config,
       });
     }
-    return previewEngine.updateFilterBackendConfig(config);
+    return getPreviewEngine().updateFilterBackendConfig(config);
   },
 
   async updateProxyFilterConfig(
@@ -2953,7 +2949,7 @@ export const proxyBridge = {
         );
       }
     }
-    return previewEngine.updateFilterBackendConfig(config);
+    return getPreviewEngine().updateFilterBackendConfig(config);
   },
 
   async getTlsRuleHitCounts(): Promise<Record<string, number>> {
@@ -2961,28 +2957,26 @@ export const proxyBridge = {
       try {
         return await invoke<Record<string, number>>("get_tls_rule_hit_counts");
       } catch {
-        return previewEngine.getTlsRuleHitCounts();
+        return {};
       }
     }
-    return previewEngine.getTlsRuleHitCounts();
+    return getPreviewEngine().getTlsRuleHitCounts();
   },
 
   async resetTlsBypassRulesToRecommended(): Promise<ProxyFilterBackendConfig> {
     if (isTauriRuntime()) {
-      const next = await invoke<ProxyFilterBackendConfig>(
+      return invoke<ProxyFilterBackendConfig>(
         "reset_tls_bypass_rules_to_recommended"
       );
-      previewEngine.updateFilterBackendConfig(next);
-      return next;
     }
-    return previewEngine.resetTlsBypassRulesToRecommended();
+    return getPreviewEngine().resetTlsBypassRulesToRecommended();
   },
 
   async getBreakpointConfig(): Promise<BreakpointConfig> {
     if (isTauriRuntime()) {
       return invoke<BreakpointConfig>("get_breakpoint_config");
     }
-    return previewEngine.getBreakpointConfig();
+    return getPreviewEngine().getBreakpointConfig();
   },
 
   async updateBreakpointConfig(
@@ -2991,21 +2985,21 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<BreakpointConfig>("update_breakpoint_config", { config });
     }
-    return previewEngine.updateBreakpointConfig(config);
+    return getPreviewEngine().updateBreakpointConfig(config);
   },
 
   async listPausedBreakpoints(): Promise<PausedBreakpointItem[]> {
     if (isTauriRuntime()) {
       return invoke<PausedBreakpointItem[]>("list_paused_breakpoints");
     }
-    return previewEngine.listPausedBreakpoints();
+    return getPreviewEngine().listPausedBreakpoints();
   },
 
   async resolveBreakpoint(resolution: BreakpointResolution): Promise<boolean> {
     if (isTauriRuntime()) {
       return invoke<boolean>("resolve_breakpoint", { resolution });
     }
-    return previewEngine.resolveBreakpoint(resolution);
+    return getPreviewEngine().resolveBreakpoint(resolution);
   },
 
   async resumeAllBreakpoints(
@@ -3014,7 +3008,7 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<number>("resume_all_breakpoints", { action });
     }
-    return previewEngine.resumeAllBreakpoints(action);
+    return getPreviewEngine().resumeAllBreakpoints(action);
   },
 
   async subscribeBreakpointsChanged(
@@ -3030,7 +3024,7 @@ export const proxyBridge = {
         }
       );
     }
-    return previewEngine.subscribeBreakpoints(onChanged);
+    return getPreviewEngine().subscribeBreakpoints(onChanged);
   },
 
   async codecTransform(
@@ -3062,7 +3056,7 @@ export const proxyBridge = {
         request: req,
       });
     }
-    return previewEngine.executeComposed(req);
+    return getPreviewEngine().executeComposed(req);
   },
 
   async subscribeSessionBatches(
@@ -3075,7 +3069,7 @@ export const proxyBridge = {
         }
       });
     }
-    return previewEngine.subscribe(onBatch);
+    return getPreviewEngine().subscribe(onBatch);
   },
 
   async subscribeSessionsRemoved(
@@ -3088,7 +3082,7 @@ export const proxyBridge = {
         }
       });
     }
-    return previewEngine.subscribeRemoved(onRemoved);
+    return getPreviewEngine().subscribeRemoved(onRemoved);
   },
 
   async subscribeStatusChanged(
@@ -3101,7 +3095,7 @@ export const proxyBridge = {
         }
       });
     }
-    return previewEngine.subscribeStatus(onChanged);
+    return getPreviewEngine().subscribeStatus(onChanged);
   },
 
   async subscribeStorageStatsChanged(
@@ -3114,7 +3108,7 @@ export const proxyBridge = {
         }
       });
     }
-    return previewEngine.subscribeStorageStats(onChanged);
+    return getPreviewEngine().subscribeStorageStats(onChanged);
   },
 
   async pickSaveFileDialog(options: {
@@ -3185,7 +3179,7 @@ export const proxyBridge = {
         sanitization: sanitization ?? null,
       });
     }
-    return previewEngine.exportPreviewSessions(
+    return getPreviewEngine().exportPreviewSessions(
       sessionIds,
       format,
       filePath,
@@ -3208,7 +3202,7 @@ export const proxyBridge = {
       );
     }
     const text = await file.text();
-    return previewEngine.importPreviewText(text);
+    return getPreviewEngine().importPreviewText(text);
   },
 
   async importSessionsBytes(
@@ -3227,7 +3221,7 @@ export const proxyBridge = {
       );
     }
     const text = new TextDecoder().decode(bytes);
-    return previewEngine.importPreviewText(text);
+    return getPreviewEngine().importPreviewText(text);
   },
 
   async saveSessionBodyFile(
@@ -3242,7 +3236,7 @@ export const proxyBridge = {
         filePath,
       });
     }
-    return previewEngine.savePreviewBody(sessionId, isResponse, filePath);
+    return getPreviewEngine().savePreviewBody(sessionId, isResponse, filePath);
   },
 
   async exportSettingsJsonFile(
@@ -3330,14 +3324,14 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<PythonRunnerStatus>("set_python_script", { code, enabled });
     }
-    return previewEngine.setPythonScript(code, enabled);
+    return getPreviewEngine().setPythonScript(code, enabled);
   },
 
   async getPythonRunnerStatus(): Promise<PythonRunnerStatus> {
     if (isTauriRuntime()) {
       return invoke<PythonRunnerStatus>("get_python_runner_status");
     }
-    return previewEngine.getPythonRunnerStatus();
+    return getPreviewEngine().getPythonRunnerStatus();
   },
 
   async subscribeScriptConsoleLogs(
@@ -3353,19 +3347,19 @@ export const proxyBridge = {
         }
       );
     }
-    return previewEngine.subscribeScriptLogs(onLog);
+    return getPreviewEngine().subscribeScriptLogs(onLog);
   },
 
   async generateStressTestSessions(count = 10_000): Promise<number> {
     if (isTauriRuntime()) {
       return invoke<number>("generate_stress_sessions", { count });
     }
-    return previewEngine.generateBulkStressSessions(count).length;
+    return getPreviewEngine().generateBulkStressSessions(count).length;
   },
 
   triggerSimulatedTrafficHit(): void {
     if (!isTauriRuntime()) {
-      void previewEngine.simulateLiveSessionFlow();
+      void getPreviewEngine().simulateLiveSessionFlow();
     }
   },
 };

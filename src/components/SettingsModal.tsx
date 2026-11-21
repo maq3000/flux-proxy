@@ -1,53 +1,26 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
-  Check,
-  ChevronDown,
-  ChevronRight,
   Columns,
-  Copy,
   Database,
   Download,
-  ExternalLink,
   FileJson,
   ListFilter,
-  Palette,
-  Plus,
-  RefreshCw,
   RotateCcw,
   Settings,
   Shield,
-  Sliders,
   Trash2,
   Upload,
   X,
 } from "lucide-react";
 import type { ThemePreference } from "../hooks/useTheme";
 import {
-  normalizeHexColor,
-  resolveEffectiveThemeTokens,
-  STATUS_FG_TO_BG_MAP,
-  THEME_PRESETS,
-  THEME_PRESETS_BY_ID,
-  THEME_TOKEN_GROUPS,
   type CustomColorOverrides,
-  type StatusFgTokenKey,
   type ThemePresetId,
   type ThemeTokenKey,
 } from "../lib/themePresets";
-import {
-  COLUMN_MIN_WIDTHS,
-  DEFAULT_COLUMN_WIDTHS,
-  TOOLBAR_GROUP_DEFINITIONS,
-  TRAFFIC_COLUMNS,
-} from "../hooks/useUiPreferences";
-import {
-  BUILT_IN_FILTER_PRESETS,
-  compileHostListFilter,
-} from "../lib/filterEngine";
-import { collectCurrentSettingsProfile } from "../lib/settingsManager";
+import { compileHostListFilter } from "../lib/filterEngine";
 import { proxyBridge } from "../lib/tauriBridge";
-import { SESSION_RETENTION_PRESETS } from "../types/proxy";
 import type {
   AutoResponderRule,
   BindHostMode,
@@ -55,7 +28,6 @@ import type {
   FilterConditionRule,
   FilterPreset,
   HostListFilterConfig,
-  HostListFilterMode,
   InspectorDockPosition,
   InspectorSplitDirection,
   NetworkInterfaceInfo,
@@ -63,16 +35,20 @@ import type {
   ProxyFilterBackendConfig,
   ProxyStatus,
   StorageStats,
-  TlsBypassRule,
   TlsInterceptMode,
   ToolbarGroupId,
 } from "../types/proxy";
 import {
   CURRENT_SETTINGS_SCHEMA_VERSION,
-  DEFAULT_SETTINGS_EXPORT_FILENAME,
   type SettingsImportPreviewSummary,
   type SettingsModalTab,
 } from "../types/settings";
+import { BackupExportSettingsTab } from "./settings/BackupExportSettingsTab";
+import type { BindConfigSectionProps } from "./settings/BindConfigSection";
+import { FiltersSettingsTab } from "./settings/FiltersSettingsTab";
+import { GeneralSettingsTab } from "./settings/GeneralSettingsTab";
+import { RulesProxySettingsTab } from "./settings/RulesProxySettingsTab";
+import { UiColumnsSettingsTab } from "./settings/UiColumnsSettingsTab";
 
 function attachDialogLightDismissFallback(
   dialog: HTMLDialogElement | null
@@ -337,79 +313,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [confirmPurgeSqliteOpen, setConfirmPurgeSqliteOpen] = useState(false);
   const [isPurgingSqlite, setIsPurgingSqlite] = useState(false);
 
-  // Port input local draft & post-blur validation
-  const [portDraft, setPortDraft] = useState<string>(() => String(status.port));
-  const [portError, setPortError] = useState<string | null>(null);
-
-  // Column width local drafts so typing doesn't jump mid-keystroke
-  const [widthDrafts, setWidthDrafts] = useState<Record<ColumnId, string>>(() => {
-    const init = {} as Record<ColumnId, string>;
-    for (const col of TRAFFIC_COLUMNS) {
-      init[col.id] = String(columnWidths[col.id] ?? col.defaultWidth);
-    }
-    return init;
-  });
-
-  // New Custom Filter Preset form
-  const [presetNameDraft, setPresetNameDraft] = useState("");
-  const [presetDescDraft, setPresetDescDraft] = useState("");
-  const [presetNameError, setPresetNameError] = useState<string | null>(null);
-
-  // Quick TLS rule addition inputs
-  const [newBypassPattern, setNewBypassPattern] = useState("");
-  const [newTargetPattern, setNewTargetPattern] = useState("");
-
-  // Optional raw JSON paste area in Backup & Export
-  const [rawJsonDraft, setRawJsonDraft] = useState("");
-  const [copiedProfileJson, setCopiedProfileJson] = useState(false);
-
-  // Theme Preset Gallery & Custom Palette Editor state
-  const [paletteEditorOpen, setPaletteEditorOpen] = useState(false);
-  const [hexDrafts, setHexDrafts] = useState<
-    Partial<Record<ThemeTokenKey, string>>
-  >({});
-
-  const activeThemePreset: ThemePresetId =
-    themePresetProp ??
-    (themePreference === "light" ? "default-light" : "default-dark");
-  const customOverrides = useMemo<CustomColorOverrides>(
-    () => customColorOverridesProp ?? {},
-    [customColorOverridesProp]
-  );
-  const resolvedFallbackPalette = useMemo(
-    () =>
-      resolveEffectiveThemeTokens(
-        activeThemePreset,
-        customOverrides,
-        themePreference !== "light",
-        themePreference
-      ),
-    [activeThemePreset, customOverrides, themePreference]
-  );
-  const effectiveTokens =
-    effectiveThemeTokensProp ?? resolvedFallbackPalette.tokens;
-  const effectiveStatusBgTokens = resolvedFallbackPalette.statusBgTokens;
-  const overriddenTokensCount = Object.keys(customOverrides).length;
-
-  useEffect(() => {
-    setHexDrafts({});
-  }, [activeThemePreset, customOverrides]);
-
-  const commitHexDraft = (tokenKey: ThemeTokenKey) => {
-    const draft = hexDrafts[tokenKey];
-    if (draft === undefined) return;
-    const normalized = normalizeHexColor(draft);
-    if (normalized) {
-      onSetCustomColorOverride?.(tokenKey, normalized);
-    }
-    setHexDrafts((prev) => {
-      if (!(tokenKey in prev)) return prev;
-      const next = { ...prev };
-      delete next[tokenKey];
-      return next;
-    });
-  };
-
   // Network interface binding selector (Loopback / AllInterfaces / Specific)
   const [networkInterfaces, setNetworkInterfaces] = useState<
     NetworkInterfaceInfo[]
@@ -418,23 +321,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [isApplyingBind, setIsApplyingBind] = useState(false);
   const [bindError, setBindError] = useState<string | null>(null);
   const [selectedSpecificIpDraft, setSelectedSpecificIpDraft] =
-    useState<string>(status.specificBindIp ?? "");
+    useState<string>(() => status.specificBindIp ?? "");
   const [pendingSpecificSelect, setPendingSpecificSelect] = useState(false);
 
   const loadNetworkInterfaces = async () => {
     setIsLoadingInterfaces(true);
     try {
-      const list = await proxyBridge.getNetworkInterfaces(true);
+      const list = await proxyBridge.getNetworkInterfaces();
       setNetworkInterfaces(list);
-      setSelectedSpecificIpDraft((prev) => {
-        if (prev && list.some((iface) => iface.ip === prev)) return prev;
-        if (status.specificBindIp) return status.specificBindIp;
-        return list.find((iface) => iface.isPrimary)?.ip ?? list[0]?.ip ?? prev;
-      });
+      if (!selectedSpecificIpDraft) {
+        const primary = list.find((iface) => iface.isPrimary) ?? list[0];
+        if (primary) {
+          setSelectedSpecificIpDraft(primary.ip);
+        }
+      }
     } catch (err) {
-      setBindError(
-        `Не удалось получить список интерфейсов: ${err instanceof Error ? err.message : String(err)}`
-      );
+      console.warn("SettingsModal: getNetworkInterfaces failed", err);
     } finally {
       setIsLoadingInterfaces(false);
     }
@@ -458,19 +360,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       setPendingSpecificSelect(false);
     }
   }, [status.specificBindIp, status.bindMode]);
-
-  useEffect(() => {
-    setPortDraft(String(status.port));
-    setPortError(null);
-  }, [status.port]);
-
-  useEffect(() => {
-    const next = {} as Record<ColumnId, string>;
-    for (const col of TRAFFIC_COLUMNS) {
-      next[col.id] = String(columnWidths[col.id] ?? col.defaultWidth);
-    }
-    setWidthDrafts(next);
-  }, [columnWidths]);
 
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -565,28 +454,29 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const handleBindModeChange = async (nextMode: BindHostMode) => {
     setBindError(null);
     if (nextMode === "specific") {
-      const targetIp =
+      setPendingSpecificSelect(true);
+      const candidateIp =
         selectedSpecificIpDraft ||
         status.specificBindIp ||
         networkInterfaces.find((iface) => iface.isPrimary)?.ip ||
-        networkInterfaces[0]?.ip ||
-        "";
-      if (!targetIp) {
-        setPendingSpecificSelect(true);
-        setBindError(
-          "Не обнаружены доступные сетевые интерфейсы. Нажмите «Обновить» или выберите другой режим."
-        );
+        networkInterfaces[0]?.ip;
+
+      if (!candidateIp) {
+        if (networkInterfaces.length === 0) {
+          await loadNetworkInterfaces();
+        }
         return;
       }
-      setPendingSpecificSelect(false);
-      setSelectedSpecificIpDraft(targetIp);
+
+      setSelectedSpecificIpDraft(candidateIp);
       setIsApplyingBind(true);
       try {
         await onSetBindConfiguration(
           "specific",
-          targetIp,
+          candidateIp,
           status.alsoBindLoopback ?? true
         );
+        setPendingSpecificSelect(false);
       } catch (err) {
         setBindError(err instanceof Error ? err.message : String(err));
       } finally {
@@ -600,7 +490,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     try {
       await onSetBindConfiguration(
         nextMode,
-        selectedSpecificIpDraft || status.specificBindIp || null,
+        status.specificBindIp ?? null,
         status.alsoBindLoopback ?? true
       );
     } catch (err) {
@@ -614,7 +504,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setSelectedSpecificIpDraft(nextIp);
     setBindError(null);
     if (!nextIp) return;
-    setPendingSpecificSelect(false);
     setIsApplyingBind(true);
     try {
       await onSetBindConfiguration(
@@ -622,6 +511,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         nextIp,
         status.alsoBindLoopback ?? true
       );
+      setPendingSpecificSelect(false);
     } catch (err) {
       setBindError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -637,7 +527,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       networkInterfaces[0]?.ip ||
       "";
     if (!targetIp) {
-      setBindError("Сначала выберите конкретный IP-интерфейс из списка.");
+      setBindError("Сначала выберите IP-адрес интерфейса.");
       return;
     }
     setBindError(null);
@@ -651,216 +541,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
-  const renderBindConfigurationSection = (sectionKey: "general" | "rules") => {
-    const radioName = `${baseId}-${sectionKey}-bind-mode`;
-    const isSpecific = effectiveBindMode === "specific";
-    const activeSpecificValue = resolvedSpecificIpCandidate;
-    const hasCurrentSpecificInList = Boolean(
-      activeSpecificValue &&
-        networkInterfaces.some((iface) => iface.ip === activeSpecificValue)
-    );
-    const alsoLoopbackChecked = status.alsoBindLoopback ?? true;
-
-    const options: {
-      value: BindHostMode;
-      title: string;
-      desc: string;
-    }[] = [
-      {
-        value: "loopback",
-        title: "Loopback (127.0.0.1)",
-        desc: "Принимать подключения только локально с этого ПК (изолированный безопасный режим).",
-      },
-      {
-        value: "all",
-        title: "All Interfaces (0.0.0.0)",
-        desc: "Слушать все сетевые интерфейсы: Wi-Fi, LAN, смартфоны iOS / Android, VPN и WSL.",
-      },
-      {
-        value: "specific",
-        title: "Specific Interface",
-        desc: "Выбрать конкретный сетевой адаптер (Wi-Fi, Ethernet, WSL, Docker, Hyper-V, VPN).",
-      },
-    ];
-
-    const body = (
-      <div className="space-y-2.5">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="font-semibold text-fg">
-            Привязка к сетевому интерфейсу (Bind Host)
-          </div>
-          <div className="flex flex-wrap items-center gap-1.5">
-            {activeBoundIps.map((ip) => (
-              <span
-                key={`${sectionKey}-${ip}`}
-                className="rounded border border-hairline bg-surface px-1.5 py-0.5 font-mono text-[10px] text-fg tabular-nums"
-              >
-                {ip}:{status.port}
-              </span>
-            ))}
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-          {options.map((opt) => {
-            const rId = `${baseId}-${sectionKey}-bind-${opt.value}`;
-            const checked = effectiveBindMode === opt.value;
-            return (
-              <label
-                key={opt.value}
-                htmlFor={rId}
-                className={`flex cursor-pointer items-start gap-2 rounded-lg border p-2.5 transition-colors ${
-                  checked
-                    ? "border-accent/50 bg-selected"
-                    : "border-hairline bg-surface hover:bg-hover"
-                } ${isApplyingBind ? "opacity-75" : ""}`}
-              >
-                <input
-                  id={rId}
-                  type="radio"
-                  name={radioName}
-                  value={opt.value}
-                  checked={checked}
-                  disabled={isApplyingBind}
-                  onChange={() => void handleBindModeChange(opt.value)}
-                  className="mt-0.5 cursor-pointer accent-[var(--accent-primary)]"
-                />
-                <div className="min-w-0">
-                  <div className="text-xs font-semibold text-fg">
-                    {opt.title}
-                  </div>
-                  <div className="mt-0.5 text-[11px] leading-snug text-muted">
-                    {opt.desc}
-                  </div>
-                </div>
-              </label>
-            );
-          })}
-        </div>
-
-        {isSpecific && (
-          <div className="space-y-2 rounded-md border border-hairline bg-surface p-2.5">
-            <div className="flex flex-wrap items-center gap-2">
-              <label
-                htmlFor={`${baseId}-${sectionKey}-iface-select`}
-                className="text-[11px] font-medium text-muted"
-              >
-                Интерфейс:
-              </label>
-              <select
-                id={`${baseId}-${sectionKey}-iface-select`}
-                value={activeSpecificValue}
-                disabled={
-                  isApplyingBind ||
-                  isLoadingInterfaces ||
-                  (networkInterfaces.length === 0 && !hasCurrentSpecificInList)
-                }
-                onChange={(e) => void handleSpecificIpChange(e.target.value)}
-                className="h-8 min-w-[240px] flex-1 rounded-md border border-strong bg-canvas px-2 font-mono text-xs text-fg focus:border-accent focus:outline-none"
-              >
-                {networkInterfaces.length === 0 && !hasCurrentSpecificInList && (
-                  <option value="">Нет доступных интерфейсов</option>
-                )}
-                {!hasCurrentSpecificInList && activeSpecificValue && (
-                  <option value={activeSpecificValue}>
-                    {activeSpecificValue} (Сохранённый / Offline)
-                  </option>
-                )}
-                {networkInterfaces.map((iface) => (
-                  <option key={`${iface.ip}-${iface.name}`} value={iface.ip}>
-                    {iface.name} — {iface.ip} ({iface.kind.toUpperCase()}
-                    {iface.isPrimary ? ", Primary" : ""})
-                  </option>
-                ))}
-              </select>
-              <button
-                type="button"
-                disabled={isLoadingInterfaces || isApplyingBind}
-                onClick={() => void loadNetworkInterfaces()}
-                className="inline-flex h-8 items-center gap-1.5 rounded-md border border-strong bg-canvas px-2.5 text-[11px] font-medium text-fg hover:bg-hover disabled:opacity-50"
-              >
-                <RefreshCw
-                  className={`h-3.5 w-3.5 ${isLoadingInterfaces ? "animate-spin" : ""}`}
-                />
-                <span>Обновить</span>
-              </button>
-            </div>
-
-            <label
-              htmlFor={`${baseId}-${sectionKey}-also-loopback`}
-              className="flex cursor-pointer items-start gap-2 pt-0.5"
-            >
-              <input
-                id={`${baseId}-${sectionKey}-also-loopback`}
-                type="checkbox"
-                checked={alsoLoopbackChecked}
-                disabled={isApplyingBind || activeSpecificValue === "127.0.0.1"}
-                onChange={(e) =>
-                  void handleAlsoBindLoopbackChange(e.target.checked)
-                }
-                className="checkbox-native mt-0.5"
-              />
-              <div>
-                <div className="text-xs font-medium text-fg">
-                  Также слушать 127.0.0.1 для системного прокси ОС
-                </div>
-                <div className="text-[11px] text-muted">
-                  {alsoLoopbackChecked && activeSpecificValue !== "127.0.0.1"
-                    ? `Dual Listener: прокси принимает подключения и на ${activeSpecificValue}:${status.port}, и на 127.0.0.1:${status.port} (системный прокси ОС указывает на 127.0.0.1).`
-                    : `Один сокет: прокси и системный прокси ОС используют ${activeSpecificValue || "выбранный IP"}:${status.port}.`}
-                </div>
-              </div>
-            </label>
-          </div>
-        )}
-
-        {bindError && (
-          <div
-            role="alert"
-            className="flex items-start gap-2 rounded-md border border-status5xx-fg/40 bg-status5xx-bg/60 px-2.5 py-2 text-[11px] text-status5xx-fg"
-          >
-            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>{bindError}</span>
-          </div>
-        )}
-      </div>
-    );
-
-    if (sectionKey === "rules") {
-      return (
-        <fieldset className="space-y-2.5 rounded-lg border border-hairline bg-canvas p-3.5">
-          <legend className="px-1 text-xs font-semibold text-fg">
-            Сетевой интерфейс прокси (Bind Host)
-          </legend>
-          {body}
-        </fieldset>
-      );
-    }
-
-    return (
-      <div className="border-t border-hairline pt-2.5">
-        {body}
-      </div>
-    );
-  };
-
-  const validatePortString = (raw: string): number | null => {
-    const clean = raw.trim();
-    if (!/^\d+$/.test(clean)) return null;
-    const num = Number(clean);
-    if (!Number.isInteger(num) || num < 1 || num > 65535) return null;
-    return num;
-  };
-
-  const handlePortSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const parsed = validatePortString(portDraft);
-    if (parsed === null) {
-      setPortError("Укажите корректный TCP-порт от 1 до 65535.");
-      return;
-    }
-    setPortError(null);
-    await onSetProxyPort(parsed);
+  const bindConfigProps: Omit<BindConfigSectionProps, "sectionKey"> = {
+    baseId,
+    status,
+    effectiveBindMode,
+    activeBoundIps,
+    resolvedSpecificIpCandidate,
+    networkInterfaces,
+    isLoadingInterfaces,
+    isApplyingBind,
+    bindError,
+    onBindModeChange: handleBindModeChange,
+    onSpecificIpChange: handleSpecificIpChange,
+    onAlsoBindLoopbackChange: handleAlsoBindLoopbackChange,
+    onReloadInterfaces: loadNetworkInterfaces,
   };
 
   const handleTabKeyDown = (
@@ -870,8 +564,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     const keys = [
       "ArrowDown",
       "ArrowUp",
-      "ArrowRight",
       "ArrowLeft",
+      "ArrowRight",
       "Home",
       "End",
     ];
@@ -892,91 +586,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     tabButtonRefs.current[targetTab.id]?.focus();
   };
 
-  const commitColumnWidth = (colId: ColumnId) => {
-    const min = COLUMN_MIN_WIDTHS[colId] ?? 48;
-    const raw = Number(widthDrafts[colId]);
-    if (!Number.isFinite(raw) || raw <= 0) {
-      setWidthDrafts((prev) => ({
-        ...prev,
-        [colId]: String(columnWidths[colId] ?? DEFAULT_COLUMN_WIDTHS[colId]),
-      }));
-      return;
-    }
-    const clamped = Math.min(1600, Math.max(min, Math.round(raw)));
-    onSetColumnWidth(colId, clamped);
-    setWidthDrafts((prev) => ({ ...prev, [colId]: String(clamped) }));
-  };
-
-  const handleCreatePreset = (e: React.FormEvent) => {
-    e.preventDefault();
-    const cleanName = presetNameDraft.trim();
-    if (!cleanName) {
-      setPresetNameError("Введите название пресета фильтров.");
-      return;
-    }
-    onSaveCustomPreset(
-      cleanName,
-      presetDescDraft.trim() || "Пользовательский пресет фильтров"
-    );
-    setPresetNameDraft("");
-    setPresetDescDraft("");
-    setPresetNameError(null);
-  };
-
-  const handleAddTlsRule = async (
-    listKind: "bypass" | "target",
-    patternRaw: string
-  ) => {
-    const clean = patternRaw.trim();
-    if (!clean) return;
-    const newRule: TlsBypassRule = {
-      id: `tls-${listKind}-${Date.now()}`,
-      enabled: true,
-      pattern: clean,
-      category: "Custom",
-      description:
-        listKind === "bypass"
-          ? "Пользовательское правило TLS Bypass"
-          : "Целевой хост Selective MITM",
-    };
-    if (listKind === "bypass") {
-      await onUpdateBackendFilterConfig({
-        ...backendFilterConfig,
-        tlsBypassRules: [newRule, ...backendFilterConfig.tlsBypassRules],
-      });
-      setNewBypassPattern("");
-    } else {
-      await onUpdateBackendFilterConfig({
-        ...backendFilterConfig,
-        tlsTargetRules: [newRule, ...backendFilterConfig.tlsTargetRules],
-      });
-      setNewTargetPattern("");
-    }
-  };
-
-  const handleCopyCurrentProfileJson = async () => {
-    try {
-      const snapshot = collectCurrentSettingsProfile();
-      await navigator.clipboard.writeText(JSON.stringify(snapshot, null, 2));
-      setCopiedProfileJson(true);
-      onNotify("📋 JSON текущего профиля настроек скопирован в буфер обмена");
-      window.setTimeout(() => setCopiedProfileJson(false), 2000);
-    } catch {
-      onNotify("⚠️ Не удалось скопировать JSON в буфер обмена");
-    }
-  };
-
   const handleConfirmReset = async () => {
     setConfirmResetOpen(false);
     await onResetAllToDefaults();
   };
-
-  const visibleColsCount = TRAFFIC_COLUMNS.filter(
-    (c) => visibleColumns[c.id]
-  ).length;
-  const visibleGroupsCount = TOOLBAR_GROUP_DEFINITIONS.filter(
-    (g) => toolbarGroups[g.id]
-  ).length;
 
   return (
     <>
@@ -1075,2143 +688,120 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 TAB 1: GENERAL
                ============================================================== */}
             {activeTab === "general" && (
-              <>
-                <fieldset className="space-y-2.5 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <legend className="px-1 text-xs font-semibold text-fg">
-                    Цветовая схема (Theme)
-                  </legend>
-                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-                    {(
-                      [
-                        {
-                          value: "dark",
-                          title: "Dark",
-                          desc: "Тёмная палитра Zinc (по умолчанию)",
-                        },
-                        {
-                          value: "light",
-                          title: "Light",
-                          desc: "Светлая высококонтрастная тема",
-                        },
-                        {
-                          value: "system",
-                          title: "System",
-                          desc: "Следовать настройкам ОС",
-                        },
-                      ] as const
-                    ).map((opt) => {
-                      const radioId = `${baseId}-theme-${opt.value}`;
-                      const checked = themePreference === opt.value;
-                      return (
-                        <label
-                          key={opt.value}
-                          htmlFor={radioId}
-                          className={`flex cursor-pointer items-start gap-2.5 rounded-lg border p-2.5 transition-colors ${
-                            checked
-                              ? "border-accent/50 bg-selected"
-                              : "border-hairline bg-surface hover:bg-hover"
-                          }`}
-                        >
-                          <input
-                            id={radioId}
-                            type="radio"
-                            name={`${baseId}-theme`}
-                            value={opt.value}
-                            checked={checked}
-                            onChange={() => onSetTheme(opt.value)}
-                            className="mt-0.5 cursor-pointer accent-[var(--accent-primary)]"
-                          />
-                          <div>
-                            <div className="font-semibold text-fg">
-                              {opt.title}
-                            </div>
-                            <div className="text-[11px] text-muted">
-                              {opt.desc}
-                            </div>
-                          </div>
-                        </label>
-                      );
-                    })}
-                  </div>
-                </fieldset>
-
-                <div className="space-y-3 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <h3 className="text-xs font-semibold text-fg">
-                    Локальный прокси-сервер и сетевые подключения
-                  </h3>
-
-                  <form
-                    onSubmit={(e) => void handlePortSubmit(e)}
-                    className="flex flex-wrap items-start gap-2.5"
-                  >
-                    <div className="flex flex-col gap-1">
-                      <label
-                        htmlFor={`${baseId}-proxy-port`}
-                        className="text-[11px] font-medium text-muted"
-                      >
-                        Порт прокси-сервера (1–65535)
-                      </label>
-                      <div className="flex items-center gap-2">
-                        <input
-                          id={`${baseId}-proxy-port`}
-                          type="text"
-                          inputMode="numeric"
-                          autoCorrect="off"
-                          autoCapitalize="off"
-                          spellCheck={false}
-                          value={portDraft}
-                          aria-invalid={portError ? "true" : undefined}
-                          aria-errormessage={
-                            portError ? `${baseId}-port-err` : undefined
-                          }
-                          onChange={(e) => {
-                            setPortDraft(e.target.value);
-                            if (portError) setPortError(null);
-                          }}
-                          onBlur={(e) => {
-                            if (validatePortString(e.currentTarget.value) === null) {
-                              setPortError(
-                                "Укажите корректный TCP-порт от 1 до 65535."
-                              );
-                            }
-                          }}
-                          className="h-8 w-28 rounded-md border border-strong bg-surface px-2.5 font-mono text-xs text-fg tabular-nums focus:border-accent focus:outline-none"
-                        />
-                        <button
-                          type="submit"
-                          className="inline-flex h-8 items-center gap-1.5 rounded-md border border-accent/40 bg-selected px-3 text-xs font-medium text-fg hover:brightness-110"
-                        >
-                          <Check className="h-3.5 w-3.5 text-accent" />
-                          <span>Применить порт</span>
-                        </button>
-                        <span className="font-mono text-[11px] text-muted">
-                          Активен: {activeEndpointsSummary}
-                        </span>
-                      </div>
-                      {portError && (
-                        <span
-                          id={`${baseId}-port-err`}
-                          role="status"
-                          aria-live="polite"
-                          className="text-[11px] font-medium text-status5xx-fg"
-                        >
-                          {portError}
-                        </span>
-                      )}
-                    </div>
-                  </form>
-
-                  <div className="space-y-2 border-t border-hairline pt-2.5">
-                    <label
-                      htmlFor={`${baseId}-auto-sysproxy`}
-                      className="flex cursor-pointer items-start gap-2.5"
-                    >
-                      <input
-                        id={`${baseId}-auto-sysproxy`}
-                        type="checkbox"
-                        checked={status.autoSystemProxy}
-                        onChange={(e) =>
-                          void onSetAutoSystemProxy(e.target.checked)
-                        }
-                        className="checkbox-native mt-0.5"
-                      />
-                      <div>
-                        <div className="font-medium text-fg">
-                          Автоматически включать системный прокси ОС (Act as System Proxy)
-                        </div>
-                        <div className="text-[11px] text-muted">
-                          При запуске захвата перенаправляет системный HTTP/HTTPS трафик на{" "}
-                          <code className="font-mono">
-                            {sysProxyTargetHost}:{status.port}
-                          </code>{" "}
-                          и откатывает при выходе.
-                        </div>
-                      </div>
-                    </label>
-
-                    {renderBindConfigurationSection("general")}
-                  </div>
-                </div>
-
-                <div className="space-y-3 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <h3 className="text-xs font-semibold text-fg">
-                    Поток трафика и кольцевой буфер памяти
-                  </h3>
-
-                  <label
-                    htmlFor={`${baseId}-follow-tail`}
-                    className="flex cursor-pointer items-start gap-2.5"
-                  >
-                    <input
-                      id={`${baseId}-follow-tail`}
-                      type="checkbox"
-                      checked={followTail}
-                      onChange={(e) => onSetFollowTail(e.target.checked)}
-                      className="checkbox-native mt-0.5"
-                    />
-                    <div>
-                      <div className="font-medium text-fg">
-                        Автопрокрутка к новым запросам (Follow Tail)
-                      </div>
-                      <div className="text-[11px] text-muted">
-                        Автоматически удерживает нижний край таблицы при поступлении новых HTTP/WS сессий.
-                      </div>
-                    </div>
-                  </label>
-
-                  <div className="flex flex-wrap items-center gap-3 border-t border-hairline pt-2.5">
-                    <label
-                      htmlFor={`${baseId}-retention-select`}
-                      className="text-[11px] font-medium text-muted"
-                    >
-                      Хранить сессий в RAM (Ring Buffer):
-                    </label>
-                    <select
-                      id={`${baseId}-retention-select`}
-                      value={
-                        sessionRetentionLimit === null
-                          ? "all"
-                          : String(sessionRetentionLimit)
-                      }
-                      onChange={(e) => {
-                        const val = e.target.value;
-                        void onSetSessionRetentionLimit(
-                          val === "all" ? null : Number(val)
-                        );
-                      }}
-                      className="h-8 rounded-md border border-strong bg-surface px-2.5 font-mono text-xs text-fg"
-                    >
-                      <option value="all">All Sessions (Без лимита)</option>
-                      {SESSION_RETENTION_PRESETS.map((preset) => (
-                        <option key={preset} value={String(preset)}>
-                          {preset.toLocaleString()} сессий
-                        </option>
-                      ))}
-                      {sessionRetentionLimit !== null &&
-                        !(SESSION_RETENTION_PRESETS as readonly number[]).includes(
-                          sessionRetentionLimit
-                        ) && (
-                          <option value={String(sessionRetentionLimit)}>
-                            {sessionRetentionLimit.toLocaleString()} (Custom)
-                          </option>
-                        )}
-                    </select>
-                  </div>
-
-                  <label
-                    htmlFor={`${baseId}-drop-non-matching`}
-                    className="flex cursor-pointer items-start gap-2.5"
-                  >
-                    <input
-                      id={`${baseId}-drop-non-matching`}
-                      type="checkbox"
-                      checked={dropNonMatching}
-                      onChange={(e) =>
-                        void onSetDropNonMatching(e.target.checked)
-                      }
-                      className="checkbox-native mt-0.5"
-                    />
-                    <div>
-                      <div className="font-medium text-fg">
-                        Отбрасывать несовпадающие с фильтром запросы при захвате (Drop Non-Matching)
-                      </div>
-                      <div className="text-[11px] text-muted">
-                        Экономит ОЗУ на высоконагруженных стендах — отсеянные сессии не сохраняются в буфер.
-                      </div>
-                    </div>
-                  </label>
-
-                  <div className="mt-3 rounded-lg border border-hairline bg-surface p-3 space-y-3">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex items-center gap-2 text-xs font-medium text-fg">
-                        <Database className="h-3.5 w-3.5 text-accent" />
-                        <span>Архив SQLite (sessions.sqlite + WAL)</span>
-                      </div>
-                      <div className="text-xs font-mono tabular-nums text-fg">
-                        {(storageStats.sqliteSizeBytes / (1024 * 1024)).toFixed(2)} MB
-                        <span className="ml-1.5 text-[11px] text-muted">
-                          ({Math.round(storageStats.sqliteSizeBytes / 1024).toLocaleString("en-US")} KB)
-                        </span>
-                      </div>
-                    </div>
-
-                    <label className="flex cursor-pointer items-start gap-2.5 text-xs">
-                      <input
-                        type="checkbox"
-                        checked={clearDbOnExit}
-                        onChange={(e) => void onSetClearDbOnExit(e.target.checked)}
-                        className="checkbox-native mt-0.5"
-                      />
-                      <div>
-                        <div className="font-medium text-fg">
-                          Очищать базу SQLite при выходе (Clear DB on App Exit)
-                        </div>
-                        <div className="text-[11px] text-muted">
-                          При закрытии приложения автоматически удаляет все архивные сессии и сжимает файл базы через VACUUM.
-                        </div>
-                      </div>
-                    </label>
-
-                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1 border-t border-hairline">
-                      <div className="text-[11px] text-muted">
-                        Полная очистка удаляет все сохранённые сессии с диска (сессии в ОЗУ сохраняются).
-                      </div>
-                      <button
-                        type="button"
-                        disabled={isPurgingSqlite}
-                        onClick={() => setConfirmPurgeSqliteOpen(true)}
-                        className="inline-flex items-center gap-1.5 rounded border border-status5xx-fg/40 bg-status5xx-bg/40 px-2.5 py-1.5 text-xs font-medium text-status5xx-fg transition-colors hover:bg-status5xx-bg disabled:opacity-50"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                        <span>
-                          {isPurgingSqlite
-                            ? "Сжатие SQLite..."
-                            : "Очистить архив SQLite сейчас (VACUUM)"}
-                        </span>
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </>
+              <GeneralSettingsTab
+                baseId={baseId}
+                themePreference={themePreference}
+                onSetTheme={onSetTheme}
+                followTail={followTail}
+                onSetFollowTail={onSetFollowTail}
+                status={status}
+                activeEndpointsSummary={activeEndpointsSummary}
+                sysProxyTargetHost={sysProxyTargetHost}
+                onSetProxyPort={onSetProxyPort}
+                onSetAutoSystemProxy={onSetAutoSystemProxy}
+                sessionRetentionLimit={sessionRetentionLimit}
+                onSetSessionRetentionLimit={onSetSessionRetentionLimit}
+                dropNonMatching={dropNonMatching}
+                onSetDropNonMatching={onSetDropNonMatching}
+                clearDbOnExit={clearDbOnExit}
+                onSetClearDbOnExit={onSetClearDbOnExit}
+                storageStats={storageStats}
+                isPurgingSqlite={isPurgingSqlite}
+                setConfirmPurgeSqliteOpen={setConfirmPurgeSqliteOpen}
+                bindConfigProps={bindConfigProps}
+              />
             )}
 
-            {/* ==============================================================
-                TAB 2: UI, THEME & COLUMNS
-               ============================================================== */}
             {activeTab === "uiColumns" && (
-              <>
-                <div className="space-y-3 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <div className="flex flex-wrap items-start justify-between gap-2">
-                    <div>
-                      <div className="flex items-center gap-1.5">
-                        <Palette className="h-3.5 w-3.5 text-accent" />
-                        <h3 className="text-xs font-semibold text-fg">
-                          Галерея цветовых тем-пресетов
-                        </h3>
-                      </div>
-                      <p className="mt-0.5 text-[11px] text-muted">
-                        Мгновенно переключает интерфейс, HTTP-статусы и подсветку Monaco Editor.
-                      </p>
-                    </div>
-
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <div
-                        role="group"
-                        aria-label="Базовая схема"
-                        className="inline-flex rounded-md border border-hairline bg-surface p-0.5"
-                      >
-                        {(
-                          [
-                            { id: "dark", label: "Dark" },
-                            { id: "light", label: "Light" },
-                            { id: "system", label: "System" },
-                          ] as const
-                        ).map((mode) => (
-                          <button
-                            key={mode.id}
-                            type="button"
-                            onClick={() => onSetTheme(mode.id)}
-                            className={`rounded px-2 py-0.5 text-[11px] font-medium transition-colors ${
-                              themePreference === mode.id
-                                ? "bg-selected text-fg"
-                                : "text-muted hover:text-fg"
-                            }`}
-                          >
-                            {mode.label}
-                          </button>
-                        ))}
-                      </div>
-
-                      <button
-                        type="button"
-                        disabled={overriddenTokensCount === 0}
-                        onClick={() => {
-                          setHexDrafts({});
-                          onResetCustomColorOverrides?.();
-                        }}
-                        className="inline-flex items-center gap-1 rounded border border-hairline bg-surface px-2.5 py-1 text-[11px] text-muted hover:border-strong hover:text-fg disabled:cursor-not-allowed disabled:opacity-45"
-                      >
-                        <RotateCcw className="h-3 w-3" />
-                        <span>
-                          Сбросить цвета
-                          {overriddenTokensCount > 0
-                            ? ` (${overriddenTokensCount})`
-                            : ""}
-                        </span>
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* 8 Theme Preset Cards Grid */}
-                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
-                    {THEME_PRESETS.map((preset) => {
-                      const isSelected = activeThemePreset === preset.id;
-                      return (
-                        <button
-                          key={preset.id}
-                          type="button"
-                          aria-pressed={isSelected}
-                          onClick={() => {
-                            setHexDrafts({});
-                            if (onSetThemePreset) {
-                              onSetThemePreset(preset.id);
-                            } else {
-                              onSetTheme(preset.baseScheme);
-                            }
-                          }}
-                          className={`group flex flex-col justify-between rounded-lg border p-2.5 text-left transition-colors ${
-                            isSelected
-                              ? "border-accent bg-selected ring-1 ring-accent/35"
-                              : "border-hairline bg-surface hover:border-strong hover:bg-hover"
-                          }`}
-                        >
-                          <div className="space-y-1.5">
-                            <div className="flex items-start justify-between gap-1.5">
-                              <span className="truncate text-xs font-semibold text-fg">
-                                {preset.name}
-                              </span>
-                              <div className="flex shrink-0 items-center gap-1">
-                                <span
-                                  className={`rounded px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase ${
-                                    preset.baseScheme === "dark"
-                                      ? "border border-strong/70 bg-elevated text-muted"
-                                      : "border border-strong/70 bg-elevated text-fg"
-                                  }`}
-                                >
-                                  {preset.baseScheme === "dark" ? "Dark" : "Light"}
-                                </span>
-                                {isSelected && (
-                                  <Check className="h-3.5 w-3.5 text-accent" />
-                                )}
-                              </div>
-                            </div>
-
-                            <p className="line-clamp-2 text-[10px] leading-snug text-muted">
-                              {preset.description}
-                            </p>
-                          </div>
-
-                          <div className="mt-2.5 flex items-center gap-1.5 border-t border-hairline/70 pt-2">
-                            {preset.swatches.map((hex, sIdx) => (
-                              <span
-                                key={`${preset.id}-swatch-${sIdx}`}
-                                title={hex}
-                                className="h-4 flex-1 rounded-sm border border-strong/50"
-                                style={{ backgroundColor: hex }}
-                              />
-                            ))}
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-
-                  {/* Expandable Detailed Palette Editor */}
-                  <div className="rounded-lg border border-hairline bg-surface">
-                    <button
-                      type="button"
-                      aria-expanded={paletteEditorOpen}
-                      aria-controls={`${baseId}-palette-editor`}
-                      onClick={() => setPaletteEditorOpen((v) => !v)}
-                      className="flex w-full items-center justify-between gap-2 px-3 py-2 text-left transition-colors hover:bg-hover"
-                    >
-                      <div className="flex items-center gap-2">
-                        {paletteEditorOpen ? (
-                          <ChevronDown className="h-3.5 w-3.5 text-accent" />
-                        ) : (
-                          <ChevronRight className="h-3.5 w-3.5 text-muted" />
-                        )}
-                        <span className="text-xs font-semibold text-fg">
-                          Детальная настройка палитры
-                        </span>
-                        <span className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-muted">
-                          {THEME_PRESETS_BY_ID[activeThemePreset]?.name ??
-                            activeThemePreset}
-                        </span>
-                      </div>
-                      <span className="font-mono text-[10px] text-muted">
-                        {overriddenTokensCount > 0
-                          ? `Переопределено: ${overriddenTokensCount}`
-                          : "По пресету"}
-                      </span>
-                    </button>
-
-                    {paletteEditorOpen && (
-                      <div
-                        id={`${baseId}-palette-editor`}
-                        className="space-y-3 border-t border-hairline p-3"
-                      >
-                        {/* Live Preview Strip */}
-                        <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-hairline bg-canvas p-2.5">
-                          <div className="flex flex-wrap items-center gap-1.5 font-mono text-[11px]">
-                            <span
-                              className="rounded px-2 py-0.5 font-semibold"
-                              style={{
-                                backgroundColor:
-                                  effectiveTokens["--bg-selected"],
-                                color: effectiveTokens["--text-primary"],
-                                border: `1px solid ${effectiveTokens["--accent-primary"]}`,
-                              }}
-                            >
-                              Selected Row
-                            </span>
-                            {(
-                              [
-                                { key: "--status-2xx-fg", text: "200 OK" },
-                                { key: "--status-3xx-fg", text: "304" },
-                                { key: "--status-4xx-fg", text: "404" },
-                                { key: "--status-5xx-fg", text: "502" },
-                                { key: "--status-ws-fg", text: "WS 101" },
-                              ] as const
-                            ).map((badge) => (
-                              <span
-                                key={badge.key}
-                                className="rounded px-1.5 py-0.5 font-semibold"
-                                style={{
-                                  color: effectiveTokens[badge.key],
-                                  backgroundColor:
-                                    effectiveStatusBgTokens[
-                                      STATUS_FG_TO_BG_MAP[badge.key]
-                                    ],
-                                }}
-                              >
-                                {badge.text}
-                              </span>
-                            ))}
-                          </div>
-
-                          <button
-                            type="button"
-                            disabled={overriddenTokensCount === 0}
-                            onClick={() => {
-                              setHexDrafts({});
-                              onResetCustomColorOverrides?.();
-                            }}
-                            className="inline-flex items-center gap-1 rounded border border-hairline bg-surface px-2.5 py-1 text-[11px] font-medium text-fg hover:bg-hover disabled:cursor-not-allowed disabled:opacity-45"
-                          >
-                            <RotateCcw className="h-3 w-3 text-accent" />
-                            <span>Сбросить кастомные цвета к пресету</span>
-                          </button>
-                        </div>
-
-                        {/* Token Groups */}
-                        <div className="space-y-3">
-                          {THEME_TOKEN_GROUPS.map((group) => (
-                            <div key={group.id} className="space-y-2">
-                              <div>
-                                <div className="text-[11px] font-semibold text-fg">
-                                  {group.title}
-                                </div>
-                                <div className="text-[10px] text-muted">
-                                  {group.description}
-                                </div>
-                              </div>
-
-                              <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-                                {group.fields.map((field) => {
-                                  const colorValue = effectiveTokens[field.key];
-                                  const draftVal = hexDrafts[field.key];
-                                  const displayValue = draftVal ?? colorValue;
-                                  const isOverridden = Boolean(
-                                    customOverrides[field.key]
-                                  );
-                                  const colorInputId = `${baseId}-color-${field.key}`;
-                                  const hexInputId = `${baseId}-hex-${field.key}`;
-                                  const statusBgKey =
-                                    field.key in STATUS_FG_TO_BG_MAP
-                                      ? STATUS_FG_TO_BG_MAP[
-                                          field.key as StatusFgTokenKey
-                                        ]
-                                      : null;
-
-                                  return (
-                                    <div
-                                      key={field.key}
-                                      className={`flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 ${
-                                        isOverridden
-                                          ? "border-accent/45 bg-selected/45"
-                                          : "border-hairline bg-canvas"
-                                      }`}
-                                    >
-                                      <div className="flex min-w-0 items-center gap-2">
-                                        <label
-                                          htmlFor={colorInputId}
-                                          className="sr-only"
-                                        >
-                                          Цвет {field.label} ({field.key})
-                                        </label>
-                                        <input
-                                          id={colorInputId}
-                                          type="color"
-                                          value={colorValue}
-                                          onChange={(e) => {
-                                            setHexDrafts((prev) => {
-                                              if (!(field.key in prev))
-                                                return prev;
-                                              const next = { ...prev };
-                                              delete next[field.key];
-                                              return next;
-                                            });
-                                            onSetCustomColorOverride?.(
-                                              field.key,
-                                              e.target.value
-                                            );
-                                          }}
-                                          className="h-6 w-7 shrink-0 cursor-pointer rounded border border-strong bg-transparent p-0"
-                                        />
-                                        <div className="min-w-0">
-                                          <div className="flex items-center gap-1.5">
-                                            <span className="truncate text-[11px] font-medium text-fg">
-                                              {field.label}
-                                            </span>
-                                            {field.previewBadge && statusBgKey && (
-                                              <span
-                                                className="rounded px-1 py-0.5 font-mono text-[9px] font-semibold"
-                                                style={{
-                                                  color: colorValue,
-                                                  backgroundColor:
-                                                    effectiveStatusBgTokens[
-                                                      statusBgKey
-                                                    ],
-                                                }}
-                                              >
-                                                {field.previewBadge}
-                                              </span>
-                                            )}
-                                          </div>
-                                          <div className="truncate font-mono text-[10px] text-subtle">
-                                            {field.key}
-                                          </div>
-                                        </div>
-                                      </div>
-
-                                      <div className="flex shrink-0 items-center gap-1">
-                                        <label
-                                          htmlFor={hexInputId}
-                                          className="sr-only"
-                                        >
-                                          HEX-значение {field.key}
-                                        </label>
-                                        <input
-                                          id={hexInputId}
-                                          type="text"
-                                          value={displayValue}
-                                          spellCheck={false}
-                                          autoCapitalize="off"
-                                          autoCorrect="off"
-                                          maxLength={7}
-                                          onChange={(e) => {
-                                            const raw = e.target.value;
-                                            setHexDrafts((prev) => ({
-                                              ...prev,
-                                              [field.key]: raw,
-                                            }));
-                                            if (
-                                              /^#?[0-9a-fA-F]{6}$/.test(
-                                                raw.trim()
-                                              )
-                                            ) {
-                                              const normalized =
-                                                normalizeHexColor(raw);
-                                              if (normalized) {
-                                                onSetCustomColorOverride?.(
-                                                  field.key,
-                                                  normalized
-                                                );
-                                              }
-                                            }
-                                          }}
-                                          onBlur={() =>
-                                            commitHexDraft(field.key)
-                                          }
-                                          onKeyDown={(e) => {
-                                            if (e.key === "Enter") {
-                                              e.preventDefault();
-                                              commitHexDraft(field.key);
-                                            } else if (e.key === "Escape") {
-                                              e.preventDefault();
-                                              setHexDrafts((prev) => {
-                                                if (!(field.key in prev))
-                                                  return prev;
-                                                const next = { ...prev };
-                                                delete next[field.key];
-                                                return next;
-                                              });
-                                            }
-                                          }}
-                                          className="h-6 w-[74px] rounded border border-strong bg-surface px-1.5 font-mono text-[11px] text-fg focus:border-accent focus:outline-none"
-                                        />
-                                        <button
-                                          type="button"
-                                          disabled={!isOverridden}
-                                          title={`Сбросить ${field.key} к пресету`}
-                                          aria-label={`Сбросить ${field.key}`}
-                                          onClick={() => {
-                                            setHexDrafts((prev) => {
-                                              if (!(field.key in prev))
-                                                return prev;
-                                              const next = { ...prev };
-                                              delete next[field.key];
-                                              return next;
-                                            });
-                                            onResetCustomColorOverride?.(
-                                              field.key
-                                            );
-                                          }}
-                                          className="inline-flex h-6 w-6 items-center justify-center rounded border border-hairline bg-surface text-muted hover:border-strong hover:text-fg disabled:cursor-not-allowed disabled:opacity-35"
-                                        >
-                                          <RotateCcw className="h-3 w-3" />
-                                        </button>
-                                      </div>
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                <div className="space-y-3 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <h3 className="text-xs font-semibold text-fg">
-                      Компоновка рабочей области
-                    </h3>
-                    <button
-                      type="button"
-                      onClick={onResetPanelLayout}
-                      className="inline-flex items-center gap-1 rounded border border-hairline bg-surface px-2.5 py-1 text-[11px] text-muted hover:border-strong hover:text-fg"
-                    >
-                      <RotateCcw className="h-3 w-3" />
-                      <span>Reset Panel Layout to Default</span>
-                    </button>
-                  </div>
-
-                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-                    <label
-                      htmlFor={`${baseId}-compact-toolbar`}
-                      className="flex cursor-pointer items-center gap-2 rounded-md border border-hairline bg-surface p-2.5"
-                    >
-                      <input
-                        id={`${baseId}-compact-toolbar`}
-                        type="checkbox"
-                        checked={compactToolbar}
-                        onChange={(e) => onSetCompactToolbar(e.target.checked)}
-                        className="checkbox-native"
-                      />
-                      <span className="font-medium text-fg">
-                        Compact Toolbar
-                      </span>
-                    </label>
-
-                    <label
-                      htmlFor={`${baseId}-sidebar-collapsed`}
-                      className="flex cursor-pointer items-center gap-2 rounded-md border border-hairline bg-surface p-2.5"
-                    >
-                      <input
-                        id={`${baseId}-sidebar-collapsed`}
-                        type="checkbox"
-                        checked={sidebarCollapsed}
-                        onChange={(e) =>
-                          onSetSidebarCollapsed(e.target.checked)
-                        }
-                        className="checkbox-native"
-                      />
-                      <span className="font-medium text-fg">
-                        Collapse Sidebar
-                      </span>
-                    </label>
-
-                    <label
-                      htmlFor={`${baseId}-inspector-collapsed`}
-                      className="flex cursor-pointer items-center gap-2 rounded-md border border-hairline bg-surface p-2.5"
-                    >
-                      <input
-                        id={`${baseId}-inspector-collapsed`}
-                        type="checkbox"
-                        checked={inspectorCollapsed}
-                        onChange={(e) =>
-                          onSetInspectorCollapsed(e.target.checked)
-                        }
-                        className="checkbox-native"
-                      />
-                      <span className="font-medium text-fg">
-                        Collapse Inspector
-                      </span>
-                    </label>
-                  </div>
-
-                  <fieldset className="space-y-2 border-t border-hairline pt-2.5">
-                    <legend className="text-[11px] font-medium text-muted">
-                      Позиция панели Session Inspector
-                    </legend>
-                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                      {(
-                        [
-                          {
-                            value: "bottom",
-                            label: "Снизу (Bottom Split)",
-                          },
-                          {
-                            value: "right",
-                            label: "Справа (Right Split)",
-                          },
-                        ] as const
-                      ).map((pos) => {
-                        const radioId = `${baseId}-dock-${pos.value}`;
-                        const checked = inspectorPosition === pos.value;
-                        return (
-                          <label
-                            key={pos.value}
-                            htmlFor={radioId}
-                            className={`flex cursor-pointer items-center gap-2 rounded-md border p-2 transition-colors ${
-                              checked
-                                ? "border-accent/50 bg-selected"
-                                : "border-hairline bg-surface hover:bg-hover"
-                            }`}
-                          >
-                            <input
-                              id={radioId}
-                              type="radio"
-                              name={`${baseId}-dock-pos`}
-                              value={pos.value}
-                              checked={checked}
-                              onChange={() => onSetInspectorPosition(pos.value)}
-                              className="cursor-pointer accent-[var(--accent-primary)]"
-                            />
-                            <span className="font-medium text-fg">
-                              {pos.label}
-                            </span>
-                          </label>
-                        );
-                      })}
-                    </div>
-                  </fieldset>
-
-                  <fieldset className="space-y-2 border-t border-hairline pt-2.5">
-                    <legend className="text-[11px] font-medium text-muted">
-                      Ориентация сплиттера внутри Session Inspector (Request / Response)
-                    </legend>
-                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-                      {(
-                        [
-                          {
-                            value: "auto",
-                            label: "Auto",
-                            desc:
-                              inspectorPosition === "bottom"
-                                ? "Сейчас: Horizontal"
-                                : "Сейчас: Vertical",
-                          },
-                          {
-                            value: "horizontal",
-                            label: "Horizontal",
-                            desc: "Request слева, Response справа",
-                          },
-                          {
-                            value: "vertical",
-                            label: "Vertical",
-                            desc: "Request сверху, Response снизу",
-                          },
-                        ] as const
-                      ).map((opt) => {
-                        const radioId = `${baseId}-split-dir-${opt.value}`;
-                        const checked = inspectorSplitDirection === opt.value;
-                        return (
-                          <label
-                            key={opt.value}
-                            htmlFor={radioId}
-                            className={`flex cursor-pointer items-start gap-2 rounded-md border p-2 transition-colors ${
-                              checked
-                                ? "border-accent/50 bg-selected"
-                                : "border-hairline bg-surface hover:bg-hover"
-                            }`}
-                          >
-                            <input
-                              id={radioId}
-                              type="radio"
-                              name={`${baseId}-split-dir`}
-                              value={opt.value}
-                              checked={checked}
-                              onChange={() =>
-                                onSetInspectorSplitDirection(opt.value)
-                              }
-                              className="mt-0.5 cursor-pointer accent-[var(--accent-primary)]"
-                            />
-                            <div className="min-w-0">
-                              <div className="font-medium text-fg">
-                                {opt.label}
-                              </div>
-                              <div className="text-[10px] text-muted">
-                                {opt.desc}
-                              </div>
-                            </div>
-                          </label>
-                        );
-                      })}
-                    </div>
-                  </fieldset>
-                </div>
-
-                <div className="space-y-2.5 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <div>
-                      <h3 className="text-xs font-semibold text-fg">
-                        Группы верхней панели инструментов ({visibleGroupsCount}/
-                        {TOOLBAR_GROUP_DEFINITIONS.length})
-                      </h3>
-                      <p className="text-[11px] text-muted">
-                        Скрытые группы остаются доступны через меню «⋯» и сохраняются в JSON-профиль.
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={onResetToolbarGroups}
-                      className="inline-flex items-center gap-1 rounded border border-hairline bg-surface px-2.5 py-1 text-[11px] text-muted hover:border-strong hover:text-fg"
-                    >
-                      <RotateCcw className="h-3 w-3" />
-                      <span>Сбросить тулбар</span>
-                    </button>
-                  </div>
-
-                  <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-                    {TOOLBAR_GROUP_DEFINITIONS.map((grp) => {
-                      const chkId = `${baseId}-tb-${grp.id}`;
-                      return (
-                        <label
-                          key={grp.id}
-                          htmlFor={chkId}
-                          className="flex cursor-pointer items-start gap-2 rounded-md border border-hairline bg-surface p-2 hover:bg-hover"
-                        >
-                          <input
-                            id={chkId}
-                            type="checkbox"
-                            checked={Boolean(toolbarGroups[grp.id])}
-                            onChange={() => onToggleToolbarGroup(grp.id)}
-                            className="checkbox-native mt-0.5"
-                          />
-                          <div className="min-w-0">
-                            <div className="truncate font-medium text-fg">
-                              {grp.label}
-                            </div>
-                            <div className="truncate text-[10px] text-muted">
-                              {grp.description}
-                            </div>
-                          </div>
-                        </label>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <div className="space-y-2.5 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <div>
-                      <h3 className="text-xs font-semibold text-fg">
-                        Видимость и ширина колонок таблицы ({visibleColsCount}/
-                        {TRAFFIC_COLUMNS.length})
-                      </h3>
-                      <p className="text-[11px] text-muted">
-                        Настройте отображаемые столбцы и их точную ширину в пикселях.
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={onResetColumns}
-                      className="inline-flex items-center gap-1 rounded border border-hairline bg-surface px-2.5 py-1 text-[11px] text-muted hover:border-strong hover:text-fg"
-                    >
-                      <RotateCcw className="h-3 w-3" />
-                      <span>Сбросить колонки</span>
-                    </button>
-                  </div>
-
-                  <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-                    {TRAFFIC_COLUMNS.map((col) => {
-                      const visId = `${baseId}-col-vis-${col.id}`;
-                      const widthId = `${baseId}-col-w-${col.id}`;
-                      const isVis = Boolean(visibleColumns[col.id]);
-                      const disableUncheck = isVis && visibleColsCount <= 1;
-                      return (
-                        <div
-                          key={col.id}
-                          className="flex items-center justify-between gap-2 rounded-md border border-hairline bg-surface px-2.5 py-1.5"
-                        >
-                          <label
-                            htmlFor={visId}
-                            className="flex min-w-0 flex-1 cursor-pointer items-center gap-2"
-                          >
-                            <input
-                              id={visId}
-                              type="checkbox"
-                              checked={isVis}
-                              disabled={disableUncheck}
-                              onChange={() => onToggleColumnVisibility(col.id)}
-                              className="checkbox-native"
-                            />
-                            <span className="truncate font-medium text-fg">
-                              {col.label}
-                            </span>
-                            <span className="font-mono text-[10px] text-subtle">
-                              ({col.id})
-                            </span>
-                          </label>
-
-                          <div className="flex shrink-0 items-center gap-1">
-                            <label htmlFor={widthId} className="sr-only">
-                              Ширина колонки {col.label} в пикселях
-                            </label>
-                            <input
-                              id={widthId}
-                              type="number"
-                              min={col.minWidth}
-                              max={1600}
-                              value={widthDrafts[col.id] ?? col.defaultWidth}
-                              onChange={(e) =>
-                                setWidthDrafts((prev) => ({
-                                  ...prev,
-                                  [col.id]: e.target.value,
-                                }))
-                              }
-                              onBlur={() => commitColumnWidth(col.id)}
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter") {
-                                  e.preventDefault();
-                                  commitColumnWidth(col.id);
-                                }
-                              }}
-                              className="h-6 w-16 rounded border border-strong bg-canvas px-1.5 text-right font-mono text-[11px] text-fg tabular-nums focus:border-accent focus:outline-none"
-                            />
-                            <span className="font-mono text-[10px] text-muted">
-                              px
-                            </span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              </>
+              <UiColumnsSettingsTab
+                baseId={baseId}
+                themePreference={themePreference}
+                onSetTheme={onSetTheme}
+                themePreset={themePresetProp}
+                customColorOverrides={customColorOverridesProp}
+                effectiveThemeTokens={effectiveThemeTokensProp}
+                onSetThemePreset={onSetThemePreset}
+                onSetCustomColorOverride={onSetCustomColorOverride}
+                onResetCustomColorOverride={onResetCustomColorOverride}
+                onResetCustomColorOverrides={onResetCustomColorOverrides}
+                compactToolbar={compactToolbar}
+                onSetCompactToolbar={onSetCompactToolbar}
+                sidebarCollapsed={sidebarCollapsed}
+                onSetSidebarCollapsed={onSetSidebarCollapsed}
+                inspectorCollapsed={inspectorCollapsed}
+                onSetInspectorCollapsed={onSetInspectorCollapsed}
+                inspectorPosition={inspectorPosition}
+                onSetInspectorPosition={onSetInspectorPosition}
+                inspectorSplitDirection={inspectorSplitDirection}
+                onSetInspectorSplitDirection={onSetInspectorSplitDirection}
+                onResetPanelLayout={onResetPanelLayout}
+                toolbarGroups={toolbarGroups}
+                onToggleToolbarGroup={onToggleToolbarGroup}
+                onResetToolbarGroups={onResetToolbarGroups}
+                visibleColumns={visibleColumns}
+                onToggleColumnVisibility={onToggleColumnVisibility}
+                columnWidths={columnWidths}
+                onSetColumnWidth={onSetColumnWidth}
+                onResetColumns={onResetColumns}
+              />
             )}
 
-            {/* ==============================================================
-                TAB 3: FILTERS
-               ============================================================== */}
             {activeTab === "filters" && (
-              <>
-                <div className="space-y-3 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <h3 className="text-xs font-semibold text-fg">
-                      Пресеты фильтрации ({userPresets.length} пользовательских)
-                    </h3>
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          dialogRef.current?.close();
-                          onOpenFilterDrawer();
-                        }}
-                        className="inline-flex items-center gap-1 rounded border border-accent/40 bg-selected px-2.5 py-1 text-[11px] font-medium text-fg hover:brightness-110"
-                      >
-                        <ExternalLink className="h-3 w-3 text-accent" />
-                        <span>Открыть Filter Matrix ({filterRules.length})</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={onResetAdvancedFilters}
-                        className="inline-flex items-center gap-1 rounded border border-hairline bg-surface px-2.5 py-1 text-[11px] text-muted hover:border-strong hover:text-fg"
-                      >
-                        <RotateCcw className="h-3 w-3" />
-                        <span>Сбросить фильтры</span>
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2.5">
-                    <label
-                      htmlFor={`${baseId}-active-preset`}
-                      className="text-[11px] font-medium text-muted"
-                    >
-                      Активный пресет:
-                    </label>
-                    <select
-                      id={`${baseId}-active-preset`}
-                      value={activePresetId ?? ""}
-                      onChange={(e) =>
-                        onApplyPreset(e.target.value ? e.target.value : null)
-                      }
-                      className="h-8 min-w-56 rounded-md border border-strong bg-surface px-2.5 text-xs text-fg"
-                    >
-                      <option value="">Без пресета (ручная настройка)</option>
-                      <optgroup label="Встроенные пресеты">
-                        {BUILT_IN_FILTER_PRESETS.map((p) => (
-                          <option key={p.id} value={p.id}>
-                            {p.name}
-                          </option>
-                        ))}
-                      </optgroup>
-                      {userPresets.length > 0 && (
-                        <optgroup label="Пользовательские пресеты">
-                          {userPresets.map((p) => (
-                            <option key={p.id} value={p.id}>
-                              {p.name}
-                            </option>
-                          ))}
-                        </optgroup>
-                      )}
-                    </select>
-
-                    <label
-                      htmlFor={`${baseId}-matrix-enabled`}
-                      className="inline-flex cursor-pointer items-center gap-1.5 rounded-md border border-hairline bg-surface px-2.5 py-1.5"
-                    >
-                      <input
-                        id={`${baseId}-matrix-enabled`}
-                        type="checkbox"
-                        checked={matrixEnabled}
-                        onChange={(e) => onSetMatrixEnabled(e.target.checked)}
-                        className="checkbox-native"
-                      />
-                      <span className="text-[11px] font-medium text-fg">
-                        Filter Matrix активна
-                      </span>
-                    </label>
-                  </div>
-
-                  <form
-                    onSubmit={handleCreatePreset}
-                    className="grid grid-cols-1 gap-2 border-t border-hairline pt-2.5 sm:grid-cols-12"
-                  >
-                    <div className="sm:col-span-4">
-                      <label
-                        htmlFor={`${baseId}-preset-name`}
-                        className="mb-1 block text-[10px] font-medium text-muted"
-                      >
-                        Сохранить текущие фильтры как пресет
-                      </label>
-                      <input
-                        id={`${baseId}-preset-name`}
-                        type="text"
-                        placeholder="Название пресета…"
-                        value={presetNameDraft}
-                        aria-invalid={presetNameError ? "true" : undefined}
-                        onChange={(e) => {
-                          setPresetNameDraft(e.target.value);
-                          if (presetNameError) setPresetNameError(null);
-                        }}
-                        onBlur={(e) => {
-                          if (
-                            e.currentTarget.value.length > 0 &&
-                            !e.currentTarget.value.trim()
-                          ) {
-                            setPresetNameError(
-                              "Введите название пресета фильтров."
-                            );
-                          }
-                        }}
-                        className="h-8 w-full rounded border border-strong bg-surface px-2 text-xs text-fg"
-                      />
-                    </div>
-                    <div className="sm:col-span-5">
-                      <label
-                        htmlFor={`${baseId}-preset-desc`}
-                        className="mb-1 block text-[10px] font-medium text-muted"
-                      >
-                        Описание
-                      </label>
-                      <input
-                        id={`${baseId}-preset-desc`}
-                        type="text"
-                        placeholder="Краткое описание условий…"
-                        value={presetDescDraft}
-                        onChange={(e) => setPresetDescDraft(e.target.value)}
-                        className="h-8 w-full rounded border border-strong bg-surface px-2 text-xs text-fg"
-                      />
-                    </div>
-                    <div className="flex items-end sm:col-span-3">
-                      <button
-                        type="submit"
-                        className="inline-flex h-8 w-full items-center justify-center gap-1 rounded bg-sky-600 px-2.5 text-xs font-medium text-white hover:bg-sky-500"
-                      >
-                        <Plus className="h-3.5 w-3.5" />
-                        <span>Сохранить</span>
-                      </button>
-                    </div>
-                    {presetNameError && (
-                      <p className="text-[11px] text-status5xx-fg sm:col-span-12">
-                        {presetNameError}
-                      </p>
-                    )}
-                  </form>
-
-                  {userPresets.length > 0 && (
-                    <div className="space-y-1 border-t border-hairline pt-2">
-                      {userPresets.map((preset) => (
-                        <div
-                          key={preset.id}
-                          className="flex items-center justify-between gap-2 rounded border border-hairline bg-surface px-2.5 py-1.5"
-                        >
-                          <div className="min-w-0">
-                            <span className="font-medium text-fg">
-                              {preset.name}
-                            </span>
-                            <span className="ml-2 text-[11px] text-muted">
-                              ({preset.rules.length} правил) — {preset.description}
-                            </span>
-                          </div>
-                          <div className="flex shrink-0 items-center gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => onApplyPreset(preset.id)}
-                              className="rounded border border-hairline bg-elevated px-2 py-0.5 text-[11px] text-fg hover:bg-hover"
-                            >
-                              Применить
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => onDeleteCustomPreset(preset.id)}
-                              aria-label={`Удалить пресет ${preset.name}`}
-                              className="rounded p-1 text-muted hover:bg-rose-500/10 hover:text-rose-400"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                <div className="space-y-3 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <h3 className="text-xs font-semibold text-fg">
-                    Пороги шума и времени ответа (Noise Thresholds)
-                  </h3>
-                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                    {(
-                      [
-                        {
-                          key: "hide304NotModified",
-                          label: "Скрывать 304 Not Modified",
-                        },
-                        {
-                          key: "hideOptionsPreflight",
-                          label: "Скрывать CORS OPTIONS preflight",
-                        },
-                        {
-                          key: "hideConnectTunnels",
-                          label: "Скрывать пустые туннели CONNECT",
-                        },
-                        {
-                          key: "hideStaticAssets",
-                          label: "Скрывать статику (.css, .js, шрифты, иконки)",
-                        },
-                        {
-                          key: "timeHeatEnabled",
-                          label: "Подсветка медленных запросов (Time Heat)",
-                        },
-                        {
-                          key: "onlySlowRequests",
-                          label: "Показывать только медленные запросы",
-                        },
-                      ] as const
-                    ).map((item) => {
-                      const chkId = `${baseId}-th-${item.key}`;
-                      return (
-                        <label
-                          key={item.key}
-                          htmlFor={chkId}
-                          className="flex cursor-pointer items-center gap-2 rounded border border-hairline bg-surface p-2"
-                        >
-                          <input
-                            id={chkId}
-                            type="checkbox"
-                            checked={noiseThresholds[item.key]}
-                            onChange={(e) =>
-                              onSetNoiseThresholds((prev) => ({
-                                ...prev,
-                                [item.key]: e.target.checked,
-                              }))
-                            }
-                            className="checkbox-native"
-                          />
-                          <span className="text-fg">{item.label}</span>
-                        </label>
-                      );
-                    })}
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-2.5 border-t border-hairline pt-2.5 sm:grid-cols-4">
-                    <div>
-                      <label
-                        htmlFor={`${baseId}-th-warn-ms`}
-                        className="mb-1 block text-[10px] text-muted"
-                      >
-                        Warning (ms)
-                      </label>
-                      <input
-                        id={`${baseId}-th-warn-ms`}
-                        type="number"
-                        min={10}
-                        max={120000}
-                        value={noiseThresholds.timeHeatWarningMs}
-                        onChange={(e) => {
-                          const val = Math.max(
-                            10,
-                            Number(e.target.value) || 500
-                          );
-                          onSetNoiseThresholds((prev) => ({
-                            ...prev,
-                            timeHeatWarningMs: val,
-                            timeHeatCriticalMs: Math.max(
-                              prev.timeHeatCriticalMs,
-                              val
-                            ),
-                          }));
-                        }}
-                        className="h-7 w-full rounded border border-strong bg-surface px-2 font-mono text-xs text-fg tabular-nums"
-                      />
-                    </div>
-                    <div>
-                      <label
-                        htmlFor={`${baseId}-th-crit-ms`}
-                        className="mb-1 block text-[10px] text-muted"
-                      >
-                        Critical (ms)
-                      </label>
-                      <input
-                        id={`${baseId}-th-crit-ms`}
-                        type="number"
-                        min={10}
-                        max={300000}
-                        value={noiseThresholds.timeHeatCriticalMs}
-                        onChange={(e) => {
-                          const val = Math.max(
-                            noiseThresholds.timeHeatWarningMs,
-                            Number(e.target.value) || 1500
-                          );
-                          onSetNoiseThresholds((prev) => ({
-                            ...prev,
-                            timeHeatCriticalMs: val,
-                          }));
-                        }}
-                        className="h-7 w-full rounded border border-strong bg-surface px-2 font-mono text-xs text-fg tabular-nums"
-                      />
-                    </div>
-                    <div>
-                      <label
-                        htmlFor={`${baseId}-th-min-bytes`}
-                        className="mb-1 block text-[10px] text-muted"
-                      >
-                        Min Body (bytes)
-                      </label>
-                      <input
-                        id={`${baseId}-th-min-bytes`}
-                        type="number"
-                        min={0}
-                        placeholder="Нет"
-                        value={noiseThresholds.minBodySizeBytes ?? ""}
-                        onChange={(e) => {
-                          const raw = e.target.value.trim();
-                          onSetNoiseThresholds((prev) => ({
-                            ...prev,
-                            minBodySizeBytes:
-                              raw === ""
-                                ? null
-                                : Math.max(0, Math.round(Number(raw) || 0)),
-                          }));
-                        }}
-                        className="h-7 w-full rounded border border-strong bg-surface px-2 font-mono text-xs text-fg tabular-nums"
-                      />
-                    </div>
-                    <div>
-                      <label
-                        htmlFor={`${baseId}-th-max-bytes`}
-                        className="mb-1 block text-[10px] text-muted"
-                      >
-                        Max Body (bytes)
-                      </label>
-                      <input
-                        id={`${baseId}-th-max-bytes`}
-                        type="number"
-                        min={0}
-                        placeholder="Нет"
-                        value={noiseThresholds.maxBodySizeBytes ?? ""}
-                        onChange={(e) => {
-                          const raw = e.target.value.trim();
-                          onSetNoiseThresholds((prev) => ({
-                            ...prev,
-                            maxBodySizeBytes:
-                              raw === ""
-                                ? null
-                                : Math.max(0, Math.round(Number(raw) || 0)),
-                          }));
-                        }}
-                        className="h-7 w-full rounded border border-strong bg-surface px-2 font-mono text-xs text-fg tabular-nums"
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                <div className="space-y-2.5 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <label
-                      htmlFor={`${baseId}-host-filter-enabled`}
-                      className="inline-flex cursor-pointer items-center gap-2 font-semibold text-fg"
-                    >
-                      <input
-                        id={`${baseId}-host-filter-enabled`}
-                        type="checkbox"
-                        checked={hostFilters.enabled}
-                        onChange={(e) =>
-                          onSetHostFilters((prev) => ({
-                            ...prev,
-                            enabled: e.target.checked,
-                          }))
-                        }
-                        className="checkbox-native"
-                      />
-                      <span>
-                        Фильтр списков доменов (Host Filters — активно токенов:{" "}
-                        {compiledHosts.activeCount})
-                      </span>
-                    </label>
-
-                    <label
-                      htmlFor={`${baseId}-host-tls-sync`}
-                      className="inline-flex cursor-pointer items-center gap-1.5 text-[11px] text-muted"
-                    >
-                      <input
-                        id={`${baseId}-host-tls-sync`}
-                        type="checkbox"
-                        checked={hostFilters.applyToTlsPassthrough}
-                        onChange={(e) =>
-                          onSetHostFilters((prev) => ({
-                            ...prev,
-                            applyToTlsPassthrough: e.target.checked,
-                          }))
-                        }
-                        className="checkbox-native"
-                      />
-                      <span>Синхронизировать с TLS Passthrough</span>
-                    </label>
-                  </div>
-
-                  <fieldset className="flex flex-wrap items-center gap-3">
-                    <legend className="sr-only">Режим фильтрации хостов</legend>
-                    {(
-                      [
-                        {
-                          value: "whitelist",
-                          label: "Whitelist (показывать только указанные)",
-                        },
-                        {
-                          value: "blacklist",
-                          label: "Blacklist (скрывать указанные)",
-                        },
-                      ] as { value: HostListFilterMode; label: string }[]
-                    ).map((m) => {
-                      const rId = `${baseId}-host-mode-${m.value}`;
-                      return (
-                        <label
-                          key={m.value}
-                          htmlFor={rId}
-                          className="inline-flex cursor-pointer items-center gap-1.5 text-xs text-fg"
-                        >
-                          <input
-                            id={rId}
-                            type="radio"
-                            name={`${baseId}-host-mode`}
-                            value={m.value}
-                            checked={hostFilters.mode === m.value}
-                            onChange={() =>
-                              onSetHostFilters((prev) => ({
-                                ...prev,
-                                mode: m.value,
-                              }))
-                            }
-                            className="cursor-pointer accent-[var(--accent-primary)]"
-                          />
-                          <span>{m.label}</span>
-                        </label>
-                      );
-                    })}
-                  </fieldset>
-
-                  <div>
-                    <label
-                      htmlFor={`${baseId}-host-raw-text`}
-                      className="mb-1 block text-[11px] text-muted"
-                    >
-                      Список доменов и масок (через перевод строки, пробел или точку с запятой, например{" "}
-                      <code className="font-mono">*.api.local</code>)
-                    </label>
-                    <textarea
-                      id={`${baseId}-host-raw-text`}
-                      rows={4}
-                      value={hostFilters.rawText}
-                      onChange={(e) =>
-                        onSetHostFilters((prev) => ({
-                          ...prev,
-                          rawText: e.target.value,
-                        }))
-                      }
-                      placeholder="*.example.com&#10;api.staging.local"
-                      className="w-full rounded-md border border-strong bg-surface p-2 font-mono text-xs text-fg focus:border-accent focus:outline-none"
-                    />
-                  </div>
-                </div>
-              </>
+              <FiltersSettingsTab
+                baseId={baseId}
+                activePresetId={activePresetId}
+                userPresets={userPresets}
+                onApplyPreset={onApplyPreset}
+                onSaveCustomPreset={onSaveCustomPreset}
+                onDeleteCustomPreset={onDeleteCustomPreset}
+                matrixEnabled={matrixEnabled}
+                onSetMatrixEnabled={onSetMatrixEnabled}
+                filterRules={filterRules}
+                noiseThresholds={noiseThresholds}
+                onSetNoiseThresholds={onSetNoiseThresholds}
+                hostFilters={hostFilters}
+                compiledHosts={compiledHosts}
+                onSetHostFilters={onSetHostFilters}
+                onResetAdvancedFilters={onResetAdvancedFilters}
+                onOpenFilterDrawer={onOpenFilterDrawer}
+                onCloseDialog={() => dialogRef.current?.close()}
+              />
             )}
 
-            {/* ==============================================================
-                TAB 4: RULES & PROXY
-               ============================================================== */}
             {activeTab === "rulesProxy" && (
-              <>
-                {renderBindConfigurationSection("rules")}
-
-                <fieldset className="space-y-2.5 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <legend className="px-1 text-xs font-semibold text-fg">
-                    Режим расшифровки HTTPS (TLS MITM Mode)
-                  </legend>
-                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                    {(
-                      [
-                        {
-                          value: "interceptAll",
-                          title: "Intercept All (кроме Bypass-списка)",
-                          desc: "Расшифровывает весь HTTPS трафик за исключением доменов TLS Bypass",
-                        },
-                        {
-                          value: "targetedOnly",
-                          title: "Targeted Only (Selective MITM)",
-                          desc: "Расшифровывает только домены из Target Rules; остальное идёт напрямую",
-                        },
-                      ] as const
-                    ).map((opt) => {
-                      const rId = `${baseId}-tls-mode-${opt.value}`;
-                      const checked =
-                        backendFilterConfig.tlsInterceptMode === opt.value;
-                      return (
-                        <label
-                          key={opt.value}
-                          htmlFor={rId}
-                          className={`flex cursor-pointer items-start gap-2.5 rounded-lg border p-2.5 transition-colors ${
-                            checked
-                              ? "border-accent/50 bg-selected"
-                              : "border-hairline bg-surface hover:bg-hover"
-                          }`}
-                        >
-                          <input
-                            id={rId}
-                            type="radio"
-                            name={`${baseId}-tls-mode`}
-                            value={opt.value}
-                            checked={checked}
-                            onChange={() => void onSetTlsInterceptMode(opt.value)}
-                            className="mt-0.5 cursor-pointer accent-[var(--accent-primary)]"
-                          />
-                          <div>
-                            <div className="font-semibold text-fg">
-                              {opt.title}
-                            </div>
-                            <div className="text-[11px] text-muted">
-                              {opt.desc}
-                            </div>
-                          </div>
-                        </label>
-                      );
-                    })}
-                  </div>
-
-                  <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-2.5">
-                    <div className="flex flex-wrap items-center gap-3">
-                      <label
-                        htmlFor={`${baseId}-tls-bypass-on`}
-                        className="inline-flex cursor-pointer items-center gap-1.5 text-fg"
-                      >
-                        <input
-                          id={`${baseId}-tls-bypass-on`}
-                          type="checkbox"
-                          checked={backendFilterConfig.tlsBypassEnabled}
-                          onChange={(e) =>
-                            void onUpdateBackendFilterConfig({
-                              ...backendFilterConfig,
-                              tlsBypassEnabled: e.target.checked,
-                            })
-                          }
-                          className="checkbox-native"
-                        />
-                        <span>TLS Bypass активен</span>
-                      </label>
-
-                      <label
-                        htmlFor={`${baseId}-strip-altsvc`}
-                        className="inline-flex cursor-pointer items-center gap-1.5 text-fg"
-                      >
-                        <input
-                          id={`${baseId}-strip-altsvc`}
-                          type="checkbox"
-                          checked={backendFilterConfig.stripAltSvc}
-                          onChange={(e) =>
-                            void onUpdateBackendFilterConfig({
-                              ...backendFilterConfig,
-                              stripAltSvc: e.target.checked,
-                            })
-                          }
-                          className="checkbox-native"
-                        />
-                        <span>Удалять Alt-Svc (блокировка ухода в QUIC/H3)</span>
-                      </label>
-                    </div>
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        dialogRef.current?.close();
-                        onOpenTlsDrawer();
-                      }}
-                      className="inline-flex items-center gap-1 rounded border border-hairline bg-surface px-2.5 py-1 text-[11px] text-fg hover:bg-hover"
-                    >
-                      <ExternalLink className="h-3 w-3 text-accent" />
-                      <span>Полный редактор TLS…</span>
-                    </button>
-                  </div>
-                </fieldset>
-
-                {/* TLS Bypass & Target Rules */}
-                <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-                  <div className="space-y-2 rounded-lg border border-hairline bg-canvas p-3">
-                    <h3 className="text-xs font-semibold text-fg">
-                      TLS Bypass Rules ({backendFilterConfig.tlsBypassRules.length})
-                    </h3>
-                    <form
-                      onSubmit={(e) => {
-                        e.preventDefault();
-                        void handleAddTlsRule("bypass", newBypassPattern);
-                      }}
-                      className="flex gap-1.5"
-                    >
-                      <label htmlFor={`${baseId}-add-bypass`} className="sr-only">
-                        Добавить домен в TLS Bypass
-                      </label>
-                      <input
-                        id={`${baseId}-add-bypass`}
-                        type="text"
-                        placeholder="*.apple.com"
-                        value={newBypassPattern}
-                        onChange={(e) => setNewBypassPattern(e.target.value)}
-                        className="h-7 flex-1 rounded border border-strong bg-surface px-2 font-mono text-xs text-fg"
-                      />
-                      <button
-                        type="submit"
-                        className="inline-flex h-7 items-center gap-1 rounded bg-elevated px-2 text-[11px] font-medium text-fg hover:bg-hover"
-                      >
-                        <Plus className="h-3 w-3" />
-                        <span>Add</span>
-                      </button>
-                    </form>
-                    <div className="max-h-36 space-y-1 overflow-y-auto pr-1">
-                      {backendFilterConfig.tlsBypassRules.map((rule) => {
-                        const rChk = `${baseId}-byp-${rule.id}`;
-                        return (
-                          <div
-                            key={rule.id}
-                            className="flex items-center justify-between gap-2 rounded border border-hairline bg-surface px-2 py-1"
-                          >
-                            <label
-                              htmlFor={rChk}
-                              className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5"
-                            >
-                              <input
-                                id={rChk}
-                                type="checkbox"
-                                checked={rule.enabled}
-                                onChange={(e) =>
-                                  void onUpdateBackendFilterConfig({
-                                    ...backendFilterConfig,
-                                    tlsBypassRules:
-                                      backendFilterConfig.tlsBypassRules.map(
-                                        (x) =>
-                                          x.id === rule.id
-                                            ? { ...x, enabled: e.target.checked }
-                                            : x
-                                      ),
-                                  })
-                                }
-                                className="checkbox-native"
-                              />
-                              <span className="truncate font-mono text-[11px] text-fg">
-                                {rule.pattern}
-                              </span>
-                            </label>
-                            <button
-                              type="button"
-                              aria-label={`Удалить правило ${rule.pattern}`}
-                              onClick={() =>
-                                void onUpdateBackendFilterConfig({
-                                  ...backendFilterConfig,
-                                  tlsBypassRules:
-                                    backendFilterConfig.tlsBypassRules.filter(
-                                      (x) => x.id !== rule.id
-                                    ),
-                                })
-                              }
-                              className="rounded p-0.5 text-subtle hover:text-rose-400"
-                            >
-                              <Trash2 className="h-3 w-3" />
-                            </button>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                  <div className="space-y-2 rounded-lg border border-hairline bg-canvas p-3">
-                    <h3 className="text-xs font-semibold text-fg">
-                      TLS Target Rules ({backendFilterConfig.tlsTargetRules.length})
-                    </h3>
-                    <form
-                      onSubmit={(e) => {
-                        e.preventDefault();
-                        void handleAddTlsRule("target", newTargetPattern);
-                      }}
-                      className="flex gap-1.5"
-                    >
-                      <label htmlFor={`${baseId}-add-target`} className="sr-only">
-                        Добавить целевой домен для расшифровки
-                      </label>
-                      <input
-                        id={`${baseId}-add-target`}
-                        type="text"
-                        placeholder="api.myapp.dev"
-                        value={newTargetPattern}
-                        onChange={(e) => setNewTargetPattern(e.target.value)}
-                        className="h-7 flex-1 rounded border border-strong bg-surface px-2 font-mono text-xs text-fg"
-                      />
-                      <button
-                        type="submit"
-                        className="inline-flex h-7 items-center gap-1 rounded bg-elevated px-2 text-[11px] font-medium text-fg hover:bg-hover"
-                      >
-                        <Plus className="h-3 w-3" />
-                        <span>Add</span>
-                      </button>
-                    </form>
-                    <div className="max-h-36 space-y-1 overflow-y-auto pr-1">
-                      {backendFilterConfig.tlsTargetRules.length === 0 ? (
-                        <p className="py-3 text-center text-[11px] text-subtle">
-                          Список целевых MITM-хостов пуст
-                        </p>
-                      ) : (
-                        backendFilterConfig.tlsTargetRules.map((rule) => {
-                          const rChk = `${baseId}-tgt-${rule.id}`;
-                          return (
-                            <div
-                              key={rule.id}
-                              className="flex items-center justify-between gap-2 rounded border border-hairline bg-surface px-2 py-1"
-                            >
-                              <label
-                                htmlFor={rChk}
-                                className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5"
-                              >
-                                <input
-                                  id={rChk}
-                                  type="checkbox"
-                                  checked={rule.enabled}
-                                  onChange={(e) =>
-                                    void onUpdateBackendFilterConfig({
-                                      ...backendFilterConfig,
-                                      tlsTargetRules:
-                                        backendFilterConfig.tlsTargetRules.map(
-                                          (x) =>
-                                            x.id === rule.id
-                                              ? {
-                                                  ...x,
-                                                  enabled: e.target.checked,
-                                                }
-                                              : x
-                                        ),
-                                    })
-                                  }
-                                  className="checkbox-native"
-                                />
-                                <span className="truncate font-mono text-[11px] text-fg">
-                                  {rule.pattern}
-                                </span>
-                              </label>
-                              <button
-                                type="button"
-                                aria-label={`Удалить целевой хост ${rule.pattern}`}
-                                onClick={() =>
-                                  void onUpdateBackendFilterConfig({
-                                    ...backendFilterConfig,
-                                    tlsTargetRules:
-                                      backendFilterConfig.tlsTargetRules.filter(
-                                        (x) => x.id !== rule.id
-                                      ),
-                                  })
-                                }
-                                className="rounded p-0.5 text-subtle hover:text-rose-400"
-                              >
-                                <Trash2 className="h-3 w-3" />
-                              </button>
-                            </div>
-                          );
-                        })
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                {/* Header Mutations */}
-                <div className="space-y-2 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <label
-                      htmlFor={`${baseId}-hm-enabled`}
-                      className="inline-flex cursor-pointer items-center gap-2 font-semibold text-fg"
-                    >
-                      <input
-                        id={`${baseId}-hm-enabled`}
-                        type="checkbox"
-                        checked={backendFilterConfig.headerMutationsEnabled}
-                        onChange={(e) =>
-                          void onUpdateBackendFilterConfig({
-                            ...backendFilterConfig,
-                            headerMutationsEnabled: e.target.checked,
-                          })
-                        }
-                        className="checkbox-native"
-                      />
-                      <span>
-                        Header Mutations ({backendFilterConfig.headerMutations.length})
-                      </span>
-                    </label>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        dialogRef.current?.close();
-                        onOpenHeadersDrawer();
-                      }}
-                      className="inline-flex items-center gap-1 rounded border border-hairline bg-surface px-2.5 py-1 text-[11px] text-fg hover:bg-hover"
-                    >
-                      <ExternalLink className="h-3 w-3 text-accent" />
-                      <span>Редактор мутаций заголовков…</span>
-                    </button>
-                  </div>
-
-                  <div className="max-h-32 space-y-1 overflow-y-auto">
-                    {backendFilterConfig.headerMutations.map((hm) => {
-                      const hmChk = `${baseId}-hm-${hm.id}`;
-                      return (
-                        <div
-                          key={hm.id}
-                          className="flex items-center justify-between gap-2 rounded border border-hairline bg-surface px-2.5 py-1.5"
-                        >
-                          <label
-                            htmlFor={hmChk}
-                            className="flex min-w-0 flex-1 cursor-pointer items-center gap-2"
-                          >
-                            <input
-                              id={hmChk}
-                              type="checkbox"
-                              checked={hm.enabled}
-                              onChange={(e) =>
-                                void onUpdateBackendFilterConfig({
-                                  ...backendFilterConfig,
-                                  headerMutations:
-                                    backendFilterConfig.headerMutations.map(
-                                      (x) =>
-                                        x.id === hm.id
-                                          ? { ...x, enabled: e.target.checked }
-                                          : x
-                                    ),
-                                })
-                              }
-                              className="checkbox-native"
-                            />
-                            <span className="truncate font-medium text-fg">
-                              {hm.name}
-                            </span>
-                            <span className="shrink-0 rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-muted">
-                              {hm.direction} • {hm.operation} {hm.headerName}
-                            </span>
-                          </label>
-                          <button
-                            type="button"
-                            aria-label={`Удалить мутацию ${hm.name}`}
-                            onClick={() =>
-                              void onUpdateBackendFilterConfig({
-                                ...backendFilterConfig,
-                                headerMutations:
-                                  backendFilterConfig.headerMutations.filter(
-                                    (x) => x.id !== hm.id
-                                  ),
-                              })
-                            }
-                            className="rounded p-0.5 text-subtle hover:text-rose-400"
-                          >
-                            <Trash2 className="h-3 w-3" />
-                          </button>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                {/* AutoResponder */}
-                <div className="space-y-2 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <label
-                      htmlFor={`${baseId}-ar-enabled`}
-                      className="inline-flex cursor-pointer items-center gap-2 font-semibold text-fg"
-                    >
-                      <input
-                        id={`${baseId}-ar-enabled`}
-                        type="checkbox"
-                        checked={autoResponderEnabled}
-                        onChange={(e) =>
-                          void onSetAutoResponderEnabled(e.target.checked)
-                        }
-                        className="checkbox-native"
-                      />
-                      <Sliders className="h-3.5 w-3.5 text-amber-400" />
-                      <span>
-                        AutoResponder ({autoResponderRules.length} правил)
-                      </span>
-                    </label>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        dialogRef.current?.close();
-                        onOpenAutoResponderStudio();
-                      }}
-                      className="inline-flex items-center gap-1 rounded border border-accent/40 bg-selected px-2.5 py-1 text-[11px] font-medium text-fg hover:brightness-110"
-                    >
-                      <ExternalLink className="h-3 w-3 text-accent" />
-                      <span>Открыть AutoResponder Studio</span>
-                    </button>
-                  </div>
-
-                  <div className="max-h-36 space-y-1 overflow-y-auto">
-                    {autoResponderRules.length === 0 ? (
-                      <p className="py-2 text-center text-[11px] text-subtle">
-                        Нет настроенных правил AutoResponder
-                      </p>
-                    ) : (
-                      autoResponderRules.map((rule) => {
-                        const arChk = `${baseId}-ar-${rule.id}`;
-                        return (
-                          <div
-                            key={rule.id}
-                            className="flex items-center justify-between gap-2 rounded border border-hairline bg-surface px-2.5 py-1.5"
-                          >
-                            <label
-                              htmlFor={arChk}
-                              className="flex min-w-0 flex-1 cursor-pointer items-center gap-2"
-                            >
-                              <input
-                                id={arChk}
-                                type="checkbox"
-                                checked={rule.enabled}
-                                onChange={(e) =>
-                                  void onUpsertAutoResponderRule({
-                                    ...rule,
-                                    enabled: e.target.checked,
-                                  })
-                                }
-                                className="checkbox-native"
-                              />
-                              <span className="truncate font-medium text-fg">
-                                {rule.name}
-                              </span>
-                              <span className="truncate font-mono text-[10px] text-muted">
-                                {rule.pattern}
-                              </span>
-                            </label>
-                            <div className="flex shrink-0 items-center gap-1.5">
-                              <span className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-amber-400">
-                                {rule.action === "delayOnly"
-                                  ? `+${rule.latencyMs}ms`
-                                  : `${rule.statusCode} • +${rule.latencyMs}ms`}
-                              </span>
-                              <button
-                                type="button"
-                                aria-label={`Удалить правило ${rule.name}`}
-                                onClick={() =>
-                                  void onDeleteAutoResponderRule(rule.id)
-                                }
-                                className="rounded p-0.5 text-subtle hover:text-rose-400"
-                              >
-                                <Trash2 className="h-3 w-3" />
-                              </button>
-                            </div>
-                          </div>
-                        );
-                      })
-                    )}
-                  </div>
-                </div>
-              </>
+              <RulesProxySettingsTab
+                bindConfigProps={bindConfigProps}
+                backendFilterConfig={backendFilterConfig}
+                onUpdateBackendFilterConfig={onUpdateBackendFilterConfig}
+                onSetTlsInterceptMode={onSetTlsInterceptMode}
+                onOpenTlsDrawer={onOpenTlsDrawer}
+                onOpenHeadersDrawer={onOpenHeadersDrawer}
+                autoResponderEnabled={autoResponderEnabled}
+                onSetAutoResponderEnabled={onSetAutoResponderEnabled}
+                autoResponderRules={autoResponderRules}
+                onUpsertAutoResponderRule={onUpsertAutoResponderRule}
+                onDeleteAutoResponderRule={onDeleteAutoResponderRule}
+                onOpenAutoResponderStudio={onOpenAutoResponderStudio}
+                onCloseDialog={() => dialogRef.current?.close()}
+              />
             )}
 
-            {/* ==============================================================
-                TAB 5: BACKUP & EXPORT
-               ============================================================== */}
             {activeTab === "backupExport" && (
-              <>
-                <div className="space-y-3 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <div className="flex flex-wrap items-start justify-between gap-2">
-                    <div>
-                      <h3 className="text-xs font-semibold text-fg">
-                        Экспорт и импорт единого JSON-профиля настроек
-                      </h3>
-                      <p className="text-[11px] text-muted">
-                        Файл по умолчанию:{" "}
-                        <code className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[11px] text-fg">
-                          {DEFAULT_SETTINGS_EXPORT_FILENAME}
-                        </code>{" "}
-                        • Версия схемы:{" "}
-                        <code className="font-mono">
-                          v{CURRENT_SETTINGS_SCHEMA_VERSION}
-                        </code>
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                    <div className="rounded-md border border-hairline bg-surface p-2.5">
-                      <div className="text-[10px] text-muted">Колонки и UI</div>
-                      <div className="mt-0.5 font-mono text-sm font-semibold text-fg tabular-nums">
-                        {visibleColsCount}/{TRAFFIC_COLUMNS.length} кол.
-                      </div>
-                      <div className="text-[10px] text-subtle">
-                        Тулбар: {visibleGroupsCount}/
-                        {TOOLBAR_GROUP_DEFINITIONS.length}
-                      </div>
-                    </div>
-                    <div className="rounded-md border border-hairline bg-surface p-2.5">
-                      <div className="text-[10px] text-muted">Пресеты фильтров</div>
-                      <div className="mt-0.5 font-mono text-sm font-semibold text-fg tabular-nums">
-                        {userPresets.length} польз.
-                      </div>
-                      <div className="text-[10px] text-subtle">
-                        Матрица: {filterRules.length} усл.
-                      </div>
-                    </div>
-                    <div className="rounded-md border border-hairline bg-surface p-2.5">
-                      <div className="text-[10px] text-muted">TLS &amp; Заголовки</div>
-                      <div className="mt-0.5 font-mono text-sm font-semibold text-fg tabular-nums">
-                        {backendFilterConfig.tlsBypassRules.length +
-                          backendFilterConfig.tlsTargetRules.length}{" "}
-                        TLS
-                      </div>
-                      <div className="text-[10px] text-subtle">
-                        Headers: {backendFilterConfig.headerMutations.length}
-                      </div>
-                    </div>
-                    <div className="rounded-md border border-hairline bg-surface p-2.5">
-                      <div className="text-[10px] text-muted">AutoResponder</div>
-                      <div className="mt-0.5 font-mono text-sm font-semibold text-fg tabular-nums">
-                        {autoResponderRules.length} правил
-                      </div>
-                      <div className="text-[10px] text-subtle">
-                        Статус: {autoResponderEnabled ? "Enabled" : "Disabled"}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2 pt-1">
-                    <button
-                      type="button"
-                      onClick={() => void onExportProfile()}
-                      className="inline-flex h-8 items-center gap-1.5 rounded-md bg-sky-600 px-3 text-xs font-semibold text-white hover:bg-sky-500"
-                    >
-                      <Download className="h-3.5 w-3.5" />
-                      <span>Export Settings Profile (JSON)...</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => void onImportProfileDialog()}
-                      className="inline-flex h-8 items-center gap-1.5 rounded-md border border-strong bg-surface px-3 text-xs font-semibold text-fg hover:bg-hover"
-                    >
-                      <Upload className="h-3.5 w-3.5 text-accent" />
-                      <span>Import Settings Profile...</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => void handleCopyCurrentProfileJson()}
-                      className="inline-flex h-8 items-center gap-1.5 rounded-md border border-hairline bg-elevated px-3 text-xs text-muted hover:border-strong hover:text-fg"
-                    >
-                      {copiedProfileJson ? (
-                        <Check className="h-3.5 w-3.5 text-status2xx-fg" />
-                      ) : (
-                        <Copy className="h-3.5 w-3.5" />
-                      )}
-                      <span>Copy JSON</span>
-                    </button>
-                  </div>
-                </div>
-
-                <div className="space-y-2 rounded-lg border border-hairline bg-canvas p-3.5">
-                  <label
-                    htmlFor={`${baseId}-paste-json`}
-                    className="block text-xs font-semibold text-fg"
-                  >
-                    Быстрый импорт профиля из текста JSON (с проверкой и превью)
-                  </label>
-                  <textarea
-                    id={`${baseId}-paste-json`}
-                    rows={5}
-                    value={rawJsonDraft}
-                    onChange={(e) => setRawJsonDraft(e.target.value)}
-                    placeholder='{"schemaVersion": 1, "ui": { ... }, "filters": { ... }}'
-                    className="w-full rounded-md border border-strong bg-surface p-2 font-mono text-[11px] text-fg focus:border-accent focus:outline-none"
-                  />
-                  <div className="flex justify-end">
-                    <button
-                      type="button"
-                      disabled={!rawJsonDraft.trim()}
-                      onClick={() =>
-                        onImportFromRawJsonText(
-                          rawJsonDraft,
-                          "буфер JSON (вставленный текст)"
-                        )
-                      }
-                      className="inline-flex h-7 items-center gap-1.5 rounded border border-accent/40 bg-selected px-3 text-xs font-medium text-fg hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-45"
-                    >
-                      <FileJson className="h-3.5 w-3.5 text-accent" />
-                      <span>Проверить и открыть превью импорта…</span>
-                    </button>
-                  </div>
-                </div>
-
-                <div className="space-y-2.5 rounded-lg border border-status5xx-fg/35 bg-status5xx-bg p-3.5">
-                  <div className="flex items-start gap-2.5">
-                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-status5xx-fg" />
-                    <div className="min-w-0 flex-1">
-                      <h3 className="text-xs font-semibold text-fg">
-                        Сброс всех настроек к заводским значениям (Reset to Defaults)
-                      </h3>
-                      <p className="mt-0.5 text-[11px] text-muted">
-                        Восстанавливает тему, компактность и группы тулбара, ширину всех колонок,
-                        пользовательские пресеты, правила фильтрации, порт прокси (8888), TLS и AutoResponder.
-                      </p>
-                      <button
-                        type="button"
-                        onClick={() => setConfirmResetOpen(true)}
-                        className="mt-2.5 inline-flex h-8 items-center gap-1.5 rounded-md border border-status5xx-fg/50 bg-surface px-3 text-xs font-semibold text-status5xx-fg hover:bg-hover"
-                      >
-                        <RotateCcw className="h-3.5 w-3.5" />
-                        <span>Reset to Defaults…</span>
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </>
+              <BackupExportSettingsTab
+                baseId={baseId}
+                visibleColumns={visibleColumns}
+                toolbarGroups={toolbarGroups}
+                userPresets={userPresets}
+                filterRules={filterRules}
+                autoResponderEnabled={autoResponderEnabled}
+                autoResponderRules={autoResponderRules}
+                backendFilterConfig={backendFilterConfig}
+                onExportProfile={onExportProfile}
+                onImportProfileDialog={onImportProfileDialog}
+                onImportFromRawJsonText={onImportFromRawJsonText}
+                onRequestResetAll={() => setConfirmResetOpen(true)}
+                onNotify={onNotify}
+              />
             )}
           </div>
         </div>

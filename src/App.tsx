@@ -7,10 +7,7 @@ import {
   type ImperativePanelGroupHandle,
 } from "react-resizable-panels";
 import { AutoResponderPanel } from "./components/AutoResponderPanel";
-import {
-  BreakpointBanner,
-  BreakpointInterceptorModal,
-} from "./components/BreakpointModal";
+import { BreakpointBanner } from "./components/BreakpointBanner";
 import { CertificateModal } from "./components/CertificateModal";
 import { ClientCertificatesModal } from "./components/ClientCertificatesModal";
 import { CodeSnippetModal } from "./components/CodeSnippetModal";
@@ -19,31 +16,75 @@ import {
   type PaletteCommand,
 } from "./components/CommandPalette";
 import { ComposerPanel } from "./components/ComposerPanel";
-import { FilterDrawer } from "./components/FilterDrawer";
 import { MenuBar } from "./components/MenuBar";
-import { MobileSetupModal } from "./components/MobileSetupModal";
-import { OpenApiExportModal } from "./components/OpenApiExportModal";
-import { ProxyDoctorModal } from "./components/ProxyDoctorModal";
-import { SanitizedExportModal } from "./components/SanitizedExportModal";
-import { ScriptingPanel } from "./components/ScriptingPanel";
 import { SessionAnnotationModal } from "./components/SessionAnnotationModal";
-import {
-  SessionDiffModal,
-  SessionDiffView,
-} from "./components/SessionDiffView";
 import { SessionInspector } from "./components/SessionInspector";
-import {
-  SettingsImportPreviewModal,
-  SettingsModal,
-} from "./components/SettingsModal";
 import { ShortcutsModal } from "./components/ShortcutsModal";
 import { Sidebar } from "./components/Sidebar";
-import {
-  TextWizardModal,
-  type TextWizardTab,
-} from "./components/TextWizardModal";
+import type { TextWizardTab } from "./components/TextWizardModal";
 import { TopToolbar } from "./components/TopToolbar";
 import { TrafficGrid } from "./components/TrafficGrid";
+
+const BreakpointInterceptorModal = React.lazy(() =>
+  import("./components/BreakpointModal").then((m) => ({
+    default: m.BreakpointInterceptorModal,
+  }))
+);
+const FilterDrawer = React.lazy(() =>
+  import("./components/FilterDrawer").then((m) => ({
+    default: m.FilterDrawer,
+  }))
+);
+const MobileSetupModal = React.lazy(() =>
+  import("./components/MobileSetupModal").then((m) => ({
+    default: m.MobileSetupModal,
+  }))
+);
+const OpenApiExportModal = React.lazy(() =>
+  import("./components/OpenApiExportModal").then((m) => ({
+    default: m.OpenApiExportModal,
+  }))
+);
+const ProxyDoctorModal = React.lazy(() =>
+  import("./components/ProxyDoctorModal").then((m) => ({
+    default: m.ProxyDoctorModal,
+  }))
+);
+const SanitizedExportModal = React.lazy(() =>
+  import("./components/SanitizedExportModal").then((m) => ({
+    default: m.SanitizedExportModal,
+  }))
+);
+const ScriptingPanel = React.lazy(() =>
+  import("./components/ScriptingPanel").then((m) => ({
+    default: m.ScriptingPanel,
+  }))
+);
+const SessionDiffModal = React.lazy(() =>
+  import("./components/SessionDiffView").then((m) => ({
+    default: m.SessionDiffModal,
+  }))
+);
+const SessionDiffView = React.lazy(() =>
+  import("./components/SessionDiffView").then((m) => ({
+    default: m.SessionDiffView,
+  }))
+);
+const SettingsImportPreviewModal = React.lazy(() =>
+  import("./components/SettingsModal").then((m) => ({
+    default: m.SettingsImportPreviewModal,
+  }))
+);
+const SettingsModal = React.lazy(() =>
+  import("./components/SettingsModal").then((m) => ({
+    default: m.SettingsModal,
+  }))
+);
+const TextWizardModal = React.lazy(() =>
+  import("./components/TextWizardModal").then((m) => ({
+    default: m.TextWizardModal,
+  }))
+);
 import { useProxySessions } from "./hooks/useProxySessions";
 import { useTheme } from "./hooks/useTheme";
 import {
@@ -73,15 +114,14 @@ import {
   SETTINGS_STORAGE_KEYS,
 } from "./lib/settingsManager";
 import { isTauriRuntime, proxyBridge } from "./lib/tauriBridge";
+import { useProxyStore } from "./stores/proxyStore";
+import { useUiStore } from "./stores/uiStore";
 import { THEME_PRESETS } from "./lib/themePresets";
 import type {
-  ActiveNavSection,
   AutoResponderRule,
   ComposedRequest,
   FilterDrawerTab,
-  PythonRunnerStatus,
   PythonScriptPreset,
-  ScriptConsoleLogEvent,
   SessionSummary,
 } from "./types/proxy";
 import type {
@@ -257,27 +297,33 @@ export const App: React.FC = () => {
     [filteredSessions, selectSessions]
   );
 
-  const [activeSection, setActiveSection] =
-    useState<ActiveNavSection>("traffic");
-  const [dockedComposer, setDockedComposer] = useState(false);
+  const activeSection = useUiStore((s) => s.activeSection);
+  const setActiveSection = useUiStore((s) => s.setActiveSection);
+  const dockedComposer = useUiStore((s) => s.dockedComposer);
+  const setDockedComposer = useUiStore((s) => s.setDockedComposer);
   const [composerDraft, setComposerDraft] = useState<ComposedRequest | null>(
     null
   );
-  const [autoResponderEnabled, setAutoResponderEnabled] = useState(true);
-  const [rules, setRules] = useState<AutoResponderRule[]>([]);
-  const [scriptCode, setScriptCode] = useState<string>(
-    DEFAULT_PYTHON_SCRIPT_CODE
+  const autoResponderEnabled = useProxyStore((s) => s.autoResponderEnabled);
+  const setAutoResponderEnabled = useProxyStore(
+    (s) => s.setAutoResponderEnabled
   );
-  const [scriptEnabled, setScriptEnabled] = useState<boolean>(false);
-  const [scriptActivePresetId, setScriptActivePresetId] = useState<
-    string | null
-  >("hmac-header-injection");
-  const [pythonRunnerStatus, setPythonRunnerStatus] =
-    useState<PythonRunnerStatus | null>(null);
-  const [scriptConsoleLogs, setScriptConsoleLogs] = useState<
-    ScriptConsoleLogEvent[]
-  >([]);
-  const [isApplyingScript, setIsApplyingScript] = useState(false);
+  const rules = useProxyStore((s) => s.rules);
+  const setRules = useProxyStore((s) => s.setRules);
+  const scriptCode = useProxyStore((s) => s.scriptCode);
+  const setScriptCode = useProxyStore((s) => s.setScriptCode);
+  const scriptEnabled = useProxyStore((s) => s.scriptEnabled);
+  const setScriptEnabled = useProxyStore((s) => s.setScriptEnabled);
+  const scriptActivePresetId = useProxyStore((s) => s.scriptActivePresetId);
+  const setScriptActivePresetId = useProxyStore(
+    (s) => s.setScriptActivePresetId
+  );
+  const pythonRunnerStatus = useProxyStore((s) => s.pythonRunnerStatus);
+  const setPythonRunnerStatus = useProxyStore((s) => s.setPythonRunnerStatus);
+  const scriptConsoleLogs = useProxyStore((s) => s.scriptConsoleLogs);
+  const setScriptConsoleLogs = useProxyStore((s) => s.setScriptConsoleLogs);
+  const isApplyingScript = useProxyStore((s) => s.isApplyingScript);
+  const setIsApplyingScript = useProxyStore((s) => s.setIsApplyingScript);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] =
     useState<SettingsModalTab>("general");
@@ -2636,18 +2682,26 @@ export const App: React.FC = () => {
 
   const renderInspectorOrDiff = () =>
     showInlineSessionDiff ? (
-      <SessionDiffView
-        leftDetail={diffLeftDetail}
-        rightDetail={diffRightDetail}
-        sessions={filteredSessions.length >= 2 ? filteredSessions : sessions}
-        resolvedTheme={resolvedTheme}
-        defaultSideBySide
-        onSelectPair={setComparePairIds}
-        onSwapPair={swapCompareSessions}
-        onAnnotateSession={(id) => openAnnotationFor([id])}
-        onExpandModal={() => setDiffModalOpen(true)}
-        onCloseDiff={() => setInlineDiffDismissed(true)}
-      />
+      <React.Suspense
+        fallback={
+          <div className="flex flex-1 items-center justify-center text-xs text-muted">
+            Loading Session Diff...
+          </div>
+        }
+      >
+        <SessionDiffView
+          leftDetail={diffLeftDetail}
+          rightDetail={diffRightDetail}
+          sessions={filteredSessions.length >= 2 ? filteredSessions : sessions}
+          resolvedTheme={resolvedTheme}
+          defaultSideBySide
+          onSelectPair={setComparePairIds}
+          onSwapPair={swapCompareSessions}
+          onAnnotateSession={(id) => openAnnotationFor([id])}
+          onExpandModal={() => setDiffModalOpen(true)}
+          onCloseDiff={() => setInlineDiffDismissed(true)}
+        />
+      </React.Suspense>
     ) : (
       <SessionInspector
         detail={selectedDetail}
@@ -3169,28 +3223,36 @@ export const App: React.FC = () => {
             )}
 
             {activeSection === "scripts" && (
-              <ScriptingPanel
-                code={scriptCode}
-                enabled={scriptEnabled}
-                activePresetId={scriptActivePresetId}
-                status={pythonRunnerStatus}
-                logs={scriptConsoleLogs}
-                resolvedTheme={resolvedTheme}
-                isApplying={isApplyingScript}
-                onChangeCode={(nextCode) => {
-                  setScriptCode(nextCode);
-                  persistPythonScriptStorage(
-                    scriptEnabled,
-                    nextCode,
-                    scriptActivePresetId
-                  );
-                }}
-                onSelectPreset={handleSelectPythonPreset}
-                onApplyScript={handleApplyPythonScript}
-                onToggleEnabled={handleTogglePythonScript}
-                onRefreshStatus={handleRefreshPythonStatus}
-                onClearLogs={() => setScriptConsoleLogs([])}
-              />
+              <React.Suspense
+                fallback={
+                  <div className="flex flex-1 items-center justify-center text-xs text-muted">
+                    Loading Python Scripting IDE...
+                  </div>
+                }
+              >
+                <ScriptingPanel
+                  code={scriptCode}
+                  enabled={scriptEnabled}
+                  activePresetId={scriptActivePresetId}
+                  status={pythonRunnerStatus}
+                  logs={scriptConsoleLogs}
+                  resolvedTheme={resolvedTheme}
+                  isApplying={isApplyingScript}
+                  onChangeCode={(nextCode) => {
+                    setScriptCode(nextCode);
+                    persistPythonScriptStorage(
+                      scriptEnabled,
+                      nextCode,
+                      scriptActivePresetId
+                    );
+                  }}
+                  onSelectPreset={handleSelectPythonPreset}
+                  onApplyScript={handleApplyPythonScript}
+                  onToggleEnabled={handleTogglePythonScript}
+                  onRefreshStatus={handleRefreshPythonStatus}
+                  onClearLogs={() => setScriptConsoleLogs([])}
+                />
+              </React.Suspense>
             )}
           </main>
         </div>
@@ -3406,108 +3468,119 @@ export const App: React.FC = () => {
         onClose={() => setShortcutsModalOpen(false)}
       />
 
-      <SettingsModal
-        open={settingsModalOpen}
-        initialTab={settingsInitialTab}
-        onClose={() => setSettingsModalOpen(false)}
-        themePreference={preference}
-        onSetTheme={setTheme}
-        themePreset={themePreset}
-        customColorOverrides={customColorOverrides}
-        effectiveThemeTokens={effectiveTokens}
-        onSetThemePreset={setThemePreset}
-        onSetCustomColorOverride={setCustomColorOverride}
-        onResetCustomColorOverride={resetCustomColorOverride}
-        onResetCustomColorOverrides={resetCustomColorOverrides}
-        compactToolbar={compactToolbar}
-        onSetCompactToolbar={setCompactToolbar}
-        sidebarCollapsed={sidebarCollapsed}
-        onSetSidebarCollapsed={setSidebarCollapsed}
-        inspectorCollapsed={inspectorCollapsed}
-        onSetInspectorCollapsed={setInspectorCollapsed}
-        inspectorPosition={inspectorPosition}
-        onSetInspectorPosition={setInspectorPosition}
-        inspectorSplitDirection={inspectorSplitDirection}
-        onSetInspectorSplitDirection={setInspectorSplitDirection}
-        onResetPanelLayout={handleResetPanelLayout}
-        followTail={followTail}
-        onSetFollowTail={setFollowTail}
-        toolbarGroups={toolbarGroups}
-        onToggleToolbarGroup={toggleToolbarGroup}
-        onResetToolbarGroups={resetToolbarGroups}
-        visibleColumns={visibleColumns}
-        onToggleColumnVisibility={toggleColumnVisibility}
-        columnWidths={columnWidths}
-        onSetColumnWidth={setColumnWidth}
-        onResetColumns={resetColumns}
-        activePresetId={activePresetId}
-        userPresets={customPresets}
-        onApplyPreset={(presetId) => {
-          if (presetId) {
-            applyPreset(presetId);
-          } else {
-            resetAdvancedFilters();
-          }
-        }}
-        onSaveCustomPreset={saveCustomPreset}
-        onDeleteCustomPreset={deleteCustomPreset}
-        matrixEnabled={matrixEnabled}
-        onSetMatrixEnabled={setMatrixEnabled}
-        filterRules={filterRules}
-        noiseThresholds={thresholds}
-        onSetNoiseThresholds={setThresholds}
-        hostFilters={hostListFilter}
-        onSetHostFilters={setHostListFilter}
-        onResetAdvancedFilters={resetAdvancedFilters}
-        onOpenFilterDrawer={() => openFilterDrawerAt("matrix")}
-        status={status}
-        onSetProxyPort={setProxyPort}
-        onSetAutoSystemProxy={setAutoSystemProxy}
-        onSetAllowRemote={setAllowRemote}
-        onSetBindConfiguration={setBindConfiguration}
-        sessionRetentionLimit={sessionRetentionLimit}
-        onSetSessionRetentionLimit={setSessionRetentionLimit}
-        dropNonMatching={dropNonMatching}
-        onSetDropNonMatching={setDropNonMatching}
-        storageStats={storageStats}
-        clearDbOnExit={clearDbOnExit}
-        onSetClearDbOnExit={setClearDbOnExit}
-        onClearSqliteDatabase={clearSqliteDatabase}
-        backendFilterConfig={backendFilterConfig}
-        onUpdateBackendFilterConfig={updateBackendFilterConfig}
-        onSetTlsInterceptMode={setTlsInterceptMode}
-        onOpenTlsDrawer={() => openFilterDrawerAt("tlsBypass")}
-        onOpenHeadersDrawer={() => openFilterDrawerAt("headers")}
-        autoResponderEnabled={autoResponderEnabled}
-        onSetAutoResponderEnabled={handleSetAutoResponderEnabled}
-        autoResponderRules={rules}
-        onUpsertAutoResponderRule={async (rule) => {
-          const next = await proxyBridge.upsertRule(rule);
-          setRules(next);
-          persistAutoResponderStorage(autoResponderEnabled, next);
-          showToast(`Saved rule "${rule.name}"`);
-        }}
-        onDeleteAutoResponderRule={async (id) => {
-          const next = await proxyBridge.deleteRule(id);
-          setRules(next);
-          persistAutoResponderStorage(autoResponderEnabled, next);
-          showToast("Deleted AutoResponder rule");
-        }}
-        onOpenAutoResponderStudio={() => setActiveSection("rules")}
-        onExportProfile={handleExportSettingsProfile}
-        onImportProfileDialog={handleImportSettingsProfileDialog}
-        onImportFromRawJsonText={(jsonText, label) =>
-          openImportPreviewFromJsonText(jsonText, label ?? "pasted-settings.json")
-        }
-        onResetAllToDefaults={() => handleResetAllSettings(true)}
-        onNotify={showToast}
-      />
+      {settingsModalOpen && (
+        <React.Suspense fallback={null}>
+          <SettingsModal
+            open={settingsModalOpen}
+            initialTab={settingsInitialTab}
+            onClose={() => setSettingsModalOpen(false)}
+            themePreference={preference}
+            onSetTheme={setTheme}
+            themePreset={themePreset}
+            customColorOverrides={customColorOverrides}
+            effectiveThemeTokens={effectiveTokens}
+            onSetThemePreset={setThemePreset}
+            onSetCustomColorOverride={setCustomColorOverride}
+            onResetCustomColorOverride={resetCustomColorOverride}
+            onResetCustomColorOverrides={resetCustomColorOverrides}
+            compactToolbar={compactToolbar}
+            onSetCompactToolbar={setCompactToolbar}
+            sidebarCollapsed={sidebarCollapsed}
+            onSetSidebarCollapsed={setSidebarCollapsed}
+            inspectorCollapsed={inspectorCollapsed}
+            onSetInspectorCollapsed={setInspectorCollapsed}
+            inspectorPosition={inspectorPosition}
+            onSetInspectorPosition={setInspectorPosition}
+            inspectorSplitDirection={inspectorSplitDirection}
+            onSetInspectorSplitDirection={setInspectorSplitDirection}
+            onResetPanelLayout={handleResetPanelLayout}
+            followTail={followTail}
+            onSetFollowTail={setFollowTail}
+            toolbarGroups={toolbarGroups}
+            onToggleToolbarGroup={toggleToolbarGroup}
+            onResetToolbarGroups={resetToolbarGroups}
+            visibleColumns={visibleColumns}
+            onToggleColumnVisibility={toggleColumnVisibility}
+            columnWidths={columnWidths}
+            onSetColumnWidth={setColumnWidth}
+            onResetColumns={resetColumns}
+            activePresetId={activePresetId}
+            userPresets={customPresets}
+            onApplyPreset={(presetId) => {
+              if (presetId) {
+                applyPreset(presetId);
+              } else {
+                resetAdvancedFilters();
+              }
+            }}
+            onSaveCustomPreset={saveCustomPreset}
+            onDeleteCustomPreset={deleteCustomPreset}
+            matrixEnabled={matrixEnabled}
+            onSetMatrixEnabled={setMatrixEnabled}
+            filterRules={filterRules}
+            noiseThresholds={thresholds}
+            onSetNoiseThresholds={setThresholds}
+            hostFilters={hostListFilter}
+            onSetHostFilters={setHostListFilter}
+            onResetAdvancedFilters={resetAdvancedFilters}
+            onOpenFilterDrawer={() => openFilterDrawerAt("matrix")}
+            status={status}
+            onSetProxyPort={setProxyPort}
+            onSetAutoSystemProxy={setAutoSystemProxy}
+            onSetAllowRemote={setAllowRemote}
+            onSetBindConfiguration={setBindConfiguration}
+            sessionRetentionLimit={sessionRetentionLimit}
+            onSetSessionRetentionLimit={setSessionRetentionLimit}
+            dropNonMatching={dropNonMatching}
+            onSetDropNonMatching={setDropNonMatching}
+            storageStats={storageStats}
+            clearDbOnExit={clearDbOnExit}
+            onSetClearDbOnExit={setClearDbOnExit}
+            onClearSqliteDatabase={clearSqliteDatabase}
+            backendFilterConfig={backendFilterConfig}
+            onUpdateBackendFilterConfig={updateBackendFilterConfig}
+            onSetTlsInterceptMode={setTlsInterceptMode}
+            onOpenTlsDrawer={() => openFilterDrawerAt("tlsBypass")}
+            onOpenHeadersDrawer={() => openFilterDrawerAt("headers")}
+            autoResponderEnabled={autoResponderEnabled}
+            onSetAutoResponderEnabled={handleSetAutoResponderEnabled}
+            autoResponderRules={rules}
+            onUpsertAutoResponderRule={async (rule) => {
+              const next = await proxyBridge.upsertRule(rule);
+              setRules(next);
+              persistAutoResponderStorage(autoResponderEnabled, next);
+              showToast(`Saved rule "${rule.name}"`);
+            }}
+            onDeleteAutoResponderRule={async (id) => {
+              const next = await proxyBridge.deleteRule(id);
+              setRules(next);
+              persistAutoResponderStorage(autoResponderEnabled, next);
+              showToast("Deleted AutoResponder rule");
+            }}
+            onOpenAutoResponderStudio={() => setActiveSection("rules")}
+            onExportProfile={handleExportSettingsProfile}
+            onImportProfileDialog={handleImportSettingsProfileDialog}
+            onImportFromRawJsonText={(jsonText, label) =>
+              openImportPreviewFromJsonText(
+                jsonText,
+                label ?? "pasted-settings.json"
+              )
+            }
+            onResetAllToDefaults={() => handleResetAllSettings(true)}
+            onNotify={showToast}
+          />
+        </React.Suspense>
+      )}
 
-      <SettingsImportPreviewModal
-        preview={pendingImportState?.preview ?? null}
-        onCancel={() => setPendingImportState(null)}
-        onConfirm={handleConfirmImportSettingsProfile}
-      />
+      {pendingImportState && (
+        <React.Suspense fallback={null}>
+          <SettingsImportPreviewModal
+            preview={pendingImportState.preview}
+            onCancel={() => setPendingImportState(null)}
+            onConfirm={handleConfirmImportSettingsProfile}
+          />
+        </React.Suspense>
+      )}
 
       <SessionAnnotationModal
         open={annotationModalOpen}
@@ -3518,70 +3591,86 @@ export const App: React.FC = () => {
         }}
       />
 
-      <SessionDiffModal
-        open={diffModalOpen}
-        leftDetail={diffLeftDetail}
-        rightDetail={diffRightDetail}
-        sessions={filteredSessions.length >= 2 ? filteredSessions : sessions}
-        resolvedTheme={resolvedTheme}
-        onSelectPair={setComparePairIds}
-        onSwapPair={swapCompareSessions}
-        onAnnotateSession={(id) => openAnnotationFor([id])}
-        onClose={() => setDiffModalOpen(false)}
-      />
+      {diffModalOpen && (
+        <React.Suspense fallback={null}>
+          <SessionDiffModal
+            open={diffModalOpen}
+            leftDetail={diffLeftDetail}
+            rightDetail={diffRightDetail}
+            sessions={filteredSessions.length >= 2 ? filteredSessions : sessions}
+            resolvedTheme={resolvedTheme}
+            onSelectPair={setComparePairIds}
+            onSwapPair={swapCompareSessions}
+            onAnnotateSession={(id) => openAnnotationFor([id])}
+            onClose={() => setDiffModalOpen(false)}
+          />
+        </React.Suspense>
+      )}
 
-      <FilterDrawer
-        open={filterDrawerOpen}
-        initialTab={filterDrawerTab}
-        onClose={() => setFilterDrawerOpen(false)}
-        totalCount={sessions.length}
-        filteredCount={filteredSessions.length}
-        sessions={sessions}
-        hostListFilter={hostListFilter}
-        compiledHostList={compiledHostList}
-        onHostListFilterChange={setHostListFilter}
-        onNotify={showToast}
-        matrixEnabled={matrixEnabled}
-        onMatrixEnabledChange={setMatrixEnabled}
-        rules={filterRules}
-        onRulesChange={setFilterRules}
-        ruleErrors={ruleErrors}
-        presets={allPresets}
-        activePresetId={activePresetId}
-        onApplyPreset={applyPreset}
-        onSavePreset={saveCustomPreset}
-        onDeletePreset={deleteCustomPreset}
-        onResetAll={resetAdvancedFilters}
-        detectedProcesses={detectedProcesses}
-        onQuickProcessFilter={quickFilterByProcess}
-        thresholds={thresholds}
-        onThresholdsChange={setThresholds}
-        backendConfig={backendFilterConfig}
-        onBackendConfigChange={updateBackendFilterConfig}
-        isForceNoCacheActive={isForceNoCacheActive}
-        onToggleForceNoCache={toggleForceNoCache}
-      />
+      {filterDrawerOpen && (
+        <React.Suspense fallback={null}>
+          <FilterDrawer
+            open={filterDrawerOpen}
+            initialTab={filterDrawerTab}
+            onClose={() => setFilterDrawerOpen(false)}
+            totalCount={sessions.length}
+            filteredCount={filteredSessions.length}
+            sessions={sessions}
+            hostListFilter={hostListFilter}
+            compiledHostList={compiledHostList}
+            onHostListFilterChange={setHostListFilter}
+            onNotify={showToast}
+            matrixEnabled={matrixEnabled}
+            onMatrixEnabledChange={setMatrixEnabled}
+            rules={filterRules}
+            onRulesChange={setFilterRules}
+            ruleErrors={ruleErrors}
+            presets={allPresets}
+            activePresetId={activePresetId}
+            onApplyPreset={applyPreset}
+            onSavePreset={saveCustomPreset}
+            onDeletePreset={deleteCustomPreset}
+            onResetAll={resetAdvancedFilters}
+            detectedProcesses={detectedProcesses}
+            onQuickProcessFilter={quickFilterByProcess}
+            thresholds={thresholds}
+            onThresholdsChange={setThresholds}
+            backendConfig={backendFilterConfig}
+            onBackendConfigChange={updateBackendFilterConfig}
+            isForceNoCacheActive={isForceNoCacheActive}
+            onToggleForceNoCache={toggleForceNoCache}
+          />
+        </React.Suspense>
+      )}
 
-      <BreakpointInterceptorModal
-        open={bpModalOpen}
-        initialMode={bpModalMode}
-        selectedBreakpointId={selectedBpId}
-        pausedItems={pausedBreakpoints}
-        config={breakpointConfig}
-        resolvedTheme={resolvedTheme}
-        onClose={() => setBpModalOpen(false)}
-        onUpdateConfig={updateBreakpointConfig}
-        onResolve={resolvePausedBreakpoint}
-        onResumeAll={resumeAllBreakpoints}
-      />
+      {bpModalOpen && (
+        <React.Suspense fallback={null}>
+          <BreakpointInterceptorModal
+            open={bpModalOpen}
+            initialMode={bpModalMode}
+            selectedBreakpointId={selectedBpId}
+            pausedItems={pausedBreakpoints}
+            config={breakpointConfig}
+            resolvedTheme={resolvedTheme}
+            onClose={() => setBpModalOpen(false)}
+            onUpdateConfig={updateBreakpointConfig}
+            onResolve={resolvePausedBreakpoint}
+            onResumeAll={resumeAllBreakpoints}
+          />
+        </React.Suspense>
+      )}
 
-      <TextWizardModal
-        open={textWizardOpen}
-        initialTab={textWizardTab}
-        initialInput={textWizardInput}
-        onClose={() => setTextWizardOpen(false)}
-        onNotify={showToast}
-      />
+      {textWizardOpen && (
+        <React.Suspense fallback={null}>
+          <TextWizardModal
+            open={textWizardOpen}
+            initialTab={textWizardTab}
+            initialInput={textWizardInput}
+            onClose={() => setTextWizardOpen(false)}
+            onNotify={showToast}
+          />
+        </React.Suspense>
+      )}
 
       <CertificateModal
         open={certModalOpen}
@@ -3595,37 +3684,53 @@ export const App: React.FC = () => {
         onNotify={showToast}
       />
 
-      <MobileSetupModal
-        open={mobileModalOpen}
-        status={status}
-        onSetAllowRemote={setAllowRemote}
-        onToggleProxy={toggleProxy}
-        onClose={() => setMobileModalOpen(false)}
-        onNotify={showToast}
-      />
+      {mobileModalOpen && (
+        <React.Suspense fallback={null}>
+          <MobileSetupModal
+            open={mobileModalOpen}
+            status={status}
+            onSetAllowRemote={setAllowRemote}
+            onToggleProxy={toggleProxy}
+            onClose={() => setMobileModalOpen(false)}
+            onNotify={showToast}
+          />
+        </React.Suspense>
+      )}
 
-      <ProxyDoctorModal
-        open={proxyDoctorModalOpen}
-        onClose={() => setProxyDoctorModalOpen(false)}
-        onNotify={showToast}
-      />
+      {proxyDoctorModalOpen && (
+        <React.Suspense fallback={null}>
+          <ProxyDoctorModal
+            open={proxyDoctorModalOpen}
+            onClose={() => setProxyDoctorModalOpen(false)}
+            onNotify={showToast}
+          />
+        </React.Suspense>
+      )}
 
-      <SanitizedExportModal
-        open={sanitizedExportModalOpen}
-        totalCount={sessions.length}
-        selectedIds={effectiveSelectedIds}
-        onClose={() => setSanitizedExportModalOpen(false)}
-        onExport={exportSanitizedSessions}
-      />
+      {sanitizedExportModalOpen && (
+        <React.Suspense fallback={null}>
+          <SanitizedExportModal
+            open={sanitizedExportModalOpen}
+            totalCount={sessions.length}
+            selectedIds={effectiveSelectedIds}
+            onClose={() => setSanitizedExportModalOpen(false)}
+            onExport={exportSanitizedSessions}
+          />
+        </React.Suspense>
+      )}
 
-      <OpenApiExportModal
-        open={openApiModalOpen}
-        selectedIds={openApiSelectedIds}
-        allSessionIds={openApiAllIds}
-        resolvedTheme={resolvedTheme}
-        onClose={() => setOpenApiModalOpen(false)}
-        onNotify={showToast}
-      />
+      {openApiModalOpen && (
+        <React.Suspense fallback={null}>
+          <OpenApiExportModal
+            open={openApiModalOpen}
+            selectedIds={openApiSelectedIds}
+            allSessionIds={openApiAllIds}
+            resolvedTheme={resolvedTheme}
+            onClose={() => setOpenApiModalOpen(false)}
+            onNotify={showToast}
+          />
+        </React.Suspense>
+      )}
 
       <CodeSnippetModal
         open={codeSnippetModalOpen}
