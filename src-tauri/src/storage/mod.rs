@@ -727,13 +727,37 @@ impl TrafficStore {
                     acc.frames.push(rec);
                 }
             }
-            acc.total_bytes = total_bytes;
+            acc.total_bytes = acc.total_bytes.max(total_bytes);
         }
 
         let mut entry = self.sessions.get_mut(&id)?;
         let detail_mut = Arc::make_mut(entry.value_mut());
-        detail_mut.summary.body_size = total_bytes;
+        detail_mut.summary.body_size = detail_mut.summary.body_size.max(total_bytes);
         Some(detail_mut.summary.clone())
+    }
+
+    /// Updates an in-RAM paused session when its breakpoint await is cancelled (e.g., client disconnect),
+    /// clearing `breakpoint_paused` and setting final status/error metadata.
+    pub fn cancel_paused_breakpoint(
+        &self,
+        id: u64,
+        status: u16,
+        error_msg: &str,
+        duration_ms: u64,
+    ) -> Option<SessionSummary> {
+        let updated_summary = {
+            let mut entry = self.sessions.get_mut(&id)?;
+            let detail_mut = Arc::make_mut(entry.value_mut());
+            detail_mut.summary.breakpoint_paused = None;
+            detail_mut.summary.status = status;
+            detail_mut.summary.duration_ms = duration_ms;
+            detail_mut.summary.error = Some(error_msg.to_string());
+            if detail_mut.summary.content_type == "pending/breakpoint-request" {
+                detail_mut.summary.content_type = "text/plain; charset=utf-8".to_string();
+            }
+            detail_mut.summary.clone()
+        };
+        Some(updated_summary)
     }
 
     /// Finalizes a WebSocket stream: materializes `websocket_frames` and JSON preview once on close.

@@ -80,8 +80,310 @@ struct CompiledCaptureMatrix {
     exclude_groups: Vec<Vec<CompiledCaptureCondition>>,
 }
 
+#[derive(Clone, Debug)]
+enum CompiledHostMatcher {
+    MatchAll,
+    Exact(String),
+    DomainSuffix(String),
+    Glob(Option<Regex>),
+    Regex(Option<Regex>),
+}
+
+impl CompiledHostMatcher {
+    fn matches(&self, host_clean: &str, host_port: &str) -> bool {
+        match self {
+            Self::MatchAll => true,
+            Self::Exact(expected) => host_clean == expected,
+            Self::DomainSuffix(suffix) => {
+                host_clean == suffix
+                    || (host_clean.len() > suffix.len()
+                        && host_clean.ends_with(suffix)
+                        && host_clean.as_bytes()[host_clean.len() - suffix.len() - 1] == b'.')
+            }
+            Self::Glob(re_opt) => re_opt.as_ref().is_some_and(|re| re.is_match(host_clean)),
+            Self::Regex(re_opt) => re_opt
+                .as_ref()
+                .is_some_and(|re| re.is_match(host_clean) || re.is_match(host_port)),
+        }
+    }
+
+    #[cfg(test)]
+    fn has_compiled_regex(&self) -> bool {
+        matches!(self, Self::Glob(Some(_)) | Self::Regex(Some(_)))
+    }
+}
+
+#[derive(Clone, Debug)]
+enum CompiledPortMatcher {
+    Any,
+    Exact(u16),
+    Glob(Option<Regex>),
+    Never,
+}
+
+impl CompiledPortMatcher {
+    fn compile(port_opt: Option<&str>) -> Self {
+        let Some(raw_port) = port_opt else {
+            return Self::Any;
+        };
+        if let Ok(port) = raw_port.parse::<u16>() {
+            return Self::Exact(port);
+        }
+        if raw_port.contains('*') || raw_port.contains('?') {
+            return Self::Glob(compile_glob_regex(raw_port));
+        }
+        Self::Never
+    }
+
+    fn matches(&self, port: u16) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Exact(expected) => port == *expected,
+            Self::Glob(re_opt) => {
+                let port_str = port.to_string();
+                re_opt.as_ref().is_some_and(|re| re.is_match(&port_str))
+            }
+            Self::Never => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CompiledHostToken {
+    host: CompiledHostMatcher,
+    port: CompiledPortMatcher,
+}
+
+impl CompiledHostToken {
+    fn compile(pattern: &NormalizedHostPattern) -> Self {
+        match pattern {
+            NormalizedHostPattern::Regex(expr) => {
+                let compiled = Regex::new(&format!("(?i){expr}")).ok();
+                Self {
+                    host: CompiledHostMatcher::Regex(compiled),
+                    port: CompiledPortMatcher::Any,
+                }
+            }
+            NormalizedHostPattern::HostPort { host, port } => {
+                let port_matcher = CompiledPortMatcher::compile(port.as_deref());
+                let host_matcher = if host == "*" {
+                    CompiledHostMatcher::MatchAll
+                } else if let Some(rest) = host.strip_prefix("*.") {
+                    if !rest.is_empty() && !rest.contains('*') && !rest.contains('?') {
+                        CompiledHostMatcher::DomainSuffix(rest.to_string())
+                    } else {
+                        CompiledHostMatcher::Glob(build_combined_regex(&[compile_host_pattern_src(
+                            host,
+                        )]))
+                    }
+                } else if let Some(rest) = host.strip_prefix('.') {
+                    if !rest.is_empty() && !rest.contains('*') && !rest.contains('?') {
+                        CompiledHostMatcher::DomainSuffix(rest.to_string())
+                    } else {
+                        CompiledHostMatcher::Glob(build_combined_regex(&[compile_host_pattern_src(
+                            host,
+                        )]))
+                    }
+                } else if host.contains('*') || host.contains('?') {
+                    CompiledHostMatcher::Glob(compile_glob_regex(host))
+                } else {
+                    CompiledHostMatcher::Exact(host.clone())
+                };
+                Self {
+                    host: host_matcher,
+                    port: port_matcher,
+                }
+            }
+        }
+    }
+
+    fn matches(&self, host_clean: &str, port: u16, host_port: &str) -> bool {
+        self.port.matches(port) && self.host.matches(host_clean, host_port)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CompiledHostRule {
+    rule: TlsBypassRule,
+    positive_tokens: Vec<CompiledHostToken>,
+}
+
+#[derive(Default)]
+struct CompiledHostRuleList {
+    has_active_rules: bool,
+    negative_tokens: Vec<CompiledHostToken>,
+    positive_rules: Vec<CompiledHostRule>,
+}
+
+impl CompiledHostRuleList {
+    fn compile(rules: &[TlsBypassRule]) -> Self {
+        let mut out = Self::default();
+        for rule in rules {
+            if !rule.enabled {
+                continue;
+            }
+            if !rule.pattern.trim().is_empty() {
+                out.has_active_rules = true;
+            }
+            let mut positive_tokens = Vec::new();
+            for raw_token in rule.pattern.split(',') {
+                if let Some(norm) = normalize_host_token(raw_token) {
+                    let compiled = CompiledHostToken::compile(&norm.pattern);
+                    if norm.negated {
+                        out.negative_tokens.push(compiled);
+                    } else {
+                        positive_tokens.push(compiled);
+                    }
+                }
+            }
+            if !positive_tokens.is_empty() {
+                out.positive_rules.push(CompiledHostRule {
+                    rule: rule.clone(),
+                    positive_tokens,
+                });
+            }
+        }
+        out
+    }
+
+    fn matches(&self, host_clean: &str, port: u16) -> Option<&TlsBypassRule> {
+        if self.negative_tokens.is_empty() && self.positive_rules.is_empty() {
+            return None;
+        }
+        let host_port = if host_clean.contains(':') {
+            format!("[{host_clean}]:{port}")
+        } else {
+            format!("{host_clean}:{port}")
+        };
+        for neg in &self.negative_tokens {
+            if neg.matches(host_clean, port, &host_port) {
+                return None;
+            }
+        }
+        for entry in &self.positive_rules {
+            if entry
+                .positive_tokens
+                .iter()
+                .any(|tok| tok.matches(host_clean, port, &host_port))
+            {
+                return Some(&entry.rule);
+            }
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug)]
+enum CompiledUrlScope {
+    MatchAll,
+    Substring(String),
+    Glob(Option<Regex>),
+    Regex(Option<Regex>),
+}
+
+impl CompiledUrlScope {
+    fn compile(pattern: &str) -> Self {
+        let trimmed = pattern.trim();
+        if trimmed.is_empty() || trimmed == "*" {
+            return Self::MatchAll;
+        }
+        if let Some(re_pat) = strip_regex_prefix(trimmed) {
+            return Self::Regex(Regex::new(re_pat.trim()).ok());
+        }
+        let pat_lower = trimmed.to_ascii_lowercase();
+        if pat_lower.contains('*') {
+            return Self::Glob(compile_glob_regex(&pat_lower));
+        }
+        Self::Substring(pat_lower)
+    }
+
+    fn matches(&self, url_lower: &mut Option<String>, raw_url: &str) -> bool {
+        match self {
+            Self::MatchAll => true,
+            Self::Substring(needle) => {
+                let lowered = url_lower.get_or_insert_with(|| raw_url.to_ascii_lowercase());
+                lowered.contains(needle)
+            }
+            Self::Glob(re_opt) => re_opt.as_ref().is_some_and(|re| {
+                let lowered = url_lower.get_or_insert_with(|| raw_url.to_ascii_lowercase());
+                re.is_match(lowered)
+            }),
+            Self::Regex(re_opt) => re_opt.as_ref().is_some_and(|re| re.is_match(raw_url)),
+        }
+    }
+
+    #[cfg(test)]
+    fn has_compiled_regex(&self) -> bool {
+        matches!(self, Self::Glob(Some(_)) | Self::Regex(Some(_)))
+    }
+}
+
+#[derive(Clone, Debug)]
+enum CompiledHeaderMutationOp {
+    Remove(Vec<String>),
+    Set { name: String, value: String },
+    Append { name: String, value: String },
+}
+
+#[derive(Clone, Debug)]
+struct CompiledHeaderMutationRule {
+    direction: HeaderMutationDirection,
+    url_scope: CompiledUrlScope,
+    op: CompiledHeaderMutationOp,
+}
+
+impl CompiledHeaderMutationRule {
+    fn compile(rule: &HeaderMutationRule) -> Option<Self> {
+        if !rule.enabled {
+            return None;
+        }
+        let op = match rule.operation {
+            HeaderMutationOp::Remove => {
+                let targets: Vec<String> = rule
+                    .header_name
+                    .split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if targets.is_empty() {
+                    return None;
+                }
+                CompiledHeaderMutationOp::Remove(targets)
+            }
+            HeaderMutationOp::Set => {
+                let name = rule.header_name.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                CompiledHeaderMutationOp::Set {
+                    name: name.to_string(),
+                    value: rule.header_value.clone(),
+                }
+            }
+            HeaderMutationOp::Append => {
+                let name = rule.header_name.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                CompiledHeaderMutationOp::Append {
+                    name: name.to_string(),
+                    value: rule.header_value.clone(),
+                }
+            }
+        };
+        Some(Self {
+            direction: rule.direction,
+            url_scope: CompiledUrlScope::compile(&rule.url_pattern),
+            op,
+        })
+    }
+}
+
 struct FilterEngineState {
     config: ProxyFilterBackendConfig,
+    compiled_tls_bypass_rules: CompiledHostRuleList,
+    compiled_tls_target_rules: CompiledHostRuleList,
+    compiled_header_mutations: Vec<CompiledHeaderMutationRule>,
     compiled_host_list: CompiledBackendHostList,
     compiled_capture_host_list: CompiledCaptureHostList,
     compiled_capture_matrix: CompiledCaptureMatrix,
@@ -389,7 +691,7 @@ impl ProxyFilterEngine {
     /// Evaluates how an incoming `CONNECT host:port` tunnel should be handled according to
     /// the synced Bulk Hosts List (if enabled) and the active `TlsInterceptMode` (`InterceptAll` vs `TargetedOnly`).
     pub fn evaluate_connect_tunnel(&self, host: &str, port: u16) -> ConnectTunnelDecision {
-        let host_lower = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+        let host_lower = normalize_clean_host(host);
         if matches!(
             host_lower.as_str(),
             "flux.proxy" | "cert.flux.proxy" | "fluxproxy.local"
@@ -413,8 +715,10 @@ impl ProxyFilterEngine {
                 }
                 ConnectTunnelDecision::InterceptMitm => {
                     if guard.config.tls_bypass_enabled {
-                        if let Some(rule) =
-                            match_host_rule_list(&guard.config.tls_bypass_rules, host, port)
+                        if let Some(rule) = guard
+                            .compiled_tls_bypass_rules
+                            .matches(&host_lower, port)
+                            .cloned()
                         {
                             self.record_rule_hit(&rule.id);
                             return ConnectTunnelDecision::Passthrough(
@@ -423,14 +727,12 @@ impl ProxyFilterEngine {
                         }
                     }
                     if guard.config.tls_intercept_mode == TlsInterceptMode::TargetedOnly
-                        && guard
-                            .config
-                            .tls_target_rules
-                            .iter()
-                            .any(|r| r.enabled && !r.pattern.trim().is_empty())
+                        && guard.compiled_tls_target_rules.has_active_rules
                     {
-                        if let Some(rule) =
-                            match_host_rule_list(&guard.config.tls_target_rules, host, port)
+                        if let Some(rule) = guard
+                            .compiled_tls_target_rules
+                            .matches(&host_lower, port)
+                            .cloned()
                         {
                             self.record_rule_hit(&rule.id);
                             return ConnectTunnelDecision::InterceptMitm;
@@ -449,8 +751,10 @@ impl ProxyFilterEngine {
                 if !guard.config.tls_bypass_enabled {
                     return ConnectTunnelDecision::InterceptMitm;
                 }
-                if let Some(rule) =
-                    match_host_rule_list(&guard.config.tls_bypass_rules, host, port)
+                if let Some(rule) = guard
+                    .compiled_tls_bypass_rules
+                    .matches(&host_lower, port)
+                    .cloned()
                 {
                     self.record_rule_hit(&rule.id);
                     ConnectTunnelDecision::Passthrough(PassthroughReason::BypassRule(rule))
@@ -459,8 +763,10 @@ impl ProxyFilterEngine {
                 }
             }
             TlsInterceptMode::TargetedOnly => {
-                if let Some(rule) =
-                    match_host_rule_list(&guard.config.tls_target_rules, host, port)
+                if let Some(rule) = guard
+                    .compiled_tls_target_rules
+                    .matches(&host_lower, port)
+                    .cloned()
                 {
                     self.record_rule_hit(&rule.id);
                     ConnectTunnelDecision::InterceptMitm
@@ -495,6 +801,8 @@ impl ProxyFilterEngine {
             } else {
                 (trimmed.to_string(), 443)
             }
+        } else if trimmed.parse::<std::net::IpAddr>().is_ok() {
+            (trimmed.to_string(), 443)
         } else if let Some((h, p)) = trimmed.rsplit_once(':') {
             if !h.contains(':') {
                 if let Ok(port) = p.parse::<u16>() {
@@ -508,9 +816,9 @@ impl ProxyFilterEngine {
         } else {
             (trimmed.to_string(), 443)
         };
-        let clean_host = raw_host.trim().trim_end_matches('.');
+        let clean_host = normalize_clean_host(&raw_host);
         matches!(
-            self.evaluate_connect_tunnel(clean_host, port),
+            self.evaluate_connect_tunnel(&clean_host, port),
             ConnectTunnelDecision::InterceptMitm
         )
     }
@@ -521,7 +829,11 @@ impl ProxyFilterEngine {
         if !guard.config.tls_bypass_enabled {
             return None;
         }
-        match_host_rule_list(&guard.config.tls_bypass_rules, host, port)
+        let host_clean = normalize_clean_host(host);
+        guard
+            .compiled_tls_bypass_rules
+            .matches(&host_clean, port)
+            .cloned()
     }
 
     /// Returns whether automatic `Alt-Svc` / `Alternate-Protocol` response header stripping is active.
@@ -566,27 +878,18 @@ impl ProxyFilterEngine {
             return mutated;
         }
 
-        let url_lower = url.to_ascii_lowercase();
+        let mut url_lower: Option<String> = None;
 
-        for rule in &guard.config.header_mutations {
-            if !rule.enabled || rule.direction != direction {
+        for rule in &guard.compiled_header_mutations {
+            if rule.direction != direction {
                 continue;
             }
-            if !url_scope_matches(&url_lower, url, &rule.url_pattern) {
+            if !rule.url_scope.matches(&mut url_lower, url) {
                 continue;
             }
 
-            match rule.operation {
-                HeaderMutationOp::Remove => {
-                    let targets: Vec<String> = rule
-                        .header_name
-                        .split(',')
-                        .map(|s| s.trim().to_ascii_lowercase())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    if targets.is_empty() {
-                        continue;
-                    }
+            match &rule.op {
+                CompiledHeaderMutationOp::Remove(targets) => {
                     let before = headers.len();
                     headers.retain(|h| {
                         let name_lower = h.name.trim().to_ascii_lowercase();
@@ -596,26 +899,18 @@ impl ProxyFilterEngine {
                         mutated = true;
                     }
                 }
-                HeaderMutationOp::Set => {
-                    let target_name = rule.header_name.trim();
-                    if target_name.is_empty() {
-                        continue;
-                    }
-                    headers.retain(|h| !h.name.trim().eq_ignore_ascii_case(target_name));
+                CompiledHeaderMutationOp::Set { name, value } => {
+                    headers.retain(|h| !h.name.trim().eq_ignore_ascii_case(name));
                     headers.push(HeaderPair {
-                        name: target_name.to_string(),
-                        value: rule.header_value.clone(),
+                        name: name.clone(),
+                        value: value.clone(),
                     });
                     mutated = true;
                 }
-                HeaderMutationOp::Append => {
-                    let target_name = rule.header_name.trim();
-                    if target_name.is_empty() {
-                        continue;
-                    }
+                CompiledHeaderMutationOp::Append { name, value } => {
                     headers.push(HeaderPair {
-                        name: target_name.to_string(),
-                        value: rule.header_value.clone(),
+                        name: name.clone(),
+                        value: value.clone(),
                     });
                     mutated = true;
                 }
@@ -648,51 +943,13 @@ fn strip_alt_svc_vec(headers: &mut Vec<HeaderPair>) -> bool {
 
 /// Evaluates a list of `TlsBypassRule` items against `(host, port)`.
 /// Supports comma-separated tokens, wildcard domains (`*.example.com`, `.example.com`),
-/// glob `*`/`?`, `regex:`, optional `:port`, and `!pattern` negative carve-out exclusions.
+/// IPv6 literals (`[::1]`, `[::1]:8443`), glob `*`/`?`, `regex:`, optional `:port`, and `!pattern` negative carve-out exclusions.
 /// Negative `!` tokens across all enabled rules take priority over positive matches.
 pub fn match_host_rule_list(rules: &[TlsBypassRule], host: &str, port: u16) -> Option<TlsBypassRule> {
-    let host_clean = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
-    let host_with_port = format!("{host_clean}:{port}");
-
-    // First pass: check negative carve-outs (`!sub.domain.com`)
-    for rule in rules {
-        if !rule.enabled {
-            continue;
-        }
-        for raw_token in rule.pattern.split(',') {
-            if let Some((true, token)) = normalize_host_token(raw_token) {
-                let subject = if token.contains(':') && !token.starts_with("regex:") {
-                    host_with_port.as_str()
-                } else {
-                    host_clean.as_str()
-                };
-                if wildcard_or_regex_matches(subject, &token) {
-                    return None;
-                }
-            }
-        }
-    }
-
-    // Second pass: check positive host/wildcard/regex rules
-    for rule in rules {
-        if !rule.enabled {
-            continue;
-        }
-        for raw_token in rule.pattern.split(',') {
-            if let Some((false, token)) = normalize_host_token(raw_token) {
-                let subject = if token.contains(':') && !token.starts_with("regex:") {
-                    host_with_port.as_str()
-                } else {
-                    host_clean.as_str()
-                };
-                if wildcard_or_regex_matches(subject, &token) {
-                    return Some(rule.clone());
-                }
-            }
-        }
-    }
-
-    None
+    let host_clean = normalize_clean_host(host);
+    CompiledHostRuleList::compile(rules)
+        .matches(&host_clean, port)
+        .cloned()
 }
 
 pub(crate) fn strip_regex_prefix(s: &str) -> Option<&str> {
@@ -703,7 +960,46 @@ pub(crate) fn strip_regex_prefix(s: &str) -> Option<&str> {
     }
 }
 
-fn normalize_host_token(raw: &str) -> Option<(bool, String)> {
+fn normalize_clean_host(raw: &str) -> String {
+    let trimmed = raw
+        .trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.');
+    if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+        ip.to_string()
+    } else {
+        trimmed.to_ascii_lowercase()
+    }
+}
+
+pub(crate) fn extract_host_from_url_or_authority(raw: &str) -> String {
+    let mut lower = raw.trim().to_ascii_lowercase();
+    for scheme in ["https://", "http://", "wss://", "ws://"] {
+        if let Some(after_scheme) = lower.strip_prefix(scheme) {
+            lower = after_scheme.to_string();
+            break;
+        }
+    }
+    if let Some(idx) = lower.find(['/', '?', '#']) {
+        lower.truncate(idx);
+    }
+    let (host_pat, _) = split_authority_pattern(&lower);
+    normalize_clean_host(host_pat)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NormalizedHostPattern {
+    Regex(String),
+    HostPort { host: String, port: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormalizedHostToken {
+    negated: bool,
+    pattern: NormalizedHostPattern,
+}
+
+fn normalize_host_token(raw: &str) -> Option<NormalizedHostToken> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -721,7 +1017,10 @@ fn normalize_host_token(raw: &str) -> Option<(bool, String)> {
         if expr.is_empty() {
             return None;
         }
-        return Some((negated, format!("regex:{expr}")));
+        return Some(NormalizedHostToken {
+            negated,
+            pattern: NormalizedHostPattern::Regex(expr.to_string()),
+        });
     }
 
     let mut lower = rest.to_ascii_lowercase();
@@ -731,56 +1030,51 @@ fn normalize_host_token(raw: &str) -> Option<(bool, String)> {
             break;
         }
     }
-    if let Some((authority, _)) = lower.split_once('/') {
-        lower = authority.to_string();
+    if let Some(idx) = lower.find(['/', '#']) {
+        lower.truncate(idx);
     }
-    let clean = lower.trim().trim_matches(['[', ']']).to_string();
-    if clean.is_empty() {
+    let (host_raw, port_raw) = split_authority_pattern(&lower);
+    let host = normalize_clean_host(host_raw);
+    if host.is_empty() {
         None
     } else {
-        Some((negated, clean))
+        Some(NormalizedHostToken {
+            negated,
+            pattern: NormalizedHostPattern::HostPort {
+                host,
+                port: port_raw.map(str::to_string),
+            },
+        })
     }
 }
 
+#[cfg(test)]
 fn url_scope_matches(url_lower: &str, raw_url: &str, pattern: &str) -> bool {
-    let trimmed = pattern.trim();
-    if trimmed.is_empty() || trimmed == "*" {
-        return true;
-    }
-    if let Some(re_pat) = strip_regex_prefix(trimmed) {
-        return Regex::new(re_pat.trim())
-            .map(|re| re.is_match(raw_url))
-            .unwrap_or(false);
-    }
-    let pat_lower = trimmed.to_ascii_lowercase();
-    if pat_lower.contains('*') {
-        return glob_matches(url_lower, &pat_lower);
-    }
-    url_lower.contains(&pat_lower)
+    let mut cached = Some(url_lower.to_string());
+    CompiledUrlScope::compile(pattern).matches(&mut cached, raw_url)
 }
 
+#[cfg(test)]
 fn wildcard_or_regex_matches(subject: &str, token: &str) -> bool {
-    if token == "*" {
-        return true;
-    }
-    if let Some(re_str) = strip_regex_prefix(token) {
-        return Regex::new(&format!("(?i){}", re_str.trim()))
-            .map(|re| re.is_match(subject))
-            .unwrap_or(false);
-    }
-    if let Some(domain_suffix) = token.strip_prefix("*.") {
-        return subject == domain_suffix || subject.ends_with(&format!(".{domain_suffix}"));
-    }
-    if let Some(domain_suffix) = token.strip_prefix('.') {
-        return subject == domain_suffix || subject.ends_with(token);
-    }
-    if token.contains('*') {
-        return glob_matches(subject, token);
-    }
-    subject == token
+    let Some(norm) = normalize_host_token(token) else {
+        return false;
+    };
+    let (host_clean, port, host_port) = if let Ok(sock) = subject.parse::<std::net::SocketAddr>() {
+        (
+            sock.ip().to_string(),
+            sock.port(),
+            format!("{}:{}", sock.ip(), sock.port()),
+        )
+    } else {
+        let (h_raw, p_opt) = split_authority_pattern(subject);
+        let h_clean = normalize_clean_host(h_raw);
+        let port = p_opt.and_then(|p| p.parse::<u16>().ok()).unwrap_or(443);
+        (h_clean, port, subject.to_string())
+    };
+    CompiledHostToken::compile(&norm.pattern).matches(&host_clean, port, &host_port)
 }
 
-fn glob_matches(subject: &str, glob: &str) -> bool {
+fn compile_glob_regex(glob: &str) -> Option<Regex> {
     let mut regex_str = String::from("^(?i)");
     for ch in glob.chars() {
         if ch == '*' {
@@ -792,9 +1086,7 @@ fn glob_matches(subject: &str, glob: &str) -> bool {
         }
     }
     regex_str.push('$');
-    Regex::new(&regex_str)
-        .map(|re| re.is_match(subject))
-        .unwrap_or(false)
+    Regex::new(&regex_str).ok()
 }
 
 fn strip_inline_comment(line: &str) -> &str {
@@ -1009,10 +1301,15 @@ fn compile_backend_host_list(sync: &HostListBackendSyncConfig) -> CompiledBacken
             None => (lower.as_str(), None),
         };
 
-        let (host_pat, port_pat) = split_authority_pattern(authority_raw);
-        if host_pat.is_empty() {
+        let (raw_host_pat, port_pat) = split_authority_pattern(authority_raw);
+        if raw_host_pat.is_empty() || raw_host_pat == "." {
             continue;
         }
+        let host_pat_canon = raw_host_pat
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|_| raw_host_pat.to_string());
+        let host_pat = host_pat_canon.as_str();
 
         compiled.active_count += 1;
 
@@ -1027,7 +1324,8 @@ fn compile_backend_host_list(sync: &HostListBackendSyncConfig) -> CompiledBacken
         }
 
         let is_whole_host_path = matches!(path_raw, None | Some("/") | Some("/*"));
-        let host_has_wildcard = host_pat.contains('*') || host_pat.contains('?');
+        let host_has_wildcard =
+            host_pat.contains('*') || host_pat.contains('?') || host_pat.starts_with('.');
         let port_has_wildcard =
             port_pat.is_some_and(|p| p.contains('*') || p.contains('?'));
 
@@ -1122,12 +1420,17 @@ fn evaluate_compiled_host_list_connect(
     }
 
     let host_port = format!("{host_lower}:{port}");
-    let synthetic_url = if port == 443 {
-        format!("https://{host_lower}/")
+    let url_host = if host_lower.contains(':') && !host_lower.starts_with('[') {
+        format!("[{host_lower}]")
     } else {
-        format!("https://{host_lower}:{port}/")
+        host_lower.to_string()
     };
-    let synthetic_url_with_port = format!("https://{host_lower}:{port}/");
+    let synthetic_url = if port == 443 {
+        format!("https://{url_host}/")
+    } else {
+        format!("https://{url_host}:{port}/")
+    };
+    let synthetic_url_with_port = format!("https://{url_host}:{port}/");
 
     match compiled.mode {
         HostListFilterMode::Whitelist => {
@@ -1301,6 +1604,13 @@ pub fn default_backend_config() -> ProxyFilterBackendConfig {
 }
 
 fn build_filter_engine_state(config: ProxyFilterBackendConfig) -> FilterEngineState {
+    let compiled_tls_bypass_rules = CompiledHostRuleList::compile(&config.tls_bypass_rules);
+    let compiled_tls_target_rules = CompiledHostRuleList::compile(&config.tls_target_rules);
+    let compiled_header_mutations = config
+        .header_mutations
+        .iter()
+        .filter_map(CompiledHeaderMutationRule::compile)
+        .collect();
     let compiled_host_list = compile_backend_host_list(&config.host_list_sync);
     let compiled_capture_host_list = compile_capture_host_list(&config.capture_host_list);
     let compiled_capture_matrix = compile_capture_matrix(&config.capture_filter_rules);
@@ -1319,6 +1629,9 @@ fn build_filter_engine_state(config: ProxyFilterBackendConfig) -> FilterEngineSt
 
     FilterEngineState {
         config,
+        compiled_tls_bypass_rules,
+        compiled_tls_target_rules,
+        compiled_header_mutations,
         compiled_host_list,
         compiled_capture_host_list,
         compiled_capture_matrix,
@@ -1328,9 +1641,7 @@ fn build_filter_engine_state(config: ProxyFilterBackendConfig) -> FilterEngineSt
 }
 
 fn extract_clean_hostname(raw_host: &str) -> String {
-    let trimmed = raw_host.trim();
-    let (h, _) = split_authority_pattern(trimmed);
-    h.trim_matches(['[', ']']).to_ascii_lowercase()
+    extract_host_from_url_or_authority(raw_host)
 }
 
 fn extract_session_port(summary: &SessionSummary) -> u16 {
@@ -1471,15 +1782,21 @@ fn compile_capture_host_list(sync: &HostListBackendSyncConfig) -> CompiledCaptur
             Some(idx) => (&lower[..idx], Some(&lower[idx..])),
             None => (lower.as_str(), None),
         };
-        let (host_pat, port_pat) = split_authority_pattern(authority_raw);
-        if host_pat.is_empty() {
+        let (raw_host_pat, port_pat) = split_authority_pattern(authority_raw);
+        if raw_host_pat.is_empty() || raw_host_pat == "." {
             continue;
         }
+        let host_pat_canon = raw_host_pat
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|_| raw_host_pat.to_string());
+        let host_pat = host_pat_canon.as_str();
 
         out.active_count += 1;
 
         let is_whole_host_path = matches!(path_raw, None | Some("/") | Some("/*"));
-        let host_has_wildcard = host_pat.contains('*') || host_pat.contains('?');
+        let host_has_wildcard =
+            host_pat.contains('*') || host_pat.contains('?') || host_pat.starts_with('.');
         let port_has_wildcard = port_pat.is_some_and(|p| p.contains('*') || p.contains('?'));
 
         if is_whole_host_path {
@@ -2611,5 +2928,370 @@ mod tests {
         assert!(stored.tls_bypass_enabled);
         assert_eq!(stored.tls_bypass_rules, default_tls_bypass_rules());
         assert_eq!(stored.tls_target_rules.len(), 1);
+    }
+
+    #[test]
+    fn leading_dot_domain_suffix_works_in_host_list_and_capture_host_list() {
+        // 1. Bare "." must be ignored and must not create active rules
+        let engine = ProxyFilterEngine::new();
+        let mut cfg = engine.get_config();
+        cfg.tls_bypass_enabled = false;
+        cfg.host_list_sync = HostListBackendSyncConfig {
+            enabled: true,
+            mode: HostListFilterMode::Whitelist,
+            raw_text: ".".into(),
+        };
+        engine.update_config(cfg);
+        assert_eq!(engine.state.read().unwrap().compiled_host_list.active_count, 0);
+        assert_eq!(
+            engine.evaluate_connect_tunnel("example.com", 443),
+            ConnectTunnelDecision::InterceptMitm
+        );
+
+        // 2. Leading ".example.com" in Blacklist mode bypasses root domain & subdomains, not suffix collisions
+        let mut cfg = engine.get_config();
+        cfg.host_list_sync = HostListBackendSyncConfig {
+            enabled: true,
+            mode: HostListFilterMode::Blacklist,
+            raw_text: ".example.com\n.\n".into(),
+        };
+        engine.update_config(cfg);
+        assert_eq!(engine.state.read().unwrap().compiled_host_list.active_count, 1);
+        assert!(matches!(
+            engine.evaluate_connect_tunnel("example.com", 443),
+            ConnectTunnelDecision::Passthrough(PassthroughReason::BypassRule(_))
+        ));
+        assert!(matches!(
+            engine.evaluate_connect_tunnel("api.example.com", 443),
+            ConnectTunnelDecision::Passthrough(PassthroughReason::BypassRule(_))
+        ));
+        assert_eq!(
+            engine.evaluate_connect_tunnel("notexample.com", 443),
+            ConnectTunnelDecision::InterceptMitm
+        );
+
+        // 3. Leading ".example.com" in Whitelist mode
+        let mut cfg = engine.get_config();
+        cfg.host_list_sync = HostListBackendSyncConfig {
+            enabled: true,
+            mode: HostListFilterMode::Whitelist,
+            raw_text: ".example.com".into(),
+        };
+        engine.update_config(cfg);
+        assert_eq!(
+            engine.evaluate_connect_tunnel("example.com", 443),
+            ConnectTunnelDecision::InterceptMitm
+        );
+        assert_eq!(
+            engine.evaluate_connect_tunnel("sub.api.example.com", 443),
+            ConnectTunnelDecision::InterceptMitm
+        );
+        assert_eq!(
+            engine.evaluate_connect_tunnel("notexample.com", 443),
+            ConnectTunnelDecision::Passthrough(PassthroughReason::NotInHostsWhitelist)
+        );
+
+        // 4. Leading ".example.com" in capture_host_list (Whitelist & Blacklist) and bare "." ignored
+        let mut cfg = default_backend_config();
+        cfg.drop_non_matching_on_capture = true;
+        cfg.capture_host_list = HostListBackendSyncConfig {
+            enabled: true,
+            mode: HostListFilterMode::Whitelist,
+            raw_text: ".example.com\n.\n".into(),
+        };
+        engine.update_config(cfg);
+        assert_eq!(
+            engine.state.read().unwrap().compiled_capture_host_list.active_count,
+            1
+        );
+
+        let root_sum = make_summary_for_filter("GET", "example.com", "/v1", 200, Some("curl.exe"));
+        let sub_sum = make_summary_for_filter("GET", "api.example.com", "/v1", 200, Some("curl.exe"));
+        let other_sum = make_summary_for_filter("GET", "notexample.com", "/v1", 200, Some("curl.exe"));
+        assert!(engine.evaluate_should_store_session(&root_sum));
+        assert!(engine.evaluate_should_store_session(&sub_sum));
+        assert!(!engine.evaluate_should_store_session(&other_sum));
+
+        let mut cfg = engine.get_config();
+        cfg.capture_host_list.mode = HostListFilterMode::Blacklist;
+        engine.update_config(cfg);
+        assert!(!engine.evaluate_should_store_session(&root_sum));
+        assert!(!engine.evaluate_should_store_session(&sub_sum));
+        assert!(engine.evaluate_should_store_session(&other_sum));
+
+        let mut cfg = engine.get_config();
+        cfg.capture_host_list = HostListBackendSyncConfig {
+            enabled: true,
+            mode: HostListFilterMode::Whitelist,
+            raw_text: ".".into(),
+        };
+        engine.update_config(cfg);
+        assert_eq!(
+            engine.state.read().unwrap().compiled_capture_host_list.active_count,
+            0
+        );
+    }
+
+    #[test]
+    fn ipv6_hosts_and_ports_parse_consistently_across_all_filter_engines() {
+        // 1. Direct authority & token parsers
+        assert_eq!(extract_host_from_url_or_authority("[::1]"), "::1");
+        assert_eq!(extract_host_from_url_or_authority("[::1]:8443"), "::1");
+        assert_eq!(extract_host_from_url_or_authority("::1"), "::1");
+        assert_eq!(extract_host_from_url_or_authority("[0:0::1]:8443"), "::1");
+        assert_eq!(
+            extract_host_from_url_or_authority("https://[::1]:8443/v1"),
+            "::1"
+        );
+
+        assert_eq!(
+            normalize_host_token("[::1]"),
+            Some(NormalizedHostToken {
+                negated: false,
+                pattern: NormalizedHostPattern::HostPort {
+                    host: "::1".into(),
+                    port: None,
+                },
+            })
+        );
+        assert_eq!(
+            normalize_host_token("[::1]:8443"),
+            Some(NormalizedHostToken {
+                negated: false,
+                pattern: NormalizedHostPattern::HostPort {
+                    host: "::1".into(),
+                    port: Some("8443".into()),
+                },
+            })
+        );
+        assert_eq!(
+            normalize_host_token("::1"),
+            Some(NormalizedHostToken {
+                negated: false,
+                pattern: NormalizedHostPattern::HostPort {
+                    host: "::1".into(),
+                    port: None,
+                },
+            })
+        );
+        assert_eq!(
+            normalize_host_token("[0:0::1]:8443"),
+            Some(NormalizedHostToken {
+                negated: false,
+                pattern: NormalizedHostPattern::HostPort {
+                    host: "::1".into(),
+                    port: Some("8443".into()),
+                },
+            })
+        );
+        assert_eq!(
+            normalize_host_token("https://[::1]:8443/v1"),
+            Some(NormalizedHostToken {
+                negated: false,
+                pattern: NormalizedHostPattern::HostPort {
+                    host: "::1".into(),
+                    port: Some("8443".into()),
+                },
+            })
+        );
+
+        // 2. TLS bypass rules & `should_intercept_tls`
+        let engine = ProxyFilterEngine::new();
+        let mut cfg = default_backend_config();
+        cfg.tls_bypass_rules = vec![TlsBypassRule {
+            id: "ipv6-port-bypass".into(),
+            enabled: true,
+            pattern: "[::1]:8443".into(),
+            category: "Custom".into(),
+            description: "IPv6 port bypass".into(),
+        }];
+        engine.update_config(cfg);
+
+        assert!(!engine.should_intercept_tls("[::1]:8443"));
+        assert!(!engine.should_intercept_tls("[0:0::1]:8443"));
+        assert!(engine.should_intercept_tls("[::1]:443"));
+        assert!(engine.should_intercept_tls("[::1]"));
+        assert!(engine.should_intercept_tls("::1"));
+
+        // Any-port IPv6 bypass rule matches both bare `[::1]` and `[::1]:8443`
+        let mut cfg = engine.get_config();
+        cfg.tls_bypass_rules[0].pattern = "::1".into();
+        engine.update_config(cfg);
+        assert!(!engine.should_intercept_tls("[::1]"));
+        assert!(!engine.should_intercept_tls("::1"));
+        assert!(!engine.should_intercept_tls("[::1]:8443"));
+
+        // 3. TargetedOnly allowlist & host_list_sync (including IPv6 synthetic URL regex)
+        let mut cfg = default_backend_config();
+        cfg.tls_bypass_enabled = false;
+        cfg.tls_intercept_mode = TlsInterceptMode::TargetedOnly;
+        cfg.tls_target_rules = vec![TlsBypassRule {
+            id: "ipv6-target".into(),
+            enabled: true,
+            pattern: "[::1]:8443".into(),
+            category: "Target".into(),
+            description: "Target IPv6".into(),
+        }];
+        engine.update_config(cfg);
+        assert!(engine.should_intercept_tls("[::1]:8443"));
+        assert!(engine.should_intercept_tls("[0:0::1]:8443"));
+        assert!(!engine.should_intercept_tls("[::1]:9443"));
+
+        let mut cfg = default_backend_config();
+        cfg.tls_bypass_enabled = false;
+        cfg.host_list_sync = HostListBackendSyncConfig {
+            enabled: true,
+            mode: HostListFilterMode::Whitelist,
+            raw_text: "https://[::1]:8443/v1, [2001:db8::1]:9443, regex:^https://\\[fe80::1\\]:8443/".into(),
+        };
+        engine.update_config(cfg);
+        assert_eq!(
+            engine.evaluate_connect_tunnel("[0:0::1]", 8443),
+            ConnectTunnelDecision::InterceptMitm
+        );
+        assert_eq!(
+            engine.evaluate_connect_tunnel("[2001:db8::1]", 9443),
+            ConnectTunnelDecision::InterceptMitm
+        );
+        assert_eq!(
+            engine.evaluate_connect_tunnel("fe80::1", 8443),
+            ConnectTunnelDecision::InterceptMitm
+        );
+        assert_eq!(
+            engine.evaluate_connect_tunnel("[::1]", 443),
+            ConnectTunnelDecision::Passthrough(PassthroughReason::NotInHostsWhitelist)
+        );
+
+        // 4. `capture_host_list` IPv6 matching
+        let mut cfg = default_backend_config();
+        cfg.drop_non_matching_on_capture = true;
+        cfg.capture_host_list = HostListBackendSyncConfig {
+            enabled: true,
+            mode: HostListFilterMode::Whitelist,
+            raw_text: "[0:0::1]:8443".into(),
+        };
+        engine.update_config(cfg);
+        let mut ipv6_match = make_summary_for_filter("GET", "[::1]:8443", "/v1", 200, Some("app"));
+        ipv6_match.url = "https://[::1]:8443/v1".into();
+        let mut ipv6_other_port =
+            make_summary_for_filter("GET", "[::1]:9443", "/v1", 200, Some("app"));
+        ipv6_other_port.url = "https://[::1]:9443/v1".into();
+        assert!(engine.evaluate_should_store_session(&ipv6_match));
+        assert!(!engine.evaluate_should_store_session(&ipv6_other_port));
+    }
+
+    #[test]
+    fn tls_rules_and_header_mutations_precompile_regexes_on_config_update() {
+        let engine = ProxyFilterEngine::new();
+        {
+            let guard = engine.state.read().unwrap();
+            let pki_rule = guard
+                .compiled_tls_bypass_rules
+                .positive_rules
+                .iter()
+                .find(|r| r.rule.id == "bypass-pki-ocsp-crl")
+                .expect("default PKI bypass rule should compile");
+            assert!(
+                pki_rule
+                    .positive_tokens
+                    .iter()
+                    .any(|t| t.host.has_compiled_regex()),
+                "ocsp.*/crl.* wildcards must precompile regexes in FilterEngineState"
+            );
+        }
+        assert!(!engine.should_intercept_tls("ocsp.digicert.com"));
+        assert!(!engine.should_intercept_tls("crl.sectigo.com"));
+
+        let mut cfg = default_backend_config();
+        cfg.tls_bypass_rules = vec![TlsBypassRule {
+            id: "glob-and-regex-bypass".into(),
+            enabled: true,
+            pattern: "api-*.internal.net, regex:^pinned-[0-9]+\\.local$".into(),
+            category: "Custom".into(),
+            description: "Precompiled glob + regex bypass".into(),
+        }];
+        cfg.tls_target_rules = vec![TlsBypassRule {
+            id: "glob-target".into(),
+            enabled: true,
+            pattern: "edge-?.target.dev, regex:^svc-[a-z]+\\.target\\.dev$".into(),
+            category: "Target".into(),
+            description: "Precompiled glob + regex target".into(),
+        }];
+        cfg.header_mutations = vec![
+            HeaderMutationRule {
+                id: "hm-glob-set".into(),
+                enabled: true,
+                name: "Glob URL Set".into(),
+                direction: HeaderMutationDirection::Request,
+                operation: HeaderMutationOp::Set,
+                header_name: "X-Pre".into(),
+                header_value: "glob".into(),
+                url_pattern: "https://api.example.com/*/v1".into(),
+            },
+            HeaderMutationRule {
+                id: "hm-regex-append".into(),
+                enabled: true,
+                name: "Regex URL Append".into(),
+                direction: HeaderMutationDirection::Response,
+                operation: HeaderMutationOp::Append,
+                header_name: "X-Auth".into(),
+                header_value: "rx".into(),
+                url_pattern: "regex:^https://auth\\.example\\.com/[0-9]+$".into(),
+            },
+            HeaderMutationRule {
+                id: "hm-disabled".into(),
+                enabled: false,
+                name: "Disabled".into(),
+                direction: HeaderMutationDirection::Request,
+                operation: HeaderMutationOp::Set,
+                header_name: "X-Off".into(),
+                header_value: "no".into(),
+                url_pattern: "regex:.*".into(),
+            },
+        ];
+        engine.update_config(cfg);
+
+        {
+            let guard = engine.state.read().unwrap();
+            assert_eq!(guard.compiled_tls_bypass_rules.positive_rules.len(), 1);
+            assert!(guard.compiled_tls_bypass_rules.positive_rules[0]
+                .positive_tokens
+                .iter()
+                .all(|t| t.host.has_compiled_regex()));
+            assert_eq!(guard.compiled_tls_target_rules.positive_rules.len(), 1);
+            assert!(guard.compiled_tls_target_rules.positive_rules[0]
+                .positive_tokens
+                .iter()
+                .all(|t| t.host.has_compiled_regex()));
+            assert_eq!(guard.compiled_header_mutations.len(), 2);
+            assert!(guard
+                .compiled_header_mutations
+                .iter()
+                .all(|m| m.url_scope.has_compiled_regex()));
+        }
+
+        assert!(engine.match_tls_bypass("api-eu.internal.net", 443).is_some());
+        assert!(engine.match_tls_bypass("pinned-42.local", 443).is_some());
+        assert!(engine.match_tls_bypass("pinned-abc.local", 443).is_none());
+
+        let mut req_headers = Vec::new();
+        assert!(engine.apply_header_mutations(
+            HeaderMutationDirection::Request,
+            "https://api.example.com/users/v1",
+            &mut req_headers,
+        ));
+        assert_eq!(req_headers.len(), 1);
+        assert_eq!(req_headers[0].name, "X-Pre");
+        assert_eq!(req_headers[0].value, "glob");
+
+        let mut resp_headers = Vec::new();
+        assert!(engine.apply_header_mutations(
+            HeaderMutationDirection::Response,
+            "https://auth.example.com/123",
+            &mut resp_headers,
+        ));
+        assert_eq!(resp_headers.len(), 1);
+        assert_eq!(resp_headers[0].name, "X-Auth");
+        assert_eq!(resp_headers[0].value, "rx");
     }
 }

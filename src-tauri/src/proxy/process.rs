@@ -11,6 +11,7 @@ pub struct ClientProcessInfo {
 }
 
 const PID_CACHE_TTL: Duration = Duration::from_secs(30);
+const PID_CACHE_MAX_ENTRIES: usize = 4_096;
 
 fn pid_name_cache() -> &'static DashMap<u32, (String, Instant)> {
     static CACHE: OnceLock<DashMap<u32, (String, Instant)>> = OnceLock::new();
@@ -61,6 +62,33 @@ fn is_local_interface_ip(addr: &SocketAddr) -> bool {
     crate::proxy::network::is_host_own_ip(addr.ip())
 }
 
+fn insert_pid_cache_entry(
+    cache: &DashMap<u32, (String, Instant)>,
+    pid: u32,
+    name: String,
+    now: Instant,
+) {
+    if !cache.contains_key(&pid) && cache.len() >= PID_CACHE_MAX_ENTRIES {
+        cache.retain(|_, (_, ts)| now.saturating_duration_since(*ts) < PID_CACHE_TTL);
+        if cache.len() >= PID_CACHE_MAX_ENTRIES {
+            let evict_batch = cache.len().saturating_sub(PID_CACHE_MAX_ENTRIES)
+                + (PID_CACHE_MAX_ENTRIES / 16).max(1);
+            let mut entries: Vec<(u32, Instant)> =
+                cache.iter().map(|entry| (*entry.key(), entry.value().1)).collect();
+            let remove_count = evict_batch.min(entries.len());
+            if remove_count > 0 {
+                if remove_count < entries.len() {
+                    entries.select_nth_unstable_by_key(remove_count - 1, |(_, ts)| *ts);
+                }
+                for (evict_pid, _) in entries.into_iter().take(remove_count) {
+                    cache.remove(&evict_pid);
+                }
+            }
+        }
+    }
+    cache.insert(pid, (name, now));
+}
+
 fn resolve_process_name_cached(pid: u32) -> Option<String> {
     let cache = pid_name_cache();
     if let Some(entry) = cache.get(&pid) {
@@ -69,8 +97,11 @@ fn resolve_process_name_cached(pid: u32) -> Option<String> {
         }
     }
 
-    let resolved = query_os_process_name(pid)?;
-    cache.insert(pid, (resolved.clone(), Instant::now()));
+    let Some(resolved) = query_os_process_name(pid) else {
+        cache.remove(&pid);
+        return None;
+    };
+    insert_pid_cache_entry(cache, pid, resolved.clone(), Instant::now());
     Some(resolved)
 }
 
@@ -507,5 +538,50 @@ mod tests {
     fn windows_mib_tcp_owner_pid_structs_match_win32_abi_sizes() {
         assert_eq!(std::mem::size_of::<imp::MibTcpRowOwnerPid>(), 24);
         assert_eq!(std::mem::size_of::<imp::MibTcp6RowOwnerPid>(), 56);
+    }
+
+    #[test]
+    fn pid_name_cache_eviction_keeps_entries_bounded_and_prunes_expired_first() {
+        let cache: DashMap<u32, (String, Instant)> = DashMap::new();
+        let t0 = Instant::now();
+        let t_now = t0 + PID_CACHE_TTL + Duration::from_secs(5);
+
+        // Fill first half with expired entries, second half with fresh entries up to capacity
+        let expired_count = PID_CACHE_MAX_ENTRIES / 2;
+        for pid in 0..expired_count as u32 {
+            cache.insert(pid, (format!("expired-{pid}.exe"), t0));
+        }
+        for pid in expired_count as u32..PID_CACHE_MAX_ENTRIES as u32 {
+            cache.insert(pid, (format!("fresh-{pid}.exe"), t_now - Duration::from_secs(1)));
+        }
+        assert_eq!(cache.len(), PID_CACHE_MAX_ENTRIES);
+
+        // Inserting one more when expired entries exist should prune expired entries without evicting fresh ones
+        insert_pid_cache_entry(&cache, 999_001, "new.exe".to_string(), t_now);
+        assert!(cache.len() <= PID_CACHE_MAX_ENTRIES);
+        assert!(cache.contains_key(&999_001));
+        assert!(!cache.contains_key(&0));
+        assert!(cache.contains_key(&(expired_count as u32)));
+
+        // Refill up to capacity with strictly fresh entries at ascending timestamps, then trigger batch eviction
+        cache.clear();
+        for i in 0..PID_CACHE_MAX_ENTRIES {
+            let ts = t_now - Duration::from_millis((PID_CACHE_MAX_ENTRIES - i) as u64);
+            cache.insert(i as u32, (format!("live-{i}.exe"), ts));
+        }
+        assert_eq!(cache.len(), PID_CACHE_MAX_ENTRIES);
+
+        insert_pid_cache_entry(&cache, 999_002, "overflow.exe".to_string(), t_now);
+        assert!(cache.len() < PID_CACHE_MAX_ENTRIES);
+        assert!(cache.contains_key(&999_002));
+        // Oldest entry (pid 0) must be evicted while newest live entry remains
+        assert!(!cache.contains_key(&0));
+        assert!(cache.contains_key(&((PID_CACHE_MAX_ENTRIES - 1) as u32)));
+
+        // Further inserts remain capped at or below PID_CACHE_MAX_ENTRIES
+        for extra in 0..600u32 {
+            insert_pid_cache_entry(&cache, 1_000_000 + extra, format!("extra-{extra}.exe"), t_now);
+            assert!(cache.len() <= PID_CACHE_MAX_ENTRIES);
+        }
     }
 }

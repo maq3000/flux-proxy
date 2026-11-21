@@ -1,4 +1,4 @@
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
 use regex::Regex;
@@ -287,6 +287,38 @@ impl BreakpointEngine {
         }
     }
 
+    /// Cancels a parked breakpoint entry by `breakpoint_id` (e.g., on client disconnect)
+    /// and emits an updated snapshot if it was still pending.
+    pub fn cancel_pending(&self, breakpoint_id: &str) -> bool {
+        if self.pending.remove(breakpoint_id).is_some() {
+            self.emit_snapshot();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Cancels all parked breakpoint entries belonging to `session_id` and emits an updated
+    /// snapshot if at least one entry was removed.
+    pub fn cancel_session(&self, session_id: u64) -> usize {
+        let keys: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|entry| entry.value().item.session_id == session_id)
+            .map(|entry| entry.key().clone())
+            .collect();
+        let mut count = 0usize;
+        for key in keys {
+            if self.pending.remove(&key).is_some() {
+                count += 1;
+            }
+        }
+        if count > 0 {
+            self.emit_snapshot();
+        }
+        count
+    }
+
     pub fn list_paused(&self) -> Vec<PausedBreakpointItem> {
         let mut list: Vec<PausedBreakpointItem> = self
             .pending
@@ -300,6 +332,54 @@ impl BreakpointEngine {
     fn emit_snapshot(&self) {
         if let Some(ref tx) = self.snapshot_tx {
             let _ = tx.send(self.list_paused());
+        }
+    }
+}
+
+/// RAII guard that removes a parked breakpoint entry and updates session state if the awaiting
+/// task is dropped or cancelled before `disarm()` is called (e.g., client socket disconnect).
+pub struct PendingBreakpointGuard {
+    engine: Arc<BreakpointEngine>,
+    breakpoint_id: String,
+    session_id: u64,
+    on_cancel: Option<Box<dyn FnOnce(u64) + Send>>,
+    active: bool,
+}
+
+impl PendingBreakpointGuard {
+    pub fn new(
+        engine: Arc<BreakpointEngine>,
+        breakpoint_id: String,
+        session_id: u64,
+        on_cancel: Option<Box<dyn FnOnce(u64) + Send>>,
+    ) -> Self {
+        Self {
+            engine,
+            breakpoint_id,
+            session_id,
+            on_cancel,
+            active: true,
+        }
+    }
+
+    /// Disarms the guard once awaiting `bp_rx` finishes normally (verdict received or handled timeout).
+    pub fn disarm(&mut self) {
+        self.active = false;
+        self.on_cancel = None;
+    }
+}
+
+impl Drop for PendingBreakpointGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        if !self.engine.cancel_pending(&self.breakpoint_id) {
+            let _ = self.engine.cancel_session(self.session_id);
+        }
+        if let Some(cb) = self.on_cancel.take() {
+            cb(self.session_id);
         }
     }
 }
@@ -486,5 +566,74 @@ mod tests {
             "GET",
             "https://api.example.com/healthz",
         ));
+    }
+
+    #[test]
+    fn pending_breakpoint_guard_cleans_up_on_drop_unless_disarmed() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let engine = Arc::new(BreakpointEngine::new(Some(tx)));
+
+        let make_item = |bp_id: &str, session_id: u64| PausedBreakpointItem {
+            breakpoint_id: bp_id.into(),
+            session_id,
+            stage: BreakpointStage::Request,
+            created_at: "2026-11-21T10:00:00Z".into(),
+            timeout_secs: 120,
+            scheme: "https".into(),
+            method: "GET".into(),
+            url: format!("https://example.com/{session_id}"),
+            host: "example.com".into(),
+            path: format!("/{session_id}"),
+            request_headers: Vec::new(),
+            request_body_base64: String::new(),
+            request_body_text: None,
+            response_status: None,
+            response_headers: Vec::new(),
+            response_body_base64: String::new(),
+            response_body_text: None,
+            process_name: None,
+            process_pid: None,
+        };
+
+        // 1. Dropped guard without disarm -> removes pending, emits empty snapshot, fires on_cancel
+        let (_bp_rx1, _) = engine.park(make_item("bp-req-101", 101));
+        assert_eq!(rx.try_recv().unwrap().len(), 1);
+        let cancelled_sid = Arc::new(AtomicU64::new(0));
+        let cancelled_sid_clone = cancelled_sid.clone();
+        {
+            let _guard = PendingBreakpointGuard::new(
+                engine.clone(),
+                "bp-req-101".into(),
+                101,
+                Some(Box::new(move |sid| {
+                    cancelled_sid_clone.store(sid, Ordering::SeqCst);
+                })),
+            );
+        }
+        assert!(engine.list_paused().is_empty());
+        assert_eq!(cancelled_sid.load(Ordering::SeqCst), 101);
+        assert!(rx.try_recv().unwrap().is_empty());
+
+        // 2. Disarmed guard -> does not fire on_cancel or cancel entry on drop
+        let (_bp_rx2, _) = engine.park(make_item("bp-req-102", 102));
+        assert_eq!(rx.try_recv().unwrap().len(), 1);
+        let disarmed_cb_called = Arc::new(AtomicU64::new(0));
+        let disarmed_cb_clone = disarmed_cb_called.clone();
+        {
+            let mut guard = PendingBreakpointGuard::new(
+                engine.clone(),
+                "bp-req-102".into(),
+                102,
+                Some(Box::new(move |sid| {
+                    disarmed_cb_clone.store(sid, Ordering::SeqCst);
+                })),
+            );
+            guard.disarm();
+        }
+        assert_eq!(disarmed_cb_called.load(Ordering::SeqCst), 0);
+        assert_eq!(engine.list_paused().len(), 1);
+        assert!(rx.try_recv().is_err());
     }
 }

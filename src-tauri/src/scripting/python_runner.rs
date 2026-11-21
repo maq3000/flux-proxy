@@ -15,6 +15,7 @@ use tokio::task::JoinHandle;
 use crate::models::{HeaderPair, ProxyError, PythonRunnerStatus, ScriptConsoleLogEvent};
 
 pub const DEFAULT_SCRIPT_TIMEOUT: Duration = Duration::from_millis(1500);
+pub const DEFAULT_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(5000);
 pub const MAX_SCRIPT_BODY_BYTES: usize = 4 * 1024 * 1024; // 4 MiB safety cap per hook payload
 const SCRIPT_CONSOLE_LOG_EVENT: &str = "proxy://script-console-log";
 
@@ -596,6 +597,7 @@ pub struct PythonScriptRunner {
     rpc_seq: AtomicU64,
     log_seq: Arc<AtomicU64>,
     timeout: Duration,
+    lock_acquire_timeout: Duration,
     app_handle: Option<AppHandle>,
     config: StdMutex<ScriptConfigState>,
     worker: AsyncMutex<Option<PythonWorkerProcess>>,
@@ -769,7 +771,12 @@ fn emit_log_with_sink(
 
 impl PythonScriptRunner {
     pub fn new(app_handle: Option<AppHandle>) -> Self {
-        Self::create_inner(app_handle, DEFAULT_SCRIPT_TIMEOUT, None)
+        Self::create_inner(
+            app_handle,
+            DEFAULT_SCRIPT_TIMEOUT,
+            DEFAULT_LOCK_ACQUIRE_TIMEOUT,
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -777,12 +784,27 @@ impl PythonScriptRunner {
         timeout: Duration,
         forced_candidates: Option<Vec<(String, Vec<String>)>>,
     ) -> Self {
-        Self::create_inner(None, timeout, forced_candidates)
+        Self::create_inner(
+            None,
+            timeout,
+            DEFAULT_LOCK_ACQUIRE_TIMEOUT,
+            forced_candidates,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_timeouts(
+        timeout: Duration,
+        lock_acquire_timeout: Duration,
+        forced_candidates: Option<Vec<(String, Vec<String>)>>,
+    ) -> Self {
+        Self::create_inner(None, timeout, lock_acquire_timeout, forced_candidates)
     }
 
     fn create_inner(
         app_handle: Option<AppHandle>,
         timeout: Duration,
+        lock_acquire_timeout: Duration,
         forced_candidates: Option<Vec<(String, Vec<String>)>>,
     ) -> Self {
         Self {
@@ -792,6 +814,7 @@ impl PythonScriptRunner {
             rpc_seq: AtomicU64::new(0),
             log_seq: Arc::new(AtomicU64::new(0)),
             timeout,
+            lock_acquire_timeout,
             app_handle,
             config: StdMutex::new(ScriptConfigState {
                 code: String::new(),
@@ -1236,6 +1259,36 @@ impl PythonScriptRunner {
         }
     }
 
+    async fn acquire_worker_lock(
+        &self,
+        hook: &str,
+        session_id: u64,
+    ) -> Option<tokio::sync::MutexGuard<'_, Option<PythonWorkerProcess>>> {
+        match tokio::time::timeout(self.lock_acquire_timeout, self.worker.lock()).await {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                {
+                    let mut cfg = self.lock_config();
+                    cfg.timeout_count += 1;
+                    cfg.last_error = Some(format!(
+                        "Python worker queue lock timed out after {} ms waiting for {hook} (fail-open)",
+                        self.lock_acquire_timeout.as_millis()
+                    ));
+                }
+                self.emit_log(
+                    "warn",
+                    Some(hook),
+                    Some(session_id),
+                    format!(
+                        "Python worker busy after {} ms queue wait; skipping {hook} without killing worker (fail-open).",
+                        self.lock_acquire_timeout.as_millis()
+                    ),
+                );
+                None
+            }
+        }
+    }
+
     pub async fn run_on_request(
         &self,
         session_id: u64,
@@ -1261,22 +1314,8 @@ impl PythonScriptRunner {
             return ScriptRequestOutcome::Unchanged;
         }
 
-        let mut worker_guard = match tokio::time::timeout(self.timeout, self.worker.lock()).await {
-            Ok(g) => g,
-            Err(_) => {
-                {
-                    let mut cfg = self.lock_config();
-                    cfg.timeout_count += 1;
-                    cfg.last_error = Some("Python worker lock timed out (fail-open)".to_string());
-                }
-                self.emit_log(
-                    "warn",
-                    Some("on_request"),
-                    Some(session_id),
-                    "Python worker busy; skipping on_request (fail-open).",
-                );
-                return ScriptRequestOutcome::Unchanged;
-            }
+        let Some(mut worker_guard) = self.acquire_worker_lock("on_request", session_id).await else {
+            return ScriptRequestOutcome::Unchanged;
         };
 
         if !self.should_run_request() {
@@ -1449,22 +1488,8 @@ impl PythonScriptRunner {
             return ScriptResponseOutcome::Unchanged;
         }
 
-        let mut worker_guard = match tokio::time::timeout(self.timeout, self.worker.lock()).await {
-            Ok(g) => g,
-            Err(_) => {
-                {
-                    let mut cfg = self.lock_config();
-                    cfg.timeout_count += 1;
-                    cfg.last_error = Some("Python worker lock timed out (fail-open)".to_string());
-                }
-                self.emit_log(
-                    "warn",
-                    Some("on_response"),
-                    Some(session_id),
-                    "Python worker busy; skipping on_response (fail-open).",
-                );
-                return ScriptResponseOutcome::Unchanged;
-            }
+        let Some(mut worker_guard) = self.acquire_worker_lock("on_response", session_id).await else {
+            return ScriptResponseOutcome::Unchanged;
         };
 
         if !self.should_run_response() {
@@ -2001,6 +2026,95 @@ def on_request(request):
             .run_on_request(6, "GET", "https://test/ok", &[], b"")
             .await;
         assert!(matches!(ok_res, ScriptRequestOutcome::Modified(_)));
+        runner.shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn queue_lock_timeout_skips_fail_open_without_killing_worker() {
+        // Part 1: deterministic queue-timeout check without requiring Python binary
+        let locked_runner = Arc::new(PythonScriptRunner::new_with_timeouts(
+            Duration::from_millis(1500),
+            Duration::from_millis(40),
+            None,
+        ));
+        locked_runner.enabled.store(true, Ordering::Release);
+        locked_runner.has_on_request.store(true, Ordering::Release);
+        locked_runner.has_on_response.store(true, Ordering::Release);
+
+        {
+            let _held_guard = locked_runner.worker.lock().await;
+            let req_res = locked_runner
+                .run_on_request(101, "GET", "https://example.com/q", &[], b"")
+                .await;
+            let resp_res = locked_runner
+                .run_on_response(102, "GET", "https://example.com/q", 200, &[], b"")
+                .await;
+            assert!(matches!(req_res, ScriptRequestOutcome::Unchanged));
+            assert!(matches!(resp_res, ScriptResponseOutcome::Unchanged));
+        }
+        {
+            let cfg = locked_runner.lock_config();
+            assert_eq!(cfg.timeout_count, 2);
+            assert_eq!(cfg.restart_count, 0);
+        }
+        let logs = locked_runner.take_test_logs();
+        assert_eq!(logs.len(), 2);
+        assert!(logs.iter().all(|l| l.level == "warn"));
+
+        // Part 2: with live Python worker, slow-but-valid RPC (< pipe timeout) holds mutex past
+        // concurrent caller's lock_acquire_timeout; concurrent caller skips fail-open WITHOUT killing worker.
+        let runner = Arc::new(PythonScriptRunner::new_with_timeouts(
+            Duration::from_millis(1500),
+            Duration::from_millis(150),
+            None,
+        ));
+        if !runner.get_status().await.available {
+            return;
+        }
+
+        let script = r#"
+import time
+
+def on_request(request):
+    if "/slow" in request["url"]:
+        time.sleep(0.45)
+    request["headers"]["X-Worker-Ok"] = "yes"
+"#;
+        let initial = runner.set_script(script.to_string(), true).await.unwrap();
+        let pid_before = initial.worker_pid;
+        assert!(pid_before.is_some());
+
+        let r1 = Arc::clone(&runner);
+        let slow_task = tokio::spawn(async move {
+            r1.run_on_request(201, "GET", "https://test/slow", &[], b"")
+                .await
+        });
+
+        // Yield briefly so slow_task acquires worker mutex first
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let queued_res = runner
+            .run_on_request(202, "GET", "https://test/queued", &[], b"")
+            .await;
+        assert!(matches!(queued_res, ScriptRequestOutcome::Unchanged));
+
+        let slow_res = slow_task.await.expect("slow task join");
+        assert!(matches!(slow_res, ScriptRequestOutcome::Modified(_)));
+
+        let mid = runner.get_status().await;
+        assert_eq!(mid.restart_count, 0, "queue lock timeout must never kill/restart worker");
+        assert_eq!(mid.worker_pid, pid_before);
+        assert!(mid.running);
+        assert_eq!(mid.timeout_count, 1);
+
+        let fast_res = runner
+            .run_on_request(203, "GET", "https://test/fast", &[], b"")
+            .await;
+        assert!(matches!(fast_res, ScriptRequestOutcome::Modified(_)));
+        let after = runner.get_status().await;
+        assert_eq!(after.restart_count, 0);
+        assert_eq!(after.worker_pid, pid_before);
+
         runner.shutdown_sync();
     }
 }

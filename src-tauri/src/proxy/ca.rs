@@ -93,6 +93,41 @@ pub(crate) fn cert_file_matches_ca_der(installed_bytes: &[u8], active_ca_der: &[
     false
 }
 
+/// Verifies that the CLI trust-store output contains a 64-hex SHA-256 fingerprint matching
+/// the active Root CA certificate (case-insensitive, ignoring colon/space separators and localized labels).
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+pub(crate) fn output_contains_sha256_fingerprint(output: &str, expected_sha256_hex: &str) -> bool {
+    let expected: String = expected_sha256_hex
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    if expected.len() != 64 {
+        return false;
+    }
+
+    output.lines().any(|line| {
+        let candidate_part = line
+            .split_once(':')
+            .map(|(_, rhs)| rhs)
+            .unwrap_or(line)
+            .trim();
+        if candidate_part.is_empty()
+            || !candidate_part
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || matches!(c, ' ' | '\t' | ':' | '-'))
+        {
+            return false;
+        }
+        let hex: String = candidate_part
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        hex.len() == 64 && hex == expected
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OsCommandSpec {
     pub program: String,
@@ -313,23 +348,36 @@ impl CertificateAuthority {
         &self.key_pem_path
     }
 
-    /// Non-destructively checks whether the FluxProxy Root CA is currently present in the OS trust store.
+    /// Non-destructively checks whether the FluxProxy Root CA is currently present in the OS trust store
+    /// AND matches the active Root CA SHA-256 fingerprint.
     pub fn is_installed_in_os_trust_store(&self) -> bool {
         #[cfg(target_os = "windows")]
         {
             new_os_command("certutil")
-                .args(["-user", "-store", "Root", ROOT_CA_COMMON_NAME])
+                .args(["-user", "-store", "-v", "Root", ROOT_CA_COMMON_NAME])
                 .output()
-                .map(|o| o.status.success())
+                .map(|o| {
+                    o.status.success()
+                        && output_contains_sha256_fingerprint(
+                            &String::from_utf8_lossy(&o.stdout),
+                            &self.sha256_fingerprint,
+                        )
+                })
                 .unwrap_or(false)
         }
 
         #[cfg(target_os = "macos")]
         {
             new_os_command("security")
-                .args(["find-certificate", "-c", ROOT_CA_COMMON_NAME])
+                .args(["find-certificate", "-a", "-Z", "-c", ROOT_CA_COMMON_NAME])
                 .output()
-                .map(|o| o.status.success())
+                .map(|o| {
+                    o.status.success()
+                        && output_contains_sha256_fingerprint(
+                            &String::from_utf8_lossy(&o.stdout),
+                            &self.sha256_fingerprint,
+                        )
+                })
                 .unwrap_or(false)
         }
 
@@ -906,5 +954,75 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&other_dir);
+    }
+
+    #[test]
+    fn output_contains_sha256_fingerprint_matches_windows_certutil_and_macos_security() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxproxy_ca_fp_match_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let ca = CertificateAuthority::init_or_load(&dir).expect("init CA");
+        let active_fp = &ca.info().sha256_fingerprint;
+        let hex_lower: String = active_fp
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        let hex_upper = hex_lower.to_ascii_uppercase();
+        let wrong_hex = "0".repeat(64);
+        assert_eq!(hex_lower.len(), 64);
+
+        // Windows `certutil -user -store -v Root "FluxProxy Local Debugging Root CA"`
+        let certutil_ok = format!(
+            "================ Certificate 0 ================\r\n\
+             Serial Number: 1234abcd\r\n\
+             Issuer: CN=FluxProxy Local Debugging Root CA\r\n\
+             Cert Hash(sha1): deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\r\n\
+             Cert Hash(sha256): {hex_lower}\r\n"
+        );
+        assert!(output_contains_sha256_fingerprint(&certutil_ok, active_fp));
+
+        // Non-English Windows localized label should still match by colon-separated SHA-256 hex
+        let certutil_localized = format!("Хэш сертификата(sha256): {hex_upper}\r\n");
+        assert!(output_contains_sha256_fingerprint(
+            &certutil_localized,
+            active_fp
+        ));
+
+        // Stale CA with same CN but wrong SHA-256 hash or SHA-1 only must NOT match
+        let certutil_stale = format!(
+            "Cert Hash(sha1): deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\r\n\
+             Cert Hash(sha256): {wrong_hex}\r\n"
+        );
+        assert!(!output_contains_sha256_fingerprint(&certutil_stale, active_fp));
+        let certutil_sha1_only = "Cert Hash(sha1): deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\r\n";
+        assert!(!output_contains_sha256_fingerprint(
+            certutil_sha1_only,
+            active_fp
+        ));
+
+        // macOS `security find-certificate -a -Z -c "FluxProxy Local Debugging Root CA"`
+        // Multiple certs with the same CN: first stale, second active
+        let security_multi = format!(
+            "SHA-256 hash: {wrong_hex}\n\
+             SHA-1 hash: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n\
+             keychain: \"/Library/Keychains/System.keychain\"\n\
+             SHA-256 hash: {hex_upper}\n"
+        );
+        assert!(output_contains_sha256_fingerprint(
+            &security_multi,
+            active_fp
+        ));
+
+        let security_stale = format!("SHA-256 hash: {wrong_hex}\n");
+        assert!(!output_contains_sha256_fingerprint(
+            &security_stale,
+            active_fp
+        ));
+        assert!(!output_contains_sha256_fingerprint("", "short"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

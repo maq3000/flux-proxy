@@ -85,7 +85,8 @@ async fn check_port_binding(status: &ProxyStatus) -> DoctorCheckResult {
         };
     }
 
-    match bind_listeners_with_cleanup(&target_ips, status.port, 1).await {
+    let retry_attempts = if status.running { 6 } else { 3 };
+    match bind_listeners_with_cleanup(&target_ips, status.port, retry_attempts).await {
         Ok((trial_listeners, actual_port)) => {
             drop(trial_listeners);
             DoctorCheckResult {

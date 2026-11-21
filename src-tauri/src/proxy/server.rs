@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,7 @@ use crate::models::{
     HeaderPair, PausedBreakpointItem, ProxyError, ProxyStatus, RuleActionType, SessionDetail,
     SessionSummary, SseEventRecord, StorageStats, WebSocketFrameRecord,
 };
-use crate::proxy::breakpoints::BreakpointEngine;
+use crate::proxy::breakpoints::{BreakpointEngine, PendingBreakpointGuard};
 use crate::proxy::ca::CertificateAuthority;
 use crate::proxy::client_certs::ClientCertificateStore;
 use crate::proxy::filters::{
@@ -50,6 +50,8 @@ const MAX_CAPTURED_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB safety cap pe
 pub const MAX_CAPTURED_REQUEST_BODY_BYTES: usize = MAX_CAPTURED_BODY_BYTES;
 const ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES: usize = 256 * 1024; // 256 KiB
 const STREAM_TEXT_PREVIEW_MAX_BYTES: usize = 64 * 1024; // 64 KiB cap for text/* or application/* large-stream previews
+const DEFAULT_UPSTREAM_TIMEOUT_SEC: u64 = 15;
+const MAX_CONTENT_ENCODING_LAYERS: usize = 4;
 type ProxyBoxBody = BoxBody<Bytes, Infallible>;
 
 #[derive(Debug)]
@@ -93,7 +95,7 @@ pub(crate) fn build_upstream_client_with_identity(
     let mut builder = reqwest::Client::builder()
         .no_proxy()
         .redirect(redirect_policy)
-        .connect_timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(DEFAULT_UPSTREAM_TIMEOUT_SEC))
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .http2_keep_alive_interval(Some(Duration::from_secs(20)))
         .http2_keep_alive_timeout(Duration::from_secs(10))
@@ -201,13 +203,25 @@ where
     }
 }
 
+pub(crate) fn extract_content_encoding_tokens(headers: &[HeaderPair]) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for h in headers {
+        if h.name.trim().eq_ignore_ascii_case("content-encoding") {
+            for token in h.value.split(',') {
+                let trimmed = token.trim();
+                if !trimmed.is_empty() {
+                    tokens.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    tokens
+}
+
 pub(crate) fn has_zstd_content_encoding(headers: &[HeaderPair]) -> bool {
-    headers.iter().any(|h| {
-        h.name.trim().eq_ignore_ascii_case("content-encoding")
-            && h.value
-                .split(',')
-                .any(|token| token.trim().eq_ignore_ascii_case("zstd"))
-    })
+    extract_content_encoding_tokens(headers)
+        .iter()
+        .any(|token| token.eq_ignore_ascii_case("zstd") || token.eq_ignore_ascii_case("x-zstd"))
 }
 
 pub(crate) const MAX_ZSTD_DECOMPRESSED_BYTES: u64 = MAX_CAPTURED_BODY_BYTES as u64;
@@ -229,44 +243,187 @@ pub(crate) fn decode_zstd_bounded(input: &[u8], max_bytes: u64) -> Result<Vec<u8
     Ok(out)
 }
 
+fn decode_single_layer_bounded(
+    encoding: &str,
+    input: &[u8],
+    max_bytes: u64,
+) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read;
+
+    let enc_lower = encoding.trim().to_ascii_lowercase();
+    let mut out = Vec::new();
+    match enc_lower.as_str() {
+        "zstd" | "x-zstd" => return decode_zstd_bounded(input, max_bytes),
+        "gzip" | "x-gzip" => {
+            let decoder = flate2::read::GzDecoder::new(input);
+            decoder
+                .take(max_bytes.saturating_add(1))
+                .read_to_end(&mut out)?;
+        }
+        "deflate" => {
+            let zlib_res = {
+                let mut tmp = Vec::new();
+                flate2::read::ZlibDecoder::new(input)
+                    .take(max_bytes.saturating_add(1))
+                    .read_to_end(&mut tmp)
+                    .map(|_| tmp)
+            };
+            match zlib_res {
+                Ok(tmp) => out = tmp,
+                Err(_) => {
+                    flate2::read::DeflateDecoder::new(input)
+                        .take(max_bytes.saturating_add(1))
+                        .read_to_end(&mut out)?;
+                }
+            }
+        }
+        "br" => {
+            let decoder = brotli::Decompressor::new(input, 4096);
+            decoder
+                .take(max_bytes.saturating_add(1))
+                .read_to_end(&mut out)?;
+        }
+        other => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("unsupported Content-Encoding '{other}'"),
+            ));
+        }
+    }
+
+    if (out.len() as u64) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{enc_lower} decompressed payload exceeds limit of {max_bytes} bytes"),
+        ));
+    }
+    Ok(out)
+}
+
+pub(crate) struct ContentEncodingDecodeResult {
+    pub body: Bytes,
+    pub decoded_any: bool,
+    pub remaining_encodings: Vec<String>,
+}
+
+pub(crate) async fn maybe_decompress_content_encodings(
+    headers: &[HeaderPair],
+    body: Bytes,
+) -> ContentEncodingDecodeResult {
+    let mut remaining = extract_content_encoding_tokens(headers);
+    if remaining.is_empty() {
+        return ContentEncodingDecodeResult {
+            body,
+            decoded_any: false,
+            remaining_encodings: remaining,
+        };
+    }
+
+    if body.is_empty() {
+        let had_supported = remaining.iter().any(|t| {
+            matches!(
+                t.to_ascii_lowercase().as_str(),
+                "identity" | "zstd" | "x-zstd" | "gzip" | "x-gzip" | "deflate" | "br"
+            )
+        });
+        remaining.retain(|t| {
+            !matches!(
+                t.to_ascii_lowercase().as_str(),
+                "identity" | "zstd" | "x-zstd"
+            )
+        });
+        return ContentEncodingDecodeResult {
+            body,
+            decoded_any: had_supported && remaining.is_empty(),
+            remaining_encodings: remaining,
+        };
+    }
+
+    let mut current = body;
+    let mut decoded_any = false;
+    let mut peeled_layers = 0usize;
+
+    while let Some(outer) = remaining.last().cloned() {
+        if peeled_layers >= MAX_CONTENT_ENCODING_LAYERS {
+            tracing::warn!(
+                "Reached max Content-Encoding decompression depth ({MAX_CONTENT_ENCODING_LAYERS}); preserving remaining encodings: {:?}",
+                remaining
+            );
+            break;
+        }
+        let outer_lower = outer.to_ascii_lowercase();
+        if outer_lower == "identity" {
+            remaining.pop();
+            continue;
+        }
+        if !matches!(
+            outer_lower.as_str(),
+            "zstd" | "x-zstd" | "gzip" | "x-gzip" | "deflate" | "br"
+        ) {
+            break;
+        }
+
+        let decode_res = if current.len() > ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES {
+            let payload_for_task = current.clone();
+            let enc_owned = outer_lower.clone();
+            match tokio::task::spawn_blocking(move || {
+                decode_single_layer_bounded(
+                    &enc_owned,
+                    payload_for_task.as_ref(),
+                    MAX_ZSTD_DECOMPRESSED_BYTES,
+                )
+            })
+            .await
+            {
+                Ok(res) => res,
+                Err(join_err) => {
+                    tracing::warn!(
+                        "Content-Encoding '{outer}' spawn_blocking task failed ({} bytes): {join_err}",
+                        current.len()
+                    );
+                    break;
+                }
+            }
+        } else {
+            decode_single_layer_bounded(
+                &outer_lower,
+                current.as_ref(),
+                MAX_ZSTD_DECOMPRESSED_BYTES,
+            )
+        };
+
+        match decode_res {
+            Ok(decoded) => {
+                current = Bytes::from(decoded);
+                remaining.pop();
+                decoded_any = true;
+                peeled_layers += 1;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Failed to decompress Content-Encoding '{outer}' ({} bytes): {err}",
+                    current.len()
+                );
+                break;
+            }
+        }
+    }
+
+    ContentEncodingDecodeResult {
+        body: current,
+        decoded_any,
+        remaining_encodings: remaining,
+    }
+}
+
+#[allow(dead_code)]
 pub(crate) async fn maybe_decompress_zstd(headers: &[HeaderPair], body: Bytes) -> (Bytes, bool) {
     if !has_zstd_content_encoding(headers) {
         return (body, false);
     }
-    if body.is_empty() {
-        return (body, true);
-    }
-
-    let decode_res = if body.len() > ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES {
-        let body_for_task = body.clone();
-        match tokio::task::spawn_blocking(move || {
-            decode_zstd_bounded(body_for_task.as_ref(), MAX_ZSTD_DECOMPRESSED_BYTES)
-        })
-        .await
-        {
-            Ok(res) => res,
-            Err(join_err) => {
-                tracing::warn!(
-                    "zstd spawn_blocking task failed ({} bytes): {join_err}",
-                    body.len()
-                );
-                return (body, false);
-            }
-        }
-    } else {
-        decode_zstd_bounded(body.as_ref(), MAX_ZSTD_DECOMPRESSED_BYTES)
-    };
-
-    match decode_res {
-        Ok(decoded) => (Bytes::from(decoded), true),
-        Err(err) => {
-            tracing::warn!(
-                "Failed to decompress zstd response body ({} bytes): {err}",
-                body.len()
-            );
-            (body, false)
-        }
-    }
+    let res = maybe_decompress_content_encodings(headers, body).await;
+    let all_decoded = res.remaining_encodings.is_empty();
+    (res.body, res.decoded_any || all_decoded)
 }
 
 #[inline]
@@ -491,8 +648,39 @@ pub struct SharedProxyContext {
     pub event_tx: mpsc::UnboundedSender<SessionSummary>,
     pub removed_tx: mpsc::UnboundedSender<Vec<u64>>,
     pub active_port: AtomicU16,
+    pub upstream_timeout_sec: u64,
     pub app_handle: Option<AppHandle>,
     pub stats_dirty: Arc<AtomicBool>,
+}
+
+fn make_breakpoint_guard(
+    ctx: &Arc<SharedProxyContext>,
+    bp_id: String,
+    session_id: u64,
+    start: Instant,
+) -> PendingBreakpointGuard {
+    let ctx_for_drop = Arc::clone(ctx);
+    PendingBreakpointGuard::new(
+        Arc::clone(&ctx.breakpoints),
+        bp_id,
+        session_id,
+        Some(Box::new(move |sid| {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            if let Some(updated_summary) = ctx_for_drop.store.cancel_paused_breakpoint(
+                sid,
+                499,
+                "Client Closed Request during Breakpoint",
+                duration_ms,
+            ) {
+                if evaluate_should_store_session(&ctx_for_drop, &updated_summary) {
+                    let _ = ctx_for_drop.event_tx.send(updated_summary);
+                } else {
+                    ctx_for_drop.store.remove_many(&[sid]);
+                    let _ = ctx_for_drop.removed_tx.send(vec![sid]);
+                }
+            }
+        })),
+    )
 }
 
 impl SharedProxyContext {
@@ -903,6 +1091,7 @@ impl ProxyEngineController {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(initial_port),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
             app_handle,
             stats_dirty,
         });
@@ -1265,7 +1454,11 @@ impl ProxyEngineController {
         );
 
         if !was_running || already_same_config {
-            return Ok(self.build_status());
+            let status = self.build_status();
+            if !already_same_config {
+                self.emit_status_changed(&status);
+            }
+            return Ok(status);
         }
 
         // Stop previous TCP listener(s) synchronously before rebinding the same port on the new interface(s)
@@ -1300,7 +1493,9 @@ impl ProxyEngineController {
                     }
                 }
 
-                Ok(self.build_status())
+                let status = self.build_status();
+                self.emit_status_changed(&status);
+                Ok(status)
             }
             Err(err) => {
                 // Attempt best-effort recovery onto previous bind configuration so capture isn't stranded
@@ -1324,14 +1519,19 @@ impl ProxyEngineController {
                     guard.shutdown_tx = Some(tx);
                     guard.listener_handles = handles;
                 } else {
-                    let mut guard = self.lock_runtime();
-                    guard.bind_mode = prev_mode;
-                    guard.bind_addr = (prev_primary, port);
-                    guard.specific_bind_ip = prev_specific_ip;
-                    guard.also_bind_loopback = prev_also_loopback;
-                    guard.bound_ips = prev_bound_ips;
-                    guard.allow_remote = prev_allow_remote;
+                    {
+                        let mut guard = self.lock_runtime();
+                        guard.bind_mode = prev_mode;
+                        guard.bind_addr = (prev_primary, port);
+                        guard.specific_bind_ip = prev_specific_ip;
+                        guard.also_bind_loopback = prev_also_loopback;
+                        guard.bound_ips = prev_bound_ips;
+                        guard.allow_remote = prev_allow_remote;
+                    }
+                    self.sysproxy.rollback_if_dirty();
                 }
+                let rollback_status = self.build_status();
+                self.emit_status_changed(&rollback_status);
                 Err(err)
             }
         }
@@ -1683,10 +1883,41 @@ impl ProxyEngineController {
                 process_name: Some("flux-proxy (Composer)".into()),
                 process_pid: Some(self_pid),
             });
+            let mut bp_guard = make_breakpoint_guard(&self.context, bp_id.clone(), session_id, start);
 
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+            let wait_res = tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await;
+            bp_guard.disarm();
+
+            match wait_res {
                 Ok(Ok(verdict)) => {
                     if verdict.action == BreakpointAction::Abort {
+                        let proto = if scheme == "https" {
+                            "HTTPS/2".to_string()
+                        } else {
+                            "HTTP/1.1".to_string()
+                        };
+                        record_error_session(
+                            &self.context,
+                            session_id,
+                            proto,
+                            &scheme,
+                            &method_str,
+                            &host,
+                            &path,
+                            &full_url,
+                            req_headers,
+                            &req_bytes,
+                            start.elapsed().as_millis() as u64,
+                            timestamp,
+                            Some("flux-proxy (Composer)".into()),
+                            Some(self_pid),
+                            false,
+                            req_mutated,
+                            true,
+                            Some("127.0.0.1".into()),
+                            "Composer (Local)".into(),
+                            "Request aborted at Live Breakpoint",
+                        );
                         return Err(ProxyError::Custom(
                             "Request aborted at Live Breakpoint".into(),
                         ));
@@ -1977,9 +2208,14 @@ impl ProxyEngineController {
                 return Err(err.into());
             }
         };
-        let (decompressed_resp_bytes, _zstd_decompressed) =
-            maybe_decompress_zstd(&resp_headers, raw_resp_bytes).await;
-        let mut resp_bytes = decompressed_resp_bytes.to_vec();
+        let mut resp_bytes = if method_str.eq_ignore_ascii_case("HEAD") {
+            raw_resp_bytes.to_vec()
+        } else {
+            maybe_decompress_content_encodings(&resp_headers, raw_resp_bytes)
+                .await
+                .body
+                .to_vec()
+        };
 
         // Live Breakpoint: After Response (Alt+F11 / `bpafter`)
         if self
@@ -2016,8 +2252,12 @@ impl ProxyEngineController {
                 process_name: Some("flux-proxy (Composer)".into()),
                 process_pid: Some(self_pid),
             });
+            let mut bp_guard = make_breakpoint_guard(&self.context, bp_id.clone(), session_id, start);
 
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+            let wait_res = tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await;
+            bp_guard.disarm();
+
+            match wait_res {
                 Ok(Ok(verdict)) => {
                     if verdict.action == BreakpointAction::Abort {
                         record_error_session(
@@ -2394,7 +2634,13 @@ async fn handle_outer_proxy_request(
                         .unwrap_or_else(|| "http/1.1".to_string());
 
                     let inner_io = TokioIo::new(tls_stream);
-                    let authority_host = if port == 443 {
+                    let authority_host = if host.contains(':') {
+                        if port == 443 {
+                            format!("[{host}]")
+                        } else {
+                            format!("[{host}]:{port}")
+                        }
+                    } else if port == 443 {
                         host.clone()
                     } else {
                         format!("{host}:{port}")
@@ -2778,8 +3024,12 @@ async fn handle_intercepted_request(
             process_name: client_proc.as_ref().map(|p| p.name.clone()),
             process_pid: client_proc.as_ref().map(|p| p.pid),
         });
+        let mut bp_guard = make_breakpoint_guard(&ctx, bp_id.clone(), session_id, start);
 
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), bp_rx).await {
+        let wait_res = tokio::time::timeout(Duration::from_secs(timeout_secs), bp_rx).await;
+        bp_guard.disarm();
+
+        match wait_res {
             Ok(Ok(verdict)) => {
                 if verdict.action == BreakpointAction::Abort {
                     return record_and_return_error(
@@ -3225,6 +3475,7 @@ async fn handle_intercepted_request(
         format_http_version(&scheme_str, upstream_version)
     };
 
+    let is_head_request = method_str.eq_ignore_ascii_case("HEAD");
     let is_sse_stream = content_type
         .to_ascii_lowercase()
         .starts_with("text/event-stream");
@@ -3233,8 +3484,20 @@ async fn handle_intercepted_request(
             .should_break(BreakpointStage::Response, &method_str, &full_url);
 
     // 4a. Real-time Server-Sent Events (`text/event-stream`) zero-buffering pass-through & chunk capture
-    if is_sse_stream && !should_break_resp {
-        let sse_has_zstd = has_zstd_content_encoding(&resp_headers);
+    if is_sse_stream && !should_break_resp && !is_head_request {
+        let mut sse_remaining_encodings = extract_content_encoding_tokens(&resp_headers);
+        let sse_has_zstd = sse_remaining_encodings
+            .last()
+            .is_some_and(|t| t.eq_ignore_ascii_case("zstd") || t.eq_ignore_ascii_case("x-zstd"));
+        if sse_has_zstd {
+            sse_remaining_encodings.pop();
+            while sse_remaining_encodings
+                .last()
+                .is_some_and(|t| t.eq_ignore_ascii_case("identity"))
+            {
+                sse_remaining_encodings.pop();
+            }
+        }
         let capped_req = &body_bytes[..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
         let initial_summary = SessionSummary {
             id: session_id,
@@ -3426,6 +3689,9 @@ async fn handle_intercepted_request(
                 builder = builder.header(&h.name, &h.value);
             }
         }
+        if !sse_remaining_encodings.is_empty() {
+            builder = builder.header("Content-Encoding", sse_remaining_encodings.join(", "));
+        }
         return builder
             .body(http_body_util::BodyExt::boxed(StreamBody::new(stream)))
             .unwrap_or_else(|_| {
@@ -3447,7 +3713,8 @@ async fn handle_intercepted_request(
         .map(|len| len > BODY_OFFLOAD_THRESHOLD_BYTES)
         .unwrap_or(false);
 
-    if !should_break_resp
+    if !is_head_request
+        && !should_break_resp
         && !is_sse_stream
         && !resp_has_zstd
         && (is_media_or_partial || is_large_stream_body)
@@ -3653,10 +3920,23 @@ async fn handle_intercepted_request(
         }
     };
 
-    let has_zstd = has_zstd_content_encoding(&resp_headers);
-    let (mut resp_bytes, zstd_decompressed) =
-        maybe_decompress_zstd(&resp_headers, raw_resp_bytes).await;
-    let mut preserve_content_encoding = has_zstd && !zstd_decompressed;
+    let (mut resp_bytes, decoded_any_encoding, mut remaining_content_encodings) =
+        if is_head_request {
+            (
+                raw_resp_bytes,
+                false,
+                extract_content_encoding_tokens(&resp_headers),
+            )
+        } else {
+            let decoded = maybe_decompress_content_encodings(&resp_headers, raw_resp_bytes).await;
+            (
+                decoded.body,
+                decoded.decoded_any,
+                decoded.remaining_encodings,
+            )
+        };
+    let mut resp_body_modified = false;
+    let mut resp_headers_replaced_by_bp = false;
 
     // 4c-script. Python Scripting Engine: on_response(response)
     // Explicitly skipped for SSE (`text/event-stream`), media (`video/*`, `audio/*`),
@@ -3684,6 +3964,11 @@ async fn handle_intercepted_request(
                     resp_mutated = true;
                 }
             }
+            let script_touched_ce = edits
+                .headers_removed
+                .iter()
+                .chain(edits.headers_set.iter().map(|(k, _)| k))
+                .any(|k| k.trim().eq_ignore_ascii_case("content-encoding"));
             if edits.headers_changed
                 && apply_header_diff(&mut resp_headers, &edits.headers_removed, &edits.headers_set)
             {
@@ -3694,11 +3979,15 @@ async fn handle_intercepted_request(
                 {
                     content_type = ct_hdr.value.clone();
                 }
+                if script_touched_ce && !resp_body_modified {
+                    remaining_content_encodings = extract_content_encoding_tokens(&resp_headers);
+                }
                 resp_mutated = true;
             }
             if let Some(next_body) = edits.body {
                 resp_bytes = Bytes::from(next_body);
-                preserve_content_encoding = false;
+                remaining_content_encodings.clear();
+                resp_body_modified = true;
                 resp_mutated = true;
             }
         }
@@ -3782,8 +4071,12 @@ async fn handle_intercepted_request(
             process_name: client_proc.as_ref().map(|p| p.name.clone()),
             process_pid: client_proc.as_ref().map(|p| p.pid),
         });
+        let mut bp_guard = make_breakpoint_guard(&ctx, bp_id.clone(), session_id, start);
 
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), bp_rx).await {
+        let wait_res = tokio::time::timeout(Duration::from_secs(timeout_secs), bp_rx).await;
+        bp_guard.disarm();
+
+        match wait_res {
             Ok(Ok(verdict)) => {
                 if verdict.action == BreakpointAction::Abort {
                     return record_and_return_error(
@@ -3823,14 +4116,20 @@ async fn handle_intercepted_request(
                     {
                         content_type = ct_hdr.value.clone();
                     }
-                    preserve_content_encoding = false;
+                    if !decoded_any_encoding && !resp_body_modified {
+                        remaining_content_encodings = extract_content_encoding_tokens(&resp_headers);
+                    } else {
+                        remaining_content_encodings.clear();
+                    }
+                    resp_headers_replaced_by_bp = true;
                     bp_modified = true;
                 }
                 if let Some(txt) = verdict.response_body_text {
                     let next_b = Bytes::from(txt.into_bytes());
                     if next_b != resp_bytes {
                         resp_bytes = next_b;
-                        preserve_content_encoding = false;
+                        remaining_content_encodings.clear();
+                        resp_body_modified = true;
                         bp_modified = true;
                     }
                 } else if let Some(b64) = verdict.response_body_base64 {
@@ -3839,7 +4138,8 @@ async fn handle_intercepted_request(
                         let next_b = Bytes::from(decoded);
                         if next_b != resp_bytes {
                             resp_bytes = next_b;
-                            preserve_content_encoding = false;
+                            remaining_content_encodings.clear();
+                            resp_body_modified = true;
                             bp_modified = true;
                         }
                     }
@@ -3919,21 +4219,35 @@ async fn handle_intercepted_request(
     record_completed_session(&ctx, detail, Some(capped_req), Some(capped_resp));
 
     let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
+    let preserve_head_content_length =
+        is_head_request && resp_bytes.is_empty() && !resp_body_modified;
+    let preserve_original_content_length = preserve_head_content_length
+        || (!decoded_any_encoding
+            && !remaining_content_encodings.is_empty()
+            && !resp_body_modified
+            && !resp_headers_replaced_by_bp);
     let mut builder =
         Response::builder().status(StatusCode::from_u16(final_status).unwrap_or(StatusCode::OK));
     for h in &resp_headers {
-        // Reqwest transparently decompresses gzip/brotli/deflate bodies and
-        // `maybe_decompress_zstd` handles `content-encoding: zstd`, so strip
-        // `content-encoding` & `content-length` before re-framing via Hyper Full<Bytes>
-        // unless zstd decompression failed (`preserve_content_encoding == true`).
+        // Reqwest transparently decompresses single-token gzip/brotli/deflate bodies and
+        // `maybe_decompress_content_encodings` peels supported outer layers (e.g. `zstd`, `br, zstd`).
+        // Re-emit only encodings that were not decoded, and preserve upstream `Content-Length` for
+        // empty `HEAD` responses (and unmodified undecoded responses).
         // Also strip HTTP/3 QUIC discovery headers (`alt-svc`, `alternate-protocol`) when enabled.
+        let keep_cl = h.name.eq_ignore_ascii_case("content-length")
+            && (preserve_head_content_length
+                || (preserve_original_content_length
+                    && h.value.trim().parse::<usize>().ok() == Some(resp_bytes.len())));
         if !is_hop_by_hop_header(&h.name)
-            && !(h.name.eq_ignore_ascii_case("content-encoding") && !preserve_content_encoding)
-            && !(h.name.eq_ignore_ascii_case("content-length") && !preserve_content_encoding)
+            && !h.name.eq_ignore_ascii_case("content-encoding")
+            && (!h.name.eq_ignore_ascii_case("content-length") || keep_cl)
             && !(strip_alt_svc && is_alt_svc_header(&h.name))
         {
             builder = builder.header(&h.name, &h.value);
         }
+    }
+    if !remaining_content_encodings.is_empty() {
+        builder = builder.header("Content-Encoding", remaining_content_encodings.join(", "));
     }
 
     builder
@@ -4001,10 +4315,15 @@ async fn handle_websocket_intercept(
         }
     };
 
-    let (upstream_ws, upstream_handshake_resp) = match tokio_tungstenite::connect_async(ws_req).await
+    let connect_timeout = Duration::from_secs(ctx.upstream_timeout_sec.max(1));
+    let (upstream_ws, upstream_handshake_resp) = match tokio::time::timeout(
+        connect_timeout,
+        tokio_tungstenite::connect_async(ws_req),
+    )
+    .await
     {
-        Ok(pair) => pair,
-        Err(tokio_tungstenite::tungstenite::Error::Http(http_resp)) => {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(tokio_tungstenite::tungstenite::Error::Http(http_resp))) => {
             let status = http_resp.status();
             let mut resp_headers = extract_hyper_headers(http_resp.headers());
             let resp_mutated = ctx.filters.apply_header_mutations(
@@ -4089,7 +4408,7 @@ async fn handle_websocket_intercept(
             }
             return rej_resp;
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             let chain = format_error_chain(&err);
             return record_and_return_error(
                 &ctx,
@@ -4108,6 +4427,29 @@ async fn handle_websocket_intercept(
                 false,
                 req_mutated,
                 format!("WebSocket upstream connect failed: {chain}"),
+            );
+        }
+        Err(_) => {
+            return record_and_return_error(
+                &ctx,
+                session_id,
+                ws_scheme,
+                "GET",
+                &host_header,
+                &path_and_query,
+                &full_url,
+                req_headers,
+                Bytes::new(),
+                start,
+                timestamp,
+                client_addr,
+                client_proc.as_ref(),
+                false,
+                req_mutated,
+                format!(
+                    "WebSocket upstream connect timed out after {}s",
+                    connect_timeout.as_secs()
+                ),
             );
         }
     };
@@ -4178,56 +4520,81 @@ async fn handle_websocket_intercept(
             let (mut upstream_sink, mut upstream_stream) = upstream_ws.split();
 
             const MAX_WS_FRAMES: usize = 256;
-            let mut recorded_count = 0usize;
-            let mut total_bytes = 0usize;
-
-            loop {
-                tokio::select! {
-                    client_msg = client_stream.next() => {
-                        match client_msg {
-                            Some(Ok(msg)) => {
-                                total_bytes += msg.len();
-                                let frame = if recorded_count < MAX_WS_FRAMES {
-                                    recorded_count += 1;
-                                    Some(record_ws_frame(recorded_count, "outbound", &msg))
-                                } else {
-                                    None
-                                };
-                                if let Some(updated_summary) =
-                                    ctx.store.append_ws_frame(session_id, frame, total_bytes, MAX_WS_FRAMES)
-                                {
-                                    let _ = ctx.event_tx.send(updated_summary);
-                                }
-                                if upstream_sink.send(msg).await.is_err() {
-                                    break;
-                                }
-                            }
-                            _ => break,
-                        }
-                    }
-                    upstream_msg = upstream_stream.next() => {
-                        match upstream_msg {
-                            Some(Ok(msg)) => {
-                                total_bytes += msg.len();
-                                let frame = if recorded_count < MAX_WS_FRAMES {
-                                    recorded_count += 1;
-                                    Some(record_ws_frame(recorded_count, "inbound", &msg))
-                                } else {
-                                    None
-                                };
-                                if let Some(updated_summary) =
-                                    ctx.store.append_ws_frame(session_id, frame, total_bytes, MAX_WS_FRAMES)
-                                {
-                                    let _ = ctx.event_tx.send(updated_summary);
-                                }
-                                if client_sink.send(msg).await.is_err() {
-                                    break;
-                                }
-                            }
-                            _ => break,
-                        }
+            fn try_claim_ws_frame_index(counter: &AtomicUsize, limit: usize) -> Option<usize> {
+                let mut curr = counter.load(Ordering::Relaxed);
+                while curr < limit {
+                    match counter.compare_exchange_weak(
+                        curr,
+                        curr + 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(prev) => return Some(prev),
+                        Err(actual) => curr = actual,
                     }
                 }
+                None
+            }
+            let recorded_count = Arc::new(AtomicUsize::new(0));
+            let total_bytes = Arc::new(AtomicUsize::new(0));
+
+            let c2u_recorded = Arc::clone(&recorded_count);
+            let c2u_bytes = Arc::clone(&total_bytes);
+            let c2u_ctx = Arc::clone(&ctx);
+            let client_to_upstream = async move {
+                while let Some(Ok(msg)) = client_stream.next().await {
+                    let new_total =
+                        c2u_bytes.fetch_add(msg.len(), Ordering::Relaxed) + msg.len();
+                    let frame = try_claim_ws_frame_index(&c2u_recorded, MAX_WS_FRAMES)
+                        .map(|prev| record_ws_frame(prev + 1, "outbound", &msg));
+                    if let Some(updated_summary) =
+                        c2u_ctx
+                            .store
+                            .append_ws_frame(session_id, frame, new_total, MAX_WS_FRAMES)
+                    {
+                        let _ = c2u_ctx.event_tx.send(updated_summary);
+                    }
+                    if upstream_sink.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    upstream_sink.close(),
+                )
+                .await;
+            };
+
+            let u2c_recorded = Arc::clone(&recorded_count);
+            let u2c_bytes = Arc::clone(&total_bytes);
+            let u2c_ctx = Arc::clone(&ctx);
+            let upstream_to_client = async move {
+                while let Some(Ok(msg)) = upstream_stream.next().await {
+                    let new_total =
+                        u2c_bytes.fetch_add(msg.len(), Ordering::Relaxed) + msg.len();
+                    let frame = try_claim_ws_frame_index(&u2c_recorded, MAX_WS_FRAMES)
+                        .map(|prev| record_ws_frame(prev + 1, "inbound", &msg));
+                    if let Some(updated_summary) =
+                        u2c_ctx
+                            .store
+                            .append_ws_frame(session_id, frame, new_total, MAX_WS_FRAMES)
+                    {
+                        let _ = u2c_ctx.event_tx.send(updated_summary);
+                    }
+                    if client_sink.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    client_sink.close(),
+                )
+                .await;
+            };
+
+            tokio::select! {
+                _ = client_to_upstream => {}
+                _ = upstream_to_client => {}
             }
 
             if let Some(final_summary) = ctx.store.finalize_ws_stream(session_id) {
@@ -4814,15 +5181,30 @@ fn plain_response(status: StatusCode, msg: &str) -> Response<ProxyBoxBody> {
 }
 
 fn split_authority(authority: &str) -> (String, u16) {
-    if let Ok(sock) = authority.parse::<SocketAddr>() {
+    let trimmed = authority.trim();
+    if let Ok(sock) = trimmed.parse::<SocketAddr>() {
         return (sock.ip().to_string(), sock.port());
     }
-    if let Some((h, p)) = authority.rsplit_once(':') {
-        if let Ok(port) = p.parse::<u16>() {
-            return (h.trim_matches(['[', ']']).to_string(), port);
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some((ipv6, tail)) = rest.split_once(']') {
+            let port = tail
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(443);
+            return (ipv6.trim().to_string(), port);
         }
     }
-    (authority.to_string(), 443)
+    if trimmed.parse::<IpAddr>().is_ok() {
+        return (trimmed.to_string(), 443);
+    }
+    if let Some((h, p)) = trimmed.rsplit_once(':') {
+        if !h.contains(':') {
+            if let Ok(port) = p.parse::<u16>() {
+                return (h.to_string(), port);
+            }
+        }
+    }
+    (trimmed.trim_matches(['[', ']']).to_string(), 443)
 }
 
 fn extract_hyper_headers(map: &http::HeaderMap) -> Vec<HeaderPair> {
@@ -5501,6 +5883,7 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -5616,6 +5999,7 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -5865,6 +6249,7 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -6009,6 +6394,7 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -6145,6 +6531,7 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(bound_port),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -6348,6 +6735,7 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -6512,6 +6900,7 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -6729,6 +7118,7 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -6901,7 +7291,15 @@ mod tests {
         let corrupt_payload = b"NOT_A_VALID_ZSTD_FRAME";
 
         let json_zstd = zstd::encode_all(json_plain.as_bytes(), 3).unwrap();
-        let html_zstd = zstd::encode_all(html_plain.as_bytes(), 3).unwrap();
+        let html_br = {
+            use std::io::Write;
+            let mut buf = Vec::new();
+            let mut compressor = brotli::CompressorWriter::new(&mut buf, 4096, 4, 22);
+            compressor.write_all(html_plain.as_bytes()).unwrap();
+            drop(compressor);
+            buf
+        };
+        let html_zstd = zstd::encode_all(html_br.as_slice(), 3).unwrap();
         let large_zstd = zstd::encode_all(large_plain.as_bytes(), 3).unwrap();
         let sse_zstd = zstd::encode_all(sse_plain.as_bytes(), 3).unwrap();
 
@@ -6997,6 +7395,7 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -7534,6 +7933,7 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -7892,6 +8292,7 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -8106,6 +8507,7 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -8202,5 +8604,629 @@ def on_response(response, request):
 
         let err = decode_zstd_bounded(&compressed, 2048).expect_err("must reject oversized output");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn split_authority_parses_ipv6_and_host_port_variants() {
+        assert_eq!(split_authority("[::1]"), ("::1".to_string(), 443));
+        assert_eq!(split_authority("[::1]:8443"), ("::1".to_string(), 8443));
+        assert_eq!(split_authority("::1"), ("::1".to_string(), 443));
+        assert_eq!(
+            split_authority("[2001:db8::1]:9443"),
+            ("2001:db8::1".to_string(), 9443)
+        );
+        assert_eq!(
+            split_authority("2001:db8::8080"),
+            ("2001:db8::8080".to_string(), 443)
+        );
+        assert_eq!(
+            split_authority("api.example.com:8443"),
+            ("api.example.com".to_string(), 8443)
+        );
+        assert_eq!(
+            split_authority("api.example.com"),
+            ("api.example.com".to_string(), 443)
+        );
+        assert_eq!(
+            split_authority("127.0.0.1:8080"),
+            ("127.0.0.1".to_string(), 8080)
+        );
+    }
+
+    #[tokio::test]
+    async fn breakpoint_raii_guard_cleans_up_pending_on_client_disconnect_and_composer_abort_records_502() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-bp-guard-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let (bp_tx, mut bp_rx) = mpsc::unbounded_channel();
+        let breakpoints = Arc::new(BreakpointEngine::new(Some(bp_tx)));
+        breakpoints.update_config(BreakpointConfig {
+            break_before_request: true,
+            break_after_response: false,
+            timeout_secs: 60,
+            rules: Vec::new(),
+        });
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("bp-guard.sqlite")).unwrap());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let os_backend = RecordingOsProxyBackend::new();
+        let sysproxy = Arc::new(SystemProxyManager::with_backend(&tmp_dir, os_backend));
+
+        let ctx = Arc::new(SharedProxyContext {
+            ca: ca.clone(),
+            rules: rules.clone(),
+            filters: filters.clone(),
+            breakpoints: breakpoints.clone(),
+            store: store.clone(),
+            upstream_client: build_upstream_client(false).unwrap(),
+            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(0),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_ctx = ctx.clone();
+
+        tokio::spawn(async move {
+            if let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await {
+                let io = TokioIo::new(tcp_stream);
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let c = proxy_ctx.clone();
+                    async move {
+                        Ok::<_, Infallible>(
+                            handle_outer_proxy_request(req, client_addr, None, c).await,
+                        )
+                    }
+                });
+                let _ = AutoConnBuilder::new(TokioExecutor::new())
+                    .serve_connection_with_upgrades(io, service)
+                    .await;
+            }
+        });
+
+        // 1. Client opens HTTP request via proxy, pauses at Before Request breakpoint, then drops TCP socket
+        let mut client_sock = TcpStream::connect(proxy_addr).await.unwrap();
+        client_sock
+            .write_all(b"GET http://example.invalid/disconnect-bp HTTP/1.1\r\nHost: example.invalid\r\n\r\n")
+            .await
+            .unwrap();
+
+        let paused_snap = tokio::time::timeout(Duration::from_secs(3), bp_rx.recv())
+            .await
+            .expect("expected breakpoint snapshot")
+            .expect("snapshot channel open");
+        assert_eq!(paused_snap.len(), 1);
+        let paused_sid = paused_snap[0].session_id;
+        assert_eq!(breakpoints.list_paused().len(), 1);
+
+        // Simulate client abort/disconnect while paused at breakpoint
+        drop(client_sock);
+
+        let cleared_snap = tokio::time::timeout(Duration::from_secs(3), bp_rx.recv())
+            .await
+            .expect("expected cleared breakpoint snapshot on disconnect")
+            .expect("snapshot channel open");
+        assert!(
+            cleared_snap.is_empty(),
+            "breakpoint pending snapshot must be cleared on client disconnect"
+        );
+        assert!(breakpoints.list_paused().is_empty());
+
+        let updated_detail = store.get(paused_sid).expect("session must exist in TrafficStore");
+        assert_eq!(updated_detail.summary.status, 499);
+        assert!(updated_detail.summary.breakpoint_paused.is_none());
+        let mut saw_499_event = false;
+        while let Ok(ev) = event_rx.try_recv() {
+            if ev.id == paused_sid && ev.status == 499 && ev.breakpoint_paused.is_none() {
+                saw_499_event = true;
+            }
+        }
+        assert!(saw_499_event, "TrafficStore update event with status 499 must be emitted");
+
+        // 2. Composer Abort at Request Breakpoint must update session to 502 with breakpoint_paused = None
+        let (comp_bp_tx, mut comp_bp_rx) = mpsc::unbounded_channel();
+        let (comp_event_tx, _comp_event_rx) = mpsc::unbounded_channel();
+        let (comp_removed_tx, _comp_removed_rx) = mpsc::unbounded_channel();
+        let controller = ProxyEngineController::new_with_channels(
+            ca,
+            rules,
+            filters,
+            store.clone(),
+            sysproxy,
+            Arc::new(ClientCertificateStore::in_memory()),
+            comp_event_tx,
+            comp_removed_tx,
+            comp_bp_tx,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        controller.context.breakpoints.update_config(BreakpointConfig {
+            break_before_request: true,
+            break_after_response: false,
+            timeout_secs: 60,
+            rules: Vec::new(),
+        });
+        let comp_bp = controller.context.breakpoints.clone();
+        tokio::spawn(async move {
+            if let Some(snapshot) = comp_bp_rx.recv().await {
+                if let Some(item) = snapshot.first() {
+                    comp_bp.resolve(BreakpointResolution {
+                        breakpoint_id: item.breakpoint_id.clone(),
+                        action: BreakpointAction::Abort,
+                        method: None,
+                        url: None,
+                        request_headers: None,
+                        request_body_base64: None,
+                        request_body_text: None,
+                        status_code: None,
+                        response_headers: None,
+                        response_body_base64: None,
+                        response_body_text: None,
+                    });
+                }
+            }
+        });
+
+        let composed_res = controller
+            .execute_composed(ComposedRequest {
+                method: "POST".into(),
+                url: "http://example.invalid/composer-abort".into(),
+                headers: Vec::new(),
+                body: "payload".into(),
+                body_base64: None,
+                follow_redirects: false,
+            })
+            .await;
+        assert!(composed_res.is_err());
+
+        let composer_summary = store
+            .list_summaries()
+            .into_iter()
+            .find(|s| s.path == "/composer-abort")
+            .expect("aborted composed session must be recorded in TrafficStore");
+        assert_eq!(composer_summary.status, 502);
+        assert!(composer_summary.breakpoint_paused.is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn websocket_connect_timeout_and_bidirectional_large_frame_blast_without_deadlock() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        // 1. Stalled TCP listener (accepts socket, never sends HTTP 101) to test connect_async timeout
+        let stalled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_addr = stalled_listener.local_addr().unwrap();
+        let stalled_task = tokio::spawn(async move {
+            if let Ok((sock, _)) = stalled_listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                drop(sock);
+            }
+        });
+
+        // 2. Blast WS upstream: after 1 trigger frame, immediately writes 32 * 64 KiB = 2 MiB
+        // BEFORE reading client's 32 * 64 KiB frames (would deadlock single-loop select!)
+        let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = ws_listener.accept().await {
+                let ws_stream = tokio_tungstenite::accept_async(sock).await.unwrap();
+                let (mut sink, mut stream) = ws_stream.split();
+                let trigger = stream.next().await.unwrap().unwrap();
+                assert_eq!(trigger.into_text().unwrap().as_str(), "start-blast");
+
+                let server_payload = "S".repeat(64 * 1024);
+                for _ in 0..32 {
+                    sink.send(Message::Text(server_payload.clone().into()))
+                        .await
+                        .unwrap();
+                }
+
+                let mut client_frames = 0usize;
+                while client_frames < 32 {
+                    let msg = stream.next().await.unwrap().unwrap();
+                    assert_eq!(msg.len(), 64 * 1024);
+                    client_frames += 1;
+                }
+                let _ = sink.close().await;
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-ws-deadlock-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("ws-deadlock.sqlite")).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            store: store.clone(),
+            upstream_client: build_upstream_client(false).unwrap(),
+            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(0),
+            upstream_timeout_sec: 1,
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_ctx = ctx.clone();
+
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                if let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await {
+                    let c = proxy_ctx.clone();
+                    tokio::spawn(async move {
+                        let io = TokioIo::new(tcp_stream);
+                        let service = service_fn(move |req: Request<Incoming>| {
+                            let inner_c = c.clone();
+                            async move {
+                                Ok::<_, Infallible>(
+                                    handle_outer_proxy_request(req, client_addr, None, inner_c)
+                                        .await,
+                                )
+                            }
+                        });
+                        let _ = AutoConnBuilder::new(TokioExecutor::new())
+                            .serve_connection_with_upgrades(io, service)
+                            .await;
+                    });
+                }
+            }
+        });
+
+        // Verify connect_async timeout returns 502 promptly
+        let mut stalled_client = TcpStream::connect(proxy_addr).await.unwrap();
+        let stalled_req = format!(
+            "GET http://{stalled_addr}/ws-hang HTTP/1.1\r\n\
+             Host: {stalled_addr}\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        stalled_client.write_all(stalled_req.as_bytes()).await.unwrap();
+        let mut stalled_resp_buf = vec![0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(4), stalled_client.read(&mut stalled_resp_buf))
+            .await
+            .expect("WS connect timeout must fire promptly within 4s")
+            .unwrap();
+        let stalled_resp_str = String::from_utf8_lossy(&stalled_resp_buf[..n]);
+        assert!(stalled_resp_str.starts_with("HTTP/1.1 502"));
+        assert!(stalled_resp_str.contains("timed out"));
+        stalled_task.abort();
+
+        // Verify bidirectional 2 MiB * 2 simultaneous large frame blast completes without deadlock
+        let mut blast_client_tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        let blast_req = format!(
+            "GET http://{ws_addr}/ws-blast HTTP/1.1\r\n\
+             Host: {ws_addr}\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        blast_client_tcp.write_all(blast_req.as_bytes()).await.unwrap();
+        let mut hs_buf = Vec::new();
+        let mut b = [0u8; 1];
+        while !hs_buf.ends_with(b"\r\n\r\n") {
+            blast_client_tcp.read_exact(&mut b).await.unwrap();
+            hs_buf.push(b[0]);
+        }
+        assert!(String::from_utf8_lossy(&hs_buf).starts_with("HTTP/1.1 101"));
+
+        let blast_ws = WebSocketStream::from_raw_socket(blast_client_tcp, Role::Client, None).await;
+        let (mut c_sink, mut c_stream) = blast_ws.split();
+        c_sink
+            .send(Message::Text("start-blast".into()))
+            .await
+            .unwrap();
+
+        let send_fut = async move {
+            let client_payload = "C".repeat(64 * 1024);
+            for _ in 0..32 {
+                c_sink
+                    .send(Message::Text(client_payload.clone().into()))
+                    .await
+                    .unwrap();
+            }
+            c_sink
+        };
+        let recv_fut = async move {
+            let mut server_frames = 0usize;
+            while server_frames < 32 {
+                let msg = c_stream.next().await.unwrap().unwrap();
+                assert_eq!(msg.len(), 64 * 1024);
+                server_frames += 1;
+            }
+        };
+
+        let (mut c_sink, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(send_fut, recv_fut)
+        })
+        .await
+        .expect("bidirectional large WS frame relay must not deadlock");
+        let _ = c_sink.close().await;
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn head_preserves_content_length_and_layered_or_unknown_content_encoding_preserved() {
+        use std::io::Write;
+
+        let plain_layered = "MultiLayerEncodedBody-1234567890";
+        let gzipped = {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(plain_layered.as_bytes()).unwrap();
+            enc.finish().unwrap()
+        };
+        let gzip_then_zstd = zstd::encode_all(gzipped.as_slice(), 3).unwrap();
+        let unknown_inner = b"OPAQUE_CUSTOM_STREAM";
+        let custom_then_zstd = zstd::encode_all(unknown_inner.as_slice(), 3).unwrap();
+        let raw_custom = b"RAW_UNKNOWN_ENCODING_BYTES";
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream_listener.accept().await else {
+                    break;
+                };
+                let gzip_then_zstd = gzip_then_zstd.clone();
+                let custom_then_zstd = custom_then_zstd.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    if req_str.starts_with("HEAD ") {
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n";
+                        sock.write_all(head.as_bytes()).await.unwrap();
+                    } else if req_str.contains("/multi-gzip-zstd") {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: gzip, zstd\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            gzip_then_zstd.len()
+                        );
+                        sock.write_all(head.as_bytes()).await.unwrap();
+                        sock.write_all(&gzip_then_zstd).await.unwrap();
+                    } else if req_str.contains("/partial-custom-zstd") {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Encoding: x-custom, zstd\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            custom_then_zstd.len()
+                        );
+                        sock.write_all(head.as_bytes()).await.unwrap();
+                        sock.write_all(&custom_then_zstd).await.unwrap();
+                    } else if req_str.contains("/unknown-enc") {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Encoding: x-custom-enc\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            raw_custom.len()
+                        );
+                        sock.write_all(head.as_bytes()).await.unwrap();
+                        sock.write_all(raw_custom).await.unwrap();
+                    }
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-head-ce-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("head-ce.sqlite")).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            store,
+            upstream_client: build_upstream_client(false).unwrap(),
+            upstream_redirect_client: build_upstream_client(true).unwrap(),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(0),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_ctx = ctx.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await else {
+                    break;
+                };
+                let c = proxy_ctx.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let inner_c = c.clone();
+                        async move {
+                            Ok::<_, Infallible>(
+                                handle_outer_proxy_request(req, client_addr, None, inner_c).await,
+                            )
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, service)
+                        .await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap();
+
+        // 1. HEAD preserves original Content-Length: 4096
+        let head_resp = client
+            .head(format!("http://{upstream_addr}/file.bin"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head_resp.status(), StatusCode::OK);
+        assert_eq!(
+            head_resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok()),
+            Some("4096")
+        );
+
+        // 2. Multi-layer gzip, zstd -> both layers decoded, Content-Encoding removed
+        let multi_resp = client
+            .get(format!("http://{upstream_addr}/multi-gzip-zstd"))
+            .send()
+            .await
+            .unwrap();
+        assert!(multi_resp.headers().get("content-encoding").is_none());
+        assert_eq!(multi_resp.text().await.unwrap(), plain_layered);
+
+        // 3. Partial x-custom, zstd -> zstd peeled, x-custom preserved
+        let partial_resp = client
+            .get(format!("http://{upstream_addr}/partial-custom-zstd"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            partial_resp
+                .headers()
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("x-custom")
+        );
+        assert_eq!(partial_resp.bytes().await.unwrap().as_ref(), unknown_inner);
+
+        // 4. Unknown Content-Encoding preserved verbatim with original bytes
+        let unknown_resp = client
+            .get(format!("http://{upstream_addr}/unknown-enc"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            unknown_resp
+                .headers()
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("x-custom-enc")
+        );
+        assert_eq!(unknown_resp.bytes().await.unwrap().as_ref(), raw_custom);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn set_bind_configuration_rolls_back_sysproxy_on_double_bind_failure() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-bind-rollback-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("bind-rollback.sqlite")).unwrap());
+        let os_backend = RecordingOsProxyBackend::new();
+        let sysproxy = Arc::new(SystemProxyManager::with_backend(
+            &tmp_dir,
+            os_backend.clone(),
+        ));
+
+        let controller = ProxyEngineController::new_for_test(
+            ca,
+            rules,
+            filters,
+            store,
+            sysproxy,
+        )
+        .unwrap();
+
+        let started = controller
+            .start("127.0.0.1".to_string(), 0)
+            .await
+            .expect("start loopback proxy");
+        assert!(started.running);
+        assert!(started.system_proxy_enabled);
+
+        // Simulate previous bound interface becoming unavailable (e.g. Wi-Fi disconnected)
+        {
+            let mut guard = controller.lock_runtime();
+            guard.bind_mode = BindHostMode::Specific;
+            guard.specific_bind_ip = Some("203.0.113.1".to_string());
+            guard.also_bind_loopback = false;
+            guard.bound_ips = vec!["203.0.113.1".to_string()];
+        }
+
+        // Switching to another unbindable IP causes primary + fallback binds to fail
+        let err = controller
+            .set_bind_configuration(
+                BindHostMode::Specific,
+                Some("203.0.113.2".to_string()),
+                false,
+            )
+            .await
+            .expect_err("double bind failure must return error");
+        let _ = err;
+
+        let post_status = controller.status().await;
+        assert!(!post_status.running);
+        assert!(
+            !post_status.system_proxy_enabled,
+            "OS system proxy must be rolled back on double bind failure"
+        );
+        assert!(os_backend.active.lock().unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
