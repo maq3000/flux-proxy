@@ -80,3 +80,6 @@ dumps/
 ehthumbs.db
 Thumbs.db
 [Dd]esktop.ini
+
+# --- Internal / Private Audit Documentation ---
+PROJECT_CONTEXT_AND_AUDIT.md
