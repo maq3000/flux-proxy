@@ -17,18 +17,86 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::models::{
-    HeaderMutationDirection, HeaderPair, SessionDetail, SessionSummary, WebSocketFrameRecord,
+    HeaderMutationDirection, HeaderPair, SessionDetail, SessionSummary, SessionTimings,
+    SessionTransferStats, WebSocketFrameRecord,
 };
 use crate::proxy::filters::is_alt_svc_header;
 use crate::proxy::network::normalize_client_ip;
 use crate::proxy::process::ClientProcessInfo;
+use crate::proxy::upstream_client::{
+    duration_ms_f64, elapsed_ms, estimate_request_headers_bytes, estimate_response_headers_bytes,
+    extract_peer_cert_subject_issuer, format_rfc3339_micros, format_tls_cipher,
+    format_tls_protocol, timestamp_at_instant,
+};
 
 use super::http_handler::format_error_chain;
 use super::{
-    boxed_full, extract_hyper_headers, is_hop_by_hop_header, plain_response,
-    record_and_return_error, record_completed_session, ProxyBoxBody, SharedProxyContext,
-    MAX_CAPTURED_BODY_BYTES,
+    boxed_full, extract_hyper_headers, format_mitm_tls_display, format_raw_http_version,
+    is_hop_by_hop_header, plain_response, record_and_return_error, record_completed_session,
+    ClientConnContext, ProxyBoxBody, SharedProxyContext, MAX_CAPTURED_BODY_BYTES,
 };
+
+struct WsServerConnTelemetry {
+    server_addr: Option<String>,
+    server_ip: Option<String>,
+    server_port: Option<u16>,
+    server_tls_version: Option<String>,
+    server_tls_cipher: Option<String>,
+    server_tls_alpn: Option<String>,
+    server_cert_subject: Option<String>,
+    server_cert_issuer: Option<String>,
+}
+
+fn extract_ws_server_telemetry(
+    stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+) -> WsServerConnTelemetry {
+    match stream {
+        tokio_tungstenite::MaybeTlsStream::Plain(tcp) => {
+            let peer = tcp.peer_addr().ok();
+            WsServerConnTelemetry {
+                server_addr: peer.map(|a| a.to_string()),
+                server_ip: peer.map(|a| a.ip().to_string()),
+                server_port: peer.map(|a| a.port()),
+                server_tls_version: None,
+                server_tls_cipher: None,
+                server_tls_alpn: None,
+                server_cert_subject: None,
+                server_cert_issuer: None,
+            }
+        }
+        tokio_tungstenite::MaybeTlsStream::Rustls(tls) => {
+            let (tcp, conn) = tls.get_ref();
+            let peer = tcp.peer_addr().ok();
+            let (cert_subject, cert_issuer) = conn
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .map(|leaf| extract_peer_cert_subject_issuer(leaf.as_ref()))
+                .unwrap_or((None, None));
+            WsServerConnTelemetry {
+                server_addr: peer.map(|a| a.to_string()),
+                server_ip: peer.map(|a| a.ip().to_string()),
+                server_port: peer.map(|a| a.port()),
+                server_tls_version: conn.protocol_version().map(format_tls_protocol),
+                server_tls_cipher: conn.negotiated_cipher_suite().map(format_tls_cipher),
+                server_tls_alpn: conn
+                    .alpn_protocol()
+                    .map(|b| String::from_utf8_lossy(b).into_owned()),
+                server_cert_subject: cert_subject,
+                server_cert_issuer: cert_issuer,
+            }
+        }
+        _ => WsServerConnTelemetry {
+            server_addr: None,
+            server_ip: None,
+            server_port: None,
+            server_tls_version: None,
+            server_tls_cipher: None,
+            server_tls_alpn: None,
+            server_cert_subject: None,
+            server_cert_issuer: None,
+        },
+    }
+}
 
 /// Intercepts `ws://` and decrypted `wss://` WebSocket connections, relaying frames
 /// bidirectionally while recording frame metadata in `TrafficStore`.
@@ -47,9 +115,14 @@ pub(super) async fn handle_websocket_intercept(
     timestamp: String,
     client_addr: SocketAddr,
     client_proc: Option<ClientProcessInfo>,
+    client_conn: ClientConnContext,
     ctx: Arc<SharedProxyContext>,
 ) -> Response<ProxyBoxBody> {
     let start = Instant::now();
+    let start_utc = Utc::now();
+    let req_begin_at = format_rfc3339_micros(start_utc);
+    let client_http_ver = format_raw_http_version(req.version()).to_string();
+    let (client_reused, client_tls_ms) = client_conn.claim_request_seq();
     let ws_scheme = if scheme == "https" { "wss" } else { "ws" };
     let ws_url = format!("{ws_scheme}://{host_header}{path_and_query}");
 
@@ -65,6 +138,8 @@ pub(super) async fn handle_websocket_intercept(
         &full_url,
         &mut req_headers,
     );
+    let req_headers_bytes =
+        estimate_request_headers_bytes("GET", &path_and_query, &client_http_ver, &req_headers);
 
     let ws_req = match build_upstream_websocket_request(&ws_url, &req_headers) {
         Ok(request) => request,
@@ -91,6 +166,8 @@ pub(super) async fn handle_websocket_intercept(
     };
 
     let connect_timeout = Duration::from_secs(ctx.upstream_timeout_sec.max(1));
+    let ws_connect_start = Instant::now();
+    let proxy_begin_at = timestamp_at_instant(start, start_utc, ws_connect_start);
     let (upstream_ws, upstream_handshake_resp) = match tokio::time::timeout(
         connect_timeout,
         tokio_tungstenite::connect_async(ws_req),
@@ -100,6 +177,10 @@ pub(super) async fn handle_websocket_intercept(
         Ok(Ok(pair)) => pair,
         Ok(Err(tokio_tungstenite::tungstenite::Error::Http(http_resp))) => {
             let status = http_resp.status();
+            let got_resp_instant = Instant::now();
+            let got_resp_at = timestamp_at_instant(start, start_utc, got_resp_instant);
+            let handshake_ms = duration_ms_f64(got_resp_instant.saturating_duration_since(ws_connect_start));
+            let overall_ms = elapsed_ms(start);
             let mut resp_headers = extract_hyper_headers(http_resp.headers());
             let resp_mutated = ctx.filters.apply_header_mutations(
                 HeaderMutationDirection::Response,
@@ -107,13 +188,50 @@ pub(super) async fn handle_websocket_intercept(
                 &mut resp_headers,
             );
             let resp_bytes = Bytes::from(http_resp.into_body().unwrap_or_default());
+            let resp_headers_bytes =
+                estimate_response_headers_bytes(status.as_u16(), "HTTP/1.1", &resp_headers);
             let content_type = resp_headers
                 .iter()
                 .find(|h| h.name.eq_ignore_ascii_case("content-type"))
                 .map(|h| h.value.clone())
                 .unwrap_or_else(|| "text/plain".to_string());
 
-            let summary = SessionSummary {
+            let timings = SessionTimings {
+                client_connected: Some(client_conn.connected_at.clone()),
+                client_begin_request: Some(req_begin_at.clone()),
+                got_request_headers: Some(req_begin_at.clone()),
+                client_done_request: Some(req_begin_at),
+                proxy_begin_request: Some(proxy_begin_at),
+                got_response_headers: Some(got_resp_at.clone()),
+                server_done_response: Some(got_resp_at.clone()),
+                client_begin_response: Some(got_resp_at.clone()),
+                client_done_response: Some(got_resp_at),
+                client_read_ms: Some(0.0),
+                client_tls_handshake_ms: client_tls_ms,
+                server_wait_ms: Some(handshake_ms),
+                overall_elapsed_ms: Some(overall_ms),
+                net_elapsed_ms: Some(overall_ms),
+                ..Default::default()
+            };
+            let transfer_stats = SessionTransferStats {
+                request_headers_bytes: Some(req_headers_bytes),
+                request_body_bytes: Some(0),
+                request_wire_body_bytes: Some(0),
+                response_headers_bytes: Some(resp_headers_bytes),
+                response_body_bytes: Some(resp_bytes.len()),
+                response_wire_body_bytes: Some(resp_bytes.len()),
+                client_conn_id: Some(client_conn.conn_id),
+                client_conn_reused: Some(client_reused),
+                client_http_version: Some(client_http_ver),
+                client_tls_version: client_conn.client_tls_version.clone(),
+                client_tls_cipher: client_conn.client_tls_cipher.clone(),
+                client_alpn: client_conn.client_alpn.clone(),
+                server_http_version: Some("HTTP/1.1".to_string()),
+                server_conn_reused: Some(false),
+                ..Default::default()
+            };
+
+            let mut summary = SessionSummary {
                 id: session_id,
                 status: status.as_u16(),
                 protocol: ws_scheme.to_ascii_uppercase(),
@@ -139,7 +257,17 @@ pub(super) async fn handle_websocket_intercept(
                 marked_color: None,
                 client_ip: Some(normalize_client_ip(client_addr)),
                 remapped_to: None,
+                ttfb_ms: None,
+                dns_ms: None,
+                connect_ms: None,
+                tls_ms: None,
+                receive_ms: None,
+                request_size: None,
+                wire_body_size: None,
+                server_ip: None,
+                server_conn_reused: None,
             };
+            summary.apply_telemetry(Some(&timings), Some(&transfer_stats));
 
             let capped = &resp_bytes[..resp_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
             let detail = SessionDetail {
@@ -150,16 +278,19 @@ pub(super) async fn handle_websocket_intercept(
                 response_body_base64: base64::engine::general_purpose::STANDARD.encode(capped),
                 request_body_text: None,
                 response_body_text: std::str::from_utf8(capped).ok().map(str::to_owned),
-                tls_version: if ws_scheme == "wss" {
-                    Some("TLS 1.3 (WSS MITM)".into())
-                } else {
-                    None
-                },
+                tls_version: format_mitm_tls_display(
+                    ws_scheme,
+                    client_conn.client_tls_version.as_deref(),
+                    Some("WSS"),
+                    None,
+                ),
                 client_addr: client_addr.to_string(),
                 websocket_frames: Vec::new(),
                 sse_events: Vec::new(),
                 body_offloaded: false,
                 request_body_offloaded: false,
+                timings: Some(timings),
+                transfer_stats: Some(transfer_stats),
             };
 
             record_completed_session(&ctx, detail, None, None);
@@ -230,14 +361,64 @@ pub(super) async fn handle_websocket_intercept(
         }
     };
 
+    let got_resp_instant = Instant::now();
+    let got_resp_at = timestamp_at_instant(start, start_utc, got_resp_instant);
+    let handshake_ms =
+        duration_ms_f64(got_resp_instant.saturating_duration_since(ws_connect_start));
+    let overall_init_ms = elapsed_ms(start);
+    let server_tel = extract_ws_server_telemetry(upstream_ws.get_ref());
+
     let mut resp_headers = extract_hyper_headers(upstream_handshake_resp.headers());
     let resp_mutated = ctx.filters.apply_header_mutations(
         HeaderMutationDirection::Response,
         &full_url,
         &mut resp_headers,
     );
+    let resp_headers_bytes = estimate_response_headers_bytes(101, "HTTP/1.1", &resp_headers);
 
-    let summary = SessionSummary {
+    let initial_timings = SessionTimings {
+        client_connected: Some(client_conn.connected_at.clone()),
+        client_begin_request: Some(req_begin_at.clone()),
+        got_request_headers: Some(req_begin_at.clone()),
+        client_done_request: Some(req_begin_at),
+        proxy_begin_request: Some(proxy_begin_at),
+        got_response_headers: Some(got_resp_at.clone()),
+        client_begin_response: Some(got_resp_at),
+        client_read_ms: Some(0.0),
+        client_tls_handshake_ms: client_tls_ms,
+        server_wait_ms: Some(handshake_ms),
+        overall_elapsed_ms: Some(overall_init_ms),
+        net_elapsed_ms: Some(overall_init_ms),
+        ..Default::default()
+    };
+    let initial_stats = SessionTransferStats {
+        request_headers_bytes: Some(req_headers_bytes),
+        request_body_bytes: Some(0),
+        request_wire_body_bytes: Some(0),
+        response_headers_bytes: Some(resp_headers_bytes),
+        response_body_bytes: Some(0),
+        response_wire_body_bytes: Some(0),
+        client_conn_id: Some(client_conn.conn_id),
+        client_conn_reused: Some(client_reused),
+        client_http_version: Some(client_http_ver),
+        client_tls_version: client_conn.client_tls_version.clone(),
+        client_tls_cipher: client_conn.client_tls_cipher.clone(),
+        client_alpn: client_conn.client_alpn.clone(),
+        server_addr: server_tel.server_addr,
+        server_ip: server_tel.server_ip,
+        server_port: server_tel.server_port,
+        server_conn_reused: Some(false),
+        server_http_version: Some("HTTP/1.1".to_string()),
+        server_tls_version: server_tel.server_tls_version,
+        server_tls_cipher: server_tel.server_tls_cipher,
+        server_tls_alpn: server_tel.server_tls_alpn,
+        server_cert_subject: server_tel.server_cert_subject,
+        server_cert_issuer: server_tel.server_cert_issuer,
+        is_streaming: Some(true),
+        ..Default::default()
+    };
+
+    let mut summary = SessionSummary {
         id: session_id,
         status: 101,
         protocol: ws_scheme.to_ascii_uppercase(),
@@ -263,7 +444,17 @@ pub(super) async fn handle_websocket_intercept(
         marked_color: None,
         client_ip: Some(normalize_client_ip(client_addr)),
         remapped_to: None,
+        ttfb_ms: None,
+        dns_ms: None,
+        connect_ms: None,
+        tls_ms: None,
+        receive_ms: None,
+        request_size: None,
+        wire_body_size: None,
+        server_ip: None,
+        server_conn_reused: None,
     };
+    summary.apply_telemetry(Some(&initial_timings), Some(&initial_stats));
 
     let initial_detail = SessionDetail {
         summary: summary.clone(),
@@ -273,16 +464,19 @@ pub(super) async fn handle_websocket_intercept(
         response_body_base64: String::new(),
         request_body_text: None,
         response_body_text: Some("[WebSocket Tunnel Established — Inspect Frames]".into()),
-        tls_version: if ws_scheme == "wss" {
-            Some("TLS 1.3 (WSS MITM)".into())
-        } else {
-            None
-        },
+        tls_version: format_mitm_tls_display(
+            ws_scheme,
+            client_conn.client_tls_version.as_deref(),
+            Some("WSS"),
+            None,
+        ),
         client_addr: client_addr.to_string(),
         websocket_frames: Vec::new(),
         sse_events: Vec::new(),
         body_offloaded: false,
         request_body_offloaded: false,
+        timings: Some(initial_timings),
+        transfer_stats: Some(initial_stats),
     };
 
     record_completed_session(&ctx, initial_detail, None, None);
@@ -314,14 +508,18 @@ pub(super) async fn handle_websocket_intercept(
             }
             let recorded_count = Arc::new(AtomicUsize::new(0));
             let total_bytes = Arc::new(AtomicUsize::new(0));
+            let tx_bytes = Arc::new(AtomicUsize::new(0));
+            let rx_bytes = Arc::new(AtomicUsize::new(0));
 
             let c2u_recorded = Arc::clone(&recorded_count);
             let c2u_bytes = Arc::clone(&total_bytes);
+            let c2u_tx = Arc::clone(&tx_bytes);
             let c2u_ctx = Arc::clone(&ctx);
             let client_to_upstream = async move {
                 while let Some(Ok(msg)) = client_stream.next().await {
-                    let new_total =
-                        c2u_bytes.fetch_add(msg.len(), Ordering::Relaxed) + msg.len();
+                    let msg_len = msg.len();
+                    c2u_tx.fetch_add(msg_len, Ordering::Relaxed);
+                    let new_total = c2u_bytes.fetch_add(msg_len, Ordering::Relaxed) + msg_len;
                     let frame = try_claim_ws_frame_index(&c2u_recorded, MAX_WS_FRAMES)
                         .map(|prev| record_ws_frame(prev + 1, "outbound", &msg));
                     if let Some(updated_summary) =
@@ -344,11 +542,13 @@ pub(super) async fn handle_websocket_intercept(
 
             let u2c_recorded = Arc::clone(&recorded_count);
             let u2c_bytes = Arc::clone(&total_bytes);
+            let u2c_rx = Arc::clone(&rx_bytes);
             let u2c_ctx = Arc::clone(&ctx);
             let upstream_to_client = async move {
                 while let Some(Ok(msg)) = upstream_stream.next().await {
-                    let new_total =
-                        u2c_bytes.fetch_add(msg.len(), Ordering::Relaxed) + msg.len();
+                    let msg_len = msg.len();
+                    u2c_rx.fetch_add(msg_len, Ordering::Relaxed);
+                    let new_total = u2c_bytes.fetch_add(msg_len, Ordering::Relaxed) + msg_len;
                     let frame = try_claim_ws_frame_index(&u2c_recorded, MAX_WS_FRAMES)
                         .map(|prev| record_ws_frame(prev + 1, "inbound", &msg));
                     if let Some(updated_summary) =
@@ -374,7 +574,34 @@ pub(super) async fn handle_websocket_intercept(
                 _ = upstream_to_client => {}
             }
 
-            if let Some(final_summary) = ctx.store.finalize_ws_stream(session_id) {
+            let _ = ctx.store.finalize_ws_stream(session_id);
+            let end_instant = Instant::now();
+            let done_at = timestamp_at_instant(start, start_utc, end_instant);
+            let overall_ms = elapsed_ms(start);
+            let relay_ms = duration_ms_f64(end_instant.saturating_duration_since(got_resp_instant));
+            let final_tx = tx_bytes.load(Ordering::Relaxed);
+            let final_rx = rx_bytes.load(Ordering::Relaxed);
+
+            if let Some(final_summary) = ctx.store.update_session_telemetry(session_id, |detail| {
+                detail.summary.duration_ms = start.elapsed().as_millis() as u64;
+                let timings = detail.timings.get_or_insert_with(Default::default);
+                timings.server_done_response = Some(done_at.clone());
+                timings.client_done_response = Some(done_at);
+                timings.content_download_ms = Some(relay_ms);
+                timings.overall_elapsed_ms = Some(overall_ms);
+                timings.net_elapsed_ms = Some(overall_ms);
+
+                let stats = detail.transfer_stats.get_or_insert_with(Default::default);
+                stats.request_wire_body_bytes = Some(final_tx);
+                stats.request_body_bytes = Some(final_tx);
+                stats.response_wire_body_bytes = Some(final_rx);
+                stats.response_body_bytes = Some(final_rx);
+                let timings_clone = detail.timings.clone();
+                let stats_clone = detail.transfer_stats.clone();
+                detail
+                    .summary
+                    .apply_telemetry(timings_clone.as_ref(), stats_clone.as_ref());
+            }) {
                 let _ = ctx.event_tx.send(final_summary);
             }
         }

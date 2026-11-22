@@ -3,7 +3,8 @@ use chrono::{SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::models::{
-    HeaderPair, ProxyError, SessionDetail, SessionSummary, SseEventRecord, WebSocketFrameRecord,
+    HeaderPair, ProxyError, SessionDetail, SessionSummary, SessionTimings, SessionTransferStats,
+    SseEventRecord, WebSocketFrameRecord,
 };
 
 use super::raw::{canonical_status_reason, decode_detail_body_bytes, find_header_value};
@@ -390,10 +391,16 @@ pub struct FluxProxyHarExt {
     pub tls_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_body_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remapped_to: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub websocket_frames: Vec<WebSocketFrameRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sse_events: Vec<SseEventRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<SessionTimings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_stats: Option<SessionTransferStats>,
 }
 
 // ============================================================================
@@ -552,10 +559,81 @@ pub fn deserialize_json_or_har(json_str: &str) -> Result<Vec<SessionDetail>, Pro
     Ok(vec![single])
 }
 
+pub(super) fn build_har_timings(detail: &SessionDetail, total_ms: f64) -> HarTimings {
+    let Some(t) = detail.timings.as_ref() else {
+        return HarTimings {
+            blocked: -1.0,
+            dns: -1.0,
+            connect: -1.0,
+            send: 0.0,
+            wait: total_ms,
+            receive: 0.0,
+            ssl: -1.0,
+            comment: None,
+        };
+    };
+
+    let server_reused = detail
+        .transfer_stats
+        .as_ref()
+        .and_then(|st| st.server_conn_reused)
+        .unwrap_or(false);
+
+    let (dns, connect, ssl) = if server_reused {
+        (-1.0, -1.0, -1.0)
+    } else {
+        let dns = t.dns_ms.filter(|v| *v >= 0.0).unwrap_or(-1.0);
+        let ssl = t.tls_handshake_ms.filter(|v| *v >= 0.0).unwrap_or(-1.0);
+        // HAR 1.2 spec: `connect` is total time to establish connection including `ssl` handshake.
+        let connect = if t.tcp_connect_ms.is_some() || t.tls_handshake_ms.is_some() {
+            t.tcp_connect_ms.unwrap_or(0.0).max(0.0) + t.tls_handshake_ms.unwrap_or(0.0).max(0.0)
+        } else {
+            -1.0
+        };
+        (dns, connect, ssl)
+    };
+
+    let blocked_candidates = [
+        t.client_read_ms,
+        t.breakpoint_pause_ms,
+        t.script_hook_ms,
+        t.autoresponder_delay_ms,
+        t.proxy_overhead_ms,
+    ];
+    let any_blocked_present = blocked_candidates.iter().any(Option::is_some);
+    let blocked_sum: f64 = blocked_candidates
+        .into_iter()
+        .flatten()
+        .filter(|v| *v >= 0.0)
+        .sum();
+    let blocked = if any_blocked_present && blocked_sum > 0.0 {
+        blocked_sum
+    } else {
+        -1.0
+    };
+
+    HarTimings {
+        blocked,
+        dns,
+        connect,
+        send: t.send_request_ms.unwrap_or(0.0).max(0.0),
+        wait: t.server_wait_ms.unwrap_or(0.0).max(0.0),
+        receive: t.content_download_ms.unwrap_or(0.0).max(0.0),
+        ssl,
+        comment: None,
+    }
+}
+
 pub(super) fn session_to_har_entry(detail: &SessionDetail, pageref: Option<String>) -> HarEntry {
     let s = &detail.summary;
+    let stats_ref = detail.transfer_stats.as_ref();
     let started_date_time = normalize_iso8601_timestamp(&s.timestamp);
-    let total_ms = s.duration_ms as f64;
+    let total_ms = detail
+        .timings
+        .as_ref()
+        .and_then(|t| t.overall_elapsed_ms)
+        .filter(|v| *v > 0.0)
+        .unwrap_or(s.duration_ms as f64);
     let http_version = protocol_to_har_http_version(&s.protocol);
 
     let full_url = ensure_valid_har_url(&s.url, &s.scheme, &s.host, &s.path);
@@ -640,15 +718,46 @@ pub(super) fn session_to_har_entry(detail: &SessionDetail, pageref: Option<Strin
         .unwrap_or("")
         .to_string();
 
-    let req_headers_size = estimate_http_headers_size(
-        &format!("{} {} {}", s.method, s.path, http_version),
-        &detail.request_headers,
-    );
+    let req_headers_size = stats_ref
+        .and_then(|st| st.request_headers_bytes)
+        .map(|b| b as i64)
+        .unwrap_or_else(|| {
+            estimate_http_headers_size(
+                &format!("{} {} {}", s.method, s.path, http_version),
+                &detail.request_headers,
+            )
+        });
     let status_text = canonical_status_reason(s.status).to_string();
-    let resp_headers_size = estimate_http_headers_size(
-        &format!("{} {} {}", http_version, s.status, status_text),
-        &detail.response_headers,
-    );
+    let resp_headers_size = stats_ref
+        .and_then(|st| st.response_headers_bytes)
+        .map(|b| b as i64)
+        .unwrap_or_else(|| {
+            estimate_http_headers_size(
+                &format!("{} {} {}", http_version, s.status, status_text),
+                &detail.response_headers,
+            )
+        });
+    let req_wire_body_size = stats_ref
+        .and_then(|st| st.request_wire_body_bytes)
+        .map(|b| b as i64)
+        .unwrap_or(req_bytes.len() as i64);
+    let resp_wire_body_size = stats_ref
+        .and_then(|st| st.response_wire_body_bytes)
+        .or(s.wire_body_size)
+        .map(|b| b as i64)
+        .unwrap_or(resp_bytes.len() as i64);
+    let content_compression = if resp_wire_body_size >= 0 && content_size > resp_wire_body_size {
+        Some(content_size - resp_wire_body_size)
+    } else {
+        None
+    };
+    let timings = build_har_timings(detail, total_ms);
+    let server_ip_address = stats_ref
+        .and_then(|st| st.server_ip.clone())
+        .or_else(|| s.server_ip.clone());
+    let connection = stats_ref
+        .and_then(|st| st.server_conn_id)
+        .map(|id| id.to_string());
 
     let start_epoch_sec = chrono::DateTime::parse_from_rfc3339(&started_date_time)
         .map(|dt| dt.timestamp_millis() as f64 / 1000.0)
@@ -712,8 +821,11 @@ pub(super) fn session_to_har_entry(detail: &SessionDetail, pageref: Option<Strin
         } else {
             Some(base64::engine::general_purpose::STANDARD.encode(&req_bytes))
         },
+        remapped_to: s.remapped_to.clone(),
         websocket_frames: detail.websocket_frames.clone(),
         sse_events: detail.sse_events.clone(),
+        timings: detail.timings.clone(),
+        transfer_stats: detail.transfer_stats.clone(),
     };
 
     HarEntry {
@@ -741,7 +853,7 @@ pub(super) fn session_to_har_entry(detail: &SessionDetail, pageref: Option<Strin
             query_string,
             post_data,
             headers_size: req_headers_size,
-            body_size: req_bytes.len() as i64,
+            body_size: req_wire_body_size,
             comment: None,
         },
         response: HarResponse {
@@ -760,7 +872,7 @@ pub(super) fn session_to_har_entry(detail: &SessionDetail, pageref: Option<Strin
                 .collect(),
             content: HarContent {
                 size: content_size,
-                compression: None,
+                compression: content_compression,
                 mime_type: resp_mime,
                 text: content_text,
                 encoding: content_encoding,
@@ -768,27 +880,197 @@ pub(super) fn session_to_har_entry(detail: &SessionDetail, pageref: Option<Strin
             },
             redirect_url,
             headers_size: resp_headers_size,
-            body_size: resp_bytes.len() as i64,
+            body_size: resp_wire_body_size,
             comment: None,
         },
         cache: HarCache::default(),
-        timings: HarTimings {
-            blocked: -1.0,
-            dns: -1.0,
-            connect: -1.0,
-            send: 0.0,
-            wait: total_ms,
-            receive: 0.0,
-            ssl: -1.0,
-            comment: None,
-        },
-        server_ip_address: None,
-        connection: None,
+        timings,
+        server_ip_address,
+        connection,
         comment: s.comment.clone(),
         resource_type,
         web_socket_messages,
         flux_proxy: Some(flux_ext),
     }
+}
+
+pub(super) fn reconstruct_timings_from_har(
+    entry: &HarEntry,
+    timestamp_iso: &str,
+) -> Option<SessionTimings> {
+    let t = &entry.timings;
+    let has_any = t.dns >= 0.0
+        || t.connect >= 0.0
+        || t.ssl >= 0.0
+        || t.blocked >= 0.0
+        || t.send > 0.0
+        || t.wait > 0.0
+        || t.receive > 0.0
+        || entry.time > 0.0;
+    if !has_any {
+        return None;
+    }
+
+    let start_dt = parse_timestamp_utc(timestamp_iso);
+    let client_begin_request = start_dt
+        .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Micros, true))
+        .or_else(|| Some(timestamp_iso.to_string()));
+
+    let dns_ms = (t.dns >= 0.0).then_some(t.dns);
+    let tls_handshake_ms = (t.ssl >= 0.0).then_some(t.ssl);
+    let tcp_connect_ms =
+        (t.connect >= 0.0).then_some((t.connect - tls_handshake_ms.unwrap_or(0.0)).max(0.0));
+    let send_request_ms = (t.send >= 0.0).then_some(t.send);
+    let server_wait_ms = (t.wait >= 0.0).then_some(t.wait);
+    let content_download_ms = (t.receive >= 0.0).then_some(t.receive);
+    let proxy_overhead_ms = (t.blocked >= 0.0).then_some(t.blocked);
+
+    let net_components = [
+        dns_ms,
+        tcp_connect_ms,
+        tls_handshake_ms,
+        send_request_ms,
+        server_wait_ms,
+        content_download_ms,
+    ];
+    let net_sum: f64 = net_components.into_iter().flatten().sum();
+    let net_elapsed_ms = net_components.iter().any(Option::is_some).then_some(net_sum);
+
+    let overall_elapsed_ms = if entry.time > 0.0 {
+        Some(entry.time)
+    } else {
+        let total = net_sum + proxy_overhead_ms.unwrap_or(0.0);
+        (total > 0.0).then_some(total)
+    };
+
+    let client_done_response = match (start_dt, overall_elapsed_ms) {
+        (Some(dt), Some(elapsed))
+            if elapsed.is_finite() && (0.0..=315_360_000_000.0).contains(&elapsed) =>
+        {
+            let delta = chrono::TimeDelta::microseconds((elapsed * 1000.0).round() as i64);
+            dt.checked_add_signed(delta)
+                .map(|end| end.to_rfc3339_opts(SecondsFormat::Micros, true))
+        }
+        _ => None,
+    };
+
+    Some(SessionTimings {
+        client_begin_request,
+        client_done_response,
+        dns_ms,
+        tcp_connect_ms,
+        tls_handshake_ms,
+        send_request_ms,
+        server_wait_ms,
+        content_download_ms,
+        proxy_overhead_ms,
+        overall_elapsed_ms,
+        net_elapsed_ms,
+        ..Default::default()
+    })
+}
+
+pub(super) fn reconstruct_transfer_stats_from_har(
+    entry: &HarEntry,
+    req_bytes_len: usize,
+    resp_bytes_len: usize,
+    response_headers: &[HeaderPair],
+) -> Option<SessionTransferStats> {
+    let request_headers_bytes =
+        (entry.request.headers_size >= 0).then_some(entry.request.headers_size as usize);
+    let response_headers_bytes =
+        (entry.response.headers_size >= 0).then_some(entry.response.headers_size as usize);
+    let request_wire_body_bytes =
+        (entry.request.body_size >= 0).then_some(entry.request.body_size as usize);
+    let response_wire_body_bytes = if entry.response.body_size >= 0 {
+        Some(entry.response.body_size as usize)
+    } else if let Some(comp) = entry.response.content.compression {
+        if comp >= 0 && (resp_bytes_len as i64) >= comp {
+            Some((resp_bytes_len as i64 - comp) as usize)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let response_content_encoding = find_header_value(response_headers, "content-encoding")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let server_ip = entry
+        .server_ip_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let server_conn_id = entry
+        .connection
+        .as_deref()
+        .and_then(|c| c.trim().parse::<u64>().ok());
+
+    let server_conn_reused = if entry.timings.connect < 0.0
+        && entry.timings.dns < 0.0
+        && entry.timings.ssl < 0.0
+        && (server_conn_id.is_some()
+            || server_ip.is_some()
+            || entry.connection.as_deref().is_some_and(|c| !c.trim().is_empty()))
+    {
+        Some(true)
+    } else if entry.timings.connect >= 0.0 || entry.timings.dns >= 0.0 {
+        Some(false)
+    } else {
+        None
+    };
+
+    let client_http_version = (!entry.request.http_version.trim().is_empty())
+        .then(|| entry.request.http_version.trim().to_string());
+    let server_http_version = (!entry.response.http_version.trim().is_empty())
+        .then(|| entry.response.http_version.trim().to_string());
+
+    let has_any = request_headers_bytes.is_some()
+        || response_headers_bytes.is_some()
+        || request_wire_body_bytes.is_some()
+        || response_wire_body_bytes.is_some()
+        || response_content_encoding.is_some()
+        || server_ip.is_some()
+        || server_conn_id.is_some()
+        || server_conn_reused.is_some()
+        || client_http_version.is_some()
+        || server_http_version.is_some();
+
+    if !has_any {
+        return None;
+    }
+
+    let req_body = if req_bytes_len > 0 || entry.request.body_size >= 0 {
+        Some(req_bytes_len)
+    } else {
+        None
+    };
+    let resp_body = if resp_bytes_len > 0 {
+        Some(resp_bytes_len)
+    } else if entry.response.content.size >= 0 {
+        Some(entry.response.content.size as usize)
+    } else {
+        None
+    };
+
+    Some(SessionTransferStats {
+        request_headers_bytes,
+        request_body_bytes: req_body,
+        request_wire_body_bytes,
+        response_headers_bytes,
+        response_body_bytes: resp_body,
+        response_wire_body_bytes,
+        response_content_encoding,
+        client_http_version,
+        server_ip,
+        server_conn_id,
+        server_conn_reused,
+        server_http_version,
+        ..Default::default()
+    })
 }
 
 pub(super) fn har_entry_to_session(entry: &HarEntry, fallback_id: u64) -> SessionDetail {
@@ -1001,39 +1283,64 @@ pub(super) fn har_entry_to_session(entry: &HarEntry, fallback_id: u64) -> Sessio
     };
 
     let sse_events = ext.map(|x| x.sse_events.clone()).unwrap_or_default();
+    let timings = ext
+        .and_then(|x| x.timings.clone())
+        .or_else(|| reconstruct_timings_from_har(entry, &timestamp));
+    let transfer_stats = ext
+        .and_then(|x| x.transfer_stats.clone())
+        .or_else(|| {
+            reconstruct_transfer_stats_from_har(
+                entry,
+                req_bytes.len(),
+                body_size,
+                &response_headers,
+            )
+        });
+
+    let mut summary = SessionSummary {
+        id: ext.and_then(|x| x.original_id).unwrap_or(fallback_id),
+        status: entry.response.status,
+        protocol,
+        scheme,
+        method: if entry.request.method.trim().is_empty() {
+            "GET".to_string()
+        } else {
+            entry.request.method.trim().to_uppercase()
+        },
+        host: parsed_host,
+        path: parsed_path,
+        url,
+        content_type,
+        body_size,
+        duration_ms,
+        timestamp,
+        is_mocked: ext.is_some_and(|x| x.is_mocked),
+        matched_rule_id: ext.and_then(|x| x.matched_rule_id.clone()),
+        error: ext.and_then(|x| x.error.clone()),
+        process_name: ext.and_then(|x| x.process_name.clone()),
+        process_pid: ext.and_then(|x| x.process_pid),
+        tls_bypassed: ext.is_some_and(|x| x.tls_bypassed),
+        headers_mutated: ext.is_some_and(|x| x.headers_mutated),
+        breakpoint_paused: None,
+        breakpoint_modified: ext.is_some_and(|x| x.breakpoint_modified),
+        comment: entry.comment.clone(),
+        marked_color: ext.and_then(|x| x.marked_color.clone()),
+        client_ip: ext.and_then(|x| x.client_ip.clone()),
+        remapped_to: ext.and_then(|x| x.remapped_to.clone()),
+        ttfb_ms: None,
+        dns_ms: None,
+        connect_ms: None,
+        tls_ms: None,
+        receive_ms: None,
+        request_size: None,
+        wire_body_size: None,
+        server_ip: None,
+        server_conn_reused: None,
+    };
+    summary.apply_telemetry(timings.as_ref(), transfer_stats.as_ref());
 
     SessionDetail {
-        summary: SessionSummary {
-            id: ext.and_then(|x| x.original_id).unwrap_or(fallback_id),
-            status: entry.response.status,
-            protocol,
-            scheme,
-            method: if entry.request.method.trim().is_empty() {
-                "GET".to_string()
-            } else {
-                entry.request.method.trim().to_uppercase()
-            },
-            host: parsed_host,
-            path: parsed_path,
-            url,
-            content_type,
-            body_size,
-            duration_ms,
-            timestamp,
-            is_mocked: ext.is_some_and(|x| x.is_mocked),
-            matched_rule_id: ext.and_then(|x| x.matched_rule_id.clone()),
-            error: ext.and_then(|x| x.error.clone()),
-            process_name: ext.and_then(|x| x.process_name.clone()),
-            process_pid: ext.and_then(|x| x.process_pid),
-            tls_bypassed: ext.is_some_and(|x| x.tls_bypassed),
-            headers_mutated: ext.is_some_and(|x| x.headers_mutated),
-            breakpoint_paused: None,
-            breakpoint_modified: ext.is_some_and(|x| x.breakpoint_modified),
-            comment: entry.comment.clone(),
-            marked_color: ext.and_then(|x| x.marked_color.clone()),
-            client_ip: ext.and_then(|x| x.client_ip.clone()),
-            remapped_to: None,
-        },
+        summary,
         request_headers,
         response_headers,
         request_body_base64,
@@ -1048,6 +1355,8 @@ pub(super) fn har_entry_to_session(entry: &HarEntry, fallback_id: u64) -> Sessio
         sse_events,
         body_offloaded: false,
         request_body_offloaded: false,
+        timings,
+        transfer_stats,
     }
 }
 

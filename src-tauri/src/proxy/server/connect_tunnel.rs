@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,19 +15,23 @@ use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
-use crate::models::{HeaderPair, SessionDetail, SessionSummary};
+use crate::models::{HeaderPair, SessionDetail, SessionSummary, SessionTimings, SessionTransferStats};
 use crate::proxy::filters::{ConnectTunnelDecision, PassthroughReason};
 use crate::proxy::hosts::HostRemapRegistry;
 use crate::proxy::network::normalize_client_ip;
 use crate::proxy::process::ClientProcessInfo;
 use crate::proxy::throttle::ThrottledStream;
+use crate::proxy::upstream_client::{
+    duration_ms_f64, elapsed_ms, estimate_request_headers_bytes, estimate_response_headers_bytes,
+    format_rfc3339_micros, format_tls_cipher, format_tls_protocol, timestamp_at_instant,
+};
 
 use super::http_handler::handle_intercepted_request;
 use super::mobile_portal::{is_builtin_portal_target, is_virtual_portal_domain};
 use super::{
-    boxed_full, extract_hyper_headers, is_loopback_ip, is_loopback_or_unspecified_host,
-    plain_response, record_and_return_error_with_opts, record_completed_session, split_authority,
-    ProxyBoxBody, SharedProxyContext,
+    boxed_full, extract_hyper_headers, format_raw_http_version, is_loopback_ip,
+    is_loopback_or_unspecified_host, plain_response, record_and_return_error_with_opts,
+    record_completed_session, split_authority, ClientConnContext, ProxyBoxBody, SharedProxyContext,
 };
 
 /// Entry handler for outer proxy TCP connections:
@@ -39,6 +43,7 @@ pub(super) async fn handle_outer_proxy_request(
     req: Request<Incoming>,
     client_addr: SocketAddr,
     client_proc: Option<ClientProcessInfo>,
+    client_conn: ClientConnContext,
     ctx: Arc<SharedProxyContext>,
 ) -> Response<ProxyBoxBody> {
     if req.method() == Method::CONNECT {
@@ -107,9 +112,15 @@ pub(super) async fn handle_outer_proxy_request(
                 ctx.filters.evaluate_connect_tunnel(&host, port)
             {
             let start = Instant::now();
-            let timestamp = Utc::now().to_rfc3339();
+            let start_utc = Utc::now();
+            let timestamp = start_utc.to_rfc3339();
+            let req_begin_at = format_rfc3339_micros(start_utc);
             let session_id = ctx.store.allocate_id();
             let connect_headers = extract_hyper_headers(req.headers());
+            let client_http_ver = format_raw_http_version(req.version()).to_string();
+            let req_headers_bytes =
+                estimate_request_headers_bytes("CONNECT", &authority, &client_http_ver, &connect_headers);
+            let (client_reused, _) = client_conn.claim_request_seq();
             let target_url = format!("https://{authority}/");
             let tunnel_path = format!("Tunnel to {host}:{port}");
 
@@ -146,9 +157,60 @@ pub(super) async fn handle_outer_proxy_request(
                 );
             }
 
-            let upstream_tcp = match TcpStream::connect((connect_host.as_str(), connect_port)).await {
-                Ok(stream) => stream,
-                Err(err) => {
+            let connect_host_clean = connect_host.trim_matches(['[', ']']);
+            let (resolved_addrs, dns_ms): (Vec<SocketAddr>, f64) =
+                if let Ok(ip) = connect_host_clean.parse::<IpAddr>() {
+                    (vec![SocketAddr::new(ip, connect_port)], 0.0)
+                } else {
+                    let dns_start = Instant::now();
+                    match tokio::net::lookup_host((connect_host_clean, connect_port)).await {
+                        Ok(iter) => (iter.collect(), elapsed_ms(dns_start)),
+                        Err(err) => {
+                            return record_and_return_error_with_opts(
+                                &ctx,
+                                session_id,
+                                "https",
+                                "CONNECT",
+                                &host,
+                                &tunnel_path,
+                                &target_url,
+                                connect_headers,
+                                Bytes::new(),
+                                start,
+                                timestamp,
+                                client_addr,
+                                client_proc.as_ref(),
+                                true,
+                                false,
+                                StatusCode::BAD_GATEWAY,
+                                remapped_to,
+                                format!(
+                                    "TLS Passthrough DNS lookup failed for {connect_host}:{connect_port}: {err}"
+                                ),
+                            );
+                        }
+                    }
+                };
+
+            let tcp_start = Instant::now();
+            let mut upstream_tcp_opt = None;
+            let mut last_tcp_err = None;
+            for addr in resolved_addrs {
+                match TcpStream::connect(addr).await {
+                    Ok(stream) => {
+                        let _ = stream.set_nodelay(true);
+                        upstream_tcp_opt = Some(stream);
+                        break;
+                    }
+                    Err(err) => last_tcp_err = Some(err),
+                }
+            }
+            let upstream_tcp = match upstream_tcp_opt {
+                Some(stream) => stream,
+                None => {
+                    let err_detail = last_tcp_err
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "no reachable address".to_string());
                     return record_and_return_error_with_opts(
                         &ctx,
                         session_id,
@@ -168,11 +230,15 @@ pub(super) async fn handle_outer_proxy_request(
                         StatusCode::BAD_GATEWAY,
                         remapped_to,
                         format!(
-                            "TLS Passthrough TCP connect failed for {connect_host}:{connect_port}: {err}"
+                            "TLS Passthrough TCP connect failed for {connect_host}:{connect_port}: {err_detail}"
                         ),
                     );
                 }
             };
+            let tcp_connect_ms = elapsed_ms(tcp_start);
+            let tunnel_start_instant = Instant::now();
+            let server_connected_at = timestamp_at_instant(start, start_utc, tunnel_start_instant);
+            let server_sock = upstream_tcp.peer_addr().ok();
 
             let (protocol_label, mut passthrough_note, mode_header_val, tls_version_label) =
                 match &reason {
@@ -226,7 +292,44 @@ pub(super) async fn handle_outer_proxy_request(
                 });
             }
 
-            let summary = SessionSummary {
+            let resp_headers_bytes =
+                estimate_response_headers_bytes(200, "HTTP/1.1", &resp_headers);
+            let initial_overall = elapsed_ms(start);
+            let initial_timings = SessionTimings {
+                client_connected: Some(client_conn.connected_at.clone()),
+                client_begin_request: Some(req_begin_at.clone()),
+                got_request_headers: Some(req_begin_at.clone()),
+                client_done_request: Some(req_begin_at.clone()),
+                proxy_begin_request: Some(req_begin_at),
+                server_connected: Some(server_connected_at.clone()),
+                server_got_request: Some(server_connected_at.clone()),
+                client_begin_response: Some(server_connected_at),
+                dns_ms: Some(dns_ms),
+                tcp_connect_ms: Some(tcp_connect_ms),
+                overall_elapsed_ms: Some(initial_overall),
+                net_elapsed_ms: Some(initial_overall),
+                ..Default::default()
+            };
+            let initial_stats = SessionTransferStats {
+                request_headers_bytes: Some(req_headers_bytes),
+                request_body_bytes: Some(0),
+                request_wire_body_bytes: Some(0),
+                response_headers_bytes: Some(resp_headers_bytes),
+                response_body_bytes: Some(0),
+                response_wire_body_bytes: Some(0),
+                client_conn_id: Some(client_conn.conn_id),
+                client_conn_reused: Some(client_reused),
+                client_http_version: Some(client_http_ver),
+                server_addr: server_sock.map(|a| a.to_string()),
+                server_ip: server_sock.map(|a| a.ip().to_string()),
+                server_port: server_sock.map(|a| a.port()),
+                server_conn_reused: Some(false),
+                remapped_target: remapped_to.clone(),
+                is_streaming: Some(true),
+                ..Default::default()
+            };
+
+            let mut summary = SessionSummary {
                 id: session_id,
                 status: 200,
                 protocol: protocol_label,
@@ -252,7 +355,17 @@ pub(super) async fn handle_outer_proxy_request(
                 marked_color: None,
                 client_ip: Some(normalize_client_ip(client_addr)),
                 remapped_to,
+                ttfb_ms: None,
+                dns_ms: None,
+                connect_ms: None,
+                tls_ms: None,
+                receive_ms: None,
+                request_size: None,
+                wire_body_size: None,
+                server_ip: None,
+                server_conn_reused: None,
             };
+            summary.apply_telemetry(Some(&initial_timings), Some(&initial_stats));
 
             let detail = SessionDetail {
                 summary: summary.clone(),
@@ -269,6 +382,8 @@ pub(super) async fn handle_outer_proxy_request(
                 sse_events: Vec::new(),
                 body_offloaded: false,
                 request_body_offloaded: false,
+                timings: Some(initial_timings),
+                transfer_stats: Some(initial_stats),
             };
 
             record_completed_session(&ctx, detail, None, None);
@@ -282,13 +397,39 @@ pub(super) async fn handle_outer_proxy_request(
                         match tokio::io::copy_bidirectional(&mut client_io, &mut throttled_upstream).await
                         {
                             Ok((tx_bytes, rx_bytes)) => {
-                                if let Some(mut existing) = ctx.store.get(session_id) {
-                                    existing.summary.body_size =
-                                        (tx_bytes.saturating_add(rx_bytes)) as usize;
-                                    existing.summary.duration_ms =
-                                        start.elapsed().as_millis() as u64;
-                                    let updated_summary = existing.summary.clone();
-                                    ctx.store.insert(existing);
+                                let end_instant = Instant::now();
+                                let done_at = timestamp_at_instant(start, start_utc, end_instant);
+                                let overall_ms = duration_ms_f64(end_instant.saturating_duration_since(start));
+                                let transfer_ms = duration_ms_f64(
+                                    end_instant.saturating_duration_since(tunnel_start_instant),
+                                );
+                                if let Some(updated_summary) =
+                                    ctx.store.update_session_telemetry(session_id, |detail| {
+                                        detail.summary.body_size =
+                                            (tx_bytes.saturating_add(rx_bytes)) as usize;
+                                        detail.summary.duration_ms =
+                                            start.elapsed().as_millis() as u64;
+                                        let timings =
+                                            detail.timings.get_or_insert_with(Default::default);
+                                        timings.server_done_response = Some(done_at.clone());
+                                        timings.client_done_response = Some(done_at);
+                                        timings.content_download_ms = Some(transfer_ms);
+                                        timings.overall_elapsed_ms = Some(overall_ms);
+                                        timings.net_elapsed_ms = Some(overall_ms);
+                                        let stats = detail
+                                            .transfer_stats
+                                            .get_or_insert_with(Default::default);
+                                        stats.request_wire_body_bytes = Some(tx_bytes as usize);
+                                        stats.request_body_bytes = Some(tx_bytes as usize);
+                                        stats.response_wire_body_bytes = Some(rx_bytes as usize);
+                                        stats.response_body_bytes = Some(rx_bytes as usize);
+                                        let timings_clone = detail.timings.clone();
+                                        let stats_clone = detail.transfer_stats.clone();
+                                        detail
+                                            .summary
+                                            .apply_telemetry(timings_clone.as_ref(), stats_clone.as_ref());
+                                    })
+                                {
                                     let _ = ctx.event_tx.send(updated_summary);
                                 }
                             }
@@ -323,6 +464,7 @@ pub(super) async fn handle_outer_proxy_request(
                         }
                     };
 
+                    let tls_accept_start = Instant::now();
                     let acceptor = TlsAcceptor::from(server_cfg);
                     let tls_stream = match acceptor.accept(TokioIo::new(upgraded)).await {
                         Ok(s) => s,
@@ -331,6 +473,7 @@ pub(super) async fn handle_outer_proxy_request(
                             return;
                         }
                     };
+                    let client_tls_handshake_ms = elapsed_ms(tls_accept_start);
 
                     if let ConnectTunnelDecision::Passthrough(reason) =
                         ctx.filters.evaluate_connect_tunnel(&host, port)
@@ -344,12 +487,25 @@ pub(super) async fn handle_outer_proxy_request(
                         return;
                     }
 
-                    let negotiated_alpn = tls_stream
-                        .get_ref()
-                        .1
+                    let client_tls_info = tls_stream.get_ref().1;
+                    let client_tls_version = client_tls_info
+                        .protocol_version()
+                        .map(format_tls_protocol);
+                    let client_tls_cipher = client_tls_info
+                        .negotiated_cipher_suite()
+                        .map(format_tls_cipher);
+                    let negotiated_alpn_opt = client_tls_info
                         .alpn_protocol()
-                        .map(|p| String::from_utf8_lossy(p).to_string())
+                        .map(|p| String::from_utf8_lossy(p).to_string());
+                    let negotiated_alpn = negotiated_alpn_opt
+                        .clone()
                         .unwrap_or_else(|| "http/1.1".to_string());
+                    let mitm_conn = client_conn.with_mitm_tls(
+                        client_tls_handshake_ms,
+                        client_tls_version,
+                        client_tls_cipher,
+                        negotiated_alpn_opt,
+                    );
 
                     let inner_io = TokioIo::new(tls_stream);
                     let authority_host = if host.contains(':') {
@@ -371,6 +527,7 @@ pub(super) async fn handle_outer_proxy_request(
                         let default_host = authority_host.clone();
                         let alpn = negotiated_alpn.clone();
                         let proc_info = client_proc.clone();
+                        let inner_conn = mitm_conn.clone();
                         async move {
                             Ok::<_, Infallible>(
                                 handle_intercepted_request(
@@ -380,6 +537,7 @@ pub(super) async fn handle_outer_proxy_request(
                                     Some(&alpn),
                                     client_addr,
                                     proc_info,
+                                    inner_conn,
                                     req_ctx,
                                 )
                                 .await,
@@ -436,5 +594,6 @@ pub(super) async fn handle_outer_proxy_request(
             .unwrap();
     }
 
-    handle_intercepted_request(req, "http", None, None, client_addr, client_proc, ctx).await
+    handle_intercepted_request(req, "http", None, None, client_addr, client_proc, client_conn, ctx)
+        .await
 }

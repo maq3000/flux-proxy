@@ -422,6 +422,7 @@ export const App: React.FC = () => {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsModalOpen, setShortcutsModalOpen] = useState(false);
   const [hexTriggerSeq, setHexTriggerSeq] = useState(0);
+  const [statisticsTriggerSeq, setStatisticsTriggerSeq] = useState(0);
   const [customRetentionTriggerSeq, setCustomRetentionTriggerSeq] = useState(0);
   const [filterDrawerOpen, setFilterDrawerOpen] = useState(false);
   const [filterDrawerTab, setFilterDrawerTab] =
@@ -2761,6 +2762,13 @@ export const App: React.FC = () => {
     breakpointConfig.rules.some((r) => r.enabled);
   const showInlineSessionDiff =
     selectedIds.length === 2 && !inlineDiffDismissed;
+  const selectedSessions = useMemo(() => {
+    if (selectedIds.length === 0) return [];
+    const byId = new Map(sessions.map((s) => [s.id, s]));
+    return selectedIds
+      .map((id) => byId.get(id))
+      .filter((s): s is SessionSummary => Boolean(s));
+  }, [sessions, selectedIds]);
 
   const renderTrafficGrid = () => (
     <TrafficGrid
@@ -2841,12 +2849,22 @@ export const App: React.FC = () => {
           onSwapPair={swapCompareSessions}
           onAnnotateSession={(id) => openAnnotationFor([id])}
           onExpandModal={() => setDiffModalOpen(true)}
+          onOpenStatistics={() => {
+            setInlineDiffDismissed(true);
+            setStatisticsTriggerSeq((n) => n + 1);
+          }}
           onCloseDiff={() => setInlineDiffDismissed(true)}
         />
       </React.Suspense>
     ) : (
       <SessionInspector
         detail={selectedDetail}
+        selectedSessions={selectedSessions}
+        onSelectSession={(id) => {
+          setInlineDiffDismissed(true);
+          setSelectedId(id);
+        }}
+        statisticsOpenTrigger={statisticsTriggerSeq}
         resolvedTheme={resolvedTheme}
         containerRef={inspectorContainerRef}
         onReturnFocusToGrid={focusTrafficGrid}

@@ -27,6 +27,8 @@ import type {
   ScriptConsoleLogEvent,
   SessionDetail,
   SessionSummary,
+  SessionTimings,
+  SessionTransferStats,
   StorageStats,
   ThrottleConfig,
   ThrottlePreset,
@@ -2413,76 +2415,117 @@ class BrowserPreviewEngine {
               },
             ]
           : [],
-        entries: effectiveList.map((d) => ({
-          pageref: "page_1",
-          startedDateTime: d.summary.timestamp,
-          time: d.summary.durationMs,
-          request: {
-            method: d.summary.method,
-            url: d.summary.url,
-            httpVersion: d.summary.protocol.includes("2")
-              ? "HTTP/2.0"
-              : "HTTP/1.1",
-            cookies: [],
-            headers: d.requestHeaders,
-            queryString: parseQueryParams(d.summary.url),
-            ...(d.requestBodyText
-              ? {
-                  postData: {
-                    mimeType:
-                      d.requestHeaders.find(
-                        (h) => h.name.toLowerCase() === "content-type"
-                      )?.value ?? "application/octet-stream",
-                    params: [],
-                    text: d.requestBodyText,
-                  },
-                }
-              : {}),
-            headersSize: -1,
-            bodySize: d.requestBodyText ? d.requestBodyText.length : 0,
-          },
-          response: {
-            status: d.summary.status,
-            statusText: "OK",
-            httpVersion: d.summary.protocol.includes("2")
-              ? "HTTP/2.0"
-              : "HTTP/1.1",
-            cookies: [],
-            headers: d.responseHeaders,
-            content: {
-              size: d.summary.bodySize,
-              mimeType: d.summary.contentType || "application/octet-stream",
-              ...(d.responseBodyText !== null
-                ? { text: d.responseBodyText }
-                : d.responseBodyBase64
-                  ? { text: d.responseBodyBase64, encoding: "base64" }
-                  : {}),
+        entries: effectiveList.map((d) => {
+          const st = d.transferStats;
+          const t = d.timings;
+          const reused = Boolean(st?.serverConnReused ?? d.summary.serverConnReused);
+          const sslMs =
+            reused || t?.tlsHandshakeMs == null ? -1 : Math.max(0, t.tlsHandshakeMs);
+          const connectMs = reused
+            ? -1
+            : t?.tcpConnectMs != null || t?.tlsHandshakeMs != null
+              ? Math.max(0, t?.tcpConnectMs ?? 0) + Math.max(0, t?.tlsHandshakeMs ?? 0)
+              : -1;
+          const dnsMs =
+            reused || t?.dnsMs == null ? -1 : Math.max(0, t.dnsMs);
+          const blockedParts = [
+            t?.clientReadMs,
+            t?.breakpointPauseMs,
+            t?.scriptHookMs,
+            t?.autoresponderDelayMs,
+            t?.proxyOverheadMs,
+          ].filter((v): v is number => typeof v === "number" && v >= 0);
+          const blockedSum = blockedParts.reduce((a, b) => a + b, 0);
+          const blockedMs =
+            blockedParts.length > 0 && blockedSum > 0 ? blockedSum : -1;
+
+          const reqWireBody =
+            st?.requestWireBodyBytes ??
+            (d.requestBodyText ? d.requestBodyText.length : 0);
+          const respWireBody =
+            st?.responseWireBodyBytes ?? d.summary.wireBodySize ?? d.summary.bodySize;
+          const contentSize = st?.responseBodyBytes ?? d.summary.bodySize;
+          const compression =
+            contentSize > respWireBody ? contentSize - respWireBody : undefined;
+
+          return {
+            pageref: "page_1",
+            startedDateTime: d.summary.timestamp,
+            time: t?.overallElapsedMs ?? d.summary.durationMs,
+            request: {
+              method: d.summary.method,
+              url: d.summary.url,
+              httpVersion: d.summary.protocol.includes("2")
+                ? "HTTP/2.0"
+                : "HTTP/1.1",
+              cookies: [],
+              headers: d.requestHeaders,
+              queryString: parseQueryParams(d.summary.url),
+              ...(d.requestBodyText
+                ? {
+                    postData: {
+                      mimeType:
+                        d.requestHeaders.find(
+                          (h) => h.name.toLowerCase() === "content-type"
+                        )?.value ?? "application/octet-stream",
+                      params: [],
+                      text: d.requestBodyText,
+                    },
+                  }
+                : {}),
+              headersSize: st?.requestHeadersBytes ?? -1,
+              bodySize: reqWireBody,
             },
-            redirectURL: "",
-            headersSize: -1,
-            bodySize: d.summary.bodySize,
-          },
-          cache: {},
-          timings: {
-            blocked: -1,
-            dns: -1,
-            connect: -1,
-            send: 0,
-            wait: d.summary.durationMs,
-            receive: 0,
-            ssl: -1,
-          },
-          comment: d.summary.comment ?? undefined,
-          _fluxProxy: {
-            protocol: d.summary.protocol,
-            scheme: d.summary.scheme,
-            markedColor: d.summary.markedColor,
-            processName: d.summary.processName,
-            processPid: d.summary.processPid,
-            clientIp: d.summary.clientIp ?? null,
-            clientAddr: d.clientAddr,
-          },
-        })),
+            response: {
+              status: d.summary.status,
+              statusText: "OK",
+              httpVersion: d.summary.protocol.includes("2")
+                ? "HTTP/2.0"
+                : "HTTP/1.1",
+              cookies: [],
+              headers: d.responseHeaders,
+              content: {
+                size: contentSize,
+                ...(compression !== undefined ? { compression } : {}),
+                mimeType: d.summary.contentType || "application/octet-stream",
+                ...(d.responseBodyText !== null
+                  ? { text: d.responseBodyText }
+                  : d.responseBodyBase64
+                    ? { text: d.responseBodyBase64, encoding: "base64" }
+                    : {}),
+              },
+              redirectURL: "",
+              headersSize: st?.responseHeadersBytes ?? -1,
+              bodySize: respWireBody,
+            },
+            cache: {},
+            timings: {
+              blocked: blockedMs,
+              dns: dnsMs,
+              connect: connectMs,
+              send: t?.sendRequestMs ?? 0,
+              wait: t ? (t.serverWaitMs ?? 0) : d.summary.durationMs,
+              receive: t?.contentDownloadMs ?? 0,
+              ssl: sslMs,
+            },
+            serverIPAddress: st?.serverIp ?? d.summary.serverIp ?? undefined,
+            connection:
+              st?.serverConnId != null ? String(st.serverConnId) : undefined,
+            comment: d.summary.comment ?? undefined,
+            _fluxProxy: {
+              protocol: d.summary.protocol,
+              scheme: d.summary.scheme,
+              markedColor: d.summary.markedColor,
+              processName: d.summary.processName,
+              processPid: d.summary.processPid,
+              clientIp: d.summary.clientIp ?? null,
+              clientAddr: d.clientAddr,
+              remappedTo: d.summary.remappedTo ?? null,
+              timings: d.timings ?? undefined,
+              transferStats: d.transferStats ?? undefined,
+            },
+          };
+        }),
       },
     };
     const outName =
@@ -2552,14 +2595,141 @@ class BrowserPreviewEngine {
               : encodeTextToBase64(content.text)
             : "";
 
+        const reqHeadersList = Array.isArray(req.headers)
+          ? (req.headers as { name: string; value: string }[])
+          : [];
+        const respHeadersList = Array.isArray(resp.headers)
+          ? (resp.headers as { name: string; value: string }[])
+          : [];
+        const ext = (
+          entry._fluxProxy && typeof entry._fluxProxy === "object"
+            ? entry._fluxProxy
+            : null
+        ) as Record<string, unknown> | null;
+        const rawHarTimings = (
+          entry.timings && typeof entry.timings === "object"
+            ? entry.timings
+            : null
+        ) as Record<string, unknown> | null;
+
+        let importedTimings: SessionTimings | null =
+          ext?.timings && typeof ext.timings === "object"
+            ? (ext.timings as SessionTimings)
+            : null;
+        if (!importedTimings && rawHarTimings) {
+          const dns = Number(rawHarTimings.dns ?? -1);
+          const connect = Number(rawHarTimings.connect ?? -1);
+          const ssl = Number(rawHarTimings.ssl ?? -1);
+          const send = Number(rawHarTimings.send ?? 0);
+          const wait = Number(rawHarTimings.wait ?? 0);
+          const receive = Number(rawHarTimings.receive ?? 0);
+          const blocked = Number(rawHarTimings.blocked ?? -1);
+          const overall = Number(entry.time ?? 0);
+          if (
+            dns >= 0 ||
+            connect >= 0 ||
+            ssl >= 0 ||
+            blocked >= 0 ||
+            send > 0 ||
+            wait > 0 ||
+            receive > 0 ||
+            overall > 0
+          ) {
+            const tcpMs =
+              connect >= 0 ? Math.max(0, connect - Math.max(0, ssl)) : null;
+            importedTimings = {
+              clientBeginRequest: String(
+                entry.startedDateTime ?? new Date().toISOString()
+              ),
+              dnsMs: dns >= 0 ? dns : null,
+              tcpConnectMs: tcpMs,
+              tlsHandshakeMs: ssl >= 0 ? ssl : null,
+              sendRequestMs: send >= 0 ? send : null,
+              serverWaitMs: wait >= 0 ? wait : null,
+              contentDownloadMs: receive >= 0 ? receive : null,
+              proxyOverheadMs: blocked >= 0 ? blocked : null,
+              overallElapsedMs: overall > 0 ? overall : null,
+            };
+          }
+        }
+
+        let importedTransferStats: SessionTransferStats | null =
+          ext?.transferStats && typeof ext.transferStats === "object"
+            ? (ext.transferStats as SessionTransferStats)
+            : null;
+        if (!importedTransferStats) {
+          const serverIpRaw =
+            typeof entry.serverIPAddress === "string"
+              ? entry.serverIPAddress.trim()
+              : "";
+          const connNum =
+            typeof entry.connection === "string" &&
+            /^\d+$/.test(entry.connection.trim())
+              ? Number(entry.connection.trim())
+              : null;
+          const reqHdrSz = Number(req.headersSize ?? -1);
+          const respHdrSz = Number(resp.headersSize ?? -1);
+          const reqBodySz = Number(req.bodySize ?? -1);
+          const respBodySz = Number(resp.bodySize ?? -1);
+          const encodingHdr =
+            respHeadersList.find(
+              (h) => h.name.toLowerCase() === "content-encoding"
+            )?.value ?? null;
+          if (
+            serverIpRaw ||
+            connNum !== null ||
+            reqHdrSz >= 0 ||
+            respHdrSz >= 0 ||
+            respBodySz >= 0 ||
+            encodingHdr
+          ) {
+            const harDns = Number(rawHarTimings?.dns ?? -1);
+            const harConn = Number(rawHarTimings?.connect ?? -1);
+            const harSsl = Number(rawHarTimings?.ssl ?? -1);
+            const serverConnReused =
+              harConn < 0 &&
+              harDns < 0 &&
+              harSsl < 0 &&
+              (connNum !== null || Boolean(serverIpRaw))
+                ? true
+                : harConn >= 0 || harDns >= 0
+                  ? false
+                  : null;
+            importedTransferStats = {
+              requestHeadersBytes: reqHdrSz >= 0 ? reqHdrSz : null,
+              requestWireBodyBytes: reqBodySz >= 0 ? reqBodySz : null,
+              requestBodyBytes: reqText ? new TextEncoder().encode(reqText).length : null,
+              responseHeadersBytes: respHdrSz >= 0 ? respHdrSz : null,
+              responseWireBodyBytes: respBodySz >= 0 ? respBodySz : null,
+              responseBodyBytes: Number(content.size ?? 0),
+              responseContentEncoding: encodingHdr,
+              serverIp: serverIpRaw || null,
+              serverConnId: connNum,
+              serverConnReused,
+            };
+          }
+        }
+
+        const reqTotalBytes =
+          importedTransferStats?.requestHeadersBytes != null ||
+          importedTransferStats?.requestWireBodyBytes != null
+            ? (importedTransferStats?.requestHeadersBytes ?? 0) +
+              (importedTransferStats?.requestWireBodyBytes ??
+                importedTransferStats?.requestBodyBytes ??
+                0)
+            : null;
+
         const detail: SessionDetail = {
           summary: {
             id,
             status: Number(resp.status ?? 200),
-            protocol: String(req.httpVersion ?? "HTTP/1.1").includes("2")
-              ? `${scheme.toUpperCase()}/2`
-              : `${scheme.toUpperCase()}/1.1`,
-            scheme,
+            protocol:
+              typeof ext?.protocol === "string"
+                ? ext.protocol
+                : String(req.httpVersion ?? "HTTP/1.1").includes("2")
+                  ? `${scheme.toUpperCase()}/2`
+                  : `${scheme.toUpperCase()}/1.1`,
+            scheme: typeof ext?.scheme === "string" ? ext.scheme : scheme,
             method: String(req.method ?? "GET").toUpperCase(),
             host,
             path,
@@ -2573,21 +2743,40 @@ class BrowserPreviewEngine {
             isMocked: false,
             matchedRuleId: null,
             error: null,
+            processName:
+              typeof ext?.processName === "string" ? ext.processName : null,
+            processPid:
+              typeof ext?.processPid === "number" ? ext.processPid : null,
             comment: typeof entry.comment === "string" ? entry.comment : null,
+            markedColor:
+              typeof ext?.markedColor === "string" ? ext.markedColor : null,
+            clientIp: typeof ext?.clientIp === "string" ? ext.clientIp : null,
+            remappedTo:
+              typeof ext?.remappedTo === "string" ? ext.remappedTo : null,
+            ttfbMs: importedTimings?.serverWaitMs ?? null,
+            dnsMs: importedTimings?.dnsMs ?? null,
+            connectMs: importedTimings?.tcpConnectMs ?? null,
+            tlsMs: importedTimings?.tlsHandshakeMs ?? null,
+            receiveMs: importedTimings?.contentDownloadMs ?? null,
+            requestSize: reqTotalBytes,
+            wireBodySize:
+              importedTransferStats?.responseWireBodyBytes ?? null,
+            serverIp: importedTransferStats?.serverIp ?? null,
+            serverConnReused:
+              importedTransferStats?.serverConnReused ?? null,
           },
-          requestHeaders: Array.isArray(req.headers)
-            ? (req.headers as { name: string; value: string }[])
-            : [],
-          responseHeaders: Array.isArray(resp.headers)
-            ? (resp.headers as { name: string; value: string }[])
-            : [],
+          requestHeaders: reqHeadersList,
+          responseHeaders: respHeadersList,
           requestBodyBase64: reqText ? encodeTextToBase64(reqText) : "",
           responseBodyBase64: respB64,
           requestBodyText: reqText,
           responseBodyText: respText,
           tlsVersion: scheme === "https" ? "TLS 1.3" : null,
-          clientAddr: "har-import",
+          clientAddr:
+            typeof ext?.clientAddr === "string" ? ext.clientAddr : "har-import",
           websocketFrames: [],
+          timings: importedTimings,
+          transferStats: importedTransferStats,
         };
         const stored = this.insertIntoStoreWithRingBuffer(detail);
         importedSummaries.push(stored.summary);

@@ -9,7 +9,8 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::models::{
-    HeaderPair, ProxyError, SessionDetail, SessionSummary, SseEventRecord, WebSocketFrameRecord,
+    HeaderPair, ProxyError, SessionDetail, SessionSummary, SessionTimings, SessionTransferStats,
+    SseEventRecord, WebSocketFrameRecord,
 };
 
 use super::har::{har_http_version_to_protocol, parse_authority_and_path};
@@ -285,8 +286,32 @@ pub(super) fn build_saz_index_html(sessions: &[SessionDetail], pad_width: usize)
 }
 
 
+fn format_saz_timer_timestamp(ts: Option<&str>, fallback: &str) -> String {
+    if let Some(raw) = ts.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(dt) = parse_timestamp_utc(raw) {
+            return dt.to_rfc3339_opts(SecondsFormat::Micros, true);
+        }
+        return raw.to_string();
+    }
+    fallback.to_string()
+}
+
+fn format_saz_cipher_flag(stats: &SessionTransferStats) -> Option<String> {
+    match (
+        stats.server_tls_version.as_deref().filter(|s| !s.is_empty()),
+        stats.server_tls_cipher.as_deref().filter(|s| !s.is_empty()),
+    ) {
+        (Some(ver), Some(cipher)) => Some(format!("{ver} ({cipher})")),
+        (Some(ver), None) => Some(ver.to_string()),
+        (None, Some(cipher)) => Some(cipher.to_string()),
+        (None, None) => None,
+    }
+}
+
 pub(super) fn build_saz_metadata_xml(detail: &SessionDetail, sid: usize) -> String {
     let s = &detail.summary;
+    let timings = detail.timings.as_ref();
+    let stats = detail.transfer_stats.as_ref();
     let start_dt = parse_timestamp_utc(&s.timestamp).unwrap_or_else(Utc::now);
     let delta =
         TimeDelta::try_milliseconds(s.duration_ms.min(86_400_000 * 365) as i64).unwrap_or_default();
@@ -294,6 +319,70 @@ pub(super) fn build_saz_metadata_xml(detail: &SessionDetail, sid: usize) -> Stri
 
     let start_str = start_dt.to_rfc3339_opts(SecondsFormat::Micros, true);
     let end_str = end_dt.to_rfc3339_opts(SecondsFormat::Micros, true);
+
+    let client_connected = format_saz_timer_timestamp(
+        timings.and_then(|t| t.client_connected.as_deref()),
+        &start_str,
+    );
+    let client_begin_request = format_saz_timer_timestamp(
+        timings.and_then(|t| t.client_begin_request.as_deref()),
+        &start_str,
+    );
+    let got_request_headers = format_saz_timer_timestamp(
+        timings.and_then(|t| t.got_request_headers.as_deref()),
+        &start_str,
+    );
+    let client_done_request = format_saz_timer_timestamp(
+        timings.and_then(|t| t.client_done_request.as_deref()),
+        &start_str,
+    );
+    let server_connected = format_saz_timer_timestamp(
+        timings.and_then(|t| t.server_connected.as_deref()),
+        &start_str,
+    );
+    let fiddler_begin_request = format_saz_timer_timestamp(
+        timings.and_then(|t| t.proxy_begin_request.as_deref()),
+        &start_str,
+    );
+    let server_got_request = format_saz_timer_timestamp(
+        timings.and_then(|t| t.server_got_request.as_deref()),
+        &start_str,
+    );
+    let server_begin_response = format_saz_timer_timestamp(
+        timings.and_then(|t| t.server_begin_response.as_deref()),
+        &end_str,
+    );
+    let got_response_headers = format_saz_timer_timestamp(
+        timings.and_then(|t| t.got_response_headers.as_deref()),
+        &end_str,
+    );
+    let server_done_response = format_saz_timer_timestamp(
+        timings.and_then(|t| t.server_done_response.as_deref()),
+        &end_str,
+    );
+    let client_begin_response = format_saz_timer_timestamp(
+        timings.and_then(|t| t.client_begin_response.as_deref()),
+        &end_str,
+    );
+    let client_done_response = format_saz_timer_timestamp(
+        timings.and_then(|t| t.client_done_response.as_deref()),
+        &end_str,
+    );
+
+    let dns_time_ms = timings
+        .and_then(|t| t.dns_ms)
+        .map(|v| v.max(0.0).round() as i64)
+        .unwrap_or(0);
+    let tcp_connect_time_ms = timings
+        .and_then(|t| t.tcp_connect_ms)
+        .map(|v| v.max(0.0).round() as i64)
+        .unwrap_or(0);
+    let https_handshake_time_ms = timings
+        .and_then(|t| t.tls_handshake_ms)
+        .map(|v| v.max(0.0).round() as i64)
+        .unwrap_or(0);
+    let clt_reuse = stats.and_then(|st| st.client_conn_reused).unwrap_or(false);
+    let srv_reuse = stats.and_then(|st| st.server_conn_reused).unwrap_or(false);
 
     // Fiddler SessionFlags BitFlags: 0x01 = IsHTTPS, 0x10 = ResponseGeneratedByFiddler, 0x800 = IsWebSocketTunnel
     let mut bit_flags: u32 = 0;
@@ -332,6 +421,15 @@ pub(super) fn build_saz_metadata_xml(detail: &SessionDetail, sid: usize) -> Stri
         flags.push(("x-clientport".into(), cport));
     }
 
+    if let Some(host_ip) = stats
+        .and_then(|st| st.server_ip.as_deref())
+        .or(s.server_ip.as_deref())
+    {
+        if !host_ip.is_empty() {
+            flags.push(("x-hostip".into(), host_ip.to_string()));
+        }
+    }
+
     if let Some(comment) = &s.comment {
         if !comment.is_empty() {
             flags.push(("ui-comments".into(), comment.clone()));
@@ -347,6 +445,9 @@ pub(super) fn build_saz_metadata_xml(detail: &SessionDetail, sid: usize) -> Stri
         if !tls.is_empty() {
             flags.push(("x-secureprotocol".into(), tls.clone()));
         }
+    }
+    if let Some(cipher_flag) = stats.and_then(format_saz_cipher_flag) {
+        flags.push(("https-server-cipher".into(), cipher_flag));
     }
 
     // Lossless FluxProxy flags
@@ -367,9 +468,22 @@ pub(super) fn build_saz_metadata_xml(detail: &SessionDetail, sid: usize) -> Stri
     if let Some(err) = &s.error {
         flags.push(("x-fluxproxy-error".into(), err.clone()));
     }
+    if let Some(remapped) = &s.remapped_to {
+        flags.push(("x-fluxproxy-remapped-to".into(), remapped.clone()));
+    }
     if !detail.sse_events.is_empty() {
         if let Ok(sse_json) = serde_json::to_string(&detail.sse_events) {
             flags.push(("x-fluxproxy-sse-events".into(), sse_json));
+        }
+    }
+    if let Some(t) = timings {
+        if let Ok(t_json) = serde_json::to_string(t) {
+            flags.push(("x-fluxproxy-timings".into(), t_json));
+        }
+    }
+    if let Some(st) = stats {
+        if let Ok(st_json) = serde_json::to_string(st) {
+            flags.push(("x-fluxproxy-transfer-stats".into(), st_json));
         }
     }
 
@@ -385,10 +499,22 @@ pub(super) fn build_saz_metadata_xml(detail: &SessionDetail, sid: usize) -> Stri
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n\
         <Session SID=\"{sid}\" BitFlags=\"{bit_flags}\">\r\n\
-          <SessionTimers ClientConnected=\"{start_str}\" ClientBeginRequest=\"{start_str}\" GotRequestHeaders=\"{start_str}\" ClientDoneRequest=\"{start_str}\" GatewayTime=\"0\" DNSTime=\"0\" TCPConnectTime=\"0\" HTTPSHandshakeTime=\"0\" ServerConnected=\"{start_str}\" FiddlerBeginRequest=\"{start_str}\" ServerGotRequest=\"{start_str}\" ServerBeginResponse=\"{end_str}\" GotResponseHeaders=\"{end_str}\" ServerDoneResponse=\"{end_str}\" ClientBeginResponse=\"{end_str}\" ClientDoneResponse=\"{end_str}\" />\r\n\
-          <PipeInfo CltReuse=\"false\" Reused=\"false\" />\r\n\
+          <SessionTimers ClientConnected=\"{client_connected}\" ClientBeginRequest=\"{client_begin_request}\" GotRequestHeaders=\"{got_request_headers}\" ClientDoneRequest=\"{client_done_request}\" GatewayTime=\"0\" DNSTime=\"{dns_time_ms}\" TCPConnectTime=\"{tcp_connect_time_ms}\" HTTPSHandshakeTime=\"{https_handshake_time_ms}\" ServerConnected=\"{server_connected}\" FiddlerBeginRequest=\"{fiddler_begin_request}\" ServerGotRequest=\"{server_got_request}\" ServerBeginResponse=\"{server_begin_response}\" GotResponseHeaders=\"{got_response_headers}\" ServerDoneResponse=\"{server_done_response}\" ClientBeginResponse=\"{client_begin_response}\" ClientDoneResponse=\"{client_done_response}\" />\r\n\
+          <PipeInfo CltReuse=\"{clt_reuse}\" Reused=\"{srv_reuse}\" />\r\n\
           <SessionFlags>\r\n{flags_xml}  </SessionFlags>\r\n\
-        </Session>\r\n"
+        </Session>\r\n",
+        client_connected = xml_escape(&client_connected),
+        client_begin_request = xml_escape(&client_begin_request),
+        got_request_headers = xml_escape(&got_request_headers),
+        client_done_request = xml_escape(&client_done_request),
+        server_connected = xml_escape(&server_connected),
+        fiddler_begin_request = xml_escape(&fiddler_begin_request),
+        server_got_request = xml_escape(&server_got_request),
+        server_begin_response = xml_escape(&server_begin_response),
+        got_response_headers = xml_escape(&got_response_headers),
+        server_done_response = xml_escape(&server_done_response),
+        client_begin_response = xml_escape(&client_begin_response),
+        client_done_response = xml_escape(&client_done_response),
     )
 }
 
@@ -432,11 +558,53 @@ pub(super) fn parse_saz_websocket_log(raw: &str) -> Vec<WebSocketFrameRecord> {
 }
 
 #[derive(Default)]
+pub(super) struct SazParsedTimers {
+    pub(super) client_connected: Option<DateTime<Utc>>,
+    pub(super) client_begin_request: Option<DateTime<Utc>>,
+    pub(super) got_request_headers: Option<DateTime<Utc>>,
+    pub(super) client_done_request: Option<DateTime<Utc>>,
+    pub(super) server_connected: Option<DateTime<Utc>>,
+    pub(super) fiddler_begin_request: Option<DateTime<Utc>>,
+    pub(super) server_got_request: Option<DateTime<Utc>>,
+    pub(super) server_begin_response: Option<DateTime<Utc>>,
+    pub(super) got_response_headers: Option<DateTime<Utc>>,
+    pub(super) server_done_response: Option<DateTime<Utc>>,
+    pub(super) client_begin_response: Option<DateTime<Utc>>,
+    pub(super) client_done_response: Option<DateTime<Utc>>,
+    pub(super) dns_time_ms: Option<f64>,
+    pub(super) tcp_connect_time_ms: Option<f64>,
+    pub(super) https_handshake_time_ms: Option<f64>,
+}
+
+#[derive(Default)]
 pub(super) struct ParsedSazMeta {
     pub(super) bit_flags: u32,
     pub(super) start_time: Option<DateTime<Utc>>,
     pub(super) end_time: Option<DateTime<Utc>>,
+    pub(super) timers: SazParsedTimers,
+    pub(super) clt_reuse: Option<bool>,
+    pub(super) srv_reuse: Option<bool>,
     pub(super) flags: BTreeMap<String, String>,
+}
+
+fn parse_saz_timer_ms_attr(tag: &str, attr: &str) -> Option<f64> {
+    extract_xml_attr(tag, attr)?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+fn parse_xml_bool_attr(tag: &str, attr: &str) -> Option<bool> {
+    let val = extract_xml_attr(tag, attr)?;
+    let trimmed = val.trim();
+    if trimmed.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if trimmed.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 pub(super) fn parse_saz_metadata_xml(xml: &str) -> ParsedSazMeta {
@@ -453,15 +621,52 @@ pub(super) fn parse_saz_metadata_xml(xml: &str) -> ParsedSazMeta {
     }
 
     if let Some(timers_tag) = extract_xml_tag_fragment(cleaned, "SessionTimers") {
-        meta.start_time = ["ClientBeginRequest", "ClientConnected", "FiddlerBeginRequest", "ServerConnected"]
-            .into_iter()
-            .find_map(|attr| extract_xml_attr(timers_tag, attr))
-            .and_then(|v| parse_fiddler_timestamp(&v));
+        meta.timers.client_connected =
+            extract_xml_attr(timers_tag, "ClientConnected").and_then(|v| parse_fiddler_timestamp(&v));
+        meta.timers.client_begin_request =
+            extract_xml_attr(timers_tag, "ClientBeginRequest").and_then(|v| parse_fiddler_timestamp(&v));
+        meta.timers.got_request_headers =
+            extract_xml_attr(timers_tag, "GotRequestHeaders").and_then(|v| parse_fiddler_timestamp(&v));
+        meta.timers.client_done_request =
+            extract_xml_attr(timers_tag, "ClientDoneRequest").and_then(|v| parse_fiddler_timestamp(&v));
+        meta.timers.server_connected =
+            extract_xml_attr(timers_tag, "ServerConnected").and_then(|v| parse_fiddler_timestamp(&v));
+        meta.timers.fiddler_begin_request =
+            extract_xml_attr(timers_tag, "FiddlerBeginRequest").and_then(|v| parse_fiddler_timestamp(&v));
+        meta.timers.server_got_request =
+            extract_xml_attr(timers_tag, "ServerGotRequest").and_then(|v| parse_fiddler_timestamp(&v));
+        meta.timers.server_begin_response =
+            extract_xml_attr(timers_tag, "ServerBeginResponse").and_then(|v| parse_fiddler_timestamp(&v));
+        meta.timers.got_response_headers =
+            extract_xml_attr(timers_tag, "GotResponseHeaders").and_then(|v| parse_fiddler_timestamp(&v));
+        meta.timers.server_done_response =
+            extract_xml_attr(timers_tag, "ServerDoneResponse").and_then(|v| parse_fiddler_timestamp(&v));
+        meta.timers.client_begin_response =
+            extract_xml_attr(timers_tag, "ClientBeginResponse").and_then(|v| parse_fiddler_timestamp(&v));
+        meta.timers.client_done_response =
+            extract_xml_attr(timers_tag, "ClientDoneResponse").and_then(|v| parse_fiddler_timestamp(&v));
+        meta.timers.dns_time_ms = parse_saz_timer_ms_attr(timers_tag, "DNSTime");
+        meta.timers.tcp_connect_time_ms = parse_saz_timer_ms_attr(timers_tag, "TCPConnectTime");
+        meta.timers.https_handshake_time_ms = parse_saz_timer_ms_attr(timers_tag, "HTTPSHandshakeTime");
 
-        meta.end_time = ["ClientDoneResponse", "ServerDoneResponse", "GotResponseHeaders", "ServerBeginResponse"]
-            .into_iter()
-            .find_map(|attr| extract_xml_attr(timers_tag, attr))
-            .and_then(|v| parse_fiddler_timestamp(&v));
+        meta.start_time = meta
+            .timers
+            .client_begin_request
+            .or(meta.timers.client_connected)
+            .or(meta.timers.fiddler_begin_request)
+            .or(meta.timers.server_connected);
+
+        meta.end_time = meta
+            .timers
+            .client_done_response
+            .or(meta.timers.server_done_response)
+            .or(meta.timers.got_response_headers)
+            .or(meta.timers.server_begin_response);
+    }
+
+    if let Some(pipe_tag) = extract_xml_tag_fragment(cleaned, "PipeInfo") {
+        meta.clt_reuse = parse_xml_bool_attr(pipe_tag, "CltReuse");
+        meta.srv_reuse = parse_xml_bool_attr(pipe_tag, "Reused");
     }
 
     let mut search_from = 0usize;
@@ -479,6 +684,206 @@ pub(super) fn parse_saz_metadata_xml(xml: &str) -> ParsedSazMeta {
     }
 
     meta
+}
+
+fn saz_delta_ms(start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> Option<f64> {
+    match (start, end) {
+        (Some(s), Some(e)) => e
+            .signed_duration_since(s)
+            .num_microseconds()
+            .map(|us| ((us as f64 / 1000.0).max(0.0) * 1000.0).round() / 1000.0),
+        _ => None,
+    }
+}
+
+fn dt_opt_to_rfc3339(dt: Option<DateTime<Utc>>) -> Option<String> {
+    dt.map(|v| v.to_rfc3339_opts(SecondsFormat::Micros, true))
+}
+
+fn reconstruct_timings_from_saz(meta: &ParsedSazMeta, scheme: &str) -> Option<SessionTimings> {
+    let t = &meta.timers;
+    let is_https = scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss");
+    let reused = meta.srv_reuse == Some(true);
+
+    let dns_ms = t
+        .dns_time_ms
+        .filter(|v| *v > 0.0 || t.server_connected.is_some() || reused);
+    let tcp_connect_ms = t
+        .tcp_connect_time_ms
+        .filter(|v| *v > 0.0 || t.server_connected.is_some() || reused);
+    let tls_handshake_ms = t
+        .https_handshake_time_ms
+        .filter(|v| *v > 0.0 || (is_https && (t.server_connected.is_some() || reused)));
+
+    let client_read_ms = saz_delta_ms(t.client_begin_request, t.client_done_request);
+    let send_request_ms = saz_delta_ms(
+        t.fiddler_begin_request.or(t.client_done_request),
+        t.server_got_request,
+    );
+    let server_wait_ms = saz_delta_ms(
+        t.server_got_request,
+        t.server_begin_response.or(t.got_response_headers),
+    );
+    let content_download_ms = saz_delta_ms(
+        t.server_begin_response.or(t.got_response_headers),
+        t.server_done_response,
+    );
+    let client_send_ms = saz_delta_ms(t.client_begin_response, t.client_done_response);
+    let overall_elapsed_ms = saz_delta_ms(meta.start_time, meta.end_time);
+
+    let net_parts = [
+        dns_ms,
+        tcp_connect_ms,
+        tls_handshake_ms,
+        send_request_ms,
+        server_wait_ms,
+        content_download_ms,
+    ];
+    let net_elapsed_ms = net_parts
+        .iter()
+        .any(Option::is_some)
+        .then(|| ((net_parts.into_iter().flatten().sum::<f64>()) * 1000.0).round() / 1000.0);
+
+    let has_any = t.client_connected.is_some()
+        || t.client_begin_request.is_some()
+        || t.server_connected.is_some()
+        || t.server_got_request.is_some()
+        || t.client_done_response.is_some()
+        || dns_ms.is_some()
+        || tcp_connect_ms.is_some()
+        || tls_handshake_ms.is_some()
+        || overall_elapsed_ms.is_some();
+
+    if !has_any {
+        return None;
+    }
+
+    Some(SessionTimings {
+        client_connected: dt_opt_to_rfc3339(t.client_connected),
+        client_begin_request: dt_opt_to_rfc3339(t.client_begin_request),
+        got_request_headers: dt_opt_to_rfc3339(t.got_request_headers),
+        client_done_request: dt_opt_to_rfc3339(t.client_done_request),
+        proxy_begin_request: dt_opt_to_rfc3339(t.fiddler_begin_request),
+        server_connected: dt_opt_to_rfc3339(t.server_connected),
+        server_got_request: dt_opt_to_rfc3339(t.server_got_request),
+        server_begin_response: dt_opt_to_rfc3339(t.server_begin_response),
+        got_response_headers: dt_opt_to_rfc3339(t.got_response_headers),
+        server_done_response: dt_opt_to_rfc3339(t.server_done_response),
+        client_begin_response: dt_opt_to_rfc3339(t.client_begin_response),
+        client_done_response: dt_opt_to_rfc3339(t.client_done_response),
+        client_read_ms,
+        dns_ms,
+        tcp_connect_ms,
+        tls_handshake_ms,
+        send_request_ms,
+        server_wait_ms,
+        content_download_ms,
+        client_send_ms,
+        overall_elapsed_ms,
+        net_elapsed_ms,
+        ..Default::default()
+    })
+}
+
+fn parse_saz_cipher_flag(raw: &str) -> (Option<String>, Option<String>) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (None, None);
+    }
+    if let Some((ver, rest)) = trimmed.split_once(" (") {
+        if let Some(cipher) = rest.strip_suffix(')') {
+            let v = ver.trim();
+            let c = cipher.trim();
+            return (
+                (!v.is_empty()).then(|| v.to_string()),
+                (!c.is_empty()).then(|| c.to_string()),
+            );
+        }
+    }
+    if trimmed.to_ascii_uppercase().starts_with("TLS") && !trimmed.contains('_') {
+        (Some(trimmed.to_string()), None)
+    } else {
+        (None, Some(trimmed.to_string()))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_transfer_stats_from_saz(
+    meta: &ParsedSazMeta,
+    client_bytes_len: usize,
+    server_bytes_len: usize,
+    raw_req_body_len: usize,
+    decoded_req_body_len: usize,
+    raw_resp_body_len: usize,
+    decoded_resp_body_len: usize,
+    response_headers: &[HeaderPair],
+    req_http_ver: &str,
+    resp_http_ver: &str,
+) -> Option<SessionTransferStats> {
+    let server_ip = meta
+        .flags
+        .get("x-hostip")
+        .map(|s| s.trim_start_matches("::ffff:").trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let (parsed_tls_ver, parsed_tls_cipher) = meta
+        .flags
+        .get("https-server-cipher")
+        .map(|raw| parse_saz_cipher_flag(raw))
+        .unwrap_or((None, None));
+    let server_tls_version = parsed_tls_ver.or_else(|| {
+        meta.flags
+            .get("x-secureprotocol")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
+
+    let response_content_encoding = find_header_value(response_headers, "content-encoding")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let request_headers_bytes =
+        (client_bytes_len > 0).then(|| client_bytes_len.saturating_sub(raw_req_body_len));
+    let response_headers_bytes =
+        (server_bytes_len > 0).then(|| server_bytes_len.saturating_sub(raw_resp_body_len));
+    let request_wire_body_bytes = (client_bytes_len > 0).then_some(raw_req_body_len);
+    let request_body_bytes = (client_bytes_len > 0).then_some(decoded_req_body_len);
+    let response_wire_body_bytes = (server_bytes_len > 0).then_some(raw_resp_body_len);
+    let response_body_bytes = (server_bytes_len > 0).then_some(decoded_resp_body_len);
+
+    let client_http_version = (!req_http_ver.trim().is_empty()).then(|| req_http_ver.trim().to_string());
+    let server_http_version = (!resp_http_ver.trim().is_empty()).then(|| resp_http_ver.trim().to_string());
+
+    let has_any = server_ip.is_some()
+        || server_tls_version.is_some()
+        || parsed_tls_cipher.is_some()
+        || meta.clt_reuse.is_some()
+        || meta.srv_reuse.is_some()
+        || request_headers_bytes.is_some()
+        || response_headers_bytes.is_some()
+        || response_content_encoding.is_some();
+
+    if !has_any {
+        return None;
+    }
+
+    Some(SessionTransferStats {
+        request_headers_bytes,
+        request_body_bytes,
+        request_wire_body_bytes,
+        response_headers_bytes,
+        response_body_bytes,
+        response_wire_body_bytes,
+        response_content_encoding,
+        client_conn_reused: meta.clt_reuse,
+        client_http_version,
+        server_ip,
+        server_conn_reused: meta.srv_reuse,
+        server_http_version,
+        server_tls_version,
+        server_tls_cipher: parsed_tls_cipher,
+        ..Default::default()
+    })
 }
 
 pub(super) fn build_session_from_saz_parts(
@@ -639,43 +1044,79 @@ pub(super) fn build_session_from_saz_parts(
             }
         });
 
+    let timings = meta
+        .flags
+        .get("x-fluxproxy-timings")
+        .and_then(|raw| serde_json::from_str::<SessionTimings>(raw).ok())
+        .or_else(|| reconstruct_timings_from_saz(&meta, &scheme));
+    let transfer_stats = meta
+        .flags
+        .get("x-fluxproxy-transfer-stats")
+        .and_then(|raw| serde_json::from_str::<SessionTransferStats>(raw).ok())
+        .or_else(|| {
+            reconstruct_transfer_stats_from_saz(
+                &meta,
+                client_bytes.len(),
+                server_bytes.len(),
+                raw_req_body.len(),
+                decoded_req_body.len(),
+                raw_resp_body.len(),
+                decoded_resp_body.len(),
+                &response_headers,
+                &req_http_ver,
+                &resp_http_ver,
+            )
+        });
+
+    let mut summary = SessionSummary {
+        id,
+        status,
+        protocol,
+        scheme,
+        method,
+        host,
+        path,
+        url,
+        content_type,
+        body_size: decoded_resp_body.len(),
+        duration_ms,
+        timestamp,
+        is_mocked,
+        matched_rule_id: meta.flags.get("x-fluxproxy-rule-id").cloned(),
+        error: meta.flags.get("x-fluxproxy-error").cloned(),
+        process_name,
+        process_pid,
+        tls_bypassed: meta
+            .flags
+            .get("x-fluxproxy-tls-bypassed")
+            .is_some_and(|v| v == "true"),
+        headers_mutated: meta
+            .flags
+            .get("x-fluxproxy-headers-mutated")
+            .is_some_and(|v| v == "true"),
+        breakpoint_paused: None,
+        breakpoint_modified: meta
+            .flags
+            .get("x-fluxproxy-bp-modified")
+            .is_some_and(|v| v == "true"),
+        comment,
+        marked_color,
+        client_ip,
+        remapped_to: meta.flags.get("x-fluxproxy-remapped-to").cloned(),
+        ttfb_ms: None,
+        dns_ms: None,
+        connect_ms: None,
+        tls_ms: None,
+        receive_ms: None,
+        request_size: None,
+        wire_body_size: None,
+        server_ip: None,
+        server_conn_reused: None,
+    };
+    summary.apply_telemetry(timings.as_ref(), transfer_stats.as_ref());
+
     Ok(SessionDetail {
-        summary: SessionSummary {
-            id,
-            status,
-            protocol,
-            scheme,
-            method,
-            host,
-            path,
-            url,
-            content_type,
-            body_size: decoded_resp_body.len(),
-            duration_ms,
-            timestamp,
-            is_mocked,
-            matched_rule_id: meta.flags.get("x-fluxproxy-rule-id").cloned(),
-            error: meta.flags.get("x-fluxproxy-error").cloned(),
-            process_name,
-            process_pid,
-            tls_bypassed: meta
-                .flags
-                .get("x-fluxproxy-tls-bypassed")
-                .is_some_and(|v| v == "true"),
-            headers_mutated: meta
-                .flags
-                .get("x-fluxproxy-headers-mutated")
-                .is_some_and(|v| v == "true"),
-            breakpoint_paused: None,
-            breakpoint_modified: meta
-                .flags
-                .get("x-fluxproxy-bp-modified")
-                .is_some_and(|v| v == "true"),
-            comment,
-            marked_color,
-            client_ip,
-            remapped_to: None,
-        },
+        summary,
         request_headers,
         response_headers,
         request_body_base64,
@@ -688,6 +1129,8 @@ pub(super) fn build_session_from_saz_parts(
         sse_events,
         body_offloaded: false,
         request_body_offloaded: false,
+        timings,
+        transfer_stats,
     })
 }
 

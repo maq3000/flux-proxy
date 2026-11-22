@@ -71,6 +71,179 @@ pub struct SessionSummary {
     pub client_ip: Option<String>,
     #[serde(default)]
     pub remapped_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttfb_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receive_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_body_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_conn_reused: Option<bool>,
+}
+
+/// Fiddler Classic–style per-session timestamps (RFC 3339 micros) and phase durations (ms).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTimings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_connected: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_begin_request: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub got_request_headers: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_done_request: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_begin_request: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_connected: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_got_request: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_begin_response: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub got_response_headers: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_done_response: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_begin_response: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_done_response: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_read_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_tls_handshake_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_connect_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_handshake_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_request_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_wait_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_download_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_send_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakpoint_pause_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_hook_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoresponder_delay_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_overhead_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overall_elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_elapsed_ms: Option<f64>,
+}
+
+/// Wire vs decoded byte counters, compression info, and connection/TLS telemetry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTransferStats {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_headers_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_wire_body_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_headers_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_wire_body_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_content_encoding: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_conn_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_conn_reused: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_http_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_tls_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_tls_cipher: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_alpn: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_conn_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_conn_reused: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_http_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tls_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tls_cipher: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_tls_alpn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_cert_subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_cert_issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_mtls_cn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remapped_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_streaming: Option<bool>,
+}
+
+impl SessionSummary {
+    /// Synchronizes compact summary telemetry fields from full `SessionTimings` and `SessionTransferStats`.
+    pub fn apply_telemetry(
+        &mut self,
+        timings: Option<&SessionTimings>,
+        stats: Option<&SessionTransferStats>,
+    ) {
+        if let Some(t) = timings {
+            self.ttfb_ms = t.server_wait_ms;
+            self.dns_ms = t.dns_ms;
+            self.connect_ms = t.tcp_connect_ms;
+            self.tls_ms = t.tls_handshake_ms;
+            self.receive_ms = t.content_download_ms;
+        }
+        if let Some(s) = stats {
+            let req_total = match (
+                s.request_headers_bytes,
+                s.request_wire_body_bytes.or(s.request_body_bytes),
+            ) {
+                (Some(h), Some(b)) => Some(h.saturating_add(b)),
+                (Some(h), None) => Some(h),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            self.request_size = req_total;
+            self.wire_body_size = s.response_wire_body_bytes;
+            self.server_ip = s.server_ip.clone();
+            self.server_conn_reused = s.server_conn_reused;
+        }
+    }
 }
 
 /// Full session payload fetched on-demand when inspecting a row or dragging into Composer.
@@ -93,6 +266,10 @@ pub struct SessionDetail {
     pub body_offloaded: bool,
     #[serde(default)]
     pub request_body_offloaded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<SessionTimings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_stats: Option<SessionTransferStats>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

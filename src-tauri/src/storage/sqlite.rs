@@ -513,6 +513,15 @@ mod tests {
                 marked_color: color.map(str::to_owned),
                 client_ip: Some("127.0.0.1".into()),
                 remapped_to: None,
+                ttfb_ms: None,
+                dns_ms: None,
+                connect_ms: None,
+                tls_ms: None,
+                receive_ms: None,
+                request_size: None,
+                wire_body_size: None,
+                server_ip: None,
+                server_conn_reused: None,
             },
             request_headers: vec![HeaderPair {
                 name: "Authorization".into(),
@@ -532,6 +541,8 @@ mod tests {
             sse_events: Vec::new(),
             body_offloaded: false,
             request_body_offloaded: false,
+            timings: None,
+            transfer_stats: None,
         }
     }
 

@@ -7,6 +7,7 @@ import {
   type ImperativePanelGroupHandle,
 } from "react-resizable-panels";
 import {
+  BarChart2,
   ChevronDown,
   ChevronRight,
   Columns3,
@@ -69,6 +70,7 @@ import type {
   InspectorTab,
   LoadedSessionBody,
   SessionDetail,
+  SessionSummary,
 } from "../types/proxy";
 import { HexViewer } from "./HexViewer";
 import {
@@ -79,10 +81,14 @@ import {
   SseInspectorPanel,
   WebSocketFramesPanel,
 } from "./InspectorProtocolPanels";
+import { SessionStatisticsPanel } from "./SessionStatisticsPanel";
 import type { TextWizardTab } from "./TextWizardModal";
 
 interface SessionInspectorProps {
   detail: SessionDetail | null;
+  selectedSessions?: SessionSummary[];
+  onSelectSession?: (id: number) => void;
+  statisticsOpenTrigger?: number;
   resolvedTheme: "dark" | "light";
   containerRef?: React.RefObject<HTMLDivElement>;
   onReturnFocusToGrid?: () => void;
@@ -138,6 +144,9 @@ const RESPONSE_TABS: { id: InspectorTab; label: string }[] = [
 
 export const SessionInspector: React.FC<SessionInspectorProps> = ({
   detail,
+  selectedSessions,
+  onSelectSession,
+  statisticsOpenTrigger = 0,
   resolvedTheme,
   containerRef,
   onReturnFocusToGrid,
@@ -164,9 +173,18 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
 }) => {
   const [reqTab, setReqTab] = useState<InspectorTab>("headers");
   const [respTab, setRespTab] = useState<InspectorTab>("json");
+  const [inspectorMode, setInspectorMode] = useState<"inspectors" | "statistics">(
+    "inspectors"
+  );
   const [activePane, setActivePane] = useState<"request" | "response">(
     "response"
   );
+
+  useEffect(() => {
+    if (statisticsOpenTrigger > 0) {
+      setInspectorMode("statistics");
+    }
+  }, [statisticsOpenTrigger]);
   const internalContainerRef = useRef<HTMLDivElement>(null);
   const resolvedContainerRef = containerRef ?? internalContainerRef;
   const [localSplitDirection, setLocalSplitDirection] = useState<
@@ -602,6 +620,72 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detail?.summary.id]);
 
+  const multiSelectCount = selectedSessions?.length ?? 0;
+
+  if (!detail && multiSelectCount >= 2 && inspectorMode === "statistics") {
+    return (
+      <div
+        ref={resolvedContainerRef}
+        tabIndex={-1}
+        onKeyDown={handleContainerKeyDown}
+        aria-label="Session Inspector Statistics"
+        className="pane-contain flex h-full flex-col bg-surface focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-accent/50"
+      >
+        <div className="flex h-8 shrink-0 items-center justify-between gap-2 border-b border-hairline bg-elevated/60 px-2.5">
+          <span className="font-mono text-xs font-semibold text-fg">
+            Selected {multiSelectCount} sessions
+          </span>
+          <div className="flex shrink-0 items-center gap-1.5">
+            <div
+              role="group"
+              aria-label="Inspector View Mode"
+              className="inline-flex rounded border border-hairline bg-surface p-0.5 text-[10px]"
+            >
+              <button
+                type="button"
+                onClick={() => setInspectorMode("inspectors")}
+                aria-pressed={false}
+                className="rounded px-1.5 py-0.5 text-muted hover:text-fg"
+              >
+                Inspectors
+              </button>
+              <button
+                type="button"
+                onClick={() => setInspectorMode("statistics")}
+                aria-pressed={true}
+                className="inline-flex items-center gap-1 rounded bg-elevated px-1.5 py-0.5 font-semibold text-accent"
+              >
+                <BarChart2 className="h-3 w-3" aria-hidden="true" />
+                <span>Statistics ({multiSelectCount})</span>
+              </button>
+            </div>
+            {onCollapseInspector && (
+              <button
+                type="button"
+                onClick={onCollapseInspector}
+                title="Collapse Session Inspector"
+                className="rounded border border-hairline bg-surface p-1 text-muted hover:text-fg"
+              >
+                {inspectorPosition === "bottom" ? (
+                  <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+              </button>
+            )}
+          </div>
+        </div>
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <SessionStatisticsPanel
+            detail={null}
+            selectedSessions={selectedSessions}
+            onSelectSession={onSelectSession}
+          />
+        </div>
+      </div>
+    );
+  }
+
   if (!detail) {
     return (
       <div
@@ -861,13 +945,54 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                 <span>Passthrough</span>
               </button>
             )}
-          <span className="hidden font-mono tabular-nums lg:inline">
-            {isInFlightPending ? (
-              <span className="animate-pulse text-accent">Pending...</span>
-            ) : (
-              `${formatBytes(summary.bodySize)} • ${formatDuration(summary.durationMs)}`
-            )}
-          </span>
+          <div
+            role="group"
+            aria-label="Inspector View Mode"
+            className="inline-flex shrink-0 rounded border border-hairline bg-surface p-0.5 text-[10px]"
+          >
+            <button
+              type="button"
+              onClick={() => setInspectorMode("inspectors")}
+              aria-pressed={inspectorMode === "inspectors"}
+              className={`rounded px-1.5 py-0.5 transition-colors ${
+                inspectorMode === "inspectors"
+                  ? "bg-elevated font-semibold text-fg"
+                  : "text-muted hover:text-fg"
+              }`}
+            >
+              Inspectors
+            </button>
+            <button
+              type="button"
+              onClick={() => setInspectorMode("statistics")}
+              aria-pressed={inspectorMode === "statistics"}
+              className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 transition-colors ${
+                inspectorMode === "statistics"
+                  ? "bg-elevated font-semibold text-accent"
+                  : "text-muted hover:text-fg"
+              }`}
+            >
+              <BarChart2 className="h-3 w-3" aria-hidden="true" />
+              <span>
+                Statistics
+                {multiSelectCount >= 2 ? ` (${multiSelectCount})` : ""}
+              </span>
+            </button>
+          </div>
+          {isInFlightPending ? (
+            <span className="hidden animate-pulse font-mono text-accent tabular-nums lg:inline">
+              Pending...
+            </span>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setInspectorMode("statistics")}
+              title="Открыть статистику запроса и пофазные тайминги (Statistics)"
+              className="hidden rounded px-1.5 py-0.5 font-mono text-muted tabular-nums transition-colors hover:bg-surface hover:text-accent lg:inline"
+            >
+              {`${formatBytes(summary.bodySize)} • ${formatDuration(summary.durationMs)}`}
+            </button>
+          )}
           {onReplaySession && (
             <button
               type="button"
@@ -987,7 +1112,15 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
         </div>
       )}
 
-      {/* Split Request (Top/Left) & Response (Bottom/Right) */}
+      {inspectorMode === "statistics" ? (
+        <div className="min-h-0 flex-1 overflow-hidden">
+          <SessionStatisticsPanel
+            detail={effectiveDetail}
+            selectedSessions={selectedSessions}
+            onSelectSession={onSelectSession}
+          />
+        </div>
+      ) : (
       <PanelGroup
         ref={inspectorGroupRef}
         autoSaveId={FLUX_PANEL_AUTOSAVE_IDS.inspectorSplit}
@@ -1560,6 +1693,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
           </div>
         </Panel>
       </PanelGroup>
+      )}
     </div>
   );
 };

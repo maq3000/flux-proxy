@@ -6,12 +6,16 @@ use std::sync::RwLock;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use moka::sync::Cache;
+use rustls_pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+};
 use serde::{Deserialize, Serialize};
 use x509_parser::extensions::GeneralName;
 
 use crate::models::ProxyError;
 use crate::proxy::hosts::HostRemapRegistry;
-use crate::proxy::server::{build_upstream_client_with_identity, build_upstream_client_with_options};
+use crate::proxy::server::build_upstream_client_with_options;
+use crate::proxy::upstream_client::UpstreamHttpClient;
 
 const CLIENT_CERTS_DIR_NAME: &str = "client_certs";
 const REGISTRY_FILE_NAME: &str = "registry.json";
@@ -291,13 +295,51 @@ pub fn extract_x509_metadata(cert_der: &[u8]) -> Result<(String, String), ProxyE
     Ok((cn, expires_at))
 }
 
-fn validate_identity_pem_with_reqwest(pem_bytes: &[u8]) -> Result<(), ProxyError> {
-    let identity = reqwest::Identity::from_pem(pem_bytes).map_err(|e| {
-        ProxyError::Custom(format!(
-            "Не удалось сформировать TLS Identity из сертификата и ключа: {e}"
-        ))
+fn parse_rustls_client_auth_from_pem(
+    pem_bytes: &[u8],
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), ProxyError> {
+    let blocks = pem::parse_many(pem_bytes).map_err(|e| {
+        ProxyError::Custom(format!("Некорректный формат PEM mTLS-идентичности: {e}"))
     })?;
-    build_upstream_client_with_identity(false, Some(identity)).map_err(|e| {
+    let mut certs: Vec<CertificateDer<'static>> = Vec::new();
+    let mut key: Option<PrivateKeyDer<'static>> = None;
+
+    for block in blocks {
+        match block.tag() {
+            "CERTIFICATE" => certs.push(CertificateDer::from(block.into_contents())),
+            "PRIVATE KEY" if key.is_none() => {
+                key = Some(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+                    block.into_contents(),
+                )));
+            }
+            "RSA PRIVATE KEY" if key.is_none() => {
+                key = Some(PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(
+                    block.into_contents(),
+                )));
+            }
+            "EC PRIVATE KEY" if key.is_none() => {
+                key = Some(PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(
+                    block.into_contents(),
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    if certs.is_empty() {
+        return Err(ProxyError::Custom(
+            "В PEM-идентичности отсутствует сертификат (CERTIFICATE).".into(),
+        ));
+    }
+    let priv_key = key.ok_or_else(|| {
+        ProxyError::Custom("В PEM-идентичности отсутствует закрытый ключ.".into())
+    })?;
+    Ok((certs, priv_key))
+}
+
+fn validate_identity_pem_with_reqwest(pem_bytes: &[u8]) -> Result<(), ProxyError> {
+    let (certs, key) = parse_rustls_client_auth_from_pem(pem_bytes)?;
+    UpstreamHttpClient::build(None, Some((certs, key, "validation".to_string()))).map_err(|e| {
         ProxyError::Custom(format!(
             "Сертификат и закрытый ключ не прошли проверку TLS-клиента (rustls): {e}"
         ))
@@ -547,11 +589,12 @@ fn validate_cert_source_path(
 }
 
 /// Manages mTLS client certificates (`.p12`/`.pfx` and `.pem`), domain bindings,
-/// `0600` vault storage, and cached `reqwest::Client` instances.
+/// `0600` vault storage, and cached upstream HTTP/TLS clients.
 pub struct ClientCertificateStore {
     storage_dir: Option<PathBuf>,
     entries: RwLock<Vec<ClientCertificateEntry>>,
     client_cache: Cache<String, reqwest::Client>,
+    upstream_client_cache: Cache<String, Arc<UpstreamHttpClient>>,
     id_seq: AtomicU64,
 }
 
@@ -609,6 +652,7 @@ impl ClientCertificateStore {
             storage_dir: Some(dir),
             entries: RwLock::new(entries),
             client_cache: Cache::builder().max_capacity(CLIENT_CACHE_CAPACITY).build(),
+            upstream_client_cache: Cache::builder().max_capacity(CLIENT_CACHE_CAPACITY).build(),
             id_seq: AtomicU64::new(1),
         })
     }
@@ -619,6 +663,7 @@ impl ClientCertificateStore {
             storage_dir: None,
             entries: RwLock::new(Vec::new()),
             client_cache: Cache::builder().max_capacity(CLIENT_CACHE_CAPACITY).build(),
+            upstream_client_cache: Cache::builder().max_capacity(CLIENT_CACHE_CAPACITY).build(),
             id_seq: AtomicU64::new(1),
         }
     }
@@ -778,7 +823,7 @@ impl ClientCertificateStore {
             *guard = next;
         }
 
-        self.client_cache.invalidate_all();
+        self.invalidate_client_cache();
         Ok(entry)
     }
 
@@ -804,7 +849,7 @@ impl ClientCertificateStore {
             cloned
         };
 
-        self.client_cache.invalidate_all();
+        self.invalidate_client_cache();
         Ok(updated)
     }
 
@@ -875,7 +920,7 @@ impl ClientCertificateStore {
             }
         }
 
-        self.client_cache.invalidate_all();
+        self.invalidate_client_cache();
         Ok(remaining)
     }
 
@@ -904,6 +949,48 @@ impl ClientCertificateStore {
 
     pub fn invalidate_client_cache(&self) {
         self.client_cache.invalidate_all();
+        self.upstream_client_cache.invalidate_all();
+    }
+
+    /// Returns a cached or freshly constructed instrumented `UpstreamHttpClient` configured with
+    /// the matching mTLS client certificate for `host`, or `Ok(None)` if no enabled certificate matches.
+    pub fn get_or_build_upstream_client(
+        &self,
+        host: &str,
+        host_remap: Option<Arc<HostRemapRegistry>>,
+    ) -> Result<Option<(Arc<UpstreamHttpClient>, ClientCertificateEntry)>, ProxyError> {
+        let Some(entry) = self.match_certificate_for_host(host) else {
+            return Ok(None);
+        };
+
+        let resolver_tag = if host_remap.is_some() { "remap" } else { "sys" };
+        let cache_key = format!("{}:dns={resolver_tag}", entry.id);
+        if let Some(cached) = self.upstream_client_cache.get(&cache_key) {
+            return Ok(Some((cached, entry)));
+        }
+
+        let identity_path = self.resolve_identity_pem_path(&entry)?;
+        let pem_bytes = fs::read(&identity_path).map_err(|e| {
+            ProxyError::Custom(format!(
+                "Не удалось прочитать файл mTLS-идентичности '{}': {e}",
+                identity_path.display()
+            ))
+        })?;
+        let (certs, key) = parse_rustls_client_auth_from_pem(&pem_bytes)?;
+        let client = UpstreamHttpClient::build(
+            host_remap,
+            Some((certs, key, entry.common_name.clone())),
+        )
+        .map_err(|e| {
+            ProxyError::Custom(format!(
+                "Ошибка сборки instrumented mTLS-клиента для '{}': {e}",
+                entry.domain_pattern
+            ))
+        })?;
+        let arc_client = Arc::new(client);
+        self.upstream_client_cache
+            .insert(cache_key, Arc::clone(&arc_client));
+        Ok(Some((arc_client, entry)))
     }
 
     /// Returns a cached or freshly constructed `reqwest::Client` configured with the matching

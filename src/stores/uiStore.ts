@@ -154,6 +154,7 @@ export interface ColumnDefinition {
   minWidth: number;
   maxAutoFitWidth: number;
   align?: "left" | "right";
+  defaultVisible?: boolean;
 }
 
 export const TRAFFIC_COLUMNS: ColumnDefinition[] = [
@@ -217,6 +218,23 @@ export const TRAFFIC_COLUMNS: ColumnDefinition[] = [
     align: "right",
   },
   {
+    id: "ttfb",
+    label: "TTFB",
+    defaultWidth: 74,
+    minWidth: 56,
+    maxAutoFitWidth: 120,
+    align: "right",
+    defaultVisible: false,
+  },
+  {
+    id: "serverIp",
+    label: "Server IP",
+    defaultWidth: 128,
+    minWidth: 84,
+    maxAutoFitWidth: 260,
+    defaultVisible: false,
+  },
+  {
     id: "comment",
     label: "Comment",
     defaultWidth: 168,
@@ -245,7 +263,7 @@ export const DEFAULT_COLUMN_WIDTHS: Record<ColumnId, number> =
 export const DEFAULT_VISIBLE_COLUMNS: Record<ColumnId, boolean> =
   TRAFFIC_COLUMNS.reduce(
     (acc, col) => {
-      acc[col.id] = true;
+      acc[col.id] = col.defaultVisible ?? true;
       return acc;
     },
     {} as Record<ColumnId, boolean>

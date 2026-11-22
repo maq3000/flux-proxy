@@ -769,6 +769,64 @@ impl TrafficStore {
         Some(detail_mut.summary.clone())
     }
 
+    /// Updates telemetry fields (`timings`, `transfer_stats`, `summary`) of an active/stored session.
+    pub fn update_session_telemetry(
+        &self,
+        id: u64,
+        update_fn: impl FnOnce(&mut SessionDetail),
+    ) -> Option<SessionSummary> {
+        let mut entry = self.sessions.get_mut(&id)?;
+        let detail_mut = Arc::make_mut(entry.value_mut());
+        update_fn(detail_mut);
+        let summary_clone = detail_mut.summary.clone();
+        let snapshot = detail_mut.clone();
+        drop(entry);
+        let _ = self.sqlite.sync_session_if_archived(&snapshot);
+        Some(summary_clone)
+    }
+
+    /// Updates client response send completion timing once the local response body has finished draining.
+    /// Returns `(summary, duration_changed)` so callers only emit extra IPC events if integer `duration_ms` changed.
+    pub fn update_client_send_timing(
+        &self,
+        id: u64,
+        client_done_at: String,
+        client_send_ms: f64,
+        overall_elapsed_ms: f64,
+    ) -> Option<(SessionSummary, bool)> {
+        let mut entry = self.sessions.get_mut(&id)?;
+        let detail_mut = Arc::make_mut(entry.value_mut());
+        let timings = detail_mut.timings.get_or_insert_with(Default::default);
+        timings.client_done_response = Some(client_done_at);
+        timings.client_send_ms = Some(client_send_ms);
+        let rounded_overall = if overall_elapsed_ms.is_finite() && overall_elapsed_ms >= 0.0 {
+            (overall_elapsed_ms * 1000.0).round() / 1000.0
+        } else {
+            0.0
+        };
+        timings.overall_elapsed_ms = Some(rounded_overall);
+        let pause_sum = timings.breakpoint_pause_ms.unwrap_or(0.0)
+            + timings.script_hook_ms.unwrap_or(0.0)
+            + timings.autoresponder_delay_ms.unwrap_or(0.0);
+        let net_elapsed = (rounded_overall - pause_sum).max(0.0);
+        timings.net_elapsed_ms = Some((net_elapsed * 1000.0).round() / 1000.0);
+        let tracked_net = timings.client_read_ms.unwrap_or(0.0)
+            + timings.dns_ms.unwrap_or(0.0)
+            + timings.tcp_connect_ms.unwrap_or(0.0)
+            + timings.tls_handshake_ms.unwrap_or(0.0)
+            + timings.send_request_ms.unwrap_or(0.0)
+            + timings.server_wait_ms.unwrap_or(0.0)
+            + timings.content_download_ms.unwrap_or(0.0)
+            + client_send_ms;
+        let overhead = (net_elapsed - tracked_net).max(0.0);
+        timings.proxy_overhead_ms = Some((overhead * 1000.0).round() / 1000.0);
+
+        let prev_dur = detail_mut.summary.duration_ms;
+        let next_dur = prev_dur.max(rounded_overall.round() as u64);
+        detail_mut.summary.duration_ms = next_dur;
+        Some((detail_mut.summary.clone(), next_dur != prev_dur))
+    }
+
     pub fn get_in_ram(&self, id: u64) -> Option<SessionDetail> {
         let entry = self.sessions.get(&id)?;
         let mut detail = (**entry).clone();
@@ -1061,6 +1119,15 @@ impl TrafficStore {
                 marked_color: None,
                 client_ip: Some("127.0.0.1".to_string()),
                 remapped_to: None,
+                ttfb_ms: Some(12.0),
+                dns_ms: Some(if i % 4 == 0 { 8.0 } else { 0.0 }),
+                connect_ms: Some(if i % 4 == 0 { 14.0 } else { 0.0 }),
+                tls_ms: Some(if i % 4 == 0 { 19.0 } else { 0.0 }),
+                receive_ms: Some(3.0),
+                request_size: Some(128),
+                wire_body_size: Some(body_size),
+                server_ip: Some("93.184.216.34".to_string()),
+                server_conn_reused: Some(i % 4 != 0),
             };
 
             if !filters.evaluate_should_store_session(&summary) {
@@ -1107,6 +1174,8 @@ impl TrafficStore {
                 sse_events: Vec::new(),
                 body_offloaded: false,
                 request_body_offloaded: false,
+                timings: None,
+                transfer_stats: None,
             };
 
             self.sessions.insert(id, Arc::new(detail));
@@ -1226,6 +1295,15 @@ mod tests {
                 marked_color: None,
                 client_ip: Some("127.0.0.1".into()),
                 remapped_to: None,
+                ttfb_ms: None,
+                dns_ms: None,
+                connect_ms: None,
+                tls_ms: None,
+                receive_ms: None,
+                request_size: None,
+                wire_body_size: None,
+                server_ip: None,
+                server_conn_reused: None,
             },
             request_headers: vec![HeaderPair {
                 name: "Host".into(),
@@ -1245,6 +1323,8 @@ mod tests {
             sse_events: Vec::new(),
             body_offloaded: false,
             request_body_offloaded: false,
+            timings: None,
+            transfer_stats: None,
         }
     }
 

@@ -3,6 +3,7 @@ import { DiffEditor, type MonacoDiffEditor } from "@monaco-editor/react";
 import {
   ArrowDownAz,
   ArrowLeftRight,
+  BarChart2,
   Check,
   ChevronDown,
   ChevronUp,
@@ -66,6 +67,7 @@ interface SessionDiffViewProps {
   onSwapPair: () => void;
   onAnnotateSession?: (id: number) => void;
   onExpandModal?: () => void;
+  onOpenStatistics?: () => void;
   onCloseDiff?: () => void;
   closeLabel?: string;
 }
@@ -80,6 +82,7 @@ export const SessionDiffView: React.FC<SessionDiffViewProps> = ({
   onSwapPair,
   onAnnotateSession,
   onExpandModal,
+  onOpenStatistics,
   onCloseDiff,
   closeLabel = "К инспектору",
 }) => {
@@ -223,8 +226,19 @@ export const SessionDiffView: React.FC<SessionDiffViewProps> = ({
           </span>
         </div>
 
-        {/* Right Actions: Expand / Close */}
+        {/* Right Actions: Statistics / Expand / Close */}
         <div className="flex shrink-0 items-center gap-1.5">
+          {onOpenStatistics && (
+            <button
+              type="button"
+              onClick={onOpenStatistics}
+              title="Открыть сводную статистику выбранных сессий (Statistics)"
+              className="inline-flex h-7 items-center gap-1 rounded-md border border-hairline bg-surface px-2 text-[11px] font-medium text-fg transition-colors hover:border-accent/50 hover:text-accent"
+            >
+              <BarChart2 className="h-3 w-3" aria-hidden="true" />
+              <span className="hidden lg:inline">Statistics (2)</span>
+            </button>
+          )}
           {onExpandModal && (
             <button
               type="button"

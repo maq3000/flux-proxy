@@ -35,6 +35,10 @@ import {
   formatDuration,
   getRowSemanticTone,
 } from "../lib/formatters";
+import {
+  formatMsPrecise,
+  formatTimeCellTooltip,
+} from "../lib/requestStatistics";
 import { hexToRgba } from "../lib/sessionDiff";
 import type {
   ColumnId,
@@ -110,6 +114,14 @@ function compareSessions(
       return a.bodySize - b.bodySize;
     case "time":
       return a.durationMs - b.durationMs;
+    case "ttfb":
+      return (a.ttfbMs ?? -1) - (b.ttfbMs ?? -1);
+    case "serverIp":
+      return (a.serverIp || "").localeCompare(
+        b.serverIp || "",
+        undefined,
+        STRING_SORT_LOCALE_OPTS
+      );
     case "method":
       return (a.method || "").localeCompare(
         b.method || "",
@@ -208,6 +220,12 @@ function getCellSampleText(s: SessionSummary, colId: ColumnId): string {
       return s.status === 0 && !s.breakpointPaused && !s.tlsBypassed && !s.error
         ? "..."
         : formatDuration(s.durationMs);
+    case "ttfb":
+      return s.ttfbMs != null && Number.isFinite(s.ttfbMs)
+        ? formatMsPrecise(s.ttfbMs)
+        : "—";
+    case "serverIp":
+      return s.serverIp || "—";
     case "comment":
       return s.comment ?? "";
   }
@@ -1447,25 +1465,82 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
                               </span>
                             ) : isCriticalSlow ? (
                               <span
-                                title={`Critical Latency (>= ${thresholds.timeHeatCriticalMs} ms)`}
+                                title={formatTimeCellTooltip(
+                                  s,
+                                  `Critical Latency (>= ${thresholds.timeHeatCriticalMs} ms)`
+                                )}
                                 className="inline-flex items-center gap-0.5 rounded bg-status5xx-bg px-1.5 py-0.2 font-semibold text-status5xx-fg"
                               >
-                                <Flame className="h-2.5 w-2.5 shrink-0" />
+                                <Flame
+                                  className="h-2.5 w-2.5 shrink-0"
+                                  aria-hidden="true"
+                                />
                                 <span>{formatDuration(s.durationMs)}</span>
                               </span>
                             ) : isWarningSlow ? (
                               <span
-                                title={`Slow Request (>= ${thresholds.timeHeatWarningMs} ms)`}
+                                title={formatTimeCellTooltip(
+                                  s,
+                                  `Slow Request (>= ${thresholds.timeHeatWarningMs} ms)`
+                                )}
                                 className="inline-flex items-center gap-0.5 rounded bg-status4xx-bg px-1.5 py-0.2 font-semibold text-status4xx-fg"
                               >
-                                <Flame className="h-2.5 w-2.5 shrink-0" />
+                                <Flame
+                                  className="h-2.5 w-2.5 shrink-0"
+                                  aria-hidden="true"
+                                />
                                 <span>{formatDuration(s.durationMs)}</span>
                               </span>
                             ) : (
-                              <span className="truncate text-muted">
+                              <span
+                                title={formatTimeCellTooltip(s)}
+                                className="truncate text-muted"
+                              >
                                 {formatDuration(s.durationMs)}
                               </span>
                             )}
+                          </span>
+                        );
+
+                      case "ttfb":
+                        return (
+                          <span
+                            key="ttfb"
+                            role="gridcell"
+                            title={
+                              s.ttfbMs != null && Number.isFinite(s.ttfbMs)
+                                ? `Time To First Byte (Server Wait): ${formatMsPrecise(s.ttfbMs)}`
+                                : "TTFB не измерен"
+                            }
+                            className="min-w-0 truncate px-2 text-right text-[11px] tabular-nums text-muted"
+                          >
+                            {isInFlightPending
+                              ? "..."
+                              : s.ttfbMs != null && Number.isFinite(s.ttfbMs)
+                                ? formatMsPrecise(s.ttfbMs)
+                                : "—"}
+                          </span>
+                        );
+
+                      case "serverIp":
+                        return (
+                          <span
+                            key="serverIp"
+                            role="gridcell"
+                            title={
+                              s.serverIp
+                                ? `${s.serverIp}${
+                                    s.serverConnReused === true
+                                      ? " (Pooled / Reused)"
+                                      : s.serverConnReused === false
+                                        ? " (Cold Connect)"
+                                        : ""
+                                  }`
+                                : "Server IP недоступен"
+                            }
+                            className="min-w-0 truncate px-2 text-[11px] text-muted"
+                          >
+                            {s.serverIp ? s.serverIp : <span className="text-subtle">—</span>}
                           </span>
                         );
 

@@ -11,3 +11,4 @@ pub mod rules;
 pub mod server;
 pub mod sysproxy;
 pub mod throttle;
+pub mod upstream_client;

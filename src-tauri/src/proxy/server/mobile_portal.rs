@@ -3,18 +3,24 @@ use std::time::Instant;
 
 use base64::Engine as _;
 use bytes::Bytes;
+use chrono::Utc;
 use http::header::CONTENT_TYPE;
 use http::{Request, Response, StatusCode};
 use hyper::body::Incoming;
 
-use crate::models::{HeaderPair, SessionDetail, SessionSummary};
+use crate::models::{HeaderPair, SessionDetail, SessionSummary, SessionTimings, SessionTransferStats};
 use crate::proxy::network::{is_host_own_ip, normalize_client_ip};
 use crate::proxy::process::ClientProcessInfo;
+use crate::proxy::upstream_client::{
+    elapsed_ms, estimate_request_headers_bytes, estimate_response_headers_bytes,
+    format_rfc3339_micros,
+};
 
 use super::{
-    boxed_full, extract_hyper_headers, is_loopback_ip, is_unspecified_ip,
-    parse_host_and_optional_port, parse_ip_including_mapped_and_shorthand, plain_response,
-    resolve_protocol_label, ProxyBoxBody, SharedProxyContext,
+    boxed_full, extract_hyper_headers, format_mitm_tls_display, format_raw_http_version,
+    is_loopback_ip, is_unspecified_ip, parse_host_and_optional_port,
+    parse_ip_including_mapped_and_shorthand, plain_response, resolve_protocol_label,
+    ClientConnContext, ProxyBoxBody, SharedProxyContext,
 };
 
 pub(super) fn is_virtual_portal_domain(host: &str) -> bool {
@@ -123,6 +129,7 @@ pub(super) fn handle_builtin_portal_request(
     timestamp: String,
     client_addr: SocketAddr,
     client_proc: Option<&ClientProcessInfo>,
+    client_conn: &ClientConnContext,
     ctx: &SharedProxyContext,
 ) -> Response<ProxyBoxBody> {
     let raw_path = req.uri().path();
@@ -202,8 +209,45 @@ pub(super) fn handle_builtin_portal_request(
         });
     }
 
+    let (client_reused, client_tls_ms) = client_conn.claim_request_seq();
+    let client_http_ver = format_raw_http_version(req_version).to_string();
+    let req_headers_bytes =
+        estimate_request_headers_bytes(&method_str, path_and_query, &client_http_ver, &req_headers);
+    let resp_headers_bytes = estimate_response_headers_bytes(200, &client_http_ver, &resp_headers);
+    let done_at = format_rfc3339_micros(Utc::now());
+    let overall_ms = elapsed_ms(start);
+    let timings = SessionTimings {
+        client_connected: Some(client_conn.connected_at.clone()),
+        client_begin_request: Some(done_at.clone()),
+        got_request_headers: Some(done_at.clone()),
+        client_done_request: Some(done_at.clone()),
+        client_begin_response: Some(done_at.clone()),
+        client_done_response: Some(done_at),
+        client_read_ms: Some(0.0),
+        client_tls_handshake_ms: client_tls_ms,
+        proxy_overhead_ms: Some(overall_ms),
+        overall_elapsed_ms: Some(overall_ms),
+        net_elapsed_ms: Some(overall_ms),
+        ..Default::default()
+    };
+    let transfer_stats = SessionTransferStats {
+        request_headers_bytes: Some(req_headers_bytes),
+        request_body_bytes: Some(0),
+        request_wire_body_bytes: Some(0),
+        response_headers_bytes: Some(resp_headers_bytes),
+        response_body_bytes: Some(resp_bytes.len()),
+        response_wire_body_bytes: Some(resp_bytes.len()),
+        client_conn_id: Some(client_conn.conn_id),
+        client_conn_reused: Some(client_reused),
+        client_http_version: Some(client_http_ver),
+        client_tls_version: client_conn.client_tls_version.clone(),
+        client_tls_cipher: client_conn.client_tls_cipher.clone(),
+        client_alpn: client_conn.client_alpn.clone(),
+        ..Default::default()
+    };
+
     let protocol_label = resolve_protocol_label(scheme_str, alpn, req_version);
-    let summary = SessionSummary {
+    let mut summary = SessionSummary {
         id: session_id,
         status: 200,
         protocol: protocol_label,
@@ -229,7 +273,17 @@ pub(super) fn handle_builtin_portal_request(
         marked_color: None,
         client_ip: Some(client_ip_str),
         remapped_to: None,
+        ttfb_ms: None,
+        dns_ms: None,
+        connect_ms: None,
+        tls_ms: None,
+        receive_ms: None,
+        request_size: None,
+        wire_body_size: None,
+        server_ip: None,
+        server_conn_reused: None,
     };
+    summary.apply_telemetry(Some(&timings), Some(&transfer_stats));
 
     let detail = SessionDetail {
         summary: summary.clone(),
@@ -239,16 +293,19 @@ pub(super) fn handle_builtin_portal_request(
         response_body_base64: base64::engine::general_purpose::STANDARD.encode(&resp_bytes),
         request_body_text: None,
         response_body_text: std::str::from_utf8(&resp_bytes).ok().map(str::to_owned),
-        tls_version: if scheme_str == "https" {
-            Some("TLS 1.3 (FluxProxy Portal)".into())
-        } else {
-            None
-        },
+        tls_version: format_mitm_tls_display(
+            scheme_str,
+            client_conn.client_tls_version.as_deref(),
+            Some("Portal"),
+            None,
+        ),
         client_addr: client_addr.to_string(),
         websocket_frames: Vec::new(),
         sse_events: Vec::new(),
         body_offloaded: false,
         request_body_offloaded: false,
+        timings: Some(timings),
+        transfer_stats: Some(transfer_stats),
     };
 
     ctx.store.insert(detail);

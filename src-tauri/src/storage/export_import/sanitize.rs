@@ -570,6 +570,12 @@ pub fn sanitize_sessions(
                         detail.request_body_base64 =
                             base64::engine::general_purpose::STANDARD.encode(sanitized_req.as_bytes());
                         detail.request_body_text = Some(sanitized_req);
+                        if detail.summary.request_size.is_some() {
+                            detail.summary.request_size = Some(new_len);
+                        }
+                        if let Some(ref mut stats) = detail.transfer_stats {
+                            stats.request_body_bytes = Some(new_len);
+                        }
                         update_content_length_header(&mut detail.request_headers, new_len);
                     }
                 }
@@ -593,6 +599,9 @@ pub fn sanitize_sessions(
                             base64::engine::general_purpose::STANDARD.encode(sanitized_resp.as_bytes());
                         detail.response_body_text = Some(sanitized_resp);
                         detail.summary.body_size = new_len;
+                        if let Some(ref mut stats) = detail.transfer_stats {
+                            stats.response_body_bytes = Some(new_len);
+                        }
                         update_content_length_header(&mut detail.response_headers, new_len);
                     }
                 }
@@ -623,6 +632,9 @@ pub fn sanitize_sessions(
                         base64::engine::general_purpose::STANDARD.encode(rebuilt_sse.as_bytes());
                     detail.response_body_text = Some(rebuilt_sse);
                     detail.summary.body_size = new_len;
+                    if let Some(ref mut stats) = detail.transfer_stats {
+                        stats.response_body_bytes = Some(new_len);
+                    }
                     update_content_length_header(&mut detail.response_headers, new_len);
                 }
 
@@ -651,6 +663,9 @@ pub fn sanitize_sessions(
                             base64::engine::general_purpose::STANDARD.encode(rebuilt_ws.as_bytes());
                         detail.response_body_text = Some(rebuilt_ws);
                         detail.summary.body_size = new_len;
+                        if let Some(ref mut stats) = detail.transfer_stats {
+                            stats.response_body_bytes = Some(new_len);
+                        }
                         update_content_length_header(&mut detail.response_headers, new_len);
                     }
                 }
@@ -688,6 +703,9 @@ pub fn sanitize_sessions(
                 detail.summary.client_ip = Some("0.0.0.0".to_string());
                 detail.summary.process_name = Some("redacted-process".to_string());
                 detail.summary.process_pid = None;
+                if let Some(ref mut stats) = detail.transfer_stats {
+                    stats.client_conn_id = None;
+                }
             }
 
             detail

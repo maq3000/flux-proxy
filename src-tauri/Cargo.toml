@@ -22,15 +22,20 @@ serde_json = "1.0"
 # Async Runtime & Networking Core
 tokio = { version = "1.42", features = ["full"] }
 hyper = { version = "1.5", features = ["full"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service", "client-legacy", "http1", "http2"] }
 http-body-util = "0.1"
 http = "1.2"
 bytes = "1.9"
 futures-util = "0.3"
+tower-service = "0.3"
+url = "2"
 
 # MITM TLS & On-the-fly X.509 Certificate Generation
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = "0.8"
+rustls-pki-types = "1"
+webpki-roots = "0.26"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 x509-parser = "0.16"
 pem = "3.0"

@@ -181,7 +181,8 @@ mod tests {
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipArchive, ZipWriter};
     use crate::models::{
-        HeaderPair, SanitizationOptions, SessionSummary, SseEventRecord, WebSocketFrameRecord,
+        HeaderPair, SanitizationOptions, SessionSummary, SessionTimings, SessionTransferStats,
+        SseEventRecord, WebSocketFrameRecord,
     };
 
     fn unique_temp_path(name: &str) -> std::path::PathBuf {
@@ -230,6 +231,15 @@ mod tests {
                     marked_color: Some("green".into()),
                     client_ip: Some("127.0.0.1".into()),
                     remapped_to: None,
+                    ttfb_ms: None,
+                    dns_ms: None,
+                    connect_ms: None,
+                    tls_ms: None,
+                    receive_ms: None,
+                    request_size: None,
+                    wire_body_size: None,
+                    server_ip: None,
+                    server_conn_reused: None,
                 },
                 request_headers: vec![
                     HeaderPair {
@@ -265,6 +275,8 @@ mod tests {
                 sse_events: Vec::new(),
                 body_offloaded: false,
                 request_body_offloaded: false,
+                timings: None,
+                transfer_stats: None,
             },
             SessionDetail {
                 summary: SessionSummary {
@@ -293,6 +305,15 @@ mod tests {
                     marked_color: Some("blue".into()),
                     client_ip: Some("127.0.0.1".into()),
                     remapped_to: None,
+                    ttfb_ms: None,
+                    dns_ms: None,
+                    connect_ms: None,
+                    tls_ms: None,
+                    receive_ms: None,
+                    request_size: None,
+                    wire_body_size: None,
+                    server_ip: None,
+                    server_conn_reused: None,
                 },
                 request_headers: vec![HeaderPair {
                     name: "Host".into(),
@@ -319,6 +340,8 @@ mod tests {
                 sse_events: Vec::new(),
                 body_offloaded: false,
                 request_body_offloaded: false,
+                timings: None,
+                transfer_stats: None,
             },
         ]
     }
@@ -1149,5 +1172,266 @@ mod tests {
         extreme[0].summary.duration_ms = u64::MAX;
         let mut saz_out = Cursor::new(Vec::new());
         assert_eq!(write_saz_to_writer(&mut saz_out, &extreme).unwrap(), 2);
+    }
+
+    fn make_telemetried_sample(reused: bool) -> SessionDetail {
+        let mut detail = sample_sessions().into_iter().next().unwrap();
+        let body_bytes = vec![b'A'; 1000];
+        let body_text = String::from_utf8(body_bytes.clone()).unwrap();
+        detail.response_headers = vec![
+            HeaderPair {
+                name: "Content-Type".into(),
+                value: "application/json; charset=utf-8".into(),
+            },
+            HeaderPair {
+                name: "Content-Encoding".into(),
+                value: "gzip".into(),
+            },
+        ];
+        detail.response_body_base64 = base64::engine::general_purpose::STANDARD.encode(&body_bytes);
+        detail.response_body_text = Some(body_text);
+        detail.summary.body_size = 1000;
+        detail.summary.duration_ms = if reused { 46 } else { 94 };
+
+        let timings = SessionTimings {
+            client_connected: Some("2026-11-22T09:15:30.245000Z".into()),
+            client_begin_request: Some("2026-11-22T09:15:30.250000Z".into()),
+            got_request_headers: Some("2026-11-22T09:15:30.250800Z".into()),
+            client_done_request: Some("2026-11-22T09:15:30.251500Z".into()),
+            proxy_begin_request: Some("2026-11-22T09:15:30.252000Z".into()),
+            server_connected: Some("2026-11-22T09:15:30.300000Z".into()),
+            server_got_request: Some("2026-11-22T09:15:30.301200Z".into()),
+            server_begin_response: Some("2026-11-22T09:15:30.339600Z".into()),
+            got_response_headers: Some("2026-11-22T09:15:30.340000Z".into()),
+            server_done_response: Some("2026-11-22T09:15:30.345700Z".into()),
+            client_begin_response: Some("2026-11-22T09:15:30.346000Z".into()),
+            client_done_response: Some("2026-11-22T09:15:30.347000Z".into()),
+            client_read_ms: Some(1.5),
+            client_tls_handshake_ms: Some(if reused { 0.0 } else { 3.5 }),
+            dns_ms: Some(if reused { 0.0 } else { 5.5 }),
+            tcp_connect_ms: Some(if reused { 0.0 } else { 12.5 }),
+            tls_handshake_ms: Some(if reused { 0.0 } else { 30.0 }),
+            send_request_ms: Some(1.2),
+            server_wait_ms: Some(38.4),
+            content_download_ms: Some(6.1),
+            client_send_ms: Some(1.0),
+            proxy_overhead_ms: Some(1.1),
+            overall_elapsed_ms: Some(if reused { 46.0 } else { 94.0 }),
+            net_elapsed_ms: Some(if reused { 45.7 } else { 93.7 }),
+            ..Default::default()
+        };
+
+        let stats = SessionTransferStats {
+            request_headers_bytes: Some(140),
+            request_body_bytes: Some(42),
+            request_wire_body_bytes: Some(42),
+            response_headers_bytes: Some(190),
+            response_body_bytes: Some(1000),
+            response_wire_body_bytes: Some(380),
+            response_content_encoding: Some("gzip".into()),
+            client_conn_id: Some(99),
+            client_conn_reused: Some(reused),
+            client_http_version: Some("HTTP/1.1".into()),
+            client_tls_version: Some("TLSv1.3".into()),
+            client_tls_cipher: Some("TLS13_AES_256_GCM_SHA384".into()),
+            client_alpn: Some("http/1.1".into()),
+            server_addr: Some("93.184.216.34:443".into()),
+            server_ip: Some("93.184.216.34".into()),
+            server_port: Some(443),
+            server_conn_id: Some(101),
+            server_conn_reused: Some(reused),
+            server_http_version: Some("HTTP/2.0".into()),
+            server_tls_version: Some("TLSv1.3".into()),
+            server_tls_cipher: Some("TLS13_AES_128_GCM_SHA256".into()),
+            server_tls_alpn: Some("h2".into()),
+            server_cert_subject: Some("CN=auth.fluxproxy.dev".into()),
+            server_cert_issuer: Some("CN=Test CA".into()),
+            ..Default::default()
+        };
+
+        detail.summary.apply_telemetry(Some(&timings), Some(&stats));
+        detail.timings = Some(timings);
+        detail.transfer_stats = Some(stats);
+        detail
+    }
+
+    #[test]
+    fn har_1_2_telemetry_roundtrip_and_third_party_fallback() {
+        let cold = make_telemetried_sample(false);
+        let warm = make_telemetried_sample(true);
+        let har_json = serialize_har_1_2(&[cold.clone(), warm]).expect("serialize HAR");
+        let raw_val: serde_json::Value = serde_json::from_str(&har_json).unwrap();
+
+        let e0 = &raw_val["log"]["entries"][0];
+        assert_eq!(e0["serverIPAddress"], "93.184.216.34");
+        assert_eq!(e0["connection"], "101");
+        assert_eq!(e0["timings"]["dns"], 5.5);
+        assert_eq!(e0["timings"]["ssl"], 30.0);
+        // HAR 1.2 connect = tcp + ssl
+        assert_eq!(e0["timings"]["connect"], 42.5);
+        assert_eq!(e0["timings"]["send"], 1.2);
+        assert_eq!(e0["timings"]["wait"], 38.4);
+        assert_eq!(e0["timings"]["receive"], 6.1);
+        assert_eq!(e0["response"]["content"]["size"], 1000);
+        assert_eq!(e0["response"]["content"]["compression"], 620);
+        assert_eq!(e0["response"]["bodySize"], 380);
+
+        let e1 = &raw_val["log"]["entries"][1];
+        assert_eq!(e1["timings"]["dns"], -1.0);
+        assert_eq!(e1["timings"]["connect"], -1.0);
+        assert_eq!(e1["timings"]["ssl"], -1.0);
+        assert_eq!(e1["connection"], "101");
+
+        let restored = deserialize_har_1_2(&har_json).expect("roundtrip HAR");
+        assert_eq!(restored[0].timings, cold.timings);
+        assert_eq!(restored[0].transfer_stats, cold.transfer_stats);
+        assert_eq!(restored[0].summary.ttfb_ms, Some(38.4));
+        assert_eq!(restored[0].summary.server_ip.as_deref(), Some("93.184.216.34"));
+        assert_eq!(restored[0].summary.wire_body_size, Some(380));
+
+        // Third-party Chrome DevTools HAR without `_fluxProxy`
+        let chrome_har = r#"{
+          "log": {
+            "version": "1.2",
+            "creator": { "name": "Chrome", "version": "131" },
+            "entries": [{
+              "startedDateTime": "2026-11-22T10:00:00.000Z",
+              "time": 91.0,
+              "serverIPAddress": "1.1.1.1",
+              "connection": "77",
+              "request": {
+                "method": "GET",
+                "url": "https://cdn.example.org/app.js",
+                "httpVersion": "HTTP/2.0",
+                "headers": [],
+                "queryString": [],
+                "cookies": [],
+                "headersSize": 180,
+                "bodySize": 0
+              },
+              "response": {
+                "status": 200,
+                "statusText": "OK",
+                "httpVersion": "HTTP/2.0",
+                "headers": [{ "name": "Content-Encoding", "value": "br" }],
+                "cookies": [],
+                "content": { "size": 1000, "compression": 600, "mimeType": "application/javascript", "text": "console.log(1);" },
+                "redirectURL": "",
+                "headersSize": 220,
+                "bodySize": 400
+              },
+              "cache": {},
+              "timings": { "blocked": 2.0, "dns": 4.5, "connect": 32.0, "ssl": 20.0, "send": 1.5, "wait": 45.0, "receive": 8.0 }
+            }]
+          }
+        }"#;
+        let ext_imported = deserialize_har_1_2(chrome_har).expect("third-party HAR import");
+        let ext_t = ext_imported[0].timings.as_ref().expect("reconstructed timings");
+        assert_eq!(ext_t.dns_ms, Some(4.5));
+        assert_eq!(ext_t.tcp_connect_ms, Some(12.0));
+        assert_eq!(ext_t.tls_handshake_ms, Some(20.0));
+        assert_eq!(ext_t.server_wait_ms, Some(45.0));
+        assert_eq!(ext_t.content_download_ms, Some(8.0));
+        let ext_s = ext_imported[0]
+            .transfer_stats
+            .as_ref()
+            .expect("reconstructed stats");
+        assert_eq!(ext_s.server_ip.as_deref(), Some("1.1.1.1"));
+        assert_eq!(ext_s.server_conn_id, Some(77));
+        assert_eq!(ext_s.server_conn_reused, Some(false));
+        assert_eq!(ext_s.response_wire_body_bytes, Some(400));
+        assert_eq!(ext_imported[0].summary.ttfb_ms, Some(45.0));
+        assert_eq!(ext_imported[0].summary.connect_ms, Some(12.0));
+    }
+
+    #[test]
+    fn saz_telemetry_roundtrip_and_authentic_fiddler_timers_import() {
+        let cold = make_telemetried_sample(false);
+        let mut saz_buf = Cursor::new(Vec::new());
+        assert_eq!(write_saz_to_writer(&mut saz_buf, std::slice::from_ref(&cold)).unwrap(), 1);
+
+        saz_buf.set_position(0);
+        {
+            let mut archive = ZipArchive::new(&mut saz_buf).unwrap();
+            let mut m_xml = String::new();
+            archive.by_name("raw/0001_m.xml").unwrap().read_to_string(&mut m_xml).unwrap();
+            assert!(m_xml.contains("DNSTime=\"6\""));
+            assert!(m_xml.contains("TCPConnectTime=\"13\""));
+            assert!(m_xml.contains("HTTPSHandshakeTime=\"30\""));
+            assert!(m_xml.contains("<PipeInfo CltReuse=\"false\" Reused=\"false\" />"));
+            assert!(m_xml.contains("N=\"x-hostip\" V=\"93.184.216.34\""));
+            assert!(m_xml.contains("N=\"https-server-cipher\" V=\"TLSv1.3 (TLS13_AES_128_GCM_SHA256)\""));
+        }
+
+        saz_buf.set_position(0);
+        let saz_restored = read_saz_from_reader(saz_buf).expect("roundtrip SAZ");
+        assert_eq!(saz_restored[0].timings, cold.timings);
+        assert_eq!(saz_restored[0].transfer_stats, cold.transfer_stats);
+
+        // Authentic Fiddler Classic `.saz` with sentinel timestamps and no x-fluxproxy-* flags
+        let fiddler_m_xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<Session SID="1" BitFlags="1">
+  <SessionTimers ClientConnected="2026-11-22T10:00:00.000000Z" ClientBeginRequest="2026-11-22T10:00:00.000000Z" GotRequestHeaders="0001-01-01T00:00:00" ClientDoneRequest="2026-11-22T10:00:00.002000Z" GatewayTime="0" DNSTime="7" TCPConnectTime="15" HTTPSHandshakeTime="28" ServerConnected="2026-11-22T10:00:00.052000Z" FiddlerBeginRequest="2026-11-22T10:00:00.002000Z" ServerGotRequest="2026-11-22T10:00:00.054000Z" ServerBeginResponse="2026-11-22T10:00:00.094000Z" GotResponseHeaders="2026-11-22T10:00:00.095000Z" ServerDoneResponse="2026-11-22T10:00:00.104000Z" ClientBeginResponse="2026-11-22T10:00:00.105000Z" ClientDoneResponse="2026-11-22T10:00:00.107000Z" />
+  <PipeInfo CltReuse="true" Reused="false" />
+  <SessionFlags>
+    <SessionFlag N="x-hostip" V="104.16.10.20" />
+    <SessionFlag N="https-server-cipher" V="TLSv1.3 (TLS_AES_256_GCM_SHA384)" />
+  </SessionFlags>
+</Session>"#;
+        let mut fiddler_zip = Cursor::new(Vec::new());
+        {
+            let mut zw = ZipWriter::new(&mut fiddler_zip);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zw.start_file("raw/0001_c.txt", opts).unwrap();
+            zw.write_all(b"GET https://edge.test/data HTTP/1.1\r\nHost: edge.test\r\n\r\n")
+                .unwrap();
+            zw.start_file("raw/0001_s.txt", opts).unwrap();
+            zw.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 9\r\n\r\n{\"ok\":1}\n")
+                .unwrap();
+            zw.start_file("raw/0001_m.xml", opts).unwrap();
+            zw.write_all(fiddler_m_xml.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+        let imported = import_sessions_from_bytes("classic.saz", fiddler_zip.get_ref()).unwrap();
+        let it = imported[0].timings.as_ref().expect("imported timings");
+        assert!(it.got_request_headers.is_none());
+        assert_eq!(it.dns_ms, Some(7.0));
+        assert_eq!(it.tcp_connect_ms, Some(15.0));
+        assert_eq!(it.tls_handshake_ms, Some(28.0));
+        assert_eq!(it.server_wait_ms, Some(40.0));
+        assert_eq!(it.content_download_ms, Some(10.0));
+        let is = imported[0].transfer_stats.as_ref().expect("imported stats");
+        assert_eq!(is.client_conn_reused, Some(true));
+        assert_eq!(is.server_conn_reused, Some(false));
+        assert_eq!(is.server_ip.as_deref(), Some("104.16.10.20"));
+        assert_eq!(is.server_tls_version.as_deref(), Some("TLSv1.3"));
+        assert_eq!(
+            is.server_tls_cipher.as_deref(),
+            Some("TLS_AES_256_GCM_SHA384")
+        );
+        assert_eq!(imported[0].summary.server_ip.as_deref(), Some("104.16.10.20"));
+    }
+
+    #[test]
+    fn sanitization_anonymizes_transfer_stats_client_conn_id_and_preserves_server_telemetry() {
+        let session = make_telemetried_sample(false);
+        let sanitized = sanitize_sessions(
+            &[session],
+            &SanitizationOptions {
+                redact_auth_headers: false,
+                custom_redacted_headers: Vec::new(),
+                mask_json_keys: Vec::new(),
+                strip_query_params: Vec::new(),
+                anonymize_client_info: true,
+                replacement_text: "[REDACTED]".into(),
+            },
+        );
+        assert_eq!(sanitized.len(), 1);
+        assert_eq!(sanitized[0].client_addr, "0.0.0.0:0");
+        assert_eq!(sanitized[0].summary.client_ip.as_deref(), Some("0.0.0.0"));
+        let stats = sanitized[0].transfer_stats.as_ref().unwrap();
+        assert_eq!(stats.client_conn_id, None);
+        assert_eq!(stats.server_ip.as_deref(), Some("93.184.216.34"));
+        assert!(sanitized[0].timings.is_some());
     }
 }

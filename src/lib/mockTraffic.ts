@@ -9,6 +9,8 @@ import {
   type PythonScriptPreset,
   type SanitizationOptions,
   type SessionDetail,
+  type SessionTimings,
+  type SessionTransferStats,
   type SseEventRecord,
 } from "../types/proxy";
 import { decodeBase64ToBytes, encodeTextToBase64 } from "./formatters";
@@ -687,6 +689,179 @@ export function buildSimulatedSession(id: number): SessionDetail {
       }))
     : [];
 
+  const effectiveBodySize =
+    tpl.status === 304 || tpl.status === 204
+      ? 0
+      : tpl.simulatedBodySize ??
+        (tpl.respBodyBase64
+          ? Math.floor((tpl.respBodyBase64.length * 3) / 4)
+          : new TextEncoder().encode(respText).length);
+
+  const reqBodyBytes = reqText
+    ? new TextEncoder().encode(reqText).length
+    : tpl.reqBodyBase64
+      ? Math.floor((tpl.reqBodyBase64.length * 3) / 4)
+      : 0;
+  const reqHeadersBytes = requestHeaders.reduce(
+    (acc, h) => acc + h.name.length + h.value.length + 4,
+    tpl.method.length + tpl.path.length + 14
+  );
+  const respHeadersBytes = responseHeaders.reduce(
+    (acc, h) => acc + h.name.length + h.value.length + 4,
+    20
+  );
+
+  const isCompressible =
+    tpl.status === 200 &&
+    effectiveBodySize > 120 &&
+    /json|html|javascript|svg|xml|text/i.test(tpl.contentType);
+  const responseContentEncoding = isCompressible
+    ? id % 3 === 0
+      ? "zstd"
+      : id % 2 === 0
+        ? "br"
+        : "gzip"
+    : null;
+  const responseWireBodyBytes = responseContentEncoding
+    ? Math.max(
+        48,
+        Math.round(effectiveBodySize * (id % 3 === 0 ? 0.38 : 0.48))
+      )
+    : effectiveBodySize;
+
+  const isHttps = tpl.scheme === "https" || tpl.scheme === "wss";
+  const serverConnReused = id % 2 === 0;
+  const hostSeed = Array.from(tpl.host).reduce(
+    (acc, ch) => acc + ch.charCodeAt(0),
+    0
+  );
+  const serverIp =
+    tpl.host.startsWith("127.") || tpl.host === "localhost"
+      ? "127.0.0.1"
+      : `104.${16 + (hostSeed % 64)}.${(hostSeed * 7) % 240}.${10 + (hostSeed % 200)}`;
+  const serverPort = isHttps ? 443 : 80;
+  const serverConnId = (hostSeed % 97) + (serverConnReused ? 1 : 101);
+  const clientConnId = (tpl.processPid % 89) + 1;
+
+  const dnsMs = serverConnReused
+    ? 0
+    : Number((2.2 + (hostSeed % 17) * 0.7).toFixed(2));
+  const tcpConnectMs = serverConnReused
+    ? 0
+    : Number(Math.max(2, Math.min(durationMs * 0.2, 6 + (hostSeed % 16))).toFixed(2));
+  const tlsHandshakeMs = !isHttps
+    ? null
+    : serverConnReused
+      ? 0
+      : Number(Math.max(4, Math.min(durationMs * 0.34, 14 + (hostSeed % 26))).toFixed(2));
+  const clientReadMs = 0.6;
+  const clientTlsHandshakeMs = isHttps ? (serverConnReused ? 0 : 2.9) : null;
+  const sendRequestMs = 0.9;
+  const clientSendMs = 0.7;
+  const proxyOverheadMs = 0.8;
+  const usedMs =
+    clientReadMs +
+    (clientTlsHandshakeMs ?? 0) +
+    dnsMs +
+    tcpConnectMs +
+    (tlsHandshakeMs ?? 0) +
+    sendRequestMs +
+    clientSendMs +
+    proxyOverheadMs;
+  const remainingMs = Math.max(1, durationMs - usedMs);
+  const serverWaitMs = Number((remainingMs * 0.78).toFixed(2));
+  const contentDownloadMs = Number(
+    Math.max(0.2, remainingMs - serverWaitMs).toFixed(2)
+  );
+  const overallElapsedMs = Number((usedMs + serverWaitMs + contentDownloadMs).toFixed(2));
+  const netElapsedMs = Number(
+    (
+      dnsMs +
+      tcpConnectMs +
+      (tlsHandshakeMs ?? 0) +
+      sendRequestMs +
+      serverWaitMs +
+      contentDownloadMs
+    ).toFixed(2)
+  );
+
+  const toMicrosIso = (epochMs: number) =>
+    new Date(Math.round(epochMs * 1000) / 1000).toISOString();
+  const tConn = nowMs - (clientTlsHandshakeMs ?? 0) - 0.5;
+  const tReqStart = nowMs;
+  const tReqHdr = tReqStart + 0.3;
+  const tReqDone = tReqStart + clientReadMs;
+  const tProxyBegin = tReqDone + 0.3;
+  const tSrvConn = tProxyBegin + dnsMs + tcpConnectMs + (tlsHandshakeMs ?? 0);
+  const tSrvGotReq = tSrvConn + sendRequestMs;
+  const tSrvBeginResp = tSrvGotReq + serverWaitMs;
+  const tRespHdr = tSrvBeginResp + 0.2;
+  const tSrvDone = tSrvBeginResp + contentDownloadMs;
+  const tCltBeginResp = tSrvDone + 0.3;
+  const tCltDoneResp = tCltBeginResp + clientSendMs;
+
+  const timings: SessionTimings = {
+    clientConnected: toMicrosIso(tConn),
+    clientBeginRequest: toMicrosIso(tReqStart),
+    gotRequestHeaders: toMicrosIso(tReqHdr),
+    clientDoneRequest: toMicrosIso(tReqDone),
+    proxyBeginRequest: toMicrosIso(tProxyBegin),
+    serverConnected: toMicrosIso(tSrvConn),
+    serverGotRequest: toMicrosIso(tSrvGotReq),
+    serverBeginResponse: toMicrosIso(tSrvBeginResp),
+    gotResponseHeaders: toMicrosIso(tRespHdr),
+    serverDoneResponse: toMicrosIso(tSrvDone),
+    clientBeginResponse: toMicrosIso(tCltBeginResp),
+    clientDoneResponse: toMicrosIso(tCltDoneResp),
+    clientReadMs,
+    clientTlsHandshakeMs,
+    dnsMs,
+    tcpConnectMs,
+    tlsHandshakeMs,
+    sendRequestMs,
+    serverWaitMs,
+    contentDownloadMs,
+    clientSendMs,
+    proxyOverheadMs,
+    overallElapsedMs,
+    netElapsedMs,
+  };
+
+  const serverHttpVer = tpl.protocol.includes("2") ? "HTTP/2.0" : "HTTP/1.1";
+  const transferStats: SessionTransferStats = {
+    requestHeadersBytes: reqHeadersBytes,
+    requestBodyBytes: reqBodyBytes,
+    requestWireBodyBytes: reqBodyBytes,
+    responseHeadersBytes: respHeadersBytes,
+    responseBodyBytes: effectiveBodySize,
+    responseWireBodyBytes,
+    responseContentEncoding,
+    clientConnId,
+    clientConnReused: serverConnReused,
+    clientHttpVersion: "HTTP/1.1",
+    clientTlsVersion: isHttps ? "TLSv1.3" : null,
+    clientTlsCipher: isHttps ? "TLS13_AES_256_GCM_SHA384" : null,
+    clientAlpn: isHttps ? "http/1.1" : null,
+    serverAddr: `${serverIp}:${serverPort}`,
+    serverIp,
+    serverPort,
+    serverConnId,
+    serverConnReused,
+    serverHttpVersion: serverHttpVer,
+    serverTlsVersion: isHttps ? "TLSv1.3" : null,
+    serverTlsCipher: isHttps ? "TLS13_AES_128_GCM_SHA256" : null,
+    serverTlsAlpn: isHttps
+      ? serverHttpVer === "HTTP/2.0"
+        ? "h2"
+        : "http/1.1"
+      : null,
+    serverCertSubject: isHttps ? `CN=*.${tpl.host.split(".").slice(-2).join(".")}` : null,
+    serverCertIssuer: isHttps ? "CN=Cloudflare TLS Issuing ECC CA 1" : null,
+    serverMtlsCn: null,
+    remappedTarget: null,
+    isStreaming: tpl.contentType.includes("text/event-stream"),
+  };
+
   return {
     summary: {
       id,
@@ -698,13 +873,7 @@ export function buildSimulatedSession(id: number): SessionDetail {
       path: tpl.path,
       url,
       contentType: tpl.contentType,
-      bodySize:
-        tpl.status === 304 || tpl.status === 204
-          ? 0
-          : tpl.simulatedBodySize ??
-            (tpl.respBodyBase64
-              ? Math.floor((tpl.respBodyBase64.length * 3) / 4)
-              : new TextEncoder().encode(respText).length),
+      bodySize: effectiveBodySize,
       durationMs,
       timestamp: nowIso,
       isMocked: false,
@@ -718,6 +887,15 @@ export function buildSimulatedSession(id: number): SessionDetail {
       breakpointModified: false,
       comment: tpl.defaultComment ?? null,
       markedColor: tpl.defaultMarkedColor ?? null,
+      ttfbMs: serverWaitMs,
+      dnsMs,
+      connectMs: tcpConnectMs,
+      tlsMs: tlsHandshakeMs,
+      receiveMs: contentDownloadMs,
+      requestSize: reqHeadersBytes + reqBodyBytes,
+      wireBodySize: responseWireBodyBytes,
+      serverIp,
+      serverConnReused,
     },
     requestHeaders,
     responseHeaders,
@@ -749,6 +927,8 @@ export function buildSimulatedSession(id: number): SessionDetail {
           ]
         : [],
     sseEvents,
+    timings,
+    transferStats,
   };
 }
 
@@ -1424,6 +1604,9 @@ export function sanitizeSessionsInPreview(
       detail.summary.clientIp = "0.0.0.0";
       detail.summary.processName = "redacted-process";
       detail.summary.processPid = null;
+      if (detail.transferStats) {
+        detail.transferStats.clientConnId = null;
+      }
     }
 
     return detail;

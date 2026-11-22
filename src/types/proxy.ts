@@ -23,6 +23,69 @@ export interface SseEventRecord {
   timestamp: string;
 }
 
+export interface SessionTimings {
+  clientConnected?: string | null;
+  clientBeginRequest?: string | null;
+  gotRequestHeaders?: string | null;
+  clientDoneRequest?: string | null;
+  proxyBeginRequest?: string | null;
+  serverConnected?: string | null;
+  serverGotRequest?: string | null;
+  serverBeginResponse?: string | null;
+  gotResponseHeaders?: string | null;
+  serverDoneResponse?: string | null;
+  clientBeginResponse?: string | null;
+  clientDoneResponse?: string | null;
+
+  clientReadMs?: number | null;
+  clientTlsHandshakeMs?: number | null;
+  dnsMs?: number | null;
+  tcpConnectMs?: number | null;
+  tlsHandshakeMs?: number | null;
+  sendRequestMs?: number | null;
+  serverWaitMs?: number | null;
+  contentDownloadMs?: number | null;
+  clientSendMs?: number | null;
+  breakpointPauseMs?: number | null;
+  scriptHookMs?: number | null;
+  autoresponderDelayMs?: number | null;
+  proxyOverheadMs?: number | null;
+  overallElapsedMs?: number | null;
+  netElapsedMs?: number | null;
+}
+
+export interface SessionTransferStats {
+  requestHeadersBytes?: number | null;
+  requestBodyBytes?: number | null;
+  requestWireBodyBytes?: number | null;
+  responseHeadersBytes?: number | null;
+  responseBodyBytes?: number | null;
+  responseWireBodyBytes?: number | null;
+  responseContentEncoding?: string | null;
+
+  clientConnId?: number | null;
+  clientConnReused?: boolean | null;
+  clientHttpVersion?: string | null;
+  clientTlsVersion?: string | null;
+  clientTlsCipher?: string | null;
+  clientAlpn?: string | null;
+
+  serverAddr?: string | null;
+  serverIp?: string | null;
+  serverPort?: number | null;
+  serverConnId?: number | null;
+  serverConnReused?: boolean | null;
+  serverHttpVersion?: string | null;
+  serverTlsVersion?: string | null;
+  serverTlsCipher?: string | null;
+  serverTlsAlpn?: string | null;
+  serverCertSubject?: string | null;
+  serverCertIssuer?: string | null;
+  serverMtlsCn?: string | null;
+  remappedTarget?: string | null;
+  isStreaming?: boolean | null;
+}
+
 export interface SessionSummary {
   id: number;
   status: number;
@@ -49,6 +112,15 @@ export interface SessionSummary {
   markedColor?: string | null;
   clientIp?: string | null;
   remappedTo?: string | null;
+  ttfbMs?: number | null;
+  dnsMs?: number | null;
+  connectMs?: number | null;
+  tlsMs?: number | null;
+  receiveMs?: number | null;
+  requestSize?: number | null;
+  wireBodySize?: number | null;
+  serverIp?: string | null;
+  serverConnReused?: boolean | null;
 }
 
 export interface SessionDetail {
@@ -65,6 +137,8 @@ export interface SessionDetail {
   sseEvents?: SseEventRecord[];
   bodyOffloaded?: boolean;
   requestBodyOffloaded?: boolean;
+  timings?: SessionTimings | null;
+  transferStats?: SessionTransferStats | null;
 }
 
 export interface StorageStats {
@@ -511,6 +585,8 @@ export type ColumnId =
   | "process"
   | "size"
   | "time"
+  | "ttfb"
+  | "serverIp"
   | "comment";
 
 export type SortDirection = "asc" | "desc";

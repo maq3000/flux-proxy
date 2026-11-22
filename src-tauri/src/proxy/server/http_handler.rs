@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use http::header::{HOST, UPGRADE};
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, LengthLimitError, Limited, StreamBody};
@@ -15,27 +15,32 @@ use tokio::sync::mpsc;
 
 use crate::models::{
     AutoResponderRule, BreakpointAction, BreakpointStage, HeaderMutationDirection, HeaderPair,
-    PausedBreakpointItem, RuleActionType, SessionDetail, SessionSummary, SseEventRecord,
+    PausedBreakpointItem, RuleActionType, SessionDetail, SessionSummary, SessionTimings,
+    SessionTransferStats, SseEventRecord,
 };
 use crate::proxy::filters::is_alt_svc_header;
 use crate::proxy::hosts::HostRemapRegistry;
 use crate::proxy::network::normalize_client_ip;
 use crate::proxy::process::ClientProcessInfo;
 use crate::proxy::throttle::BandwidthPacer;
+use crate::proxy::upstream_client::{
+    duration_ms_f64, elapsed_ms, estimate_request_headers_bytes, estimate_response_headers_bytes,
+    format_rfc3339_micros, round_ms, timestamp_at_instant, TrackedResponseBody,
+};
 use crate::scripting::{
     apply_header_diff, ScriptRequestEdits, ScriptRequestOutcome, ScriptResponseOutcome,
 };
-use crate::storage::{BODY_OFFLOAD_THRESHOLD_BYTES};
+use crate::storage::BODY_OFFLOAD_THRESHOLD_BYTES;
 
 use super::mobile_portal::{handle_builtin_portal_request, is_builtin_portal_target};
 use super::websocket_relay::handle_websocket_intercept;
 use super::{
-    boxed_full, encode_inline_or_offload, extract_hyper_headers, extract_reqwest_headers,
-    format_http_version, is_hop_by_hop_header, is_loopback_ip, make_breakpoint_guard,
-    parse_host_and_optional_port, plain_response, record_and_return_error,
-    record_and_return_error_with_opts, record_completed_session,
-    record_in_flight_session_with_remap, request_targets_loopback_or_unspecified,
-    resolve_protocol_label, should_use_host_mtls_for_peer, ProxyBoxBody, SharedProxyContext,
+    boxed_full, encode_inline_or_offload, extract_hyper_headers, format_http_version,
+    format_mitm_tls_display, format_raw_http_version, is_hop_by_hop_header, is_loopback_ip,
+    make_breakpoint_guard, parse_host_and_optional_port, plain_response,
+    record_completed_session, record_in_flight_session_with_remap,
+    request_targets_loopback_or_unspecified, resolve_protocol_label,
+    should_use_host_mtls_for_peer, ClientConnContext, ProxyBoxBody, SharedProxyContext,
     DEFAULT_UPSTREAM_TIMEOUT_SEC, MAX_CAPTURED_BODY_BYTES, MAX_CAPTURED_REQUEST_BODY_BYTES,
     MAX_CONTENT_ENCODING_LAYERS, STREAM_TEXT_PREVIEW_MAX_BYTES,
     ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES,
@@ -104,13 +109,6 @@ pub fn build_upstream_client_with_identity(
     identity: Option<reqwest::Identity>,
 ) -> Result<reqwest::Client, reqwest::Error> {
     build_upstream_client_with_options(follow_redirects, identity, None)
-}
-
-pub(crate) fn build_upstream_client_with_resolver(
-    follow_redirects: bool,
-    dns_resolver: Option<Arc<HostRemapRegistry>>,
-) -> Result<reqwest::Client, reqwest::Error> {
-    build_upstream_client_with_options(follow_redirects, None, dns_resolver)
 }
 
 /// Builds the shared upstream HTTP/HTTPS `reqwest::Client` without a client mTLS identity.
@@ -232,6 +230,7 @@ pub(crate) fn format_error_chain(err: &dyn std::error::Error) -> String {
     parts.join(" -> ")
 }
 
+#[cfg(test)]
 #[inline]
 pub(super) fn is_idempotent_retry_method(method: &reqwest::Method) -> bool {
     matches!(
@@ -240,6 +239,7 @@ pub(super) fn is_idempotent_retry_method(method: &reqwest::Method) -> bool {
     )
 }
 
+#[cfg(test)]
 pub(super) fn is_stale_pool_connection_error(err: &reqwest::Error) -> bool {
     if !(err.is_request() || err.is_connect()) {
         return false;
@@ -285,6 +285,7 @@ pub(super) fn is_stale_pool_connection_error(err: &reqwest::Error) -> bool {
     false
 }
 
+#[cfg(test)]
 pub(super) async fn send_upstream_with_retry<F>(
     client: &reqwest::Client,
     method: &reqwest::Method,
@@ -530,6 +531,135 @@ pub(crate) async fn maybe_decompress_zstd(headers: &[HeaderPair], body: Bytes) -
     (res.body, res.decoded_any || all_decoded)
 }
 
+pub(crate) fn compute_timings_summary(timings: &mut SessionTimings, overall_ms: f64) {
+    let rounded_overall = round_ms(overall_ms);
+    timings.overall_elapsed_ms = Some(rounded_overall);
+    let pause_sum = timings.breakpoint_pause_ms.unwrap_or(0.0)
+        + timings.script_hook_ms.unwrap_or(0.0)
+        + timings.autoresponder_delay_ms.unwrap_or(0.0);
+    let net_elapsed = (rounded_overall - pause_sum).max(0.0);
+    timings.net_elapsed_ms = Some(round_ms(net_elapsed));
+    let tracked_net = timings.client_read_ms.unwrap_or(0.0)
+        + timings.dns_ms.unwrap_or(0.0)
+        + timings.tcp_connect_ms.unwrap_or(0.0)
+        + timings.tls_handshake_ms.unwrap_or(0.0)
+        + timings.send_request_ms.unwrap_or(0.0)
+        + timings.server_wait_ms.unwrap_or(0.0)
+        + timings.content_download_ms.unwrap_or(0.0)
+        + timings.client_send_ms.unwrap_or(0.0);
+    let overhead = (net_elapsed - tracked_net).max(0.0);
+    timings.proxy_overhead_ms = Some(round_ms(overhead));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_error_timings_and_stats(
+    start: Instant,
+    start_utc: DateTime<Utc>,
+    client_conn: &ClientConnContext,
+    client_reused: bool,
+    client_tls_ms: Option<f64>,
+    client_read_ms: f64,
+    client_http_ver: &str,
+    req_headers_bytes: usize,
+    req_body_len: usize,
+    resp_len: usize,
+    bp_pause_ms: f64,
+    script_hook_ms: f64,
+    remapped_target: Option<String>,
+) -> (SessionTimings, SessionTransferStats) {
+    let now = Instant::now();
+    let now_at = timestamp_at_instant(start, start_utc, now);
+    let req_at = format_rfc3339_micros(start_utc);
+    let mut timings = SessionTimings {
+        client_connected: Some(client_conn.connected_at.clone()),
+        client_begin_request: Some(req_at.clone()),
+        got_request_headers: Some(req_at.clone()),
+        client_done_request: Some(req_at),
+        client_begin_response: Some(now_at.clone()),
+        client_done_response: Some(now_at),
+        client_read_ms: Some(round_ms(client_read_ms)),
+        client_tls_handshake_ms: client_tls_ms,
+        breakpoint_pause_ms: (bp_pause_ms > 0.0).then(|| round_ms(bp_pause_ms)),
+        script_hook_ms: (script_hook_ms > 0.0).then(|| round_ms(script_hook_ms)),
+        ..Default::default()
+    };
+    compute_timings_summary(&mut timings, duration_ms_f64(now.saturating_duration_since(start)));
+    let stats = SessionTransferStats {
+        request_headers_bytes: Some(req_headers_bytes),
+        request_body_bytes: Some(req_body_len),
+        request_wire_body_bytes: Some(req_body_len),
+        response_body_bytes: Some(resp_len),
+        response_wire_body_bytes: Some(resp_len),
+        client_conn_id: Some(client_conn.conn_id),
+        client_conn_reused: Some(client_reused),
+        client_http_version: Some(client_http_ver.to_string()),
+        client_tls_version: client_conn.client_tls_version.clone(),
+        client_tls_cipher: client_conn.client_tls_cipher.clone(),
+        client_alpn: client_conn.client_alpn.clone(),
+        remapped_target,
+        ..Default::default()
+    };
+    (timings, stats)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_and_return_error_with_telemetry(
+    ctx: &SharedProxyContext,
+    session_id: u64,
+    scheme: &str,
+    method: &str,
+    host: &str,
+    path: &str,
+    url: &str,
+    req_headers: Vec<HeaderPair>,
+    req_body: Bytes,
+    start: Instant,
+    timestamp: String,
+    client_addr: SocketAddr,
+    client_proc: Option<&ClientProcessInfo>,
+    tls_bypassed: bool,
+    breakpoint_modified: bool,
+    status_code: StatusCode,
+    remapped_to: Option<String>,
+    timings: Option<SessionTimings>,
+    transfer_stats: Option<SessionTransferStats>,
+    err_msg: String,
+) -> Response<ProxyBoxBody> {
+    let protocol = if tls_bypassed {
+        "TLS-BYPASS".into()
+    } else {
+        scheme.to_ascii_uppercase()
+    };
+    super::record_error_session_with_telemetry(
+        ctx,
+        session_id,
+        protocol,
+        scheme,
+        method,
+        host,
+        path,
+        url,
+        req_headers,
+        &req_body,
+        start.elapsed().as_millis() as u64,
+        timestamp,
+        client_proc.map(|p| p.name.clone()),
+        client_proc.map(|p| p.pid),
+        tls_bypassed,
+        false,
+        breakpoint_modified,
+        Some(normalize_client_ip(client_addr)),
+        client_addr.to_string(),
+        status_code.as_u16(),
+        remapped_to,
+        timings,
+        transfer_stats,
+        &err_msg,
+    );
+    plain_response(status_code, &err_msg)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_intercepted_request(
     req: Request<Incoming>,
     scheme: &str,
@@ -537,10 +667,13 @@ pub(super) async fn handle_intercepted_request(
     alpn: Option<&str>,
     client_addr: SocketAddr,
     client_proc: Option<ClientProcessInfo>,
+    client_conn: ClientConnContext,
     ctx: Arc<SharedProxyContext>,
 ) -> Response<ProxyBoxBody> {
     let start = Instant::now();
-    let timestamp = Utc::now().to_rfc3339();
+    let start_utc = Utc::now();
+    let timestamp = start_utc.to_rfc3339();
+    let req_begin_at = format_rfc3339_micros(start_utc);
     let session_id = ctx.store.allocate_id();
 
     let mut scheme_str = scheme.to_string();
@@ -596,15 +729,40 @@ pub(super) async fn handle_intercepted_request(
             timestamp,
             client_addr,
             client_proc.as_ref(),
+            &client_conn,
             &ctx,
         );
     }
 
     // 0a. Bandwidth Throttling: Offline mode blocks outbound HTTP/HTTPS/WS traffic immediately
     if ctx.throttle.is_offline() {
+        let (client_reused, client_tls_ms) = client_conn.claim_request_seq();
+        let client_http_ver = format_raw_http_version(req.version()).to_string();
         let method_preview = req.method().as_str().to_string();
         let req_headers = extract_hyper_headers(req.headers());
-        return record_and_return_error_with_opts(
+        let req_headers_bytes = estimate_request_headers_bytes(
+            &method_preview,
+            &path_and_query,
+            &client_http_ver,
+            &req_headers,
+        );
+        let msg = "Network Offline (Bandwidth Throttling: Offline)".to_string();
+        let (err_timings, err_stats) = build_error_timings_and_stats(
+            start,
+            start_utc,
+            &client_conn,
+            client_reused,
+            client_tls_ms,
+            0.0,
+            &client_http_ver,
+            req_headers_bytes,
+            0,
+            msg.len(),
+            0.0,
+            0.0,
+            None,
+        );
+        return record_and_return_error_with_telemetry(
             &ctx,
             session_id,
             &scheme_str,
@@ -622,7 +780,9 @@ pub(super) async fn handle_intercepted_request(
             false,
             StatusCode::SERVICE_UNAVAILABLE,
             None,
-            "Network Offline (Bandwidth Throttling: Offline)".to_string(),
+            Some(err_timings),
+            Some(err_stats),
+            msg,
         );
     }
 
@@ -678,20 +838,26 @@ pub(super) async fn handle_intercepted_request(
             timestamp,
             client_addr,
             client_proc,
+            client_conn,
             ctx,
         )
         .await;
     }
 
+    let (client_reused, client_tls_ms) = client_conn.claim_request_seq();
     let mut method_str = req.method().as_str().to_string();
     let req_version = req.version();
+    let client_http_ver = format_raw_http_version(req_version).to_string();
     let mut req_headers = extract_hyper_headers(req.headers());
     let mut req_mutated = ctx.filters.apply_header_mutations(
         HeaderMutationDirection::Request,
         &full_url,
         &mut req_headers,
     );
+    let mut req_headers_bytes =
+        estimate_request_headers_bytes(&method_str, &path_and_query, &client_http_ver, &req_headers);
 
+    let req_body_read_start = Instant::now();
     let mut body_bytes = match collect_request_body_limited(
         req.into_body(),
         MAX_CAPTURED_REQUEST_BODY_BYTES,
@@ -700,6 +866,10 @@ pub(super) async fn handle_intercepted_request(
     {
         Ok(bytes) => bytes,
         Err(RequestBodyReadError::PayloadTooLarge(limit)) => {
+            let client_done_req_instant = Instant::now();
+            let client_read_ms = duration_ms_f64(
+                client_done_req_instant.saturating_duration_since(req_body_read_start),
+            );
             let msg = format!(
                 "Request body exceeds maximum captured payload limit ({limit} bytes)"
             );
@@ -708,7 +878,29 @@ pub(super) async fn handle_intercepted_request(
                 name: "Content-Type".into(),
                 value: "text/plain; charset=utf-8".into(),
             }];
-            let summary = SessionSummary {
+            let (mut err_timings, mut err_stats) = build_error_timings_and_stats(
+                start,
+                start_utc,
+                &client_conn,
+                client_reused,
+                client_tls_ms,
+                client_read_ms,
+                &client_http_ver,
+                req_headers_bytes,
+                0,
+                msg.len(),
+                0.0,
+                0.0,
+                None,
+            );
+            err_stats.response_headers_bytes = Some(estimate_response_headers_bytes(
+                StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                &client_http_ver,
+                &resp_headers,
+            ));
+            err_timings.client_done_request =
+                Some(timestamp_at_instant(start, start_utc, client_done_req_instant));
+            let mut summary = SessionSummary {
                 id: session_id,
                 status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
                 protocol,
@@ -734,7 +926,17 @@ pub(super) async fn handle_intercepted_request(
                 marked_color: None,
                 client_ip: Some(normalize_client_ip(client_addr)),
                 remapped_to: None,
+                ttfb_ms: None,
+                dns_ms: None,
+                connect_ms: None,
+                tls_ms: None,
+                receive_ms: None,
+                request_size: None,
+                wire_body_size: None,
+                server_ip: None,
+                server_conn_reused: None,
             };
+            summary.apply_telemetry(Some(&err_timings), Some(&err_stats));
             let detail = SessionDetail {
                 summary,
                 request_headers: req_headers,
@@ -750,12 +952,31 @@ pub(super) async fn handle_intercepted_request(
                 sse_events: Vec::new(),
                 body_offloaded: false,
                 request_body_offloaded: false,
+                timings: Some(err_timings),
+                transfer_stats: Some(err_stats),
             };
             record_completed_session(&ctx, detail, None, Some(msg.as_bytes()));
             return plain_response(StatusCode::PAYLOAD_TOO_LARGE, &msg);
         }
         Err(RequestBodyReadError::Transport(err)) => {
-            return record_and_return_error(
+            let client_read_ms = elapsed_ms(req_body_read_start);
+            let msg = format!("Failed reading client request body: {err}");
+            let (err_timings, err_stats) = build_error_timings_and_stats(
+                start,
+                start_utc,
+                &client_conn,
+                client_reused,
+                client_tls_ms,
+                client_read_ms,
+                &client_http_ver,
+                req_headers_bytes,
+                0,
+                msg.len(),
+                0.0,
+                0.0,
+                None,
+            );
+            return record_and_return_error_with_telemetry(
                 &ctx,
                 session_id,
                 &scheme_str,
@@ -771,12 +992,24 @@ pub(super) async fn handle_intercepted_request(
                 client_proc.as_ref(),
                 false,
                 false,
-                format!("Failed reading client request body: {err}"),
+                StatusCode::BAD_GATEWAY,
+                None,
+                Some(err_timings),
+                Some(err_stats),
+                msg,
             );
         }
     };
+    let client_done_req_instant = Instant::now();
+    let client_done_request_at = timestamp_at_instant(start, start_utc, client_done_req_instant);
+    let client_read_ms = duration_ms_f64(
+        client_done_req_instant.saturating_duration_since(req_body_read_start),
+    );
 
     let mut bp_modified = false;
+    let mut total_bp_pause_ms = 0.0_f64;
+    let mut total_script_hook_ms = 0.0_f64;
+    let mut autoresponder_delay_ms = 0.0_f64;
 
     // 1b. Live Breakpoint: Before Request (F11 / `bpu`)
     if ctx
@@ -793,15 +1026,17 @@ pub(super) async fn handle_intercepted_request(
             process_pid: client_proc.as_ref().map(|p| p.pid),
             client_ip: Some(normalize_client_ip(client_addr)),
             client_addr: client_addr.to_string(),
-            tls_version: if scheme_str == "https" {
-                Some("TLS 1.3 (MITM Paused)".into())
-            } else {
-                None
-            },
+            tls_version: format_mitm_tls_display(
+                &scheme_str,
+                client_conn.client_tls_version.as_deref(),
+                Some("Paused"),
+                None,
+            ),
             summary_body_size: req_vec.len(),
             req_mutated,
         };
-        if run_request_breakpoint_stage(
+        let bp_start = Instant::now();
+        let bp_res = run_request_breakpoint_stage(
             &ctx,
             bp_input,
             &mut method_str,
@@ -813,10 +1048,26 @@ pub(super) async fn handle_intercepted_request(
             &mut req_vec,
             &mut bp_modified,
         )
-        .await
-        .is_err()
-        {
-            return record_and_return_error(
+        .await;
+        total_bp_pause_ms += elapsed_ms(bp_start);
+        if bp_res.is_err() {
+            let msg = "Aborted at Live Breakpoint (Before Request)".to_string();
+            let (err_timings, err_stats) = build_error_timings_and_stats(
+                start,
+                start_utc,
+                &client_conn,
+                client_reused,
+                client_tls_ms,
+                client_read_ms,
+                &client_http_ver,
+                req_headers_bytes,
+                req_vec.len(),
+                msg.len(),
+                total_bp_pause_ms,
+                total_script_hook_ms,
+                None,
+            );
+            return record_and_return_error_with_telemetry(
                 &ctx,
                 session_id,
                 &scheme_str,
@@ -832,19 +1083,27 @@ pub(super) async fn handle_intercepted_request(
                 client_proc.as_ref(),
                 false,
                 true,
-                "Aborted at Live Breakpoint (Before Request)".to_string(),
+                StatusCode::BAD_GATEWAY,
+                None,
+                Some(err_timings),
+                Some(err_stats),
+                msg,
             );
         }
         body_bytes = Bytes::from(req_vec);
+        req_headers_bytes =
+            estimate_request_headers_bytes(&method_str, &path_and_query, &client_http_ver, &req_headers);
     }
 
     // 1c. Python Scripting Engine: on_request(request)
     if ctx.script_runner.should_run_request() {
-        match ctx
+        let py_req_start = Instant::now();
+        let outcome = ctx
             .script_runner
             .run_on_request(session_id, &method_str, &full_url, &req_headers, &body_bytes)
-            .await
-        {
+            .await;
+        total_script_hook_ms += elapsed_ms(py_req_start);
+        match outcome {
             ScriptRequestOutcome::Unchanged => {}
             ScriptRequestOutcome::Modified(edits) => {
                 apply_script_request_edits(
@@ -858,6 +1117,12 @@ pub(super) async fn handle_intercepted_request(
                     &mut body_bytes,
                     &mut req_mutated,
                 );
+                req_headers_bytes = estimate_request_headers_bytes(
+                    &method_str,
+                    &path_and_query,
+                    &client_http_ver,
+                    &req_headers,
+                );
             }
             ScriptRequestOutcome::MockResponse { edits, mock } => {
                 apply_script_request_edits(
@@ -870,6 +1135,12 @@ pub(super) async fn handle_intercepted_request(
                     &mut req_headers,
                     &mut body_bytes,
                     &mut req_mutated,
+                );
+                req_headers_bytes = estimate_request_headers_bytes(
+                    &method_str,
+                    &path_and_query,
+                    &client_http_ver,
+                    &req_headers,
                 );
 
                 let mock_bytes = Bytes::from(mock.body);
@@ -891,9 +1162,46 @@ pub(super) async fn handle_intercepted_request(
                         Vec::new()
                     };
 
+                let now_instant = Instant::now();
+                let resp_at = timestamp_at_instant(start, start_utc, now_instant);
+                let overall_ms = duration_ms_f64(now_instant.saturating_duration_since(start));
+                let mut mock_timings = SessionTimings {
+                    client_connected: Some(client_conn.connected_at.clone()),
+                    client_begin_request: Some(req_begin_at.clone()),
+                    got_request_headers: Some(req_begin_at.clone()),
+                    client_done_request: Some(client_done_request_at.clone()),
+                    client_begin_response: Some(resp_at.clone()),
+                    client_done_response: Some(resp_at),
+                    client_read_ms: Some(client_read_ms),
+                    client_tls_handshake_ms: client_tls_ms,
+                    breakpoint_pause_ms: (total_bp_pause_ms > 0.0).then(|| round_ms(total_bp_pause_ms)),
+                    script_hook_ms: Some(round_ms(total_script_hook_ms)),
+                    ..Default::default()
+                };
+                compute_timings_summary(&mut mock_timings, overall_ms);
+                let mock_stats = SessionTransferStats {
+                    request_headers_bytes: Some(req_headers_bytes),
+                    request_body_bytes: Some(body_bytes.len()),
+                    request_wire_body_bytes: Some(body_bytes.len()),
+                    response_headers_bytes: Some(estimate_response_headers_bytes(
+                        mock.status,
+                        &client_http_ver,
+                        &mock_resp_headers,
+                    )),
+                    response_body_bytes: Some(mock_bytes.len()),
+                    response_wire_body_bytes: Some(mock_bytes.len()),
+                    client_conn_id: Some(client_conn.conn_id),
+                    client_conn_reused: Some(client_reused),
+                    client_http_version: Some(client_http_ver.clone()),
+                    client_tls_version: client_conn.client_tls_version.clone(),
+                    client_tls_cipher: client_conn.client_tls_cipher.clone(),
+                    client_alpn: client_conn.client_alpn.clone(),
+                    ..Default::default()
+                };
+
                 let protocol_label = resolve_protocol_label(&scheme_str, alpn, req_version);
                 let duration_ms = start.elapsed().as_millis() as u64;
-                let summary = SessionSummary {
+                let mut summary = SessionSummary {
                     id: session_id,
                     status: mock.status,
                     protocol: protocol_label,
@@ -919,7 +1227,17 @@ pub(super) async fn handle_intercepted_request(
                     marked_color: None,
                     client_ip: Some(normalize_client_ip(client_addr)),
                     remapped_to: None,
+                    ttfb_ms: None,
+                    dns_ms: None,
+                    connect_ms: None,
+                    tls_ms: None,
+                    receive_ms: None,
+                    request_size: None,
+                    wire_body_size: None,
+                    server_ip: None,
+                    server_conn_reused: None,
                 };
+                summary.apply_telemetry(Some(&mock_timings), Some(&mock_stats));
 
                 let capped_req = &body_bytes[..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
                 let capped_mock = &mock_bytes[..mock_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
@@ -933,16 +1251,19 @@ pub(super) async fn handle_intercepted_request(
                     response_body_base64: resp_b64,
                     request_body_text: req_txt,
                     response_body_text: resp_txt,
-                    tls_version: if scheme_str == "https" {
-                        Some("TLS 1.3 (MITM Python Mock)".into())
-                    } else {
-                        None
-                    },
+                    tls_version: format_mitm_tls_display(
+                        &scheme_str,
+                        client_conn.client_tls_version.as_deref(),
+                        Some("Python Mock"),
+                        None,
+                    ),
                     client_addr: client_addr.to_string(),
                     websocket_frames: Vec::new(),
                     sse_events,
                     body_offloaded: resp_offloaded,
                     request_body_offloaded: req_offloaded,
+                    timings: Some(mock_timings),
+                    transfer_stats: Some(mock_stats),
                 };
 
                 record_completed_session(&ctx, detail, Some(capped_req), Some(capped_mock));
@@ -983,11 +1304,13 @@ pub(super) async fn handle_intercepted_request(
 
     if let Some(ref rule) = matched_rule {
         if rule.latency_ms > 0 {
+            let delay_start = Instant::now();
             tokio::time::sleep(Duration::from_millis(rule.latency_ms)).await;
+            autoresponder_delay_ms = elapsed_ms(delay_start);
         }
 
         if matches!(rule.action, RuleActionType::MockResponse) {
-            let mock_out = build_autoresponder_mock_detail(
+            let mut mock_out = build_autoresponder_mock_detail(
                 &ctx,
                 AutoResponderMockInput {
                     session_id,
@@ -996,7 +1319,7 @@ pub(super) async fn handle_intercepted_request(
                     scheme: scheme_str.clone(),
                     method: method_str,
                     host: host_header,
-                    path: path_and_query,
+                    path: path_and_query.clone(),
                     full_url,
                     req_headers,
                     req_bytes: &body_bytes,
@@ -1008,13 +1331,56 @@ pub(super) async fn handle_intercepted_request(
                     bp_modified,
                     client_ip: Some(normalize_client_ip(client_addr)),
                     client_addr: client_addr.to_string(),
-                    tls_version: if scheme_str == "https" {
-                        Some("TLS 1.3 (MITM Mock)".into())
-                    } else {
-                        None
-                    },
+                    tls_version: format_mitm_tls_display(
+                        &scheme_str,
+                        client_conn.client_tls_version.as_deref(),
+                        Some("Mock"),
+                        None,
+                    ),
                 },
             );
+            let now_instant = Instant::now();
+            let resp_at = timestamp_at_instant(start, start_utc, now_instant);
+            let overall_ms = duration_ms_f64(now_instant.saturating_duration_since(start));
+            let mut mock_timings = SessionTimings {
+                client_connected: Some(client_conn.connected_at.clone()),
+                client_begin_request: Some(req_begin_at.clone()),
+                got_request_headers: Some(req_begin_at.clone()),
+                client_done_request: Some(client_done_request_at.clone()),
+                client_begin_response: Some(resp_at.clone()),
+                client_done_response: Some(resp_at),
+                client_read_ms: Some(client_read_ms),
+                client_tls_handshake_ms: client_tls_ms,
+                breakpoint_pause_ms: (total_bp_pause_ms > 0.0).then(|| round_ms(total_bp_pause_ms)),
+                script_hook_ms: (total_script_hook_ms > 0.0).then(|| round_ms(total_script_hook_ms)),
+                autoresponder_delay_ms: (autoresponder_delay_ms > 0.0)
+                    .then(|| round_ms(autoresponder_delay_ms)),
+                ..Default::default()
+            };
+            compute_timings_summary(&mut mock_timings, overall_ms);
+            let mock_stats = SessionTransferStats {
+                request_headers_bytes: Some(req_headers_bytes),
+                request_body_bytes: Some(body_bytes.len()),
+                request_wire_body_bytes: Some(body_bytes.len()),
+                response_headers_bytes: Some(estimate_response_headers_bytes(
+                    rule.status_code,
+                    &client_http_ver,
+                    &mock_out.1,
+                )),
+                response_body_bytes: Some(mock_out.2.len()),
+                response_wire_body_bytes: Some(mock_out.2.len()),
+                client_conn_id: Some(client_conn.conn_id),
+                client_conn_reused: Some(client_reused),
+                client_http_version: Some(client_http_ver.clone()),
+                client_tls_version: client_conn.client_tls_version.clone(),
+                client_tls_cipher: client_conn.client_tls_cipher.clone(),
+                client_alpn: client_conn.client_alpn.clone(),
+                ..Default::default()
+            };
+            mock_out.0.summary.apply_telemetry(Some(&mock_timings), Some(&mock_stats));
+            mock_out.0.timings = Some(mock_timings);
+            mock_out.0.transfer_stats = Some(mock_stats);
+
             let capped_req = &body_bytes[..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
             let capped_mock = &mock_out.2[..mock_out.2.len().min(MAX_CAPTURED_BODY_BYTES)];
             record_completed_session(&ctx, mock_out.0, Some(capped_req), Some(capped_mock));
@@ -1037,31 +1403,45 @@ pub(super) async fn handle_intercepted_request(
     }
 
     // 3. Forward Request Upstream
-    let reqwest_method = match reqwest::Method::from_bytes(method_str.as_bytes()) {
+    let http_method = match http::Method::from_bytes(method_str.as_bytes()) {
         Ok(m) => m,
         Err(err) => {
             return plain_response(StatusCode::BAD_REQUEST, &format!("Invalid method: {err}"));
         }
     };
 
-    let target_host = reqwest::Url::parse(&full_url)
+    let target_host = url::Url::parse(&full_url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned))
         .unwrap_or_else(|| host_header.clone());
     let upstream_target = prepare_remapped_upstream_target(&ctx, &full_url, &host_header, &scheme_str);
 
     let (upstream_client, mtls_cn) = if should_use_host_mtls_for_peer(client_addr, &scheme_str) {
-        match ctx.client_certs.get_or_build_client_with_resolver(
-            &target_host,
-            false,
-            Some(ctx.host_remap.clone()),
-        ) {
+        match ctx
+            .client_certs
+            .get_or_build_upstream_client(&target_host, Some(ctx.host_remap.clone()))
+        {
             Ok(Some((mtls_client, entry))) => (mtls_client, Some(entry.common_name)),
-            Ok(None) => (ctx.upstream_client(), None),
+            Ok(None) => (ctx.upstream_http_client(), None),
             Err(err) => {
                 let msg = format!("Client certificate (mTLS) error for '{target_host}': {err}");
                 tracing::warn!("{msg}");
-                return record_and_return_error_with_opts(
+                let (err_timings, err_stats) = build_error_timings_and_stats(
+                    start,
+                    start_utc,
+                    &client_conn,
+                    client_reused,
+                    client_tls_ms,
+                    client_read_ms,
+                    &client_http_ver,
+                    req_headers_bytes,
+                    body_bytes.len(),
+                    msg.len(),
+                    total_bp_pause_ms,
+                    total_script_hook_ms,
+                    upstream_target.remapped_to.clone(),
+                );
+                return record_and_return_error_with_telemetry(
                     &ctx,
                     session_id,
                     &scheme_str,
@@ -1079,12 +1459,14 @@ pub(super) async fn handle_intercepted_request(
                     bp_modified,
                     StatusCode::BAD_GATEWAY,
                     upstream_target.remapped_to.clone(),
+                    Some(err_timings),
+                    Some(err_stats),
                     msg,
                 );
             }
         }
     } else {
-        (ctx.upstream_client(), None)
+        (ctx.upstream_http_client(), None)
     };
 
     record_in_flight_session_with_remap(
@@ -1103,14 +1485,12 @@ pub(super) async fn handle_intercepted_request(
         bp_modified,
         Some(normalize_client_ip(client_addr)),
         client_addr.to_string(),
-        if scheme_str == "https" {
-            Some(match &mtls_cn {
-                Some(cn) => format!("TLS 1.3 (MITM · mTLS: {cn})"),
-                None => "TLS 1.3 (MITM)".into(),
-            })
-        } else {
-            None
-        },
+        format_mitm_tls_display(
+            &scheme_str,
+            client_conn.client_tls_version.as_deref(),
+            None,
+            mtls_cn.as_deref(),
+        ),
         req_headers.clone(),
         &body_bytes,
         upstream_target.remapped_to.clone(),
@@ -1118,7 +1498,23 @@ pub(super) async fn handle_intercepted_request(
 
     // Apply Bandwidth Throttling RTT latency & upload bandwidth pacing before upstream send
     if let Err(err) = ctx.throttle.apply_latency().await {
-        return record_and_return_error_with_opts(
+        let msg = err.to_string();
+        let (err_timings, err_stats) = build_error_timings_and_stats(
+            start,
+            start_utc,
+            &client_conn,
+            client_reused,
+            client_tls_ms,
+            client_read_ms,
+            &client_http_ver,
+            req_headers_bytes,
+            body_bytes.len(),
+            msg.len(),
+            total_bp_pause_ms,
+            total_script_hook_ms,
+            upstream_target.remapped_to.clone(),
+        );
+        return record_and_return_error_with_telemetry(
             &ctx,
             session_id,
             &scheme_str,
@@ -1136,12 +1532,30 @@ pub(super) async fn handle_intercepted_request(
             bp_modified,
             StatusCode::SERVICE_UNAVAILABLE,
             upstream_target.remapped_to.clone(),
-            err.to_string(),
+            Some(err_timings),
+            Some(err_stats),
+            msg,
         );
     }
     if !body_bytes.is_empty() {
         if let Err(err) = ctx.throttle.throttle_bytes(body_bytes.len(), false).await {
-            return record_and_return_error_with_opts(
+            let msg = err.to_string();
+            let (err_timings, err_stats) = build_error_timings_and_stats(
+                start,
+                start_utc,
+                &client_conn,
+                client_reused,
+                client_tls_ms,
+                client_read_ms,
+                &client_http_ver,
+                req_headers_bytes,
+                body_bytes.len(),
+                msg.len(),
+                total_bp_pause_ms,
+                total_script_hook_ms,
+                upstream_target.remapped_to.clone(),
+            );
+            return record_and_return_error_with_telemetry(
                 &ctx,
                 session_id,
                 &scheme_str,
@@ -1159,32 +1573,36 @@ pub(super) async fn handle_intercepted_request(
                 bp_modified,
                 StatusCode::SERVICE_UNAVAILABLE,
                 upstream_target.remapped_to.clone(),
-                err.to_string(),
+                Some(err_timings),
+                Some(err_stats),
+                msg,
             );
         }
     }
 
-    let mut upstream_resp = match send_upstream_with_retry(&upstream_client, &reqwest_method, |client| {
-        let mut upstream_req = client.request(reqwest_method.clone(), &upstream_target.upstream_url);
-        for h in &req_headers {
-            if !is_hop_by_hop_header(&h.name)
+    let outbound_headers: Vec<(String, String)> = req_headers
+        .iter()
+        .filter(|h| {
+            !is_hop_by_hop_header(&h.name)
                 && !h.name.eq_ignore_ascii_case("host")
                 && !h.name.eq_ignore_ascii_case("content-length")
-            {
-                upstream_req = upstream_req.header(&h.name, &h.value);
-            }
-        }
-        if let Some(ref host_override) = upstream_target.host_header_override {
-            upstream_req = upstream_req.header(reqwest::header::HOST, host_override);
-        }
-        if !body_bytes.is_empty() {
-            upstream_req = upstream_req.body(body_bytes.clone());
-        }
-        upstream_req
-    })
-    .await
+        })
+        .map(|h| (h.name.clone(), h.value.clone()))
+        .collect();
+    let req_timeout = Duration::from_secs(ctx.upstream_timeout_sec.max(1));
+
+    let exchange = match upstream_client
+        .send_with_idempotent_retry(
+            http_method,
+            &upstream_target.upstream_url,
+            &outbound_headers,
+            upstream_target.host_header_override.as_deref(),
+            body_bytes.clone(),
+            req_timeout,
+        )
+        .await
     {
-        Ok(r) => r,
+        Ok(ex) => ex,
         Err(err) => {
             let chain = format_error_chain(&err);
             tracing::warn!(
@@ -1193,7 +1611,23 @@ pub(super) async fn handle_intercepted_request(
                 full_url,
                 chain
             );
-            return record_and_return_error_with_opts(
+            let msg = format!("Upstream connection error: {chain}");
+            let (err_timings, err_stats) = build_error_timings_and_stats(
+                start,
+                start_utc,
+                &client_conn,
+                client_reused,
+                client_tls_ms,
+                client_read_ms,
+                &client_http_ver,
+                req_headers_bytes,
+                body_bytes.len(),
+                msg.len(),
+                total_bp_pause_ms,
+                total_script_hook_ms,
+                upstream_target.remapped_to.clone(),
+            );
+            return record_and_return_error_with_telemetry(
                 &ctx,
                 session_id,
                 &scheme_str,
@@ -1209,12 +1643,24 @@ pub(super) async fn handle_intercepted_request(
                 client_proc.as_ref(),
                 false,
                 bp_modified,
-                StatusCode::BAD_GATEWAY,
+                err.status_hint(),
                 upstream_target.remapped_to.clone(),
-                format!("Upstream connection error: {chain}"),
+                Some(err_timings),
+                Some(err_stats),
+                msg,
             );
         }
     };
+
+    let conn_meta = exchange.conn_meta.clone();
+    let claimed = exchange.claimed.clone();
+    let proxy_begin_request_at = exchange.proxy_begin_request_at.clone();
+    let server_got_request_at = exchange.server_got_request_at.clone();
+    let got_response_headers_at = exchange.got_response_headers_at.clone();
+    let got_response_headers_instant = exchange.got_response_headers_instant;
+    let send_request_ms = exchange.send_request_ms;
+    let server_wait_ms = exchange.server_wait_ms;
+    let upstream_resp = exchange.response;
 
     let mut final_status = upstream_resp.status().as_u16();
     let mut is_mocked = false;
@@ -1228,7 +1674,15 @@ pub(super) async fn handle_intercepted_request(
         }
     }
 
-    let mut resp_headers = extract_reqwest_headers(upstream_resp.headers());
+    let upstream_version = upstream_resp.version();
+    let server_http_ver = format_raw_http_version(upstream_version).to_string();
+    let mut resp_headers = extract_hyper_headers(upstream_resp.headers());
+    let raw_response_content_encoding = resp_headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("content-encoding"))
+        .map(|h| h.value.clone());
+    let resp_headers_bytes =
+        estimate_response_headers_bytes(final_status, &server_http_ver, &resp_headers);
     let mut resp_mutated = ctx.filters.apply_header_mutations(
         HeaderMutationDirection::Response,
         &full_url,
@@ -1240,12 +1694,68 @@ pub(super) async fn handle_intercepted_request(
         .map(|h| h.value.clone())
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    let upstream_version = upstream_resp.version();
     let protocol_label = if alpn.is_some() {
         resolve_protocol_label(&scheme_str, alpn, req_version)
     } else {
         format_http_version(&scheme_str, upstream_version)
     };
+
+    let mut base_timings = SessionTimings {
+        client_connected: Some(client_conn.connected_at.clone()),
+        client_begin_request: Some(req_begin_at.clone()),
+        got_request_headers: Some(req_begin_at.clone()),
+        client_done_request: Some(client_done_request_at.clone()),
+        proxy_begin_request: Some(proxy_begin_request_at),
+        server_connected: claimed.as_ref().and_then(|c| c.server_connected_at.clone()),
+        server_got_request: Some(server_got_request_at),
+        server_begin_response: Some(got_response_headers_at.clone()),
+        got_response_headers: Some(got_response_headers_at.clone()),
+        client_read_ms: Some(client_read_ms),
+        client_tls_handshake_ms: client_tls_ms,
+        dns_ms: Some(claimed.as_ref().map_or(0.0, |c| c.dns_ms)),
+        tcp_connect_ms: Some(claimed.as_ref().map_or(0.0, |c| c.tcp_connect_ms)),
+        tls_handshake_ms: claimed.as_ref().and_then(|c| c.tls_handshake_ms),
+        send_request_ms: Some(send_request_ms),
+        server_wait_ms: Some(server_wait_ms),
+        breakpoint_pause_ms: (total_bp_pause_ms > 0.0).then(|| round_ms(total_bp_pause_ms)),
+        script_hook_ms: (total_script_hook_ms > 0.0).then(|| round_ms(total_script_hook_ms)),
+        autoresponder_delay_ms: (autoresponder_delay_ms > 0.0)
+            .then(|| round_ms(autoresponder_delay_ms)),
+        ..Default::default()
+    };
+    let mut base_stats = SessionTransferStats {
+        request_headers_bytes: Some(req_headers_bytes),
+        request_body_bytes: Some(body_bytes.len()),
+        request_wire_body_bytes: Some(body_bytes.len()),
+        response_headers_bytes: Some(resp_headers_bytes),
+        response_content_encoding: raw_response_content_encoding,
+        client_conn_id: Some(client_conn.conn_id),
+        client_conn_reused: Some(client_reused),
+        client_http_version: Some(client_http_ver.clone()),
+        client_tls_version: client_conn.client_tls_version.clone(),
+        client_tls_cipher: client_conn.client_tls_cipher.clone(),
+        client_alpn: client_conn.client_alpn.clone(),
+        server_addr: conn_meta.as_ref().map(|m| m.server_addr.to_string()),
+        server_ip: conn_meta.as_ref().map(|m| m.server_ip.clone()),
+        server_port: conn_meta.as_ref().map(|m| m.server_port),
+        server_conn_id: conn_meta.as_ref().map(|m| m.conn_id),
+        server_conn_reused: claimed.as_ref().map(|c| c.reused),
+        server_http_version: Some(server_http_ver),
+        server_tls_version: conn_meta.as_ref().and_then(|m| m.tls_version.clone()),
+        server_tls_cipher: conn_meta.as_ref().and_then(|m| m.tls_cipher.clone()),
+        server_tls_alpn: conn_meta.as_ref().and_then(|m| m.tls_alpn.clone()),
+        server_cert_subject: conn_meta.as_ref().and_then(|m| m.cert_subject.clone()),
+        server_cert_issuer: conn_meta.as_ref().and_then(|m| m.cert_issuer.clone()),
+        server_mtls_cn: mtls_cn.clone(),
+        remapped_target: upstream_target
+            .remapped_to
+            .clone()
+            .or_else(|| conn_meta.as_ref().and_then(|m| m.remapped_target.clone())),
+        is_streaming: None,
+        ..Default::default()
+    };
+
+    let mut upstream_resp_body = upstream_resp.into_body();
 
     let is_head_request = method_str.eq_ignore_ascii_case("HEAD");
     let is_sse_stream = content_type
@@ -1258,10 +1768,16 @@ pub(super) async fn handle_intercepted_request(
     // 4a. Real-time Server-Sent Events (`text/event-stream`) zero-buffering pass-through & chunk capture
     if is_sse_stream && !should_break_resp && !is_head_request {
         let mut sse_remaining_encodings = extract_content_encoding_tokens(&resp_headers);
-        let sse_has_zstd = sse_remaining_encodings
+        let outer_sse_encoding = sse_remaining_encodings
             .last()
-            .is_some_and(|t| t.eq_ignore_ascii_case("zstd") || t.eq_ignore_ascii_case("x-zstd"));
-        if sse_has_zstd {
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| {
+                matches!(
+                    t.as_str(),
+                    "zstd" | "x-zstd" | "gzip" | "x-gzip" | "deflate" | "br"
+                )
+            });
+        if outer_sse_encoding.is_some() {
             sse_remaining_encodings.pop();
             while sse_remaining_encodings
                 .last()
@@ -1270,8 +1786,14 @@ pub(super) async fn handle_intercepted_request(
                 sse_remaining_encodings.pop();
             }
         }
+        base_stats.is_streaming = Some(true);
+        base_stats.response_body_bytes = Some(0);
+        base_stats.response_wire_body_bytes = Some(0);
+        base_timings.client_begin_response = Some(got_response_headers_at.clone());
+        compute_timings_summary(&mut base_timings, elapsed_ms(start));
+
         let capped_req = &body_bytes[..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
-        let initial_summary = SessionSummary {
+        let mut initial_summary = SessionSummary {
             id: session_id,
             status: final_status,
             protocol: protocol_label,
@@ -1297,30 +1819,40 @@ pub(super) async fn handle_intercepted_request(
             marked_color: None,
             client_ip: Some(normalize_client_ip(client_addr)),
             remapped_to: upstream_target.remapped_to.clone(),
+            ttfb_ms: None,
+            dns_ms: None,
+            connect_ms: None,
+            tls_ms: None,
+            receive_ms: None,
+            request_size: None,
+            wire_body_size: None,
+            server_ip: None,
+            server_conn_reused: None,
         };
+        initial_summary.apply_telemetry(Some(&base_timings), Some(&base_stats));
 
         let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
         let initial_detail = SessionDetail {
-            summary: initial_summary.clone(),
+            summary: initial_summary,
             request_headers: req_headers,
             response_headers: resp_headers.clone(),
             request_body_base64: req_b64,
             response_body_base64: String::new(),
             request_body_text: req_txt,
             response_body_text: Some(String::new()),
-            tls_version: if scheme_str == "https" {
-                Some(match &mtls_cn {
-                    Some(cn) => format!("TLS 1.3 (MITM SSE · mTLS: {cn})"),
-                    None => "TLS 1.3 (MITM SSE)".into(),
-                })
-            } else {
-                None
-            },
+            tls_version: format_mitm_tls_display(
+                &scheme_str,
+                client_conn.client_tls_version.as_deref(),
+                Some("SSE"),
+                mtls_cn.as_deref(),
+            ),
             client_addr: client_addr.to_string(),
             websocket_frames: Vec::new(),
             sse_events: Vec::new(),
             body_offloaded: false,
             request_body_offloaded: req_offloaded,
+            timings: Some(base_timings),
+            transfer_stats: Some(base_stats),
         };
 
         record_completed_session(&ctx, initial_detail, Some(capped_req), None);
@@ -1331,19 +1863,19 @@ pub(super) async fn handle_intercepted_request(
         tokio::spawn(async move {
             use std::io::Write;
 
-            struct BoundedSseZstdSink {
+            struct BoundedSseSink {
                 buf: Vec<u8>,
                 total_written: usize,
                 max_total: usize,
             }
 
-            impl Write for BoundedSseZstdSink {
+            impl Write for BoundedSseSink {
                 fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
                     if self.total_written.saturating_add(data.len()) > self.max_total {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             format!(
-                                "SSE zstd decompressed output exceeds limit of {} bytes",
+                                "SSE decompressed output exceeds limit of {} bytes",
                                 self.max_total
                             ),
                         ));
@@ -1358,47 +1890,123 @@ pub(super) async fn handle_intercepted_request(
                 }
             }
 
+            enum SseStreamDecoder {
+                Zstd(zstd::stream::write::Decoder<'static, BoundedSseSink>),
+                Gzip(flate2::write::GzDecoder<BoundedSseSink>),
+                Deflate(flate2::write::ZlibDecoder<BoundedSseSink>),
+                Brotli(Box<brotli::DecompressorWriter<BoundedSseSink>>),
+            }
+
+            impl SseStreamDecoder {
+                fn write_and_take(&mut self, input: &[u8]) -> Result<Vec<u8>, String> {
+                    match self {
+                        Self::Zstd(d) => {
+                            d.write_all(input)
+                                .and_then(|()| d.flush())
+                                .map_err(|e| e.to_string())?;
+                            Ok(std::mem::take(&mut d.get_mut().buf))
+                        }
+                        Self::Gzip(d) => {
+                            d.write_all(input)
+                                .and_then(|()| d.flush())
+                                .map_err(|e| e.to_string())?;
+                            Ok(std::mem::take(&mut d.get_mut().buf))
+                        }
+                        Self::Deflate(d) => {
+                            d.write_all(input)
+                                .and_then(|()| d.flush())
+                                .map_err(|e| e.to_string())?;
+                            Ok(std::mem::take(&mut d.get_mut().buf))
+                        }
+                        Self::Brotli(d) => {
+                            d.write_all(input)
+                                .and_then(|()| d.flush())
+                                .map_err(|e| e.to_string())?;
+                            Ok(std::mem::take(&mut d.get_mut().buf))
+                        }
+                    }
+                }
+
+                fn flush_tail(mut self) -> Vec<u8> {
+                    match &mut self {
+                        Self::Zstd(d) => {
+                            let _ = d.flush();
+                            std::mem::take(&mut d.get_mut().buf)
+                        }
+                        Self::Gzip(d) => {
+                            let _ = d.flush();
+                            std::mem::take(&mut d.get_mut().buf)
+                        }
+                        Self::Deflate(d) => {
+                            let _ = d.flush();
+                            std::mem::take(&mut d.get_mut().buf)
+                        }
+                        Self::Brotli(d) => {
+                            let _ = d.flush();
+                            std::mem::take(&mut d.get_mut().buf)
+                        }
+                    }
+                }
+            }
+
+            let make_sink = || BoundedSseSink {
+                buf: Vec::new(),
+                total_written: 0,
+                max_total: MAX_CAPTURED_BODY_BYTES,
+            };
+
+            let mut decoder = match outer_sse_encoding.as_deref() {
+                Some("zstd" | "x-zstd") => {
+                    match zstd::stream::write::Decoder::new(make_sink()) {
+                        Ok(dec) => Some(SseStreamDecoder::Zstd(dec)),
+                        Err(err) => {
+                            tracing::warn!("Failed to initialize SSE zstd stream decoder: {err}");
+                            return;
+                        }
+                    }
+                }
+                Some("gzip" | "x-gzip") => {
+                    Some(SseStreamDecoder::Gzip(flate2::write::GzDecoder::new(make_sink())))
+                }
+                Some("deflate") => {
+                    Some(SseStreamDecoder::Deflate(flate2::write::ZlibDecoder::new(make_sink())))
+                }
+                Some("br") => Some(SseStreamDecoder::Brotli(Box::new(
+                    brotli::DecompressorWriter::new(make_sink(), 4096),
+                ))),
+                _ => None,
+            };
+
             const MAX_SSE_EVENTS: usize = 1024;
             let mut pending_parse_buf: Vec<u8> = Vec::new();
             let mut total_parsed_events = 0usize;
             let mut total_bytes = 0usize;
+            let mut total_wire_bytes = 0usize;
             let mut download_pacer = BandwidthPacer::new();
-            let mut zstd_decoder = if sse_has_zstd {
-                match zstd::stream::write::Decoder::new(BoundedSseZstdSink {
-                    buf: Vec::new(),
-                    total_written: 0,
-                    max_total: MAX_CAPTURED_BODY_BYTES,
-                }) {
-                    Ok(dec) => Some(dec),
-                    Err(err) => {
-                        tracing::warn!("Failed to initialize SSE zstd stream decoder: {err}");
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
 
-            while let Ok(Some(chunk)) = upstream_resp.chunk().await {
+            while let Some(Ok(frame)) = upstream_resp_body.frame().await {
+                let Some(chunk) = frame.into_data().ok().filter(|c| !c.is_empty()) else {
+                    continue;
+                };
+                total_wire_bytes = total_wire_bytes.saturating_add(chunk.len());
                 if download_pacer.pace(&sse_ctx.throttle, chunk.len(), true).await.is_err() {
                     break;
                 }
-                let effective_chunk = if let Some(dec) = zstd_decoder.as_mut() {
-                    if let Err(err) = dec.write_all(&chunk).and_then(|()| dec.flush()) {
-                        tracing::warn!("SSE zstd stream decode error: {err}");
-                        break;
+                let effective_chunk = if let Some(dec) = decoder.as_mut() {
+                    match dec.write_and_take(&chunk) {
+                        Ok(decoded) if decoded.is_empty() => continue,
+                        Ok(decoded) => Bytes::from(decoded),
+                        Err(err) => {
+                            tracing::warn!("SSE stream decode error: {err}");
+                            break;
+                        }
                     }
-                    let decoded = std::mem::take(&mut dec.get_mut().buf);
-                    if decoded.is_empty() {
-                        continue;
-                    }
-                    Bytes::from(decoded)
                 } else {
                     chunk
                 };
 
                 let chunk_offset_ms = start.elapsed().as_millis() as u64;
-                total_bytes += effective_chunk.len();
+                total_bytes = total_bytes.saturating_add(effective_chunk.len());
                 record_sse_chunk(
                     &sse_ctx,
                     session_id,
@@ -1415,12 +2023,11 @@ pub(super) async fn handle_intercepted_request(
                 }
             }
 
-            if let Some(mut dec) = zstd_decoder {
-                let _ = dec.flush();
-                let tail_decoded = std::mem::take(&mut dec.get_mut().buf);
+            if let Some(dec) = decoder {
+                let tail_decoded = dec.flush_tail();
                 if !tail_decoded.is_empty() {
                     let chunk_offset_ms = start.elapsed().as_millis() as u64;
-                    total_bytes += tail_decoded.len();
+                    total_bytes = total_bytes.saturating_add(tail_decoded.len());
                     record_sse_chunk(
                         &sse_ctx,
                         session_id,
@@ -1442,10 +2049,31 @@ pub(super) async fn handle_intercepted_request(
             } else {
                 None
             };
+            let _ = sse_ctx
+                .store
+                .finalize_sse_stream(session_id, end_ms, trailing_event, MAX_SSE_EVENTS);
+            let done_instant = Instant::now();
+            let done_at = timestamp_at_instant(start, start_utc, done_instant);
+            let download_ms = duration_ms_f64(
+                done_instant.saturating_duration_since(got_response_headers_instant),
+            );
+            let overall_ms = duration_ms_f64(done_instant.saturating_duration_since(start));
             if let Some(updated_summary) =
-                sse_ctx
-                    .store
-                    .finalize_sse_stream(session_id, end_ms, trailing_event, MAX_SSE_EVENTS)
+                sse_ctx.store.update_session_telemetry(session_id, |detail| {
+                    let timings = detail.timings.get_or_insert_with(Default::default);
+                    timings.server_done_response = Some(done_at.clone());
+                    timings.client_done_response = Some(done_at);
+                    timings.content_download_ms = Some(download_ms);
+                    compute_timings_summary(timings, overall_ms);
+
+                    let stats = detail.transfer_stats.get_or_insert_with(Default::default);
+                    stats.response_body_bytes = Some(total_bytes);
+                    stats.response_wire_body_bytes = Some(total_wire_bytes);
+
+                    let t_clone = detail.timings.clone();
+                    let s_clone = detail.transfer_stats.clone();
+                    detail.summary.apply_telemetry(t_clone.as_ref(), s_clone.as_ref());
+                })
             {
                 let _ = sse_ctx.event_tx.send(updated_summary);
             }
@@ -1496,22 +2124,18 @@ pub(super) async fn handle_intercepted_request(
         && !resp_has_zstd
         && (is_media_or_partial || is_large_stream_body)
     {
-        let has_reqwest_decoded_encoding = resp_headers.iter().any(|h| {
-            h.name.trim().eq_ignore_ascii_case("content-encoding")
-                && h.value.split(',').any(|token| {
-                    let t = token.trim();
-                    t.eq_ignore_ascii_case("gzip")
-                        || t.eq_ignore_ascii_case("x-gzip")
-                        || t.eq_ignore_ascii_case("br")
-                        || t.eq_ignore_ascii_case("deflate")
-                })
-        });
         let capture_text_preview = !is_media_or_partial
             && (ct_lower.starts_with("text/") || ct_lower.starts_with("application/"));
 
+        base_stats.is_streaming = Some(true);
+        base_stats.response_body_bytes = Some(0);
+        base_stats.response_wire_body_bytes = Some(0);
+        base_timings.client_begin_response = Some(got_response_headers_at.clone());
+        compute_timings_summary(&mut base_timings, elapsed_ms(start));
+
         let capped_req = &body_bytes[..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
         let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
-        let initial_summary = SessionSummary {
+        let mut initial_summary = SessionSummary {
             id: session_id,
             status: final_status,
             protocol: protocol_label,
@@ -1537,7 +2161,17 @@ pub(super) async fn handle_intercepted_request(
             marked_color: None,
             client_ip: Some(normalize_client_ip(client_addr)),
             remapped_to: upstream_target.remapped_to.clone(),
+            ttfb_ms: None,
+            dns_ms: None,
+            connect_ms: None,
+            tls_ms: None,
+            receive_ms: None,
+            request_size: None,
+            wire_body_size: None,
+            server_ip: None,
+            server_conn_reused: None,
         };
+        initial_summary.apply_telemetry(Some(&base_timings), Some(&base_stats));
 
         let initial_detail = SessionDetail {
             summary: initial_summary,
@@ -1547,19 +2181,19 @@ pub(super) async fn handle_intercepted_request(
             response_body_base64: String::new(),
             request_body_text: req_txt,
             response_body_text: None,
-            tls_version: if scheme_str == "https" {
-                Some(match &mtls_cn {
-                    Some(cn) => format!("TLS 1.3 (MITM Stream · mTLS: {cn})"),
-                    None => "TLS 1.3 (MITM Stream)".into(),
-                })
-            } else {
-                None
-            },
+            tls_version: format_mitm_tls_display(
+                &scheme_str,
+                client_conn.client_tls_version.as_deref(),
+                Some("Stream"),
+                mtls_cn.as_deref(),
+            ),
             client_addr: client_addr.to_string(),
             websocket_frames: Vec::new(),
             sse_events: Vec::new(),
             body_offloaded: false,
             request_body_offloaded: req_offloaded,
+            timings: Some(base_timings),
+            transfer_stats: Some(base_stats),
         };
 
         // Stage 21 Phase 1: publish final response headers & status immediately before streaming chunks
@@ -1582,8 +2216,11 @@ pub(super) async fn handle_intercepted_request(
             let mut download_pacer = BandwidthPacer::new();
 
             loop {
-                match upstream_resp.chunk().await {
-                    Ok(Some(chunk)) => {
+                match upstream_resp_body.frame().await {
+                    Some(Ok(frame)) => {
+                        let Some(chunk) = frame.into_data().ok().filter(|c| !c.is_empty()) else {
+                            continue;
+                        };
                         if let Err(err) = download_pacer.pace(&stream_ctx.throttle, chunk.len(), true).await {
                             stream_error = Some(err.to_string());
                             break;
@@ -1603,18 +2240,19 @@ pub(super) async fn handle_intercepted_request(
 
                         if last_emit.elapsed() >= Duration::from_millis(150) {
                             last_emit = Instant::now();
-                            let elapsed_ms = start.elapsed().as_millis() as u64;
+                            let cur_elapsed = start.elapsed().as_millis() as u64;
                             if let Some(mut detail) = stream_ctx.store.get(session_id) {
                                 detail.summary.body_size = total_bytes;
-                                detail.summary.duration_ms = elapsed_ms;
+                                detail.summary.duration_ms = cur_elapsed;
+                                detail.summary.wire_body_size = Some(total_bytes);
                                 let updated_summary = detail.summary.clone();
                                 stream_ctx.store.insert(detail);
                                 let _ = stream_ctx.event_tx.send(updated_summary);
                             }
                         }
                     }
-                    Ok(None) => break,
-                    Err(err) => {
+                    None => break,
+                    Some(Err(err)) => {
                         let chain = format_error_chain(&err);
                         tracing::warn!(
                             "Upstream stream chunk error for session #{session_id} after {total_bytes} bytes: {chain}"
@@ -1627,7 +2265,14 @@ pub(super) async fn handle_intercepted_request(
 
             drop(chunk_tx);
 
+            let done_instant = Instant::now();
+            let done_at = timestamp_at_instant(start, start_utc, done_instant);
             let final_duration_ms = start.elapsed().as_millis() as u64;
+            let download_ms = duration_ms_f64(
+                done_instant.saturating_duration_since(got_response_headers_instant),
+            );
+            let overall_ms = duration_ms_f64(done_instant.saturating_duration_since(start));
+
             let mut final_detail = stream_ctx.store.get(session_id).unwrap_or(initial_detail);
             final_detail.summary.body_size = total_bytes;
             final_detail.summary.duration_ms = final_duration_ms;
@@ -1642,6 +2287,25 @@ pub(super) async fn handle_intercepted_request(
             } else {
                 final_detail.response_body_base64.clear();
                 final_detail.response_body_text = None;
+            }
+            {
+                let timings = final_detail.timings.get_or_insert_with(Default::default);
+                timings.server_done_response = Some(done_at.clone());
+                timings.client_done_response = Some(done_at);
+                timings.content_download_ms = Some(download_ms);
+                compute_timings_summary(timings, overall_ms);
+
+                let stats = final_detail
+                    .transfer_stats
+                    .get_or_insert_with(Default::default);
+                stats.response_body_bytes = Some(total_bytes);
+                stats.response_wire_body_bytes = Some(total_bytes);
+
+                let t_clone = final_detail.timings.clone();
+                let s_clone = final_detail.transfer_stats.clone();
+                final_detail
+                    .summary
+                    .apply_telemetry(t_clone.as_ref(), s_clone.as_ref());
             }
 
             if initial_recorded || stream_error.is_some() || total_bytes > 0 {
@@ -1661,12 +2325,8 @@ pub(super) async fn handle_intercepted_request(
         let mut builder =
             Response::builder().status(StatusCode::from_u16(final_status).unwrap_or(StatusCode::OK));
         for h in &resp_headers {
-            if !is_hop_by_hop_header(&h.name)
-                && !(has_reqwest_decoded_encoding
-                    && (h.name.eq_ignore_ascii_case("content-encoding")
-                        || h.name.eq_ignore_ascii_case("content-length")))
-                && !(strip_alt_svc && is_alt_svc_header(&h.name))
-            {
+            // Raw wire bytes stream directly to the client untouched, so preserve Content-Encoding & Content-Length.
+            if !is_hop_by_hop_header(&h.name) && !(strip_alt_svc && is_alt_svc_header(&h.name)) {
                 builder = builder.header(&h.name, &h.value);
             }
         }
@@ -1685,16 +2345,19 @@ pub(super) async fn handle_intercepted_request(
         let mut download_pacer = BandwidthPacer::new();
         let mut stream_err: Option<(StatusCode, String)> = None;
         loop {
-            match upstream_resp.chunk().await {
-                Ok(Some(chunk)) => {
+            match upstream_resp_body.frame().await {
+                Some(Ok(frame)) => {
+                    let Some(chunk) = frame.into_data().ok().filter(|c| !c.is_empty()) else {
+                        continue;
+                    };
                     if let Err(err) = download_pacer.pace(&ctx.throttle, chunk.len(), true).await {
                         stream_err = Some((StatusCode::SERVICE_UNAVAILABLE, err.to_string()));
                         break;
                     }
                     collected.extend_from_slice(&chunk);
                 }
-                Ok(None) => break,
-                Err(err) => {
+                None => break,
+                Some(Err(err)) => {
                     let chain = format_error_chain(&err);
                     stream_err = Some((
                         StatusCode::BAD_GATEWAY,
@@ -1705,7 +2368,18 @@ pub(super) async fn handle_intercepted_request(
             }
         }
         if let Some((err_status, err_msg)) = stream_err {
-            return record_and_return_error_with_opts(
+            let now = Instant::now();
+            let now_at = timestamp_at_instant(start, start_utc, now);
+            base_timings.server_done_response = Some(now_at.clone());
+            base_timings.client_begin_response = Some(now_at.clone());
+            base_timings.client_done_response = Some(now_at);
+            base_timings.content_download_ms = Some(duration_ms_f64(
+                now.saturating_duration_since(got_response_headers_instant),
+            ));
+            compute_timings_summary(&mut base_timings, duration_ms_f64(now.saturating_duration_since(start)));
+            base_stats.response_wire_body_bytes = Some(collected.len());
+            base_stats.response_body_bytes = Some(err_msg.len());
+            return record_and_return_error_with_telemetry(
                 &ctx,
                 session_id,
                 &scheme_str,
@@ -1723,16 +2397,32 @@ pub(super) async fn handle_intercepted_request(
                 bp_modified,
                 err_status,
                 upstream_target.remapped_to.clone(),
+                Some(base_timings),
+                Some(base_stats),
                 err_msg,
             );
         }
         Bytes::from(collected)
     } else {
-        match upstream_resp.bytes().await {
-            Ok(b) => b,
+        match upstream_resp_body.collect().await {
+            Ok(collected) => collected.to_bytes(),
             Err(err) => {
                 let chain = format_error_chain(&err);
-                return record_and_return_error_with_opts(
+                let now = Instant::now();
+                let now_at = timestamp_at_instant(start, start_utc, now);
+                base_timings.server_done_response = Some(now_at.clone());
+                base_timings.client_begin_response = Some(now_at.clone());
+                base_timings.client_done_response = Some(now_at);
+                base_timings.content_download_ms = Some(duration_ms_f64(
+                    now.saturating_duration_since(got_response_headers_instant),
+                ));
+                compute_timings_summary(
+                    &mut base_timings,
+                    duration_ms_f64(now.saturating_duration_since(start)),
+                );
+                let msg = format!("Failed reading upstream response body: {chain}");
+                base_stats.response_body_bytes = Some(msg.len());
+                return record_and_return_error_with_telemetry(
                     &ctx,
                     session_id,
                     &scheme_str,
@@ -1750,11 +2440,23 @@ pub(super) async fn handle_intercepted_request(
                     bp_modified,
                     StatusCode::BAD_GATEWAY,
                     upstream_target.remapped_to.clone(),
-                    format!("Failed reading upstream response body: {chain}"),
+                    Some(base_timings),
+                    Some(base_stats),
+                    msg,
                 );
             }
         }
     };
+
+    let server_done_instant = Instant::now();
+    let server_done_at = timestamp_at_instant(start, start_utc, server_done_instant);
+    let content_download_ms = duration_ms_f64(
+        server_done_instant.saturating_duration_since(got_response_headers_instant),
+    );
+    let response_wire_len = raw_resp_bytes.len();
+    base_timings.server_done_response = Some(server_done_at);
+    base_timings.content_download_ms = Some(content_download_ms);
+    base_stats.response_wire_body_bytes = Some(response_wire_len);
 
     let (mut resp_bytes, decoded_any_encoding, mut remaining_content_encodings) =
         if is_head_request {
@@ -1782,7 +2484,8 @@ pub(super) async fn handle_intercepted_request(
         || ct_lower.starts_with("video/")
         || ct_lower.starts_with("audio/");
     if !is_streaming_response && ctx.script_runner.should_run_response() {
-        if let ScriptResponseOutcome::Modified(edits) = ctx
+        let py_resp_start = Instant::now();
+        let outcome = ctx
             .script_runner
             .run_on_response(
                 session_id,
@@ -1792,8 +2495,9 @@ pub(super) async fn handle_intercepted_request(
                 &resp_headers,
                 &resp_bytes,
             )
-            .await
-        {
+            .await;
+        total_script_hook_ms += elapsed_ms(py_resp_start);
+        if let ScriptResponseOutcome::Modified(edits) = outcome {
             if let Some(next_status) = edits.status {
                 if (100..=599).contains(&next_status) && next_status != final_status {
                     final_status = next_status;
@@ -1832,6 +2536,7 @@ pub(super) async fn handle_intercepted_request(
     // 4c. Live Breakpoint: After Response (Alt+F11 / `bpafter`)
     if should_break_resp {
         let mut resp_vec = resp_bytes.to_vec();
+        let bp_resp_start = Instant::now();
         let bp_outcome = run_response_breakpoint_stage(
             &ctx,
             ResponseBreakpointStageInput {
@@ -1849,11 +2554,12 @@ pub(super) async fn handle_intercepted_request(
                 process_pid: client_proc.as_ref().map(|p| p.pid),
                 client_ip: Some(normalize_client_ip(client_addr)),
                 client_addr: client_addr.to_string(),
-                tls_version: if scheme_str == "https" {
-                    Some("TLS 1.3 (MITM Paused)".into())
-                } else {
-                    None
-                },
+                tls_version: format_mitm_tls_display(
+                    &scheme_str,
+                    client_conn.client_tls_version.as_deref(),
+                    Some("Paused"),
+                    mtls_cn.as_deref(),
+                ),
                 is_mocked,
                 matched_rule_id: matched_rule_id.clone(),
                 req_headers: req_headers.clone(),
@@ -1868,8 +2574,23 @@ pub(super) async fn handle_intercepted_request(
             &mut bp_modified,
         )
         .await;
+        total_bp_pause_ms += elapsed_ms(bp_resp_start);
         if bp_outcome.aborted {
-            return record_and_return_error_with_opts(
+            let msg = "Aborted at Live Breakpoint (After Response)".to_string();
+            base_timings.breakpoint_pause_ms =
+                (total_bp_pause_ms > 0.0).then(|| round_ms(total_bp_pause_ms));
+            base_timings.script_hook_ms =
+                (total_script_hook_ms > 0.0).then(|| round_ms(total_script_hook_ms));
+            let now = Instant::now();
+            let now_at = timestamp_at_instant(start, start_utc, now);
+            base_timings.client_begin_response = Some(now_at.clone());
+            base_timings.client_done_response = Some(now_at);
+            compute_timings_summary(
+                &mut base_timings,
+                duration_ms_f64(now.saturating_duration_since(start)),
+            );
+            base_stats.response_body_bytes = Some(msg.len());
+            return record_and_return_error_with_telemetry(
                 &ctx,
                 session_id,
                 &scheme_str,
@@ -1887,7 +2608,9 @@ pub(super) async fn handle_intercepted_request(
                 true,
                 StatusCode::BAD_GATEWAY,
                 upstream_target.remapped_to.clone(),
-                "Aborted at Live Breakpoint (After Response)".to_string(),
+                Some(base_timings),
+                Some(base_stats),
+                msg,
             );
         }
         if bp_outcome.headers_changed {
@@ -1911,6 +2634,8 @@ pub(super) async fn handle_intercepted_request(
         }
     }
 
+    let client_begin_resp_instant = Instant::now();
+    let client_begin_resp_at = timestamp_at_instant(start, start_utc, client_begin_resp_instant);
     let duration_ms = start.elapsed().as_millis() as u64;
     let sse_events = if content_type
         .to_ascii_lowercase()
@@ -1921,7 +2646,20 @@ pub(super) async fn handle_intercepted_request(
         Vec::new()
     };
 
-    let summary = SessionSummary {
+    base_timings.breakpoint_pause_ms =
+        (total_bp_pause_ms > 0.0).then(|| round_ms(total_bp_pause_ms));
+    base_timings.script_hook_ms =
+        (total_script_hook_ms > 0.0).then(|| round_ms(total_script_hook_ms));
+    base_timings.client_begin_response = Some(client_begin_resp_at.clone());
+    base_timings.client_done_response = Some(client_begin_resp_at);
+    base_timings.client_send_ms = Some(0.0);
+    compute_timings_summary(
+        &mut base_timings,
+        duration_ms_f64(client_begin_resp_instant.saturating_duration_since(start)),
+    );
+    base_stats.response_body_bytes = Some(resp_bytes.len());
+
+    let mut summary = SessionSummary {
         id: session_id,
         status: final_status,
         protocol: protocol_label,
@@ -1947,7 +2685,17 @@ pub(super) async fn handle_intercepted_request(
         marked_color: None,
         client_ip: Some(normalize_client_ip(client_addr)),
         remapped_to: upstream_target.remapped_to.clone(),
+        ttfb_ms: None,
+        dns_ms: None,
+        connect_ms: None,
+        tls_ms: None,
+        receive_ms: None,
+        request_size: None,
+        wire_body_size: None,
+        server_ip: None,
+        server_conn_reused: None,
     };
+    summary.apply_telemetry(Some(&base_timings), Some(&base_stats));
 
     let capped_req = &body_bytes[..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
     let capped_resp = &resp_bytes[..resp_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
@@ -1955,26 +2703,26 @@ pub(super) async fn handle_intercepted_request(
     let (resp_b64, resp_txt, resp_offloaded) = encode_inline_or_offload(capped_resp);
 
     let detail = SessionDetail {
-        summary: summary.clone(),
+        summary,
         request_headers: req_headers,
         response_headers: resp_headers.clone(),
         request_body_base64: req_b64,
         response_body_base64: resp_b64,
         request_body_text: req_txt,
         response_body_text: resp_txt,
-        tls_version: if scheme_str == "https" {
-            Some(match &mtls_cn {
-                Some(cn) => format!("TLS 1.3 (MITM · mTLS: {cn})"),
-                None => "TLS 1.3 (MITM)".into(),
-            })
-        } else {
-            None
-        },
+        tls_version: format_mitm_tls_display(
+            &scheme_str,
+            client_conn.client_tls_version.as_deref(),
+            None,
+            mtls_cn.as_deref(),
+        ),
         client_addr: client_addr.to_string(),
         websocket_frames: Vec::new(),
         sse_events,
         body_offloaded: resp_offloaded,
         request_body_offloaded: req_offloaded,
+        timings: Some(base_timings),
+        transfer_stats: Some(base_stats),
     };
 
     record_completed_session(&ctx, detail, Some(capped_req), Some(capped_resp));
@@ -1990,8 +2738,7 @@ pub(super) async fn handle_intercepted_request(
     let mut builder =
         Response::builder().status(StatusCode::from_u16(final_status).unwrap_or(StatusCode::OK));
     for h in &resp_headers {
-        // Reqwest transparently decompresses single-token gzip/brotli/deflate bodies and
-        // `maybe_decompress_content_encodings` peels supported outer layers (e.g. `zstd`, `br, zstd`).
+        // `maybe_decompress_content_encodings` peels supported encodings (`zstd`, `br`, `gzip`, `deflate`).
         // Re-emit only encodings that were not decoded, and preserve upstream `Content-Length` for
         // empty `HEAD` responses (and unmodified undecoded responses).
         // Also strip HTTP/3 QUIC discovery headers (`alt-svc`, `alternate-protocol`) when enabled.
@@ -2011,8 +2758,23 @@ pub(super) async fn handle_intercepted_request(
         builder = builder.header("Content-Encoding", remaining_content_encodings.join(", "));
     }
 
+    let ctx_for_send = Arc::clone(&ctx);
+    let tracked_body = TrackedResponseBody::new(boxed_full(resp_bytes), move |_bytes_sent, done_instant| {
+        let done_at = timestamp_at_instant(start, start_utc, done_instant);
+        let client_send_ms = duration_ms_f64(
+            done_instant.saturating_duration_since(client_begin_resp_instant),
+        );
+        let overall_ms = duration_ms_f64(done_instant.saturating_duration_since(start));
+        let _ = ctx_for_send.store.update_client_send_timing(
+            session_id,
+            done_at,
+            client_send_ms,
+            overall_ms,
+        );
+    });
+
     builder
-        .body(boxed_full(resp_bytes))
+        .body(http_body_util::BodyExt::boxed(tracked_body))
         .unwrap_or_else(|_| plain_response(StatusCode::BAD_GATEWAY, "Failed building proxy response"))
 }
 
@@ -2378,6 +3140,15 @@ pub(super) async fn run_request_breakpoint_stage(
         marked_color: None,
         client_ip: input.client_ip,
         remapped_to: None,
+        ttfb_ms: None,
+        dns_ms: None,
+        connect_ms: None,
+        tls_ms: None,
+        receive_ms: None,
+        request_size: None,
+        wire_body_size: None,
+        server_ip: None,
+        server_conn_reused: None,
     };
     ctx.store.insert(SessionDetail {
         summary: paused_summary.clone(),
@@ -2393,6 +3164,8 @@ pub(super) async fn run_request_breakpoint_stage(
         sse_events: Vec::new(),
         body_offloaded: false,
         request_body_offloaded: false,
+        timings: None,
+        transfer_stats: None,
     });
     let _ = ctx.event_tx.send(paused_summary);
 
@@ -2535,6 +3308,15 @@ pub(super) async fn run_response_breakpoint_stage(
             marked_color: None,
             client_ip: input.client_ip,
             remapped_to: None,
+            ttfb_ms: None,
+            dns_ms: None,
+            connect_ms: None,
+            tls_ms: None,
+            receive_ms: None,
+            request_size: None,
+            wire_body_size: None,
+            server_ip: None,
+            server_conn_reused: None,
         };
         ctx.store.insert(SessionDetail {
             summary: paused_summary.clone(),
@@ -2550,6 +3332,8 @@ pub(super) async fn run_response_breakpoint_stage(
             sse_events: Vec::new(),
             body_offloaded: false,
             request_body_offloaded: false,
+            timings: None,
+            transfer_stats: None,
         });
         let _ = ctx.event_tx.send(paused_summary);
     }
@@ -2706,6 +3490,15 @@ pub(super) fn build_autoresponder_mock_detail(
         marked_color: None,
         client_ip: input.client_ip,
         remapped_to: None,
+        ttfb_ms: None,
+        dns_ms: None,
+        connect_ms: None,
+        tls_ms: None,
+        receive_ms: None,
+        request_size: None,
+        wire_body_size: None,
+        server_ip: None,
+        server_conn_reused: None,
     };
 
     let capped_req = &input.req_bytes[..input.req_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
@@ -2727,6 +3520,8 @@ pub(super) fn build_autoresponder_mock_detail(
         sse_events,
         body_offloaded: resp_offloaded,
         request_body_offloaded: req_offloaded,
+        timings: None,
+        transfer_stats: None,
     };
 
     (detail, mock_resp_headers, mock_bytes)
