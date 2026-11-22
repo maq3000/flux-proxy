@@ -203,7 +203,7 @@ export const BackupExportSettingsTab: React.FC<BackupExportSettingsTabProps> = (
                       </h3>
                       <p className="mt-0.5 text-[11px] text-muted">
                         Восстанавливает тему, компактность и группы тулбара, ширину всех колонок,
-                        пользовательские пресеты, правила фильтрации, порт прокси (8888), TLS и AutoResponder.
+                        пользовательские пресеты, правила фильтрации, порт прокси (8888), TLS, AutoResponder, HOSTS Remapping, Bandwidth Throttling и Upstream Proxy.
                       </p>
                       <button
                         type="button"

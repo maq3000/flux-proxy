@@ -938,7 +938,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </p>
           <p>
             Пользовательские пресеты фильтров ({userPresets.length}), настроенные ширины колонок,
-            конфигурация групп тулбара, правила TLS/заголовков и правила AutoResponder ({autoResponderRules.length}) будут перезаписаны заводским профилем.
+            конфигурация групп тулбара, правила TLS/заголовков, AutoResponder ({autoResponderRules.length}), HOSTS Remapping, Bandwidth Throttling и Upstream Proxy будут перезаписаны заводским профилем.
           </p>
         </div>
         <div className="flex items-center justify-end gap-2 border-t border-hairline bg-canvas px-4 py-2.5">
@@ -1112,6 +1112,20 @@ export const SettingsImportPreviewModal: React.FC<
                   • Header Mutations:{" "}
                   <span className="font-mono text-fg">
                     {preview.headerMutationsCount} правил
+                  </span>
+                </div>
+                <div>
+                  • HOSTS Remapping / Throttling:{" "}
+                  <span className="font-mono text-fg">
+                    {preview.hostRemapCount ?? 0} правил /{" "}
+                    {preview.throttlePreset ?? "none"}
+                  </span>
+                </div>
+                <div>
+                  • Upstream Proxy:{" "}
+                  <span className="font-mono text-fg">
+                    {preview.upstreamProxySummary ??
+                      "Выкл (пароль не хранится в профиле)"}
                   </span>
                 </div>
                 <div>

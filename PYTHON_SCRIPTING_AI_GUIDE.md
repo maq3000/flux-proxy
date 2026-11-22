@@ -11,7 +11,7 @@
 Требования к результату:
 1. Выдавай **самодостаточный однофайловый код на Python 3**, готовый к вставке в редактор панели **Python Scripting Engine (`Alt+5`)**.
 2. Предпочитай **только стандартную библиотеку Python 3** (`json`, `re`, `hmac`, `hashlib`, `base64`, `time`, `urllib.parse`, `collections` и т.д.). Используй сторонние `pip`-пакеты, только если пользователь прямо попросил об этом.
-3. Строго соблюдай приведённый ниже контракт движка FluxProxy (`src-tauri/src/scripting/python_runner.rs` и `src-tauri/src/proxy/server.rs`). **Ничего не додумывай из API mitmproxy, FiddlerScript (C#/JScript.NET) или Charles.**
+3. Строго соблюдай приведённый ниже контракт движка FluxProxy (`src-tauri/src/scripting/python_runner.rs` и `src-tauri/src/proxy/server/http_handler.rs`). **Ничего не додумывай из API mitmproxy, FiddlerScript (C#/JScript.NET) или Charles.**
 
 ---
 
@@ -297,4 +297,4 @@ def on_response(response, request):
 ### См. также
 - [🐍 Полное руководство пользователя по Python Scripting Engine (`PYTHON_SCRIPTING_GUIDE.md`)](PYTHON_SCRIPTING_GUIDE.md)
 - [⚡ Обзор проекта и быстрый старт (`README.md`)](README.md)
-- Исходный код движка: [`src-tauri/src/scripting/python_runner.rs`](src-tauri/src/scripting/python_runner.rs), [`src-tauri/src/proxy/server.rs`](src-tauri/src/proxy/server.rs)
+- Исходный код движка: [`src-tauri/src/scripting/python_runner.rs`](src-tauri/src/scripting/python_runner.rs), [`src-tauri/src/proxy/server/http_handler.rs`](src-tauri/src/proxy/server/http_handler.rs)

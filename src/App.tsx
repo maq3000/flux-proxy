@@ -1387,6 +1387,27 @@ export const App: React.FC = () => {
     setSelectedId,
   ]);
 
+  const handleOpenStatistics = useCallback(() => {
+    setActiveSection("traffic");
+    if (selectedId === null && filteredSessions.length > 0) {
+      setSelectedId(filteredSessions[0].id);
+    }
+    if (inspectorCollapsed) {
+      setInspectorCollapsed(false);
+    }
+    setInlineDiffDismissed(true);
+    setStatisticsTriggerSeq((n) => n + 1);
+    window.requestAnimationFrame(() => {
+      inspectorContainerRef.current?.focus({ preventScroll: true });
+    });
+  }, [
+    filteredSessions,
+    inspectorCollapsed,
+    selectedId,
+    setInspectorCollapsed,
+    setSelectedId,
+  ]);
+
   const handleOpenCustomRetentionLimit = useCallback(() => {
     setActiveSection("traffic");
     setCustomRetentionTriggerSeq((n) => n + 1);
@@ -2215,6 +2236,24 @@ export const App: React.FC = () => {
         perform: handleInspectInHex,
       },
       {
+        id: "open-session-statistics",
+        category: "Inspector",
+        label:
+          "Открыть Statistics — пофазные тайминги (DNS/TCP/TLS/TTFB) и сводка выделенных сессий",
+        keywords: [
+          "statistics",
+          "timings",
+          "ttfb",
+          "dns",
+          "tls",
+          "performance",
+          "fiddler",
+          "статистика",
+          "тайминги",
+        ],
+        perform: handleOpenStatistics,
+      },
+      {
         id: "toggle-compact-toolbar",
         category: "View",
         label: compactToolbar
@@ -2787,6 +2826,7 @@ export const App: React.FC = () => {
       handleExportSettingsProfile,
       handleImportSettingsProfileDialog,
       handleInspectInHex,
+      handleOpenStatistics,
       handleOpenCustomRetentionLimit,
       handleResetAllSettings,
       handleResetPanelLayout,

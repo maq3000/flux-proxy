@@ -69,6 +69,8 @@ const SHORTCUT_GROUPS: {
       },
       { keys: "Ctrl+Shift+M", description: "Connect Mobile Device — iOS / Android Wi-Fi Proxy + QR" },
       { keys: "Ctrl+Shift+C", description: "Хранилище клиентских сертификатов (mTLS — Client Certificates)" },
+      { keys: "Ctrl+Shift+H", description: "HOSTS Remapping — виртуальный DNS и перенаправление доменов" },
+      { keys: "Ctrl+Shift+U", description: "Upstream Proxy — каскадирование через HTTP / HTTPS / SOCKS5" },
       { keys: "Ctrl+Shift+D", description: "Запустить диагностический мастер Proxy Doctor" },
       { keys: "Ctrl+E", description: "Открыть Text Wizard & JWT Decoder" },
       {
