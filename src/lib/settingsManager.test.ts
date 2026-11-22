@@ -8,6 +8,7 @@ import type {
   PythonRunnerStatus,
   StorageStats,
   ThrottleConfig,
+  UpstreamProxyConfig,
 } from "../types/proxy";
 import {
   CURRENT_SETTINGS_SCHEMA_VERSION,
@@ -77,6 +78,15 @@ const { mockState, mockProxyBridge, mockDefaultBpConfig } = vi.hoisted(() => {
       uploadKbps: 0,
       latencyMs: 0,
     } as ThrottleConfig,
+    upstreamProxyConfig: {
+      enabled: false,
+      protocol: "http",
+      host: "",
+      port: 8080,
+      username: null,
+      hasPassword: false,
+      bypassList: ["localhost", "127.0.0.1", "::1", "<local>"],
+    } as UpstreamProxyConfig,
   };
 
   const bridge = {
@@ -97,6 +107,30 @@ const { mockState, mockProxyBridge, mockDefaultBpConfig } = vi.hoisted(() => {
     setThrottleConfig: vi.fn(async (cfg: ThrottleConfig) => {
       state.throttleConfig = structuredClone(cfg);
       return structuredClone(cfg);
+    }),
+    getUpstreamProxyConfig: vi.fn(async () =>
+      structuredClone(state.upstreamProxyConfig)
+    ),
+    setUpstreamProxyConfig: vi.fn(async (cfg: UpstreamProxyConfig) => {
+      const next: UpstreamProxyConfig = {
+        enabled: cfg.enabled,
+        protocol: cfg.protocol,
+        host: cfg.host,
+        port: cfg.port,
+        username: cfg.username ?? null,
+        hasPassword:
+          cfg.password === "" || cfg.password === null
+            ? false
+            : typeof cfg.password === "string" && cfg.password.length > 0
+              ? true
+              : Boolean(state.upstreamProxyConfig.hasPassword),
+        bypassList: [...(cfg.bypassList ?? [])],
+      };
+      state.upstreamProxyConfig = structuredClone(next);
+      return structuredClone(next);
+    }),
+    injectWebSocketFrame: vi.fn(async () => {
+      throw new Error("not implemented in settingsManager mock");
     }),
     updateProxyFilterConfig: vi.fn(async (cfg: ProxyFilterBackendConfig) => {
       state.filterCfg = structuredClone(cfg);
@@ -264,6 +298,15 @@ function resetMockState(): void {
     downloadKbps: 0,
     uploadKbps: 0,
     latencyMs: 0,
+  };
+  mockState.upstreamProxyConfig = {
+    enabled: false,
+    protocol: "http",
+    host: "",
+    port: 8080,
+    username: null,
+    hasPassword: false,
+    bypassList: ["localhost", "127.0.0.1", "::1", "<local>"],
   };
 }
 
@@ -886,5 +929,127 @@ describe("settingsManager — applySettingsProfile & transactional rollback", ()
     await expect(applySettingsProfile(failingProfile)).rejects.toThrow("boom");
     expect(mockState.hostRemapRules).toEqual(report.profile.proxy.hostRemapRules);
     expect(mockState.throttleConfig).toEqual(report.profile.proxy.throttleConfig);
+  });
+
+  it("never exports upstream proxy passwords, strips plaintext password on import, and rolls back safely", async () => {
+    // 1. Export / collect strips plaintext password & hasPassword even if present in live snapshot or localStorage
+    window.localStorage.setItem(
+      SETTINGS_STORAGE_KEYS.upstreamProxyConfig,
+      JSON.stringify({
+        enabled: true,
+        protocol: "socks5",
+        host: "10.10.0.5",
+        port: 1080,
+        username: "corp-user",
+        password: "leak-attempt-password",
+        hasPassword: true,
+        bypassList: ["localhost", "*.corp.local", "10.0.0.0/8"],
+      })
+    );
+    const cleanupSnapshot = registerLiveSettingsSnapshotGetter(() => ({
+      proxy: {
+        ...createDefaultSettingsProfile().proxy,
+        upstreamProxy: {
+          enabled: true,
+          protocol: "socks5",
+          host: "10.10.0.5",
+          port: 1080,
+          username: "corp-user",
+          password: "live-secret-password",
+          hasPassword: true,
+          bypassList: ["localhost", "*.corp.local", "10.0.0.0/8"],
+        } as unknown as NonNullable<
+          FluxUserSettingsProfile["proxy"]["upstreamProxy"]
+        >,
+      },
+    }));
+
+    try {
+      const collected = collectCurrentSettingsProfile();
+      expect(collected.proxy.upstreamProxy).toEqual({
+        enabled: true,
+        protocol: "socks5",
+        host: "10.10.0.5",
+        port: 1080,
+        username: "corp-user",
+        bypassList: ["localhost", "*.corp.local", "10.0.0.0/8"],
+      });
+      expect(
+        "password" in (collected.proxy.upstreamProxy as Record<string, unknown>)
+      ).toBe(false);
+      expect(
+        "hasPassword" in
+          (collected.proxy.upstreamProxy as Record<string, unknown>)
+      ).toBe(false);
+      expect(JSON.stringify(collected)).not.toContain("live-secret-password");
+      expect(JSON.stringify(collected)).not.toContain("leak-attempt-password");
+    } finally {
+      cleanupSnapshot();
+    }
+
+    // 2. Importing a profile containing plaintext password strips it and warns user
+    const rawIncoming = {
+      ...createDefaultSettingsProfile(),
+      proxy: {
+        ...createDefaultSettingsProfile().proxy,
+        upstreamProxy: {
+          enabled: true,
+          protocol: "https",
+          host: "proxy.corp.local",
+          port: 8443,
+          username: "alice",
+          password: "plaintext-should-be-stripped",
+          bypassList: ["localhost", "192.168.0.0/16"],
+        },
+      },
+    };
+    const report = validateAndMigrateSettingsProfileWithReport(rawIncoming);
+    expect(report.profile.proxy.upstreamProxy).toEqual({
+      enabled: true,
+      protocol: "https",
+      host: "proxy.corp.local",
+      port: 8443,
+      username: "alice",
+      bypassList: ["localhost", "192.168.0.0/16"],
+    });
+    expect(
+      "password" in
+        (report.profile.proxy.upstreamProxy as Record<string, unknown>)
+    ).toBe(false);
+    expect(
+      report.warnings.some((w) => w.includes("proxy.upstreamProxy.password"))
+    ).toBe(true);
+
+    const preview = buildSettingsImportPreview(report.profile);
+    expect(preview.upstreamProxySummary).toBe("HTTPS proxy.corp.local:8443");
+
+    // 3. Apply and rollback
+    vi.useFakeTimers();
+    await applySettingsProfile(report.profile);
+    vi.runOnlyPendingTimers();
+    expect(mockState.upstreamProxyConfig).toMatchObject({
+      enabled: true,
+      protocol: "https",
+      host: "proxy.corp.local",
+      port: 8443,
+      username: "alice",
+      bypassList: ["localhost", "192.168.0.0/16"],
+    });
+
+    const failingProfile = createDefaultSettingsProfile();
+    failingProfile.proxy.upstreamProxy = {
+      enabled: true,
+      protocol: "http",
+      host: "bad.proxy.local",
+      port: 3128,
+      username: null,
+      bypassList: [],
+    };
+    mockProxyBridge.setPythonScript.mockRejectedValueOnce(new Error("boom-up"));
+    await expect(applySettingsProfile(failingProfile)).rejects.toThrow(
+      "boom-up"
+    );
+    expect(mockState.upstreamProxyConfig.host).toBe("proxy.corp.local");
+    expect(mockState.upstreamProxyConfig.port).toBe(8443);
   });
 });

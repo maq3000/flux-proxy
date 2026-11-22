@@ -1,7 +1,9 @@
-import React, { useId, useMemo, useState } from "react";
+import React, { useId, useMemo, useRef, useState } from "react";
 import Editor from "@monaco-editor/react";
 import {
   AlertTriangle,
+  ArrowDown,
+  ArrowUp,
   Binary,
   Check,
   CheckCircle2,
@@ -11,9 +13,11 @@ import {
   HardDriveDownload,
   KeyRound,
   Layers,
+  Loader2,
   Radio,
   ShieldAlert,
   Sparkles,
+  Syringe,
   Wand2,
   XCircle,
 } from "lucide-react";
@@ -25,10 +29,12 @@ import {
   parseMultipartBody,
   parseSseStream,
 } from "../lib/protocolInspectors";
+import { proxyBridge } from "../lib/tauriBridge";
 import type {
   HeaderPair,
   SessionDetail,
   WebSocketFrameRecord,
+  WsInjectDirection,
 } from "../types/proxy";
 import type { TextWizardTab } from "./TextWizardModal";
 
@@ -244,79 +250,454 @@ export const SseInspectorPanel: React.FC<{
 };
 
 // ============================================================================
-// 2. WebSocket Frames Inspector
+// 2. WebSocket Frames Inspector & Live Frame Injection
 // ============================================================================
-export const WebSocketFramesPanel: React.FC<{
-  frames: WebSocketFrameRecord[];
-}> = ({ frames }) => {
-  const captionId = useId();
+type WsPayloadMode = "text" | "json" | "hex";
 
-  if (frames.length === 0) {
-    return (
-      <div className="flex h-full items-center justify-center p-6 text-xs text-subtle">
-        Нет перехваченных WebSocket-кадров в этой сессии.
-      </div>
+function inspectHexPayload(raw: string): {
+  valid: boolean;
+  byteCount: number;
+  error?: string;
+} {
+  const parts: string[] = [];
+  for (const tok of raw.split(/[\s:\-,]+/)) {
+    if (!tok) continue;
+    parts.push(
+      tok.startsWith("0x") || tok.startsWith("0X") ? tok.slice(2) : tok
     );
   }
+  const joined = parts.join("");
+  if (joined.length === 0) {
+    return { valid: true, byteCount: 0 };
+  }
+  if (!/^[0-9a-fA-F]+$/.test(joined)) {
+    return {
+      valid: false,
+      byteCount: 0,
+      error: "Допустимы только hex-символы (0-9, a-f), пробелы, «:» или «0x».",
+    };
+  }
+  if (joined.length % 2 !== 0) {
+    return {
+      valid: false,
+      byteCount: Math.floor(joined.length / 2),
+      error: "Ожидается чётное количество hex-символов (по 2 на байт).",
+    };
+  }
+  return { valid: true, byteCount: joined.length / 2 };
+}
+
+export const WebSocketFramesPanel: React.FC<{
+  frames: WebSocketFrameRecord[];
+  sessionId?: number;
+  isWsOpen?: boolean;
+  onFrameInjected?: (frame: WebSocketFrameRecord) => void;
+}> = ({ frames, sessionId, isWsOpen = false, onFrameInjected }) => {
+  const captionId = useId();
+  const modeGroupName = useId();
+  const payloadId = useId();
+  const payloadErrId = useId();
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const [mode, setMode] = useState<WsPayloadMode>("text");
+  const [payload, setPayload] = useState("");
+  const [fieldError, setFieldError] = useState<string | null>(null);
+  const [injectError, setInjectError] = useState<string | null>(null);
+  const [injectStatus, setInjectStatus] = useState<string | null>(null);
+  const [sendingDir, setSendingDir] = useState<WsInjectDirection | null>(null);
+
+  const jsonCheck = useMemo(() => {
+    if (mode !== "json") return { valid: true, error: null as string | null };
+    if (!payload.trim()) return { valid: true, error: null as string | null };
+    try {
+      JSON.parse(payload);
+      return { valid: true, error: null as string | null };
+    } catch (err) {
+      return {
+        valid: false,
+        error: err instanceof Error ? err.message : "Невалидный JSON",
+      };
+    }
+  }, [mode, payload]);
+
+  const hexCheck = useMemo(
+    () =>
+      mode === "hex" ? inspectHexPayload(payload) : { valid: true, byteCount: 0 },
+    [mode, payload]
+  );
+
+  const utf8ByteCount = useMemo(
+    () => (mode === "hex" ? hexCheck.byteCount : new TextEncoder().encode(payload).length),
+    [mode, payload, hexCheck.byteCount]
+  );
+
+  const handleFormatJson = () => {
+    setFieldError(null);
+    setInjectError(null);
+    if (!payload.trim()) return;
+    try {
+      const formatted = JSON.stringify(JSON.parse(payload), null, 2);
+      setPayload(formatted);
+    } catch (err) {
+      setFieldError(
+        `Невозможно отформатировать JSON: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  };
+
+  const handleInject = async (direction: WsInjectDirection) => {
+    if (!isWsOpen || sessionId === undefined || sendingDir !== null) return;
+    setFieldError(null);
+    setInjectError(null);
+    setInjectStatus(null);
+
+    if (mode === "json" && payload.trim().length > 0 && !jsonCheck.valid) {
+      setFieldError(`Некорректный JSON: ${jsonCheck.error}`);
+      textareaRef.current?.focus();
+      return;
+    }
+    if (mode === "hex" && !hexCheck.valid) {
+      setFieldError(hexCheck.error ?? "Некорректный Hex payload.");
+      textareaRef.current?.focus();
+      return;
+    }
+
+    const opcode = mode === "hex" ? "binary" : "text";
+    setSendingDir(direction);
+    try {
+      const record = await proxyBridge.injectWebSocketFrame(
+        sessionId,
+        direction,
+        opcode,
+        payload
+      );
+      onFrameInjected?.(record);
+      setInjectStatus(
+        `Отправлен ${opcode.toUpperCase()}-фрейм #${record.index} (${formatBytes(
+          record.byteLength
+        )}) → ${direction === "server" ? "Server" : "Client"}`
+      );
+    } catch (err) {
+      setInjectError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSendingDir(null);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (
+      (e.ctrlKey || e.metaKey) &&
+      e.key === "Enter" &&
+      !e.nativeEvent.isComposing
+    ) {
+      e.preventDefault();
+      void handleInject("server");
+    }
+  };
+
+  const canInject = isWsOpen && sessionId !== undefined;
 
   return (
-    <div
-      tabIndex={0}
-      role="region"
-      aria-labelledby={captionId}
-      className="filter-table-wrapper h-full p-2 select-text"
-    >
-      <table
-        className="filter-data-table font-mono text-xs tabular-nums"
-        style={
-          {
-            "--label-2": '"Направление"',
-            "--label-3": '"Opcode"',
-            "--label-4": '"Размер"',
-            "--label-5": '"Payload"',
-          } as React.CSSProperties
-        }
-      >
-        <caption id={captionId} className="sr-only">
-          Перехваченные кадры WebSocket
-        </caption>
-        <thead>
-          <tr className="border-b border-hairline text-left text-[10px] uppercase text-subtle">
-            <th className="px-2 py-1.5">#</th>
-            <th className="px-2 py-1.5">Dir</th>
-            <th className="px-2 py-1.5">Opcode</th>
-            <th className="px-2 py-1.5 text-right">Bytes</th>
-            <th className="px-2 py-1.5">Payload Preview</th>
-          </tr>
-        </thead>
-        <tbody>
-          {frames.map((f) => (
-            <tr key={f.index} className="border-b border-hairline/50 hover:bg-hover/40">
-              <th className="px-2 py-1.5 text-left text-subtle">#{f.index}</th>
-              <td data-col="2" className="px-2 py-1.5">
+    <div className="flex h-full flex-col overflow-hidden">
+      {/* Status Header */}
+      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-hairline bg-elevated/40 px-3 py-1.5 text-[11px]">
+        <div className="flex items-center gap-2">
+          {isWsOpen ? (
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-status2xx-bg px-2 py-0.5 font-mono text-[10px] font-bold uppercase text-status2xx-fg">
+              <span
+                className="h-1.5 w-1.5 animate-pulse rounded-full bg-status2xx-fg"
+                aria-hidden="true"
+              />
+              OPEN (Live)
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-elevated px-2 py-0.5 font-mono text-[10px] font-bold uppercase text-subtle ring-1 ring-hairline">
+              CLOSED
+            </span>
+          )}
+          <span className="font-mono text-muted">
+            Кадров: <strong className="text-fg">{frames.length}</strong>
+          </span>
+        </div>
+        {!isWsOpen && (
+          <span className="text-[10px] text-subtle">
+            Инъекция фреймов доступна только для открытых WebSocket-соединений
+          </span>
+        )}
+      </div>
+
+      {/* Frames Table */}
+      <div className="min-h-0 flex-1 overflow-auto">
+        {frames.length === 0 ? (
+          <div className="flex h-full min-h-[96px] items-center justify-center p-6 text-xs text-subtle">
+            Нет перехваченных WebSocket-кадров в этой сессии.
+          </div>
+        ) : (
+          <div
+            tabIndex={0}
+            role="region"
+            aria-labelledby={captionId}
+            className="filter-table-wrapper p-2 select-text"
+          >
+            <table
+              className="filter-data-table font-mono text-xs tabular-nums"
+              style={
+                {
+                  "--label-2": '"Направление"',
+                  "--label-3": '"Opcode"',
+                  "--label-4": '"Размер"',
+                  "--label-5": '"Payload"',
+                } as React.CSSProperties
+              }
+            >
+              <caption id={captionId} className="sr-only">
+                Перехваченные кадры WebSocket
+              </caption>
+              <thead>
+                <tr className="border-b border-hairline text-left text-[10px] uppercase text-subtle">
+                  <th className="px-2 py-1.5">#</th>
+                  <th className="px-2 py-1.5">Dir</th>
+                  <th className="px-2 py-1.5">Opcode</th>
+                  <th className="px-2 py-1.5 text-right">Bytes</th>
+                  <th className="px-2 py-1.5">Payload Preview</th>
+                </tr>
+              </thead>
+              <tbody>
+                {frames.map((f) => (
+                  <tr
+                    key={`${f.index}-${f.timestamp}`}
+                    className="border-b border-hairline/50 hover:bg-hover/40"
+                  >
+                    <th className="px-2 py-1.5 text-left text-subtle">
+                      #{f.index}
+                    </th>
+                    <td data-col="2" className="px-2 py-1.5 whitespace-nowrap">
+                      <span
+                        className={`rounded px-1.5 py-0.5 text-[10px] font-bold uppercase ${
+                          f.direction === "outbound"
+                            ? "bg-sky-500/15 text-sky-400"
+                            : "bg-violet-500/15 text-violet-300"
+                        }`}
+                      >
+                        {f.direction === "outbound" ? "↑ Client" : "↓ Server"}
+                      </span>
+                      {f.injected && (
+                        <span
+                          title="Фрейм вручную инъектирован через FluxProxy"
+                          className="ml-1.5 inline-flex items-center gap-0.5 rounded bg-amber-500/20 px-1.5 py-0.5 text-[9px] font-bold uppercase text-amber-300 ring-1 ring-amber-400/35"
+                        >
+                          <Syringe className="h-2.5 w-2.5" aria-hidden="true" />
+                          INJECTED
+                        </span>
+                      )}
+                    </td>
+                    <td data-col="3" className="px-2 py-1.5 text-muted">
+                      {f.opcode}
+                    </td>
+                    <td data-col="4" className="px-2 py-1.5 text-right text-muted">
+                      {formatBytes(f.byteLength)}
+                    </td>
+                    <td data-col="5" className="break-all px-2 py-1.5 text-fg">
+                      {f.payloadPreview}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Live Injection Panel (only for open WS connections) */}
+      {canInject && (
+        <form
+          noValidate
+          onSubmit={(e) => {
+            e.preventDefault();
+            void handleInject("server");
+          }}
+          className="shrink-0 space-y-2 border-t border-hairline bg-surface px-3 py-2.5 text-xs"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="inline-flex items-center gap-1.5 font-mono text-[11px] font-bold uppercase tracking-wider text-accent">
+                <Syringe className="h-3.5 w-3.5" aria-hidden="true" />
+                Inject WebSocket Frame
+              </span>
+              <fieldset className="flex items-center gap-1">
+                <legend className="sr-only">Формат полезной нагрузки фрейма</legend>
+                {(
+                  [
+                    { id: "text", label: "Text" },
+                    { id: "json", label: "JSON" },
+                    { id: "hex", label: "Hex (Binary)" },
+                  ] as const
+                ).map((opt) => {
+                  const rId = `${modeGroupName}-${opt.id}`;
+                  const active = mode === opt.id;
+                  return (
+                    <label
+                      key={opt.id}
+                      htmlFor={rId}
+                      className={`inline-flex cursor-pointer items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                        active
+                          ? "bg-accent/15 text-accent ring-1 ring-accent/40"
+                          : "bg-canvas text-muted hover:text-fg"
+                      }`}
+                    >
+                      <input
+                        id={rId}
+                        type="radio"
+                        name={modeGroupName}
+                        value={opt.id}
+                        checked={active}
+                        onChange={() => {
+                          setMode(opt.id);
+                          setFieldError(null);
+                          setInjectError(null);
+                        }}
+                        className="sr-only"
+                      />
+                      <span>{opt.label}</span>
+                    </label>
+                  );
+                })}
+              </fieldset>
+            </div>
+
+            <div className="flex items-center gap-2 text-[11px]">
+              {mode === "json" && (
+                <>
+                  {payload.trim().length > 0 && (
+                    <span
+                      className={`inline-flex items-center gap-1 font-mono text-[10px] ${
+                        jsonCheck.valid ? "text-status2xx-fg" : "text-status5xx-fg"
+                      }`}
+                    >
+                      {jsonCheck.valid ? (
+                        <CheckCircle2 className="h-3 w-3" aria-hidden="true" />
+                      ) : (
+                        <XCircle className="h-3 w-3" aria-hidden="true" />
+                      )}
+                      {jsonCheck.valid ? "JSON OK" : "JSON Error"}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleFormatJson}
+                    className="inline-flex items-center gap-1 rounded border border-hairline bg-canvas px-2 py-0.5 text-[10px] font-medium text-muted hover:border-strong hover:text-fg"
+                  >
+                    <Wand2 className="h-3 w-3" aria-hidden="true" />
+                    Format JSON
+                  </button>
+                </>
+              )}
+              {mode === "hex" && (
                 <span
-                  className={`rounded px-1.5 py-0.5 text-[10px] font-bold uppercase ${
-                    f.direction === "outbound"
-                      ? "bg-sky-500/15 text-sky-400"
-                      : "bg-violet-500/15 text-violet-300"
+                  className={`font-mono text-[10px] ${
+                    hexCheck.valid ? "text-muted" : "text-status5xx-fg"
                   }`}
                 >
-                  {f.direction === "outbound" ? "↑ Client" : "↓ Server"}
+                  {hexCheck.valid
+                    ? `${hexCheck.byteCount} B`
+                    : "Invalid Hex"}
                 </span>
-              </td>
-              <td data-col="3" className="px-2 py-1.5 text-muted">
-                {f.opcode}
-              </td>
-              <td data-col="4" className="px-2 py-1.5 text-right text-muted">
-                {formatBytes(f.byteLength)}
-              </td>
-              <td data-col="5" className="break-all px-2 py-1.5 text-fg">
-                {f.payloadPreview}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+              )}
+              {mode !== "hex" && (
+                <span className="font-mono text-[10px] text-subtle">
+                  {utf8ByteCount} B
+                </span>
+              )}
+            </div>
+          </div>
+
+          <div>
+            <label htmlFor={payloadId} className="sr-only">
+              Содержимое WebSocket-фрейма
+            </label>
+            <textarea
+              ref={textareaRef}
+              id={payloadId}
+              rows={3}
+              autoCorrect="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              value={payload}
+              aria-invalid={Boolean(fieldError)}
+              aria-describedby={fieldError ? payloadErrId : undefined}
+              onChange={(e) => {
+                setPayload(e.target.value);
+                if (fieldError) setFieldError(null);
+                if (injectError) setInjectError(null);
+              }}
+              onKeyDown={handleKeyDown}
+              placeholder={
+                mode === "hex"
+                  ? "Например: 01 02 de ad be ef"
+                  : mode === "json"
+                    ? '{"type":"ping","ts":123}'
+                    : "Введите текстовый фрейм для инъекции (Ctrl+Enter → Send to Server)…"
+              }
+              className={`w-full resize-y rounded-md border bg-canvas p-2 font-mono text-xs text-fg outline-none focus:border-accent ${
+                fieldError ? "border-status5xx-fg" : "border-hairline"
+              }`}
+            />
+            {fieldError && (
+              <p id={payloadErrId} className="mt-1 text-[11px] text-status5xx-fg">
+                {fieldError}
+              </p>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="min-w-0 flex-1 text-[11px]">
+              {injectError ? (
+                <span role="alert" className="text-status5xx-fg">
+                  {injectError}
+                </span>
+              ) : injectStatus ? (
+                <span className="text-status2xx-fg">{injectStatus}</span>
+              ) : (
+                <span className="text-subtle">
+                  Ctrl+Enter — отправить на сервер · opcode:{" "}
+                  <code>{mode === "hex" ? "Binary" : "Text"}</code>
+                </span>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={sendingDir !== null}
+                onClick={() => void handleInject("client")}
+                className="inline-flex items-center gap-1.5 rounded-md border border-violet-500/40 bg-violet-500/15 px-3 py-1.5 font-mono text-[11px] font-semibold text-violet-300 transition-colors hover:bg-violet-500/25 disabled:opacity-60"
+              >
+                {sendingDir === "client" ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                ) : (
+                  <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+                <span>Send to Client</span>
+              </button>
+
+              <button
+                type="submit"
+                disabled={sendingDir !== null}
+                className="inline-flex items-center gap-1.5 rounded-md bg-sky-600 px-3 py-1.5 font-mono text-[11px] font-semibold text-white transition-colors hover:bg-sky-500 disabled:opacity-60"
+              >
+                {sendingDir === "server" ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                ) : (
+                  <ArrowUp className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+                <span>Send to Server</span>
+              </button>
+            </div>
+          </div>
+        </form>
+      )}
     </div>
   );
 };

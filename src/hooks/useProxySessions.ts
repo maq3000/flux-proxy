@@ -797,7 +797,7 @@ export function useProxySessions() {
     if (selectedId === null) return "";
     const found = sessions.find((s) => s.id === selectedId);
     if (!found) return "";
-    return `${found.status}:${found.bodySize}:${found.durationMs}:${found.contentType}:${found.error ?? ""}:${found.breakpointPaused ?? ""}:${found.breakpointModified ? "1" : "0"}:${found.comment ?? ""}:${found.markedColor ?? ""}`;
+    return `${found.status}:${found.bodySize}:${found.durationMs}:${found.contentType}:${found.error ?? ""}:${found.breakpointPaused ?? ""}:${found.breakpointModified ? "1" : "0"}:${found.comment ?? ""}:${found.markedColor ?? ""}:${found.wsOpen ? "1" : "0"}`;
   }, [selectedId, sessions]);
 
   const selectedIdRef = useRef<number | null>(selectedId);

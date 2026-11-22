@@ -9,7 +9,8 @@ use crate::models::{
     CaCertificateInfo, CodecOperation, CodecTransformResult, ComposedRequest, DoctorCheckResult,
     HostRemapRule, LoadedSessionBody, NetworkInterfaceInfo, PausedBreakpointItem, ProxyError,
     ProxyFilterBackendConfig, ProxyStatus, PythonRunnerStatus, SanitizationOptions, SessionDetail,
-    SessionSummary, StorageStats, ThrottleConfig,
+    SessionSummary, StorageStats, ThrottleConfig, UpstreamProxyConfig, WebSocketFrameRecord,
+    WsInjectDirection, WsInjectOpcode,
 };
 use crate::proxy::client_certs::{AddClientCertificateRequest, ClientCertificateEntry};
 use crate::proxy::codec::execute_codec_transform;
@@ -960,6 +961,36 @@ pub async fn set_throttle_config(
     state: State<'_, AppState>,
 ) -> Result<ThrottleConfig, ProxyError> {
     Ok(state.controller.context.throttle.set_config(config))
+}
+
+#[tauri::command]
+pub async fn get_upstream_proxy_config(
+    state: State<'_, AppState>,
+) -> Result<UpstreamProxyConfig, ProxyError> {
+    Ok(state.controller.get_upstream_proxy_config())
+}
+
+#[tauri::command]
+pub async fn set_upstream_proxy_config(
+    config: UpstreamProxyConfig,
+    state: State<'_, AppState>,
+) -> Result<UpstreamProxyConfig, ProxyError> {
+    state.controller.set_upstream_proxy_config(config)
+}
+
+#[tauri::command]
+pub async fn inject_websocket_frame(
+    session_id: u64,
+    direction: WsInjectDirection,
+    opcode: WsInjectOpcode,
+    payload: String,
+    state: State<'_, AppState>,
+) -> Result<WebSocketFrameRecord, ProxyError> {
+    state
+        .controller
+        .context
+        .inject_websocket_frame(session_id, direction, opcode, payload)
+        .await
 }
 
 #[cfg(test)]

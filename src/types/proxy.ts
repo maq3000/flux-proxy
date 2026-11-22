@@ -10,6 +10,7 @@ export interface WebSocketFrameRecord {
   payloadPreview: string;
   byteLength: number;
   timestamp: string;
+  injected?: boolean;
 }
 
 export interface SseEventRecord {
@@ -121,6 +122,7 @@ export interface SessionSummary {
   wireBodySize?: number | null;
   serverIp?: string | null;
   serverConnReused?: boolean | null;
+  wsOpen?: boolean | null;
 }
 
 export interface SessionDetail {
@@ -790,3 +792,38 @@ export const THROTTLE_PRESET_DEFINITIONS: readonly ThrottlePresetDefinition[] = 
     latencyMs: 100,
   },
 ] as const;
+
+export type UpstreamProxyProtocol = "http" | "https" | "socks5";
+
+export interface UpstreamProxyConfig {
+  enabled: boolean;
+  protocol: UpstreamProxyProtocol;
+  host: string;
+  port: number;
+  username?: string | null;
+  /** Optional write-only password sent to backend RAM on save; never returned by backend or persisted in profiles. */
+  password?: string | null;
+  /** Read-only indicator returned by backend / preview simulator showing whether a password is held in RAM. */
+  hasPassword?: boolean;
+  bypassList: string[];
+}
+
+export const DEFAULT_UPSTREAM_PROXY_BYPASS_LIST: string[] = [
+  "localhost",
+  "127.0.0.1",
+  "::1",
+  "<local>",
+];
+
+export const DEFAULT_UPSTREAM_PROXY_CONFIG: UpstreamProxyConfig = {
+  enabled: false,
+  protocol: "http",
+  host: "",
+  port: 8080,
+  username: null,
+  hasPassword: false,
+  bypassList: [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST],
+};
+
+export type WsInjectDirection = "server" | "client";
+export type WsInjectOpcode = "text" | "binary";

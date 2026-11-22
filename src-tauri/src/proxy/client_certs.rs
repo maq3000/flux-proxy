@@ -16,6 +16,7 @@ use crate::models::ProxyError;
 use crate::proxy::hosts::HostRemapRegistry;
 use crate::proxy::server::build_upstream_client_with_options;
 use crate::proxy::upstream_client::UpstreamHttpClient;
+use crate::proxy::upstream_proxy::UpstreamProxyManager;
 
 const CLIENT_CERTS_DIR_NAME: &str = "client_certs";
 const REGISTRY_FILE_NAME: &str = "registry.json";
@@ -339,7 +340,7 @@ fn parse_rustls_client_auth_from_pem(
 
 fn validate_identity_pem_with_reqwest(pem_bytes: &[u8]) -> Result<(), ProxyError> {
     let (certs, key) = parse_rustls_client_auth_from_pem(pem_bytes)?;
-    UpstreamHttpClient::build(None, Some((certs, key, "validation".to_string()))).map_err(|e| {
+    UpstreamHttpClient::build(None, None, Some((certs, key, "validation".to_string()))).map_err(|e| {
         ProxyError::Custom(format!(
             "Сертификат и закрытый ключ не прошли проверку TLS-клиента (rustls): {e}"
         ))
@@ -958,13 +959,15 @@ impl ClientCertificateStore {
         &self,
         host: &str,
         host_remap: Option<Arc<HostRemapRegistry>>,
+        upstream_proxy: Option<Arc<UpstreamProxyManager>>,
     ) -> Result<Option<(Arc<UpstreamHttpClient>, ClientCertificateEntry)>, ProxyError> {
         let Some(entry) = self.match_certificate_for_host(host) else {
             return Ok(None);
         };
 
         let resolver_tag = if host_remap.is_some() { "remap" } else { "sys" };
-        let cache_key = format!("{}:dns={resolver_tag}", entry.id);
+        let proxy_tag = if upstream_proxy.is_some() { "up" } else { "dir" };
+        let cache_key = format!("{}:dns={resolver_tag}:proxy={proxy_tag}", entry.id);
         if let Some(cached) = self.upstream_client_cache.get(&cache_key) {
             return Ok(Some((cached, entry)));
         }
@@ -979,6 +982,7 @@ impl ClientCertificateStore {
         let (certs, key) = parse_rustls_client_auth_from_pem(&pem_bytes)?;
         let client = UpstreamHttpClient::build(
             host_remap,
+            upstream_proxy,
             Some((certs, key, entry.common_name.clone())),
         )
         .map_err(|e| {

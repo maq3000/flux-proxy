@@ -315,6 +315,7 @@ impl ProxyEngineController {
             match self.context.client_certs.get_or_build_upstream_client(
                 &target_host,
                 Some(self.context.host_remap.clone()),
+                Some(self.context.upstream_proxy.clone()),
             ) {
                 Ok(Some((mtls_client, entry))) => (mtls_client, Some(entry.common_name)),
                 Ok(None) => (self.context.upstream_http_client(), None),
@@ -869,6 +870,7 @@ impl ProxyEngineController {
             wire_body_size: None,
             server_ip: None,
             server_conn_reused: None,
+            ws_open: None,
         };
         summary.apply_telemetry(Some(&timings), Some(&transfer_stats));
 

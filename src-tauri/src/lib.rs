@@ -157,6 +157,9 @@ pub fn run() {
             commands::update_host_remap_rules,
             commands::get_throttle_config,
             commands::set_throttle_config,
+            commands::get_upstream_proxy_config,
+            commands::set_upstream_proxy_config,
+            commands::inject_websocket_frame,
         ])
         .build(tauri::generate_context!())
         .expect("error while building FluxProxy Tauri application");

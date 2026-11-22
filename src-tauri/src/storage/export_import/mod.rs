@@ -240,6 +240,7 @@ mod tests {
                     wire_body_size: None,
                     server_ip: None,
                     server_conn_reused: None,
+                    ws_open: None,
                 },
                 request_headers: vec![
                     HeaderPair {
@@ -314,6 +315,7 @@ mod tests {
                     wire_body_size: None,
                     server_ip: None,
                     server_conn_reused: None,
+                    ws_open: None,
                 },
                 request_headers: vec![HeaderPair {
                     name: "Host".into(),
@@ -336,6 +338,7 @@ mod tests {
                     payload_preview: "{\"ping\":1}".into(),
                     byte_length: 10,
                     timestamp: "2026-11-09T09:15:31.010Z".into(),
+                    injected: false,
                 }],
                 sse_events: Vec::new(),
                 body_offloaded: false,
@@ -1009,6 +1012,7 @@ mod tests {
                 payload_preview: "{\"type\":1,\"arguments\":[{\"accessToken\":\"signalr-secret\",\"bearer\":\"Bearer signalr-bearer\"}]}\x1e".to_string(),
                 byte_length: 100,
                 timestamp: "2026-11-09T09:15:31.010Z".into(),
+                injected: false,
             },
             WebSocketFrameRecord {
                 index: 2,
@@ -1017,6 +1021,7 @@ mod tests {
                 payload_preview: "42/chat,[\"auth\",{\"apiKey\":\"socketio-apikey\",\"clientSecret\":\"socketio-csecret\"}]".into(),
                 byte_length: 82,
                 timestamp: "2026-11-09T09:15:31.020Z".into(),
+                injected: false,
             },
             WebSocketFrameRecord {
                 index: 3,
@@ -1025,6 +1030,7 @@ mod tests {
                 payload_preview: format!("AUTH Bearer plain-ws-bearer TOKEN {jwt}"),
                 byte_length: 90,
                 timestamp: "2026-11-09T09:15:31.030Z".into(),
+                injected: false,
             },
         ];
         let stale_ws_body = serde_json::to_string_pretty(&sessions[1].websocket_frames).unwrap();

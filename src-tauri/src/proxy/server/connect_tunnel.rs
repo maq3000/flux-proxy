@@ -15,7 +15,10 @@ use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
-use crate::models::{HeaderPair, SessionDetail, SessionSummary, SessionTimings, SessionTransferStats};
+use crate::models::{
+    HeaderPair, SessionDetail, SessionSummary, SessionTimings, SessionTransferStats,
+    UpstreamProxyProtocol,
+};
 use crate::proxy::filters::{ConnectTunnelDecision, PassthroughReason};
 use crate::proxy::hosts::HostRemapRegistry;
 use crate::proxy::network::normalize_client_ip;
@@ -25,6 +28,7 @@ use crate::proxy::upstream_client::{
     duration_ms_f64, elapsed_ms, estimate_request_headers_bytes, estimate_response_headers_bytes,
     format_rfc3339_micros, format_tls_cipher, format_tls_protocol, timestamp_at_instant,
 };
+use crate::proxy::upstream_proxy::{connect_tunnel_via_upstream, UpstreamTransportStream};
 
 use super::http_handler::handle_intercepted_request;
 use super::mobile_portal::{is_builtin_portal_target, is_virtual_portal_domain};
@@ -157,85 +161,152 @@ pub(super) async fn handle_outer_proxy_request(
                 );
             }
 
-            let connect_host_clean = connect_host.trim_matches(['[', ']']);
-            let (resolved_addrs, dns_ms): (Vec<SocketAddr>, f64) =
-                if let Ok(ip) = connect_host_clean.parse::<IpAddr>() {
-                    (vec![SocketAddr::new(ip, connect_port)], 0.0)
-                } else {
-                    let dns_start = Instant::now();
-                    match tokio::net::lookup_host((connect_host_clean, connect_port)).await {
-                        Ok(iter) => (iter.collect(), elapsed_ms(dns_start)),
-                        Err(err) => {
-                            return record_and_return_error_with_opts(
-                                &ctx,
-                                session_id,
-                                "https",
-                                "CONNECT",
-                                &host,
-                                &tunnel_path,
-                                &target_url,
-                                connect_headers,
-                                Bytes::new(),
-                                start,
-                                timestamp,
-                                client_addr,
-                                client_proc.as_ref(),
-                                true,
-                                false,
-                                StatusCode::BAD_GATEWAY,
-                                remapped_to,
-                                format!(
-                                    "TLS Passthrough DNS lookup failed for {connect_host}:{connect_port}: {err}"
-                                ),
-                            );
-                        }
+            let active_upstream_proxy = ctx.upstream_proxy.resolve_for_target(
+                &host,
+                port,
+                remapped_connect.as_ref().map(|_| connect_host.as_str()),
+                remapped_connect.as_ref().map(|_| connect_port),
+            );
+
+            let (upstream_tcp, dns_ms, tcp_connect_ms, upstream_proxy_label): (
+                UpstreamTransportStream,
+                f64,
+                f64,
+                Option<String>,
+            ) = if let Some(proxy_cfg) = active_upstream_proxy {
+                let connect_timeout = Duration::from_secs(ctx.upstream_timeout_sec.max(1));
+                let tunnel_res = match connect_tunnel_via_upstream(
+                    &proxy_cfg,
+                    &connect_host,
+                    connect_port,
+                    connect_timeout,
+                )
+                .await
+                {
+                    Ok(res) => res,
+                    Err(err_msg) => {
+                        return record_and_return_error_with_opts(
+                            &ctx,
+                            session_id,
+                            "https",
+                            "CONNECT",
+                            &host,
+                            &tunnel_path,
+                            &target_url,
+                            connect_headers,
+                            Bytes::new(),
+                            start,
+                            timestamp,
+                            client_addr,
+                            client_proc.as_ref(),
+                            true,
+                            false,
+                            StatusCode::BAD_GATEWAY,
+                            remapped_to,
+                            format!(
+                                "TLS Passthrough upstream proxy connect failed for {connect_host}:{connect_port}: {err_msg}"
+                            ),
+                        );
                     }
                 };
+                let proto_label = match proxy_cfg.protocol {
+                    UpstreamProxyProtocol::Http => "http",
+                    UpstreamProxyProtocol::Https => "https",
+                    UpstreamProxyProtocol::Socks5 => "socks5",
+                };
+                let label = format!("{proto_label}://{}:{}", proxy_cfg.host, proxy_cfg.port);
+                (
+                    tunnel_res.stream,
+                    tunnel_res.dns_ms,
+                    tunnel_res.tcp_connect_ms,
+                    Some(label),
+                )
+            } else {
+                let connect_host_clean = connect_host.trim_matches(['[', ']']);
+                let (resolved_addrs, dns_ms): (Vec<SocketAddr>, f64) =
+                    if let Ok(ip) = connect_host_clean.parse::<IpAddr>() {
+                        (vec![SocketAddr::new(ip, connect_port)], 0.0)
+                    } else {
+                        let dns_start = Instant::now();
+                        match tokio::net::lookup_host((connect_host_clean, connect_port)).await {
+                            Ok(iter) => (iter.collect(), elapsed_ms(dns_start)),
+                            Err(err) => {
+                                return record_and_return_error_with_opts(
+                                    &ctx,
+                                    session_id,
+                                    "https",
+                                    "CONNECT",
+                                    &host,
+                                    &tunnel_path,
+                                    &target_url,
+                                    connect_headers,
+                                    Bytes::new(),
+                                    start,
+                                    timestamp,
+                                    client_addr,
+                                    client_proc.as_ref(),
+                                    true,
+                                    false,
+                                    StatusCode::BAD_GATEWAY,
+                                    remapped_to,
+                                    format!(
+                                        "TLS Passthrough DNS lookup failed for {connect_host}:{connect_port}: {err}"
+                                    ),
+                                );
+                            }
+                        }
+                    };
 
-            let tcp_start = Instant::now();
-            let mut upstream_tcp_opt = None;
-            let mut last_tcp_err = None;
-            for addr in resolved_addrs {
-                match TcpStream::connect(addr).await {
-                    Ok(stream) => {
-                        let _ = stream.set_nodelay(true);
-                        upstream_tcp_opt = Some(stream);
-                        break;
+                let tcp_start = Instant::now();
+                let mut upstream_tcp_opt = None;
+                let mut last_tcp_err = None;
+                for addr in resolved_addrs {
+                    match TcpStream::connect(addr).await {
+                        Ok(stream) => {
+                            let _ = stream.set_nodelay(true);
+                            upstream_tcp_opt = Some(stream);
+                            break;
+                        }
+                        Err(err) => last_tcp_err = Some(err),
                     }
-                    Err(err) => last_tcp_err = Some(err),
                 }
-            }
-            let upstream_tcp = match upstream_tcp_opt {
-                Some(stream) => stream,
-                None => {
-                    let err_detail = last_tcp_err
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "no reachable address".to_string());
-                    return record_and_return_error_with_opts(
-                        &ctx,
-                        session_id,
-                        "https",
-                        "CONNECT",
-                        &host,
-                        &tunnel_path,
-                        &target_url,
-                        connect_headers,
-                        Bytes::new(),
-                        start,
-                        timestamp,
-                        client_addr,
-                        client_proc.as_ref(),
-                        true,
-                        false,
-                        StatusCode::BAD_GATEWAY,
-                        remapped_to,
-                        format!(
-                            "TLS Passthrough TCP connect failed for {connect_host}:{connect_port}: {err_detail}"
-                        ),
-                    );
-                }
+                let tcp_stream = match upstream_tcp_opt {
+                    Some(stream) => stream,
+                    None => {
+                        let err_detail = last_tcp_err
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "no reachable address".to_string());
+                        return record_and_return_error_with_opts(
+                            &ctx,
+                            session_id,
+                            "https",
+                            "CONNECT",
+                            &host,
+                            &tunnel_path,
+                            &target_url,
+                            connect_headers,
+                            Bytes::new(),
+                            start,
+                            timestamp,
+                            client_addr,
+                            client_proc.as_ref(),
+                            true,
+                            false,
+                            StatusCode::BAD_GATEWAY,
+                            remapped_to,
+                            format!(
+                                "TLS Passthrough TCP connect failed for {connect_host}:{connect_port}: {err_detail}"
+                            ),
+                        );
+                    }
+                };
+                (
+                    UpstreamTransportStream::Tcp(tcp_stream),
+                    dns_ms,
+                    elapsed_ms(tcp_start),
+                    None,
+                )
             };
-            let tcp_connect_ms = elapsed_ms(tcp_start);
             let tunnel_start_instant = Instant::now();
             let server_connected_at = timestamp_at_instant(start, start_utc, tunnel_start_instant);
             let server_sock = upstream_tcp.peer_addr().ok();
@@ -289,6 +360,13 @@ pub(super) async fn handle_outer_proxy_request(
                 resp_headers.push(HeaderPair {
                     name: "X-FluxProxy-Host-Remap".into(),
                     value: format!("{connect_host}:{connect_port}"),
+                });
+            }
+            if let Some(ref proxy_label) = upstream_proxy_label {
+                passthrough_note.push_str(&format!("\nUpstream Proxy: {proxy_label}"));
+                resp_headers.push(HeaderPair {
+                    name: "X-FluxProxy-Upstream-Proxy".into(),
+                    value: proxy_label.clone(),
                 });
             }
 
@@ -364,6 +442,7 @@ pub(super) async fn handle_outer_proxy_request(
                 wire_body_size: None,
                 server_ip: None,
                 server_conn_reused: None,
+                ws_open: None,
             };
             summary.apply_telemetry(Some(&initial_timings), Some(&initial_stats));
 

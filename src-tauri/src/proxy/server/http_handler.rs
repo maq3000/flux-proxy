@@ -935,6 +935,7 @@ pub(super) async fn handle_intercepted_request(
                 wire_body_size: None,
                 server_ip: None,
                 server_conn_reused: None,
+                ws_open: None,
             };
             summary.apply_telemetry(Some(&err_timings), Some(&err_stats));
             let detail = SessionDetail {
@@ -1236,6 +1237,7 @@ pub(super) async fn handle_intercepted_request(
                     wire_body_size: None,
                     server_ip: None,
                     server_conn_reused: None,
+                    ws_open: None,
                 };
                 summary.apply_telemetry(Some(&mock_timings), Some(&mock_stats));
 
@@ -1419,7 +1421,11 @@ pub(super) async fn handle_intercepted_request(
     let (upstream_client, mtls_cn) = if should_use_host_mtls_for_peer(client_addr, &scheme_str) {
         match ctx
             .client_certs
-            .get_or_build_upstream_client(&target_host, Some(ctx.host_remap.clone()))
+            .get_or_build_upstream_client(
+                &target_host,
+                Some(ctx.host_remap.clone()),
+                Some(ctx.upstream_proxy.clone()),
+            )
         {
             Ok(Some((mtls_client, entry))) => (mtls_client, Some(entry.common_name)),
             Ok(None) => (ctx.upstream_http_client(), None),
@@ -1828,6 +1834,7 @@ pub(super) async fn handle_intercepted_request(
             wire_body_size: None,
             server_ip: None,
             server_conn_reused: None,
+            ws_open: None,
         };
         initial_summary.apply_telemetry(Some(&base_timings), Some(&base_stats));
 
@@ -2170,6 +2177,7 @@ pub(super) async fn handle_intercepted_request(
             wire_body_size: None,
             server_ip: None,
             server_conn_reused: None,
+            ws_open: None,
         };
         initial_summary.apply_telemetry(Some(&base_timings), Some(&base_stats));
 
@@ -2694,6 +2702,7 @@ pub(super) async fn handle_intercepted_request(
         wire_body_size: None,
         server_ip: None,
         server_conn_reused: None,
+        ws_open: None,
     };
     summary.apply_telemetry(Some(&base_timings), Some(&base_stats));
 
@@ -3149,6 +3158,7 @@ pub(super) async fn run_request_breakpoint_stage(
         wire_body_size: None,
         server_ip: None,
         server_conn_reused: None,
+        ws_open: None,
     };
     ctx.store.insert(SessionDetail {
         summary: paused_summary.clone(),
@@ -3317,6 +3327,7 @@ pub(super) async fn run_response_breakpoint_stage(
             wire_body_size: None,
             server_ip: None,
             server_conn_reused: None,
+            ws_open: None,
         };
         ctx.store.insert(SessionDetail {
             summary: paused_summary.clone(),
@@ -3499,6 +3510,7 @@ pub(super) fn build_autoresponder_mock_detail(
         wire_body_size: None,
         server_ip: None,
         server_conn_reused: None,
+        ws_open: None,
     };
 
     let capped_req = &input.req_bytes[..input.req_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];

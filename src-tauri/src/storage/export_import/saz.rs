@@ -550,6 +550,7 @@ pub(super) fn parse_saz_websocket_log(raw: &str) -> Vec<WebSocketFrameRecord> {
                     byte_length: parts[3].parse::<usize>().unwrap_or(payload_preview.len()),
                     timestamp: parts[4].to_string(),
                     payload_preview,
+                    injected: false,
                 });
             }
         }
@@ -1112,6 +1113,7 @@ pub(super) fn build_session_from_saz_parts(
         wire_body_size: None,
         server_ip: None,
         server_conn_reused: None,
+        ws_open: None,
     };
     summary.apply_telemetry(timings.as_ref(), transfer_stats.as_ref());
 

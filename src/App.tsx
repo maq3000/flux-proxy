@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Database, Gauge, Globe, Stethoscope, Trash2, Upload, WifiOff, X } from "lucide-react";
+import { Database, Gauge, Globe, Network, Stethoscope, Trash2, Upload, WifiOff, X } from "lucide-react";
 import {
   Panel,
   PanelGroup,
@@ -86,6 +86,11 @@ const TextWizardModal = React.lazy(() =>
     default: m.TextWizardModal,
   }))
 );
+const UpstreamProxyModal = React.lazy(() =>
+  import("./components/UpstreamProxyModal").then((m) => ({
+    default: m.UpstreamProxyModal,
+  }))
+);
 import { useProxySessions } from "./hooks/useProxySessions";
 import { useTheme } from "./hooks/useTheme";
 import {
@@ -126,6 +131,7 @@ import type {
   PythonScriptPreset,
   SessionSummary,
   ThrottleConfig,
+  UpstreamProxyConfig,
 } from "./types/proxy";
 import type {
   FluxUserSettingsProfile,
@@ -331,9 +337,20 @@ export const App: React.FC = () => {
   const setHostRemapRules = useProxyStore((s) => s.setHostRemapRules);
   const throttleConfig = useProxyStore((s) => s.throttleConfig);
   const setThrottleConfig = useProxyStore((s) => s.setThrottleConfig);
+  const upstreamProxyConfig = useProxyStore((s) => s.upstreamProxyConfig);
+  const setUpstreamProxyConfig = useProxyStore(
+    (s) => s.setUpstreamProxyConfig
+  );
   const activeHostRemapCount = useMemo(
     () => hostRemapRules.filter((r) => r.enabled).length,
     [hostRemapRules]
+  );
+  const upstreamProxyActiveLabel = useMemo(
+    () =>
+      upstreamProxyConfig.enabled && upstreamProxyConfig.host.trim()
+        ? `${upstreamProxyConfig.protocol.toUpperCase()} ${upstreamProxyConfig.host.trim()}:${upstreamProxyConfig.port}`
+        : null,
+    [upstreamProxyConfig]
   );
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] =
@@ -345,6 +362,22 @@ export const App: React.FC = () => {
   const [certModalOpen, setCertModalOpen] = useState(false);
   const [clientCertsModalOpen, setClientCertsModalOpen] = useState(false);
   const [hostRemapModalOpen, setHostRemapModalOpen] = useState(false);
+  const [upstreamProxyModalOpen, setUpstreamProxyModalOpen] = useState(false);
+
+  const handleSaveUpstreamProxyConfig = useCallback(
+    async (nextCfg: UpstreamProxyConfig) => {
+      const saved = await proxyBridge.setUpstreamProxyConfig(nextCfg);
+      setUpstreamProxyConfig(saved);
+      if (saved.enabled && saved.host.trim()) {
+        showToast(
+          `🌐 Upstream Proxy: ${saved.protocol.toUpperCase()} ${saved.host}:${saved.port}`
+        );
+      } else {
+        showToast("🔌 Upstream Proxy отключён (прямое подключение)");
+      }
+    },
+    [setUpstreamProxyConfig, showToast]
+  );
 
   const handleChangeThrottleConfig = useCallback(
     async (nextCfg: ThrottleConfig) => {
@@ -406,12 +439,33 @@ export const App: React.FC = () => {
       } catch {
         // best-effort sync on boot
       }
+      try {
+        const currentUpstream = useProxyStore.getState().upstreamProxyConfig;
+        if (currentUpstream.enabled && currentUpstream.host.trim()) {
+          const savedUpstream = await proxyBridge.setUpstreamProxyConfig({
+            ...currentUpstream,
+            password: undefined,
+          });
+          if (active) setUpstreamProxyConfig(savedUpstream);
+        } else {
+          const backendUpstream = await proxyBridge.getUpstreamProxyConfig();
+          if (
+            active &&
+            ((backendUpstream.enabled && backendUpstream.host.trim()) ||
+              backendUpstream.hasPassword)
+          ) {
+            setUpstreamProxyConfig(backendUpstream);
+          }
+        }
+      } catch {
+        // best-effort sync on boot
+      }
     };
     void syncNetworkSimulationOnBoot();
     return () => {
       active = false;
     };
-  }, [setHostRemapRules, setThrottleConfig]);
+  }, [setHostRemapRules, setThrottleConfig, setUpstreamProxyConfig]);
   const [mobileModalOpen, setMobileModalOpen] = useState(false);
   const [proxyDoctorModalOpen, setProxyDoctorModalOpen] = useState(false);
   const [sanitizedExportModalOpen, setSanitizedExportModalOpen] =
@@ -1172,6 +1226,14 @@ export const App: React.FC = () => {
       sanitizationOptions: loadPersistedSanitizationOptions(),
       hostRemapRules,
       throttleConfig,
+      upstreamProxy: {
+        enabled: upstreamProxyConfig.enabled,
+        protocol: upstreamProxyConfig.protocol,
+        host: upstreamProxyConfig.host,
+        port: upstreamProxyConfig.port,
+        username: upstreamProxyConfig.username ?? null,
+        bypassList: upstreamProxyConfig.bypassList,
+      },
     },
     autoResponder: {
       enabled: autoResponderEnabled,
@@ -1708,6 +1770,22 @@ export const App: React.FC = () => {
         return;
       }
 
+      // Ctrl+Shift+U / Cmd+Shift+U -> Upstream Proxy Chaining…
+      if (
+        ctrlOrMeta &&
+        !e.altKey &&
+        e.shiftKey &&
+        (keyLower === "u" || e.code === "KeyU")
+      ) {
+        e.preventDefault();
+        if (upstreamProxyModalOpen) {
+          setUpstreamProxyModalOpen(false);
+        } else if (!hasOpenModal()) {
+          setUpstreamProxyModalOpen(true);
+        }
+        return;
+      }
+
       // Ctrl+Shift+D / Cmd+Shift+D -> Run Proxy Doctor
       if (
         ctrlOrMeta &&
@@ -1954,6 +2032,7 @@ export const App: React.FC = () => {
     toggleProxy,
     toggleSidebar,
     unmarkSessions,
+    upstreamProxyModalOpen,
   ]);
 
   const loadSessionIntoComposer = useCallback(
@@ -2466,6 +2545,23 @@ export const App: React.FC = () => {
           "хост",
         ],
         perform: () => setHostRemapModalOpen(true),
+      },
+      {
+        id: "upstream-proxy-chaining",
+        category: "Tools",
+        label: "Upstream Proxy Chaining… (HTTP / HTTPS / SOCKS5)",
+        shortcut: "Ctrl+Shift+U",
+        keywords: [
+          "upstream",
+          "proxy",
+          "chain",
+          "socks",
+          "socks5",
+          "bypass",
+          "каскад",
+          "прокси",
+        ],
+        perform: () => setUpstreamProxyModalOpen(true),
       },
       ...THROTTLE_PRESET_DEFINITIONS.filter((d) => d.id !== "custom").map(
         (presetDef) => ({
@@ -3041,6 +3137,8 @@ export const App: React.FC = () => {
         onOpenClientCertificates={() => setClientCertsModalOpen(true)}
         onOpenHostRemap={() => setHostRemapModalOpen(true)}
         activeHostRemapCount={activeHostRemapCount}
+        onOpenUpstreamProxy={() => setUpstreamProxyModalOpen(true)}
+        upstreamProxyActiveLabel={upstreamProxyActiveLabel}
         sessionRetentionLimit={sessionRetentionLimit}
         onSetSessionRetentionLimit={(limit) =>
           void setSessionRetentionLimit(limit)
@@ -3547,6 +3645,20 @@ export const App: React.FC = () => {
               </button>
             </>
           )}
+          {upstreamProxyActiveLabel && (
+            <>
+              <span className="hidden text-subtle md:inline">•</span>
+              <button
+                type="button"
+                onClick={() => setUpstreamProxyModalOpen(true)}
+                title={`Каскадирование через Upstream Proxy (${upstreamProxyActiveLabel}). Нажмите для настройки (Ctrl+Shift+U)`}
+                className="inline-flex shrink-0 items-center gap-1 text-accent hover:underline"
+              >
+                <Network className="h-3 w-3" aria-hidden="true" />
+                <span>UPSTREAM: {upstreamProxyActiveLabel}</span>
+              </button>
+            </>
+          )}
           {throttleConfig.preset !== "none" && (
             <>
               <span className="text-subtle">•</span>
@@ -3909,6 +4021,18 @@ export const App: React.FC = () => {
         onClose={() => setHostRemapModalOpen(false)}
         onNotify={showToast}
       />
+
+      {upstreamProxyModalOpen && (
+        <React.Suspense fallback={null}>
+          <UpstreamProxyModal
+            open={upstreamProxyModalOpen}
+            config={upstreamProxyConfig}
+            proxyPort={status.port}
+            onClose={() => setUpstreamProxyModalOpen(false)}
+            onSave={handleSaveUpstreamProxyConfig}
+          />
+        </React.Suspense>
+      )}
 
       {mobileModalOpen && (
         <React.Suspense fallback={null}>

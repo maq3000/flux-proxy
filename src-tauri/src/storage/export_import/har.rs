@@ -1277,6 +1277,7 @@ pub(super) fn har_entry_to_session(entry: &HarEntry, fallback_id: u64) -> Sessio
                     byte_length: msg.data.len(),
                     payload_preview: msg.data.clone(),
                     timestamp: ts,
+                    injected: false,
                 }
             })
             .collect()
@@ -1336,6 +1337,7 @@ pub(super) fn har_entry_to_session(entry: &HarEntry, fallback_id: u64) -> Sessio
         wire_body_size: None,
         server_ip: None,
         server_conn_reused: None,
+        ws_open: None,
     };
     summary.apply_telemetry(timings.as_ref(), transfer_stats.as_ref());
 

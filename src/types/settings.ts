@@ -23,6 +23,7 @@ import type {
   TlsBypassRule,
   TlsInterceptMode,
   ToolbarGroupId,
+  UpstreamProxyConfig,
 } from "./proxy";
 
 export type { CustomColorOverrides, ThemePresetId, ThemeTokenKey };
@@ -89,7 +90,15 @@ export interface FluxUserProxySettings {
   hostRemapRules?: HostRemapRule[];
   /** Bandwidth Throttling profile & custom limits */
   throttleConfig?: ThrottleConfig;
+  /** Upstream Proxy Chaining configuration (password is NEVER exported or stored in profiles) */
+  upstreamProxy?: FluxUserUpstreamProxySettings;
 }
+
+/** Security: Upstream proxy password is omitted by type and never exported in settings profiles. */
+export type FluxUserUpstreamProxySettings = Omit<
+  UpstreamProxyConfig,
+  "password" | "hasPassword"
+>;
 
 export interface FluxUserAutoResponderSettings {
   enabled: boolean;
@@ -146,6 +155,7 @@ export interface SettingsImportPreviewSummary {
   autoResponderRulesCount: number;
   hostRemapCount?: number;
   throttlePreset?: ThrottlePreset;
+  upstreamProxySummary?: string | null;
   autoResponderEnabled: boolean;
   totalRulesCount: number;
   currentTotalRulesCount: number;

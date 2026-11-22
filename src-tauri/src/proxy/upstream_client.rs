@@ -23,8 +23,12 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 use tower_service::Service;
 
-use crate::models::HeaderPair;
+use crate::models::{HeaderPair, UpstreamProxyProtocol};
 use crate::proxy::hosts::HostRemapRegistry;
+use crate::proxy::upstream_proxy::{
+    connect_http_proxy_direct, connect_tunnel_via_upstream, proxy_authorization_header_value,
+    UpstreamProxyManager, UpstreamTransportStream,
+};
 
 const CONNECT_TIMEOUT_DEFAULT: Duration = Duration::from_secs(15);
 const MAX_REDIRECT_HOPS: usize = 10;
@@ -142,7 +146,7 @@ pub fn estimate_response_headers_bytes(
     total
 }
 
-fn default_root_store() -> Arc<rustls::RootCertStore> {
+pub(crate) fn default_root_store() -> Arc<rustls::RootCertStore> {
     Arc::clone(NATIVE_ROOT_STORE.get_or_init(|| {
         let mut store = rustls::RootCertStore::empty();
         let native = rustls_native_certs::load_native_certs();
@@ -175,6 +179,7 @@ pub struct UpstreamConnMeta {
     pub mtls_cn: Option<String>,
     pub remapped_target: Option<String>,
     pub is_tls: bool,
+    pub via_http_proxy: bool,
     claimed: AtomicBool,
 }
 
@@ -221,12 +226,23 @@ pub enum InstrumentedStream {
         io: Box<TokioIo<TlsStream<TcpStream>>>,
         meta: Arc<UpstreamConnMeta>,
     },
+    Proxied {
+        io: Box<TokioIo<UpstreamTransportStream>>,
+        meta: Arc<UpstreamConnMeta>,
+    },
+    ProxiedTls {
+        io: Box<TokioIo<TlsStream<UpstreamTransportStream>>>,
+        meta: Arc<UpstreamConnMeta>,
+    },
 }
 
 impl InstrumentedStream {
     fn meta(&self) -> &Arc<UpstreamConnMeta> {
         match self {
-            Self::Plain { meta, .. } | Self::Tls { meta, .. } => meta,
+            Self::Plain { meta, .. }
+            | Self::Tls { meta, .. }
+            | Self::Proxied { meta, .. }
+            | Self::ProxiedTls { meta, .. } => meta,
         }
     }
 }
@@ -240,6 +256,8 @@ impl hyper::rt::Read for InstrumentedStream {
         match &mut *self {
             Self::Plain { io, .. } => Pin::new(io).poll_read(cx, buf),
             Self::Tls { io, .. } => Pin::new(io.as_mut()).poll_read(cx, buf),
+            Self::Proxied { io, .. } => Pin::new(io.as_mut()).poll_read(cx, buf),
+            Self::ProxiedTls { io, .. } => Pin::new(io.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -253,6 +271,8 @@ impl hyper::rt::Write for InstrumentedStream {
         match &mut *self {
             Self::Plain { io, .. } => Pin::new(io).poll_write(cx, buf),
             Self::Tls { io, .. } => Pin::new(io.as_mut()).poll_write(cx, buf),
+            Self::Proxied { io, .. } => Pin::new(io.as_mut()).poll_write(cx, buf),
+            Self::ProxiedTls { io, .. } => Pin::new(io.as_mut()).poll_write(cx, buf),
         }
     }
 
@@ -260,6 +280,8 @@ impl hyper::rt::Write for InstrumentedStream {
         match &mut *self {
             Self::Plain { io, .. } => Pin::new(io).poll_flush(cx),
             Self::Tls { io, .. } => Pin::new(io.as_mut()).poll_flush(cx),
+            Self::Proxied { io, .. } => Pin::new(io.as_mut()).poll_flush(cx),
+            Self::ProxiedTls { io, .. } => Pin::new(io.as_mut()).poll_flush(cx),
         }
     }
 
@@ -270,6 +292,8 @@ impl hyper::rt::Write for InstrumentedStream {
         match &mut *self {
             Self::Plain { io, .. } => Pin::new(io).poll_shutdown(cx),
             Self::Tls { io, .. } => Pin::new(io.as_mut()).poll_shutdown(cx),
+            Self::Proxied { io, .. } => Pin::new(io.as_mut()).poll_shutdown(cx),
+            Self::ProxiedTls { io, .. } => Pin::new(io.as_mut()).poll_shutdown(cx),
         }
     }
 
@@ -277,6 +301,8 @@ impl hyper::rt::Write for InstrumentedStream {
         match self {
             Self::Plain { io, .. } => io.is_write_vectored(),
             Self::Tls { io, .. } => io.is_write_vectored(),
+            Self::Proxied { io, .. } => io.is_write_vectored(),
+            Self::ProxiedTls { io, .. } => io.is_write_vectored(),
         }
     }
 
@@ -288,6 +314,8 @@ impl hyper::rt::Write for InstrumentedStream {
         match &mut *self {
             Self::Plain { io, .. } => Pin::new(io).poll_write_vectored(cx, bufs),
             Self::Tls { io, .. } => Pin::new(io.as_mut()).poll_write_vectored(cx, bufs),
+            Self::Proxied { io, .. } => Pin::new(io.as_mut()).poll_write_vectored(cx, bufs),
+            Self::ProxiedTls { io, .. } => Pin::new(io.as_mut()).poll_write_vectored(cx, bufs),
         }
     }
 }
@@ -296,6 +324,9 @@ impl Connection for InstrumentedStream {
     fn connected(&self) -> Connected {
         let meta = self.meta();
         let mut connected = Connected::new().extra(Arc::clone(meta));
+        if meta.via_http_proxy {
+            connected = connected.proxy(true);
+        }
         if meta.tls_alpn.as_deref() == Some("h2") {
             connected = connected.negotiated_h2();
         }
@@ -318,6 +349,7 @@ impl std::error::Error for UpstreamConnectorError {}
 pub struct InstrumentedConnector {
     tls_config: Arc<rustls::ClientConfig>,
     host_remap: Option<Arc<HostRemapRegistry>>,
+    upstream_proxy: Option<Arc<UpstreamProxyManager>>,
     connect_timeout: Duration,
     mtls_cn: Option<String>,
 }
@@ -325,6 +357,7 @@ pub struct InstrumentedConnector {
 impl InstrumentedConnector {
     pub fn new(
         host_remap: Option<Arc<HostRemapRegistry>>,
+        upstream_proxy: Option<Arc<UpstreamProxyManager>>,
         client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, String)>,
         connect_timeout: Duration,
     ) -> Result<Self, String> {
@@ -350,9 +383,40 @@ impl InstrumentedConnector {
         Ok(Self {
             tls_config: Arc::new(tls_config),
             host_remap,
+            upstream_proxy,
             connect_timeout,
             mtls_cn,
         })
+    }
+}
+
+struct TlsConnDetails {
+    tls_version: Option<String>,
+    tls_cipher: Option<String>,
+    tls_alpn: Option<String>,
+    cert_subject: Option<String>,
+    cert_issuer: Option<String>,
+}
+
+fn extract_tls_conn_details(conn_info: &rustls::ClientConnection) -> TlsConnDetails {
+    let tls_version = conn_info.protocol_version().map(format_tls_protocol);
+    let tls_cipher = conn_info
+        .negotiated_cipher_suite()
+        .map(format_tls_cipher);
+    let tls_alpn = conn_info
+        .alpn_protocol()
+        .map(|b| String::from_utf8_lossy(b).into_owned());
+    let (cert_subject, cert_issuer) = conn_info
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .map(|leaf| extract_peer_cert_subject_issuer(leaf.as_ref()))
+        .unwrap_or((None, None));
+    TlsConnDetails {
+        tls_version,
+        tls_cipher,
+        tls_alpn,
+        cert_subject,
+        cert_issuer,
     }
 }
 
@@ -368,6 +432,7 @@ impl Service<Uri> for InstrumentedConnector {
     fn call(&mut self, dst: Uri) -> Self::Future {
         let tls_config = Arc::clone(&self.tls_config);
         let host_remap = self.host_remap.clone();
+        let upstream_proxy = self.upstream_proxy.clone();
         let connect_timeout = self.connect_timeout;
         let mtls_cn = self.mtls_cn.clone();
 
@@ -399,6 +464,131 @@ impl Service<Uri> for InstrumentedConnector {
                     None,
                 )
             };
+
+            let active_proxy = upstream_proxy.as_ref().and_then(|mgr| {
+                mgr.resolve_for_target(
+                    &orig_host,
+                    orig_port,
+                    remap_rule.as_ref().map(|_| connect_host.as_str()),
+                    remap_rule.as_ref().map(|_| connect_port),
+                )
+            });
+
+            if let Some(proxy_cfg) = active_proxy {
+                let conn_id = NEXT_UPSTREAM_CONN_ID.fetch_add(1, Ordering::Relaxed);
+                if !is_tls {
+                    let is_http_proxy = matches!(
+                        proxy_cfg.protocol,
+                        UpstreamProxyProtocol::Http | UpstreamProxyProtocol::Https
+                    );
+                    let tunnel = if is_http_proxy {
+                        connect_http_proxy_direct(&proxy_cfg, connect_timeout).await
+                    } else {
+                        connect_tunnel_via_upstream(
+                            &proxy_cfg,
+                            &connect_host,
+                            connect_port,
+                            connect_timeout,
+                        )
+                        .await
+                    }
+                    .map_err(UpstreamConnectorError)?;
+
+                    let meta = Arc::new(UpstreamConnMeta {
+                        conn_id,
+                        server_addr: tunnel.proxy_addr,
+                        server_ip: tunnel.proxy_addr.ip().to_string(),
+                        server_port: tunnel.proxy_addr.port(),
+                        dns_ms: tunnel.dns_ms,
+                        tcp_connect_ms: tunnel.tcp_connect_ms,
+                        tls_handshake_ms: None,
+                        server_connected_at: format_rfc3339_micros(Utc::now()),
+                        server_connected_instant: Instant::now(),
+                        tls_version: None,
+                        tls_cipher: None,
+                        tls_alpn: None,
+                        cert_subject: None,
+                        cert_issuer: None,
+                        mtls_cn,
+                        remapped_target,
+                        is_tls: false,
+                        via_http_proxy: is_http_proxy,
+                        claimed: AtomicBool::new(false),
+                    });
+                    return Ok(InstrumentedStream::Proxied {
+                        io: Box::new(TokioIo::new(tunnel.stream)),
+                        meta,
+                    });
+                }
+
+                // HTTPS over upstream proxy (`CONNECT` or `SOCKS5` tunnel + inner TLS with original SNI & mTLS)
+                let tunnel = connect_tunnel_via_upstream(
+                    &proxy_cfg,
+                    &connect_host,
+                    connect_port,
+                    connect_timeout,
+                )
+                .await
+                .map_err(UpstreamConnectorError)?;
+
+                let sni_clean = orig_host.trim_matches(['[', ']']).to_string();
+                let server_name = ServerName::try_from(sni_clean.clone()).map_err(|_| {
+                    UpstreamConnectorError(format!("Invalid TLS ServerName for '{sni_clean}'"))
+                })?;
+
+                let tls_start = Instant::now();
+                let tls_connector = TlsConnector::from(tls_config);
+                let tls_stream = tokio::time::timeout(
+                    connect_timeout,
+                    tls_connector.connect(server_name, tunnel.stream),
+                )
+                .await
+                .map_err(|_| {
+                    UpstreamConnectorError(format!(
+                        "TLS handshake timed out via upstream proxy for {orig_host}:{orig_port}"
+                    ))
+                })?
+                .map_err(|e| {
+                    UpstreamConnectorError(format!(
+                        "TLS handshake failed via upstream proxy for {orig_host}:{orig_port}: {e}"
+                    ))
+                })?;
+                let tls_handshake_ms = Some(elapsed_ms(tls_start));
+                let now_instant = Instant::now();
+                let TlsConnDetails {
+                    tls_version,
+                    tls_cipher,
+                    tls_alpn,
+                    cert_subject,
+                    cert_issuer,
+                } = extract_tls_conn_details(tls_stream.get_ref().1);
+
+                let meta = Arc::new(UpstreamConnMeta {
+                    conn_id,
+                    server_addr: tunnel.proxy_addr,
+                    server_ip: tunnel.proxy_addr.ip().to_string(),
+                    server_port: tunnel.proxy_addr.port(),
+                    dns_ms: tunnel.dns_ms,
+                    tcp_connect_ms: tunnel.tcp_connect_ms,
+                    tls_handshake_ms,
+                    server_connected_at: format_rfc3339_micros(Utc::now()),
+                    server_connected_instant: now_instant,
+                    tls_version,
+                    tls_cipher,
+                    tls_alpn,
+                    cert_subject,
+                    cert_issuer,
+                    mtls_cn,
+                    remapped_target,
+                    is_tls: true,
+                    via_http_proxy: false,
+                    claimed: AtomicBool::new(false),
+                });
+                return Ok(InstrumentedStream::ProxiedTls {
+                    io: Box::new(TokioIo::new(tls_stream)),
+                    meta,
+                });
+            }
 
             // 1. DNS Resolution phase
             let (addrs, dns_ms): (Vec<SocketAddr>, f64) =
@@ -494,6 +684,7 @@ impl Service<Uri> for InstrumentedConnector {
                     mtls_cn,
                     remapped_target,
                     is_tls: false,
+                    via_http_proxy: false,
                     claimed: AtomicBool::new(false),
                 });
                 return Ok(InstrumentedStream::Plain {
@@ -526,19 +717,13 @@ impl Service<Uri> for InstrumentedConnector {
             let tls_handshake_ms = Some(elapsed_ms(tls_start));
             let now_instant = Instant::now();
 
-            let conn_info = tls_stream.get_ref().1;
-            let tls_version = conn_info.protocol_version().map(format_tls_protocol);
-            let tls_cipher = conn_info
-                .negotiated_cipher_suite()
-                .map(format_tls_cipher);
-            let tls_alpn = conn_info
-                .alpn_protocol()
-                .map(|b| String::from_utf8_lossy(b).into_owned());
-            let (cert_subject, cert_issuer) = conn_info
-                .peer_certificates()
-                .and_then(|certs| certs.first())
-                .map(|leaf| extract_peer_cert_subject_issuer(leaf.as_ref()))
-                .unwrap_or((None, None));
+            let TlsConnDetails {
+                tls_version,
+                tls_cipher,
+                tls_alpn,
+                cert_subject,
+                cert_issuer,
+            } = extract_tls_conn_details(tls_stream.get_ref().1);
 
             let meta = Arc::new(UpstreamConnMeta {
                 conn_id,
@@ -558,6 +743,7 @@ impl Service<Uri> for InstrumentedConnector {
                 mtls_cn,
                 remapped_target,
                 is_tls: true,
+                via_http_proxy: false,
                 claimed: AtomicBool::new(false),
             });
 
@@ -772,16 +958,22 @@ pub struct UpstreamHttpClient {
     client: Client<InstrumentedConnector, TrackedRequestBody>,
     mtls_cn: Option<String>,
     host_remap: Option<Arc<HostRemapRegistry>>,
+    upstream_proxy: Option<Arc<UpstreamProxyManager>>,
 }
 
 impl UpstreamHttpClient {
     pub fn build(
         host_remap: Option<Arc<HostRemapRegistry>>,
+        upstream_proxy: Option<Arc<UpstreamProxyManager>>,
         client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, String)>,
     ) -> Result<Self, String> {
         let mtls_cn = client_auth.as_ref().map(|(_, _, cn)| cn.clone());
-        let connector =
-            InstrumentedConnector::new(host_remap.clone(), client_auth, CONNECT_TIMEOUT_DEFAULT)?;
+        let connector = InstrumentedConnector::new(
+            host_remap.clone(),
+            upstream_proxy.clone(),
+            client_auth,
+            CONNECT_TIMEOUT_DEFAULT,
+        )?;
         let client = Client::builder(TokioExecutor::new())
             .timer(TokioTimer::new())
             .pool_timer(TokioTimer::new())
@@ -795,6 +987,7 @@ impl UpstreamHttpClient {
             client,
             mtls_cn,
             host_remap,
+            upstream_proxy,
         })
     }
 
@@ -824,7 +1017,7 @@ impl UpstreamHttpClient {
         let proxy_begin_request_at = format_rfc3339_micros(proxy_begin_request_utc);
 
         let (tracked_body, send_tracker) = TrackedRequestBody::new(body);
-        let mut builder = Request::builder().method(method).uri(uri);
+        let mut builder = Request::builder().method(method).uri(uri.clone());
 
         for (name, value) in headers {
             if let (Ok(hn), Ok(hv)) = (
@@ -837,6 +1030,38 @@ impl UpstreamHttpClient {
         if let Some(host_val) = host_header_override {
             if let Ok(hv) = HeaderValue::from_str(host_val) {
                 builder = builder.header(HOST, hv);
+            }
+        }
+        if uri
+            .scheme_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("http"))
+            && !headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case(PROXY_AUTHORIZATION.as_str()))
+        {
+            if let (Some(ref mgr), Some(orig_host)) = (&self.upstream_proxy, uri.host()) {
+                let orig_port = uri.port_u16().unwrap_or(80);
+                let remap_rule = self
+                    .host_remap
+                    .as_ref()
+                    .and_then(|reg| reg.match_host(orig_host));
+                if let Some(proxy_cfg) = mgr.resolve_for_target(
+                    orig_host,
+                    orig_port,
+                    remap_rule.as_ref().map(|r| r.target_host.as_str()),
+                    remap_rule.as_ref().and_then(|r| r.target_port),
+                ) {
+                    if matches!(
+                        proxy_cfg.protocol,
+                        UpstreamProxyProtocol::Http | UpstreamProxyProtocol::Https
+                    ) {
+                        if let Some(auth_val) = proxy_authorization_header_value(&proxy_cfg) {
+                            if let Ok(hv) = HeaderValue::from_str(&auth_val) {
+                                builder = builder.header(PROXY_AUTHORIZATION, hv);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1102,6 +1327,7 @@ mod tests {
             mtls_cn: None,
             remapped_target: None,
             is_tls: true,
+            via_http_proxy: false,
             claimed: AtomicBool::new(false),
         };
 
@@ -1139,7 +1365,7 @@ mod tests {
             }
         });
 
-        let client = UpstreamHttpClient::build(None, None).unwrap();
+        let client = UpstreamHttpClient::build(None, None, None).unwrap();
         let url = format!("http://{addr}/hello");
 
         let first = client

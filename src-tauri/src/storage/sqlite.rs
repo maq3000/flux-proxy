@@ -522,6 +522,7 @@ mod tests {
                 wire_body_size: None,
                 server_ip: None,
                 server_conn_reused: None,
+                ws_open: None,
             },
             request_headers: vec![HeaderPair {
                 name: "Authorization".into(),

@@ -51,6 +51,8 @@ import {
   DEFAULT_SESSION_RETENTION_LIMIT,
   DEFAULT_STRIP_QUERY_PARAMS,
   DEFAULT_THROTTLE_CONFIG,
+  DEFAULT_UPSTREAM_PROXY_BYPASS_LIST,
+  DEFAULT_UPSTREAM_PROXY_CONFIG,
   THROTTLE_PRESET_DEFINITIONS,
 } from "../types/proxy";
 import type {
@@ -85,6 +87,8 @@ import type {
   TlsBypassRule,
   TlsInterceptMode,
   ToolbarGroupId,
+  UpstreamProxyConfig,
+  UpstreamProxyProtocol,
 } from "../types/proxy";
 import {
   CURRENT_SETTINGS_SCHEMA_VERSION,
@@ -94,6 +98,7 @@ import {
   type ApplySettingsProfileOptions,
   type FluxUserScriptingSettings,
   type FluxUserSettingsProfile,
+  type FluxUserUpstreamProxySettings,
   type SettingsImportPreviewSummary,
   type SettingsProfileValidationReport,
 } from "../types/settings";
@@ -128,6 +133,7 @@ export const SETTINGS_STORAGE_KEYS = {
   pythonScript: PREVIEW_PYTHON_SCRIPT_STORAGE_KEY,
   hostRemapRules: "fluxproxy-host-remap-rules-v1",
   throttleConfig: "fluxproxy-throttle-config-v1",
+  upstreamProxyConfig: "fluxproxy-upstream-proxy-config-v1",
 } as const;
 
 const VALID_THEMES = new Set<ThemePreference>(["dark", "light", "system"]);
@@ -311,6 +317,14 @@ export function createDefaultSettingsProfile(): FluxUserSettingsProfile {
       sanitizationOptions: structuredClone(DEFAULT_SANITIZATION_OPTIONS),
       hostRemapRules: structuredClone(DEFAULT_HOST_REMAP_RULES),
       throttleConfig: { ...DEFAULT_THROTTLE_CONFIG },
+      upstreamProxy: {
+        enabled: false,
+        protocol: "http",
+        host: "",
+        port: 8080,
+        username: null,
+        bypassList: [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST],
+      },
     },
     autoResponder: {
       enabled: true,
@@ -922,6 +936,118 @@ function sanitizeThrottleConfig(
         latencyMs: def.latencyMs,
       }
     : { ...DEFAULT_THROTTLE_CONFIG };
+}
+
+function sanitizeUpstreamProxyConfig(
+  raw: unknown,
+  warnings: string[]
+): FluxUserUpstreamProxySettings {
+  const defaultOut: FluxUserUpstreamProxySettings = {
+    enabled: DEFAULT_UPSTREAM_PROXY_CONFIG.enabled,
+    protocol: DEFAULT_UPSTREAM_PROXY_CONFIG.protocol,
+    host: DEFAULT_UPSTREAM_PROXY_CONFIG.host,
+    port: DEFAULT_UPSTREAM_PROXY_CONFIG.port,
+    username: null,
+    bypassList: [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST],
+  };
+  if (raw === undefined) return defaultOut;
+  if (!isPlainObject(raw)) {
+    warnings.push(
+      "Секция «proxy.upstreamProxy» повреждена — сброшена к настройкам по умолчанию."
+    );
+    return defaultOut;
+  }
+
+  if (typeof raw.password === "string" && raw.password.length > 0) {
+    warnings.push(
+      "Поле «proxy.upstreamProxy.password» удалено: пароли вышестоящего прокси не сохраняются и не импортируются в открытом виде из соображений безопасности."
+    );
+  }
+
+  const rawProto =
+    typeof raw.protocol === "string" ? raw.protocol.trim().toLowerCase() : "http";
+  let protocol: UpstreamProxyProtocol = "http";
+  if (rawProto === "http" || rawProto === "https" || rawProto === "socks5") {
+    protocol = rawProto;
+  } else if (raw.protocol !== undefined) {
+    warnings.push(
+      `Неизвестный протокол «proxy.upstreamProxy.protocol» (${String(raw.protocol)}) — использован HTTP.`
+    );
+  }
+
+  const defaultPortForProto =
+    protocol === "https" ? 8443 : protocol === "socks5" ? 1080 : 8080;
+
+  let host = typeof raw.host === "string" ? raw.host.trim() : "";
+  if (raw.host !== undefined && typeof raw.host !== "string") {
+    warnings.push("Поле «proxy.upstreamProxy.host» имеет некорректный тип — сброшено.");
+    host = "";
+  }
+
+  let enabled = typeof raw.enabled === "boolean" ? raw.enabled : false;
+  if (enabled && !host) {
+    warnings.push(
+      "«proxy.upstreamProxy.enabled» отключён, так как не указан хост вышестоящего прокси."
+    );
+    enabled = false;
+  }
+
+  let port = defaultPortForProto;
+  if (raw.port !== undefined) {
+    const parsedPort = Number(raw.port);
+    if (
+      Number.isInteger(parsedPort) &&
+      parsedPort >= 1 &&
+      parsedPort <= 65535
+    ) {
+      port = parsedPort;
+    } else {
+      warnings.push(
+        `Некорректный порт «proxy.upstreamProxy.port» (${String(raw.port)}) — использован ${defaultPortForProto}.`
+      );
+    }
+  }
+
+  const username =
+    typeof raw.username === "string" && raw.username.trim().length > 0
+      ? raw.username.trim()
+      : null;
+
+  let bypassList: string[] = [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST];
+  if (raw.bypassList !== undefined) {
+    const rawTokens = Array.isArray(raw.bypassList)
+      ? raw.bypassList.filter((x): x is string => typeof x === "string")
+      : typeof raw.bypassList === "string"
+        ? raw.bypassList.split(/[\r\n,;]+/)
+        : null;
+    if (rawTokens === null) {
+      warnings.push(
+        "Поле «proxy.upstreamProxy.bypassList» повреждено — восстановлен список по умолчанию."
+      );
+    } else {
+      const seen = new Set<string>();
+      const cleaned: string[] = [];
+      for (const item of rawTokens) {
+        const trimmed = item.trim();
+        if (!trimmed) continue;
+        const lower = trimmed.toLowerCase();
+        if (!seen.has(lower)) {
+          seen.add(lower);
+          cleaned.push(trimmed);
+        }
+      }
+      bypassList = cleaned;
+    }
+  }
+
+  return {
+    enabled,
+    protocol,
+    host,
+    port,
+    username,
+    bypassList,
+  };
 }
 
 function sanitizeHeaderMutations(
@@ -1975,6 +2101,10 @@ export function validateAndMigrateSettingsProfileWithReport(
         warnings
       ),
       throttleConfig: sanitizeThrottleConfig(rawProxy.throttleConfig, warnings),
+      upstreamProxy: sanitizeUpstreamProxyConfig(
+        rawProxy.upstreamProxy,
+        warnings
+      ),
     },
     autoResponder: {
       enabled: sanitizeBoolean(
@@ -2136,6 +2266,10 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
   const storedThrottleConfig = readLocalStorageJson<ThrottleConfig>(
     SETTINGS_STORAGE_KEYS.throttleConfig,
     { ...DEFAULT_THROTTLE_CONFIG }
+  );
+  const storedUpstreamProxyRaw = readLocalStorageJson<unknown>(
+    SETTINGS_STORAGE_KEYS.upstreamProxyConfig,
+    defaults.proxy.upstreamProxy
   );
   const storedScripting = readLocalStorageJson<Partial<FluxUserScriptingSettings>>(
     SETTINGS_STORAGE_KEYS.pythonScript,
@@ -2307,6 +2441,33 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
       throttleConfig: structuredClone(
         live.proxy?.throttleConfig ?? storedThrottleConfig
       ),
+      upstreamProxy: (() => {
+        const candidate = (live.proxy?.upstreamProxy ??
+          storedUpstreamProxyRaw) as Partial<UpstreamProxyConfig> | undefined;
+        if (!candidate || typeof candidate !== "object") {
+          return structuredClone(defaults.proxy.upstreamProxy);
+        }
+        // Security: never propagate password / hasPassword into exported profile JSON.
+        return {
+          enabled: Boolean(candidate.enabled),
+          protocol:
+            candidate.protocol === "https" || candidate.protocol === "socks5"
+              ? candidate.protocol
+              : "http",
+          host: typeof candidate.host === "string" ? candidate.host : "",
+          port:
+            typeof candidate.port === "number"
+              ? candidate.port
+              : DEFAULT_UPSTREAM_PROXY_CONFIG.port,
+          username:
+            typeof candidate.username === "string" ? candidate.username : null,
+          bypassList: Array.isArray(candidate.bypassList)
+            ? candidate.bypassList.filter(
+                (item): item is string => typeof item === "string"
+              )
+            : [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST],
+        };
+      })(),
     },
     autoResponder: {
       enabled:
@@ -2452,6 +2613,10 @@ export function buildSettingsImportPreview(
     autoResponderRulesCount,
     hostRemapCount: incoming.proxy.hostRemapRules?.length ?? 0,
     throttlePreset: incoming.proxy.throttleConfig?.preset ?? "none",
+    upstreamProxySummary:
+      incoming.proxy.upstreamProxy?.enabled && incoming.proxy.upstreamProxy.host
+        ? `${incoming.proxy.upstreamProxy.protocol.toUpperCase()} ${incoming.proxy.upstreamProxy.host}:${incoming.proxy.upstreamProxy.port}`
+        : null,
     autoResponderEnabled: incoming.autoResponder.enabled,
     totalRulesCount,
     currentTotalRulesCount,
@@ -2658,6 +2823,28 @@ function atomicWriteProfileToLocalStorage(
       SETTINGS_STORAGE_KEYS.throttleConfig,
       JSON.stringify(profile.proxy.throttleConfig ?? DEFAULT_THROTTLE_CONFIG),
     ],
+    [
+      SETTINGS_STORAGE_KEYS.upstreamProxyConfig,
+      JSON.stringify(
+        profile.proxy.upstreamProxy
+          ? {
+              enabled: profile.proxy.upstreamProxy.enabled,
+              protocol: profile.proxy.upstreamProxy.protocol,
+              host: profile.proxy.upstreamProxy.host,
+              port: profile.proxy.upstreamProxy.port,
+              username: profile.proxy.upstreamProxy.username ?? null,
+              bypassList: profile.proxy.upstreamProxy.bypassList,
+            }
+          : {
+              enabled: false,
+              protocol: "http",
+              host: "",
+              port: 8080,
+              username: null,
+              bypassList: [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST],
+            }
+      ),
+    ],
   ];
 
   // Capture rollback snapshot for atomic recovery if quota is exceeded mid-batch
@@ -2741,6 +2928,15 @@ export async function applySettingsProfile(
   const nextThrottleConfig: ThrottleConfig = {
     ...(normalizedWithBreakpoints.proxy.throttleConfig ?? DEFAULT_THROTTLE_CONFIG),
   };
+  const nextUpstreamBase: FluxUserUpstreamProxySettings = normalizedWithBreakpoints
+    .proxy.upstreamProxy ?? {
+    enabled: false,
+    protocol: "http",
+    host: "",
+    port: 8080,
+    username: null,
+    bypassList: [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST],
+  };
 
   // 1. Capture current backend state snapshot for transactional rollback
   const [
@@ -2754,6 +2950,7 @@ export async function applySettingsProfile(
     prevPythonScript,
     prevHostRemapRules,
     prevThrottleConfig,
+    prevUpstreamProxy,
   ] = await Promise.all([
     proxyBridge.getStatus(),
     proxyBridge.getFilterBackendConfig(),
@@ -2765,7 +2962,29 @@ export async function applySettingsProfile(
     proxyBridge.getPythonRunnerStatus(),
     proxyBridge.getHostRemapRules(),
     proxyBridge.getThrottleConfig(),
+    proxyBridge.getUpstreamProxyConfig(),
   ]);
+
+  const sameUpstreamTarget =
+    nextUpstreamBase.enabled &&
+    prevUpstreamProxy.enabled &&
+    nextUpstreamBase.protocol === prevUpstreamProxy.protocol &&
+    nextUpstreamBase.host.trim().toLowerCase() ===
+      prevUpstreamProxy.host.trim().toLowerCase() &&
+    nextUpstreamBase.port === prevUpstreamProxy.port &&
+    (nextUpstreamBase.username ?? null) ===
+      (prevUpstreamProxy.username ?? null);
+
+  const nextUpstreamPayload: UpstreamProxyConfig = {
+    enabled: nextUpstreamBase.enabled,
+    protocol: nextUpstreamBase.protocol,
+    host: nextUpstreamBase.host,
+    port: nextUpstreamBase.port,
+    username: nextUpstreamBase.username ?? null,
+    // Preserve live RAM password only when endpoint & username match; otherwise clear stale secret.
+    password: sameUpstreamTarget ? undefined : "",
+    bypassList: [...nextUpstreamBase.bypassList],
+  };
 
   let latestStatus: ProxyStatus = prevStatus;
   let autoSysProxyChanged = false;
@@ -2788,6 +3007,7 @@ export async function applySettingsProfile(
       proxyBridge.setPythonScript(nextScripting.code, nextScripting.enabled),
       proxyBridge.updateHostRemapRules(nextHostRemapRules),
       proxyBridge.setThrottleConfig(nextThrottleConfig),
+      proxyBridge.setUpstreamProxyConfig(nextUpstreamPayload),
     ]);
 
     if (
@@ -2876,6 +3096,10 @@ export async function applySettingsProfile(
       ),
       proxyBridge.updateHostRemapRules(prevHostRemapRules),
       proxyBridge.setThrottleConfig(prevThrottleConfig),
+      proxyBridge.setUpstreamProxyConfig({
+        ...prevUpstreamProxy,
+        password: undefined,
+      }),
     ]);
     const configLabels = [
       "фильтры прокси",
@@ -2887,6 +3111,7 @@ export async function applySettingsProfile(
       "Python Scripting",
       "HOSTS Remapping",
       "Bandwidth Throttling",
+      "Upstream Proxy",
     ];
     configRollback.forEach((res, idx) => {
       if (res.status === "rejected") {

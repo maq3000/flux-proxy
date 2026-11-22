@@ -16,6 +16,8 @@ pub struct WebSocketFrameRecord {
     pub payload_preview: String,
     pub byte_length: usize,
     pub timestamp: String,
+    #[serde(default)]
+    pub injected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +91,8 @@ pub struct SessionSummary {
     pub server_ip: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_conn_reused: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_open: Option<bool>,
 }
 
 /// Fiddler Classic–style per-session timestamps (RFC 3339 micros) and phase durations (ms).
@@ -887,4 +891,116 @@ impl Serialize for ProxyError {
     {
         serializer.serialize_str(&self.to_string())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum UpstreamProxyProtocol {
+    #[default]
+    #[serde(alias = "HTTP")]
+    Http,
+    #[serde(alias = "HTTPS")]
+    Https,
+    #[serde(alias = "SOCKS5")]
+    Socks5,
+}
+
+fn default_upstream_proxy_port() -> u16 {
+    8080
+}
+
+pub fn default_upstream_bypass_list() -> Vec<String> {
+    vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ]
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpstreamProxyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub protocol: UpstreamProxyProtocol,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default = "default_upstream_proxy_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub has_password: bool,
+    #[serde(default = "default_upstream_bypass_list")]
+    pub bypass_list: Vec<String>,
+}
+
+impl std::fmt::Debug for UpstreamProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamProxyConfig")
+            .field("enabled", &self.enabled)
+            .field("protocol", &self.protocol)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field(
+                "password",
+                &self.password.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("has_password", &self.has_password)
+            .field("bypass_list", &self.bypass_list)
+            .finish()
+    }
+}
+
+impl Default for UpstreamProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            protocol: UpstreamProxyProtocol::Http,
+            host: String::new(),
+            port: default_upstream_proxy_port(),
+            username: None,
+            password: None,
+            has_password: false,
+            bypass_list: default_upstream_bypass_list(),
+        }
+    }
+}
+
+impl UpstreamProxyConfig {
+    pub fn redacted_for_ipc(&self) -> Self {
+        Self {
+            enabled: self.enabled,
+            protocol: self.protocol,
+            host: self.host.clone(),
+            port: self.port,
+            username: self.username.clone(),
+            password: None,
+            has_password: self.password.as_deref().is_some_and(|p| !p.is_empty()),
+            bypass_list: self.bypass_list.clone(),
+        }
+    }
+
+    pub fn has_credentials(&self) -> bool {
+        self.username.as_deref().is_some_and(|u| !u.is_empty())
+            || self.password.as_deref().is_some_and(|p| !p.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WsInjectDirection {
+    Server,
+    Client,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WsInjectOpcode {
+    Text,
+    Binary,
 }

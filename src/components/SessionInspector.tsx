@@ -71,6 +71,7 @@ import type {
   LoadedSessionBody,
   SessionDetail,
   SessionSummary,
+  WebSocketFrameRecord,
 } from "../types/proxy";
 import { HexViewer } from "./HexViewer";
 import {
@@ -241,6 +242,11 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
     sessionId: number;
     token: number;
   } | null>(null);
+  const [extraWsFramesEntry, setExtraWsFramesEntry] = useState<{
+    sessionId: number;
+    frames: WebSocketFrameRecord[];
+  } | null>(null);
+
   const [reqBodyErrorEntry, setReqBodyErrorEntry] = useState<{
     sessionId: number;
     message: string;
@@ -573,7 +579,35 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
     () => (effectiveDetail ? isSseSession(effectiveDetail) : false),
     [effectiveDetail]
   );
-  const wsCount = effectiveDetail?.websocketFrames.length ?? 0;
+  const mergedWsFrames = useMemo<WebSocketFrameRecord[]>(() => {
+    const base = effectiveDetail?.websocketFrames ?? [];
+    if (
+      !effectiveDetail ||
+      !extraWsFramesEntry ||
+      extraWsFramesEntry.sessionId !== effectiveDetail.summary.id
+    ) {
+      return base;
+    }
+    const seen = new Set(base.map((f) => f.index));
+    const extras = extraWsFramesEntry.frames.filter((f) => !seen.has(f.index));
+    if (extras.length === 0) return base;
+    return [...base, ...extras].sort((a, b) => a.index - b.index);
+  }, [effectiveDetail, extraWsFramesEntry]);
+
+  const handleFrameInjected = useCallback(
+    (frame: WebSocketFrameRecord) => {
+      if (!effectiveDetail) return;
+      const targetId = effectiveDetail.summary.id;
+      setExtraWsFramesEntry((prev) => {
+        const existing = prev && prev.sessionId === targetId ? prev.frames : [];
+        if (existing.some((f) => f.index === frame.index)) return prev;
+        return { sessionId: targetId, frames: [...existing, frame] };
+      });
+    },
+    [effectiveDetail]
+  );
+
+  const wsCount = mergedWsFrames.length;
 
   // Smart default tab selection when switching to specialized protocol sessions (SSE, WS, gRPC, Multipart, Image)
   useEffect(() => {
@@ -596,6 +630,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
     if (isSseSession(detail)) {
       setRespTab("sse");
     } else if (
+      detail.summary.wsOpen === true ||
       detail.websocketFrames.length > 0 ||
       detail.summary.scheme === "ws" ||
       detail.summary.scheme === "wss"
@@ -1409,8 +1444,12 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                         ? " •"
                         : t.id === "sse" && isSse
                           ? ` (${effectiveDetail.sseEvents?.length || "•"})`
-                          : t.id === "ws" && wsCount > 0
-                            ? ` (${wsCount})`
+                          : t.id === "ws" && (wsCount > 0 || summary.wsOpen)
+                            ? summary.wsOpen
+                              ? wsCount > 0
+                                ? ` (${wsCount} · LIVE)`
+                                : " (LIVE)"
+                              : ` (${wsCount})`
                             : t.id === "protobuf" && hasRespProto
                               ? " •"
                               : t.id === "image" && isImage
@@ -1528,7 +1567,12 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
               />
             )}
             {respTab === "ws" && (
-              <WebSocketFramesPanel frames={effectiveDetail.websocketFrames} />
+              <WebSocketFramesPanel
+                frames={mergedWsFrames}
+                sessionId={effectiveDetail.summary.id}
+                isWsOpen={Boolean(effectiveDetail.summary.wsOpen)}
+                onFrameInjected={handleFrameInjected}
+              />
             )}
             {respTab === "protobuf" &&
               (isRespOffloaded ? (

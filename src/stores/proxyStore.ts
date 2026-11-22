@@ -9,6 +9,8 @@ import { DEFAULT_BREAKPOINT_CONFIG } from "../lib/tauriBridge";
 import {
   DEFAULT_SESSION_RETENTION_LIMIT,
   DEFAULT_THROTTLE_CONFIG,
+  DEFAULT_UPSTREAM_PROXY_BYPASS_LIST,
+  DEFAULT_UPSTREAM_PROXY_CONFIG,
   type AutoResponderRule,
   type BindHostMode,
   type BreakpointConfig,
@@ -21,6 +23,7 @@ import {
   type SessionSummary,
   type StorageStats,
   type ThrottleConfig,
+  type UpstreamProxyConfig,
 } from "../types/proxy";
 import type { FluxUserSettingsProfile } from "../types/settings";
 
@@ -37,6 +40,34 @@ export const LS_DROP_NON_MATCHING_KEY = "fluxproxy.dropNonMatching.v1";
 export const LS_CLEAR_DB_ON_EXIT_KEY = PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY;
 export const LS_HOST_REMAP_RULES_KEY = "fluxproxy-host-remap-rules-v1";
 export const LS_THROTTLE_CONFIG_KEY = "fluxproxy-throttle-config-v1";
+export const LS_UPSTREAM_PROXY_CONFIG_KEY = "fluxproxy-upstream-proxy-config-v1";
+
+function sanitizeUpstreamConfigForStore(
+  raw: Partial<UpstreamProxyConfig> | null | undefined,
+  keepHasPassword = false
+): UpstreamProxyConfig {
+  const bypassList = Array.isArray(raw?.bypassList)
+    ? raw.bypassList.filter((item): item is string => typeof item === "string")
+    : [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST];
+  return {
+    enabled: Boolean(raw?.enabled),
+    protocol:
+      raw?.protocol === "https" || raw?.protocol === "socks5"
+        ? raw.protocol
+        : "http",
+    host: typeof raw?.host === "string" ? raw.host : "",
+    port:
+      typeof raw?.port === "number" &&
+      Number.isInteger(raw.port) &&
+      raw.port >= 1 &&
+      raw.port <= 65535
+        ? raw.port
+        : DEFAULT_UPSTREAM_PROXY_CONFIG.port,
+    username: typeof raw?.username === "string" ? raw.username : null,
+    hasPassword: keepHasPassword ? Boolean(raw?.hasPassword) : false,
+    bypassList,
+  };
+}
 
 export interface PersistedBindConfig {
   bindMode: BindHostMode;
@@ -286,6 +317,14 @@ function readInitialProxySlice() {
           ...savedThrottle,
         }
       : { ...DEFAULT_THROTTLE_CONFIG };
+  const savedUpstreamProxy = loadProxyJson<Partial<UpstreamProxyConfig> | null>(
+    LS_UPSTREAM_PROXY_CONFIG_KEY,
+    null
+  );
+  const upstreamProxyConfig: UpstreamProxyConfig = sanitizeUpstreamConfigForStore(
+    savedUpstreamProxy,
+    false
+  );
 
   return {
     sessions: [] as SessionSummary[],
@@ -312,6 +351,7 @@ function readInitialProxySlice() {
     pausedBreakpoints: [] as PausedBreakpointItem[],
     hostRemapRules,
     throttleConfig,
+    upstreamProxyConfig,
   };
 }
 
@@ -342,6 +382,7 @@ export interface ProxyStoreState {
   pausedBreakpoints: PausedBreakpointItem[];
   hostRemapRules: HostRemapRule[];
   throttleConfig: ThrottleConfig;
+  upstreamProxyConfig: UpstreamProxyConfig;
 
   // AutoResponder & Python Scripting state
   autoResponderEnabled: boolean;
@@ -371,6 +412,7 @@ export interface ProxyStoreState {
   setPausedBreakpoints: (updater: Updater<PausedBreakpointItem[]>) => void;
   setHostRemapRules: (updater: Updater<HostRemapRule[]>) => void;
   setThrottleConfig: (updater: Updater<ThrottleConfig>) => void;
+  setUpstreamProxyConfig: (updater: Updater<UpstreamProxyConfig>) => void;
 
   setAutoResponderEnabled: (updater: Updater<boolean>) => void;
   setRules: (updater: Updater<AutoResponderRule[]>) => void;
@@ -534,6 +576,30 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
     });
   },
 
+  setUpstreamProxyConfig: (updater) => {
+    set((state) => {
+      const nextRaw = resolveUpdater(updater, state.upstreamProxyConfig);
+      const upstreamProxyConfig = sanitizeUpstreamConfigForStore(nextRaw, true);
+      try {
+        const persisted = {
+          enabled: upstreamProxyConfig.enabled,
+          protocol: upstreamProxyConfig.protocol,
+          host: upstreamProxyConfig.host,
+          port: upstreamProxyConfig.port,
+          username: upstreamProxyConfig.username ?? null,
+          bypassList: upstreamProxyConfig.bypassList,
+        };
+        window.localStorage.setItem(
+          LS_UPSTREAM_PROXY_CONFIG_KEY,
+          JSON.stringify(persisted)
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+      return { upstreamProxyConfig };
+    });
+  },
+
   setScriptCode: (updater) => {
     set((state) => ({ scriptCode: resolveUpdater(updater, state.scriptCode) }));
   },
@@ -631,6 +697,31 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
       const nextThrottleConfig: ThrottleConfig = detail.proxy.throttleConfig
         ? { ...DEFAULT_THROTTLE_CONFIG, ...detail.proxy.throttleConfig }
         : { ...DEFAULT_THROTTLE_CONFIG };
+      const incomingUp = detail.proxy.upstreamProxy;
+      const sameUpstreamIdentity =
+        incomingUp &&
+        incomingUp.enabled &&
+        state.upstreamProxyConfig.enabled &&
+        incomingUp.protocol === state.upstreamProxyConfig.protocol &&
+        incomingUp.host.trim().toLowerCase() ===
+          state.upstreamProxyConfig.host.trim().toLowerCase() &&
+        incomingUp.port === state.upstreamProxyConfig.port &&
+        (incomingUp.username ?? null) ===
+          (state.upstreamProxyConfig.username ?? null);
+      const nextUpstreamProxyConfig: UpstreamProxyConfig = incomingUp
+        ? sanitizeUpstreamConfigForStore(
+            {
+              ...incomingUp,
+              hasPassword: sameUpstreamIdentity
+                ? Boolean(state.upstreamProxyConfig.hasPassword)
+                : false,
+            },
+            true
+          )
+        : {
+            ...DEFAULT_UPSTREAM_PROXY_CONFIG,
+            bypassList: [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST],
+          };
 
       return {
         followTail: nextFollowTail,
@@ -642,6 +733,7 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
         breakpointConfig: nextBp,
         hostRemapRules: nextHostRemapRules,
         throttleConfig: nextThrottleConfig,
+        upstreamProxyConfig: nextUpstreamProxyConfig,
       };
     });
   },

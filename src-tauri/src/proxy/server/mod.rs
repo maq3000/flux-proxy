@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use bytes::Bytes;
 use chrono::Utc;
+use dashmap::DashMap;
 use http::header::CONTENT_TYPE;
 use http::{Request, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;
@@ -17,11 +18,12 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
 use tauri::{AppHandle, Emitter};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use crate::models::{
     BindHostMode, BreakpointAction, HeaderPair, PausedBreakpointItem, ProxyError, ProxyStatus,
     SessionDetail, SessionSummary, SessionTimings, SessionTransferStats, StorageStats,
+    UpstreamProxyConfig, WebSocketFrameRecord, WsInjectDirection, WsInjectOpcode,
 };
 use crate::proxy::breakpoints::{BreakpointEngine, PendingBreakpointGuard};
 use crate::proxy::ca::CertificateAuthority;
@@ -34,6 +36,7 @@ use crate::proxy::rules::RuleEngine;
 use crate::proxy::sysproxy::{resolve_sysproxy_host_for_bind, SystemProxyManager};
 use crate::proxy::throttle::ThrottleEngine;
 use crate::proxy::upstream_client::{format_rfc3339_micros, UpstreamHttpClient};
+use crate::proxy::upstream_proxy::UpstreamProxyManager;
 use crate::scripting::PythonScriptRunner;
 use crate::storage::{TrafficStore, BODY_OFFLOAD_THRESHOLD_BYTES};
 
@@ -120,6 +123,9 @@ pub use http_handler::{
 pub type ProxyController = ProxyEngineController;
 
 use connect_tunnel::handle_outer_proxy_request;
+use websocket_relay::{
+    parse_hex_payload, WsInjectCommand, MAX_WS_INJECT_PAYLOAD_BYTES,
+};
 
 #[inline]
 fn evaluate_should_store_session(ctx: &SharedProxyContext, summary: &SessionSummary) -> bool {
@@ -234,6 +240,7 @@ pub(super) fn record_in_flight_session_with_remap(
         wire_body_size: None,
         server_ip: None,
         server_conn_reused: None,
+        ws_open: None,
     };
 
     if !evaluate_should_store_session(ctx, &summary) {
@@ -384,6 +391,7 @@ pub(super) fn record_error_session_with_telemetry(
         wire_body_size: None,
         server_ip: None,
         server_conn_reused: None,
+        ws_open: None,
     };
     summary.apply_telemetry(timings.as_ref(), transfer_stats.as_ref());
 
@@ -419,11 +427,13 @@ pub struct SharedProxyContext {
     pub filters: Arc<ProxyFilterEngine>,
     pub breakpoints: Arc<BreakpointEngine>,
     pub host_remap: Arc<HostRemapRegistry>,
+    pub upstream_proxy: Arc<UpstreamProxyManager>,
     pub throttle: Arc<ThrottleEngine>,
     pub store: Arc<TrafficStore>,
     pub upstream_http_client: std::sync::RwLock<Arc<UpstreamHttpClient>>,
     pub client_certs: Arc<ClientCertificateStore>,
     pub script_runner: Arc<PythonScriptRunner>,
+    pub active_ws_channels: Arc<DashMap<u64, mpsc::UnboundedSender<WsInjectCommand>>>,
     pub event_tx: mpsc::UnboundedSender<SessionSummary>,
     pub removed_tx: mpsc::UnboundedSender<Vec<u64>>,
     pub active_port: AtomicU16,
@@ -472,7 +482,8 @@ impl SharedProxyContext {
 
     pub fn rebuild_upstream_clients(&self) {
         let resolver = Arc::clone(&self.host_remap);
-        match UpstreamHttpClient::build(Some(resolver), None) {
+        let upstream_proxy = Arc::clone(&self.upstream_proxy);
+        match UpstreamHttpClient::build(Some(resolver), Some(upstream_proxy), None) {
             Ok(client) => {
                 *self
                     .upstream_http_client
@@ -484,6 +495,63 @@ impl SharedProxyContext {
             }
         }
         self.client_certs.invalidate_client_cache();
+    }
+
+    pub async fn inject_websocket_frame(
+        &self,
+        session_id: u64,
+        direction: WsInjectDirection,
+        opcode: WsInjectOpcode,
+        payload: String,
+    ) -> Result<WebSocketFrameRecord, ProxyError> {
+        let message = match opcode {
+            WsInjectOpcode::Text => {
+                if payload.len() > MAX_WS_INJECT_PAYLOAD_BYTES {
+                    return Err(ProxyError::Custom(format!(
+                        "Размер текстового WebSocket-фрейма превышает лимит {MAX_WS_INJECT_PAYLOAD_BYTES} байт."
+                    )));
+                }
+                tokio_tungstenite::tungstenite::Message::Text(payload.into())
+            }
+            WsInjectOpcode::Binary => {
+                let bytes = parse_hex_payload(&payload)?;
+                tokio_tungstenite::tungstenite::Message::Binary(bytes.into())
+            }
+        };
+
+        let sender = self
+            .active_ws_channels
+            .get(&session_id)
+            .map(|entry| entry.value().clone())
+            .ok_or_else(|| {
+                ProxyError::Custom(format!(
+                    "WebSocket-соединение для сессии #{session_id} уже закрыто или не найдено."
+                ))
+            })?;
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        sender
+            .send(WsInjectCommand {
+                direction,
+                message,
+                ack_tx,
+            })
+            .map_err(|_| {
+                ProxyError::Custom(format!(
+                    "Канал WebSocket-соединения для сессии #{session_id} уже закрыт."
+                ))
+            })?;
+
+        match tokio::time::timeout(Duration::from_secs(5), ack_rx).await {
+            Ok(Ok(Ok(record))) => Ok(record),
+            Ok(Ok(Err(err))) => Err(ProxyError::Custom(err)),
+            Ok(Err(_)) => Err(ProxyError::Custom(format!(
+                "WebSocket-соединение для сессии #{session_id} закрылось во время отправки фрейма."
+            ))),
+            Err(_) => Err(ProxyError::Custom(format!(
+                "Таймаут отправки WebSocket-фрейма в сессию #{session_id}."
+            ))),
+        }
     }
 
     pub fn current_storage_stats(&self) -> StorageStats {
@@ -873,14 +941,21 @@ impl ProxyEngineController {
         stats_dirty: Arc<AtomicBool>,
     ) -> Result<Self, ProxyError> {
         let host_remap = Arc::new(HostRemapRegistry::new());
+        let upstream_proxy = Arc::new(UpstreamProxyManager::new());
         let throttle = Arc::new(ThrottleEngine::new());
         let dns_resolver = Arc::clone(&host_remap);
         let upstream_http_client = Arc::new(
-            UpstreamHttpClient::build(Some(dns_resolver), None).map_err(ProxyError::Custom)?,
+            UpstreamHttpClient::build(
+                Some(dns_resolver),
+                Some(Arc::clone(&upstream_proxy)),
+                None,
+            )
+            .map_err(ProxyError::Custom)?,
         );
 
         let breakpoints = Arc::new(BreakpointEngine::new(Some(bp_tx)));
         let script_runner = Arc::new(PythonScriptRunner::new(app_handle.clone()));
+        let active_ws_channels = Arc::new(DashMap::new());
 
         let initial_port = sysproxy.load_proxy_port_pref();
         let context = Arc::new(SharedProxyContext {
@@ -889,11 +964,13 @@ impl ProxyEngineController {
             filters,
             breakpoints,
             host_remap,
+            upstream_proxy,
             throttle,
             store,
             upstream_http_client: std::sync::RwLock::new(upstream_http_client),
             client_certs,
             script_runner,
+            active_ws_channels,
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(initial_port),
@@ -1577,6 +1654,45 @@ impl ProxyEngineController {
         }
         self.sysproxy.rollback_sync();
     }
+
+    pub fn get_upstream_proxy_config(&self) -> UpstreamProxyConfig {
+        self.context.upstream_proxy.get_public_config()
+    }
+
+    pub fn set_upstream_proxy_config(
+        &self,
+        config: UpstreamProxyConfig,
+    ) -> Result<UpstreamProxyConfig, ProxyError> {
+        if config.enabled {
+            let (active_port, bound_ips) = {
+                let guard = self.lock_runtime();
+                let port = self.context.active_port.load(Ordering::Relaxed);
+                let effective_port = if port > 0 { port } else { guard.bind_addr.1 };
+                (effective_port, guard.bound_ips.clone())
+            };
+            let clean_host = config
+                .host
+                .trim()
+                .trim_matches(['[', ']'])
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            let targets_local_listener = clean_host == "localhost"
+                || clean_host == "127.0.0.1"
+                || clean_host == "::1"
+                || clean_host == "0.0.0.0"
+                || clean_host == "::"
+                || bound_ips.iter().any(|ip| ip.eq_ignore_ascii_case(&clean_host));
+            if targets_local_listener && config.port == active_port {
+                return Err(ProxyError::Custom(format!(
+                    "Защита от петли трафика: вышестоящий прокси не может указывать на собственный порт FluxProxy ({clean_host}:{active_port})."
+                )));
+            }
+        }
+
+        let saved = self.context.upstream_proxy.set_config(config)?;
+        self.context.rebuild_upstream_clients();
+        Ok(saved)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1926,7 +2042,7 @@ mod tests {
         host_remap: Option<Arc<HostRemapRegistry>>,
     ) -> std::sync::RwLock<Arc<UpstreamHttpClient>> {
         std::sync::RwLock::new(Arc::new(
-            UpstreamHttpClient::build(host_remap, None).unwrap(),
+            UpstreamHttpClient::build(host_remap, None, None).unwrap(),
         ))
     }
 
@@ -1979,11 +2095,13 @@ mod tests {
             filters,
             breakpoints,
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -2096,11 +2214,13 @@ mod tests {
             filters,
             breakpoints: breakpoints.clone(),
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -2347,11 +2467,13 @@ mod tests {
             filters,
             breakpoints,
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -2493,11 +2615,13 @@ mod tests {
             filters,
             breakpoints,
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -2631,11 +2755,13 @@ mod tests {
             filters,
             breakpoints,
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(bound_port),
@@ -2836,11 +2962,13 @@ mod tests {
             filters: filters.clone(),
             breakpoints,
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
@@ -3002,11 +3130,13 @@ mod tests {
             filters,
             breakpoints,
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
@@ -3221,11 +3351,13 @@ mod tests {
             filters,
             breakpoints,
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
@@ -3499,11 +3631,13 @@ mod tests {
             filters,
             breakpoints,
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
@@ -4038,11 +4172,13 @@ mod tests {
             filters,
             breakpoints,
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -4398,11 +4534,13 @@ def on_response(response, request):
             filters,
             breakpoints,
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: script_runner.clone(),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -4614,11 +4752,13 @@ def on_response(response, request):
             filters,
             breakpoints: Arc::new(BreakpointEngine::new(None)),
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store,
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
@@ -4780,11 +4920,13 @@ def on_response(response, request):
             filters: filters.clone(),
             breakpoints: breakpoints.clone(),
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -4984,11 +5126,13 @@ def on_response(response, request):
             filters,
             breakpoints,
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -5180,11 +5324,13 @@ def on_response(response, request):
             filters,
             breakpoints,
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store,
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -5426,11 +5572,13 @@ def on_response(response, request):
             filters,
             breakpoints,
             host_remap: host_remap.clone(),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle,
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(Some(resolver)),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -5553,7 +5701,7 @@ def on_response(response, request):
             .unwrap();
 
         let resolver = Arc::clone(&host_remap);
-        let client = UpstreamHttpClient::build(Some(resolver), None).unwrap();
+        let client = UpstreamHttpClient::build(Some(resolver), None, None).unwrap();
 
         let _ = client
             .send_request(
@@ -5648,11 +5796,13 @@ def on_response(response, request):
             filters,
             breakpoints,
             host_remap,
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: throttle.clone(),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -5788,11 +5938,13 @@ def on_response(response, request):
             filters,
             breakpoints,
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -5934,11 +6086,13 @@ def on_response(response, request):
             filters: Arc::new(ProxyFilterEngine::new()),
             breakpoints: Arc::new(BreakpointEngine::new(None)),
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -6073,11 +6227,13 @@ def on_response(response, request):
             filters,
             breakpoints: breakpoints.clone(),
             host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
@@ -6192,6 +6348,571 @@ def on_response(response, request):
             bp_timings.net_elapsed_ms,
             bp_timings.overall_elapsed_ms
         );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn websocket_manual_frame_injection_to_server_and_client_and_channel_cleanup() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let (server_rx_tx, mut server_rx_rx) = mpsc::unbounded_channel::<Message>();
+
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = ws_listener.accept().await {
+                let ws_stream = tokio_tungstenite::accept_async(sock).await.unwrap();
+                let (_sink, mut stream) = ws_stream.split();
+                while let Some(Ok(msg)) = stream.next().await {
+                    let is_close = matches!(msg, Message::Close(_));
+                    let _ = server_rx_tx.send(msg);
+                    if is_close {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-ws-inject-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("ws-inject.sqlite")).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
+            store: store.clone(),
+            upstream_http_client: test_upstream_http_client(None),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(0),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_ctx = ctx.clone();
+
+        tokio::spawn(async move {
+            if let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await {
+                let io = TokioIo::new(tcp_stream);
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let c = proxy_ctx.clone();
+                    async move {
+                        Ok::<_, Infallible>(
+                            handle_outer_proxy_request(
+                                req,
+                                client_addr,
+                                None,
+                                ClientConnContext::new(),
+                                c,
+                            )
+                            .await,
+                        )
+                    }
+                });
+                let _ = AutoConnBuilder::new(TokioExecutor::new())
+                    .serve_connection_with_upgrades(io, service)
+                    .await;
+            }
+        });
+
+        let mut client_tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        let raw_upgrade = format!(
+            "GET http://{ws_addr}/ws-inject HTTP/1.1\r\n\
+             Host: {ws_addr}\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        client_tcp.write_all(raw_upgrade.as_bytes()).await.unwrap();
+
+        let mut hs_buf = Vec::new();
+        let mut b = [0u8; 1];
+        while !hs_buf.ends_with(b"\r\n\r\n") {
+            client_tcp.read_exact(&mut b).await.unwrap();
+            hs_buf.push(b[0]);
+        }
+        assert!(String::from_utf8_lossy(&hs_buf).starts_with("HTTP/1.1 101"));
+
+        let mut client_ws = WebSocketStream::from_raw_socket(client_tcp, Role::Client, None).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        assert!(ctx.active_ws_channels.contains_key(&1));
+        assert_eq!(store.get(1).unwrap().summary.ws_open, Some(true));
+
+        // 1. Inject Text frame toward Server
+        let srv_rec = ctx
+            .inject_websocket_frame(
+                1,
+                WsInjectDirection::Server,
+                WsInjectOpcode::Text,
+                r#"{"cmd":"ping"}"#.into(),
+            )
+            .await
+            .expect("inject text frame to server");
+        assert!(srv_rec.injected);
+        assert_eq!(srv_rec.direction, "outbound");
+        assert_eq!(srv_rec.opcode, "text");
+        assert_eq!(srv_rec.payload_preview, r#"{"cmd":"ping"}"#);
+
+        let server_got = tokio::time::timeout(Duration::from_secs(3), server_rx_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(server_got.into_text().unwrap().as_str(), r#"{"cmd":"ping"}"#);
+
+        // 2. Inject Binary Hex frame toward Client
+        let cli_rec = ctx
+            .inject_websocket_frame(
+                1,
+                WsInjectDirection::Client,
+                WsInjectOpcode::Binary,
+                "de ad be ef".into(),
+            )
+            .await
+            .expect("inject binary frame to client");
+        assert!(cli_rec.injected);
+        assert_eq!(cli_rec.direction, "inbound");
+        assert_eq!(cli_rec.opcode, "binary");
+        assert_eq!(cli_rec.byte_length, 4);
+
+        let client_got = tokio::time::timeout(Duration::from_secs(3), client_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(client_got.into_data().as_ref(), &[0xde, 0xad, 0xbe, 0xef]);
+
+        // 3. Close connection and verify active_ws_channels cleanup + ws_open == false
+        let _ = client_ws.close(None).await;
+        drop(client_ws);
+
+        let mut cleaned = false;
+        for _ in 0..40 {
+            let ch_gone = !ctx.active_ws_channels.contains_key(&1);
+            let marked_closed = store
+                .get(1)
+                .and_then(|d| d.summary.ws_open)
+                == Some(false);
+            if ch_gone && marked_closed {
+                cleaned = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(cleaned, "active_ws_channels entry must be removed and ws_open marked false on close");
+        assert!(ctx.active_ws_channels.is_empty());
+
+        let detail = store.get(1).unwrap();
+        assert_eq!(detail.summary.ws_open, Some(false));
+        let injected_frames: Vec<_> = detail
+            .websocket_frames
+            .iter()
+            .filter(|f| f.injected)
+            .collect();
+        assert_eq!(injected_frames.len(), 2);
+        assert!(detail
+            .websocket_frames
+            .iter()
+            .filter(|f| !f.injected)
+            .all(|f| f.opcode == "close"));
+
+        let post_close_err = ctx
+            .inject_websocket_frame(
+                1,
+                WsInjectDirection::Server,
+                WsInjectOpcode::Text,
+                "after-close".into(),
+            )
+            .await;
+        assert!(post_close_err.is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn upstream_proxy_chaining_routes_http_connect_ws_and_respects_bypass_list() {
+        use crate::models::UpstreamProxyProtocol;
+        use std::sync::atomic::AtomicUsize;
+        use tokio_tungstenite::tungstenite::Message;
+
+        // 1. Target HTTP + WS server (handles GET /hello and WS /ws)
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = target_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut req_buf = Vec::new();
+                    let mut b = [0u8; 1];
+                    while !req_buf.ends_with(b"\r\n\r\n") {
+                        if sock.read_exact(&mut b).await.is_err() {
+                            return;
+                        }
+                        req_buf.push(b[0]);
+                    }
+                    let req_text = String::from_utf8_lossy(&req_buf);
+                    if let Some(key_line) = req_text
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+                    {
+                        let key = key_line.split(':').nth(1).unwrap_or("").trim();
+                        let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(
+                            key.as_bytes(),
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 101 Switching Protocols\r\n\
+                             Upgrade: websocket\r\n\
+                             Connection: Upgrade\r\n\
+                             Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                        );
+                        sock.write_all(resp.as_bytes()).await.unwrap();
+                        let mut ws =
+                            WebSocketStream::from_raw_socket(sock, Role::Server, None).await;
+                        if let Some(Ok(Message::Text(txt))) = ws.next().await {
+                            let _ = ws.send(Message::Text(format!("echo:{txt}").into())).await;
+                        }
+                        let _ = ws.close(None).await;
+                    } else {
+                        let body = "target-http-ok";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    }
+                });
+            }
+        });
+
+        // 2. Bypassed HTTP server (must be hit directly without upstream proxy)
+        let bypassed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bypassed_addr = bypassed_listener.local_addr().unwrap();
+        let bypassed_hits = Arc::new(AtomicUsize::new(0));
+        let bypassed_hits_srv = Arc::clone(&bypassed_hits);
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = bypassed_listener.accept().await {
+                let hits = Arc::clone(&bypassed_hits_srv);
+                tokio::spawn(async move {
+                    let io = TokioIo::new(sock);
+                    let svc = service_fn(move |_req: Request<Incoming>| {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        async {
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
+                                b"bypass-direct-ok",
+                            ))))
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        // 3. Raw TCP echo server for CONNECT Passthrough through upstream proxy
+        let raw_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raw_addr = raw_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = raw_listener.accept().await {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = sock.read(&mut buf).await {
+                    let _ = sock.write_all(&buf[..n]).await;
+                }
+            }
+        });
+
+        // 4. Mock Upstream HTTP Proxy requiring `Proxy-Authorization: Basic user:secret`
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_http_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_connect_hits = Arc::new(AtomicUsize::new(0));
+        let expected_auth = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("user:secret")
+        );
+
+        let up_http_cnt = Arc::clone(&upstream_http_hits);
+        let up_conn_cnt = Arc::clone(&upstream_connect_hits);
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = upstream_listener.accept().await {
+                let http_cnt = Arc::clone(&up_http_cnt);
+                let conn_cnt = Arc::clone(&up_conn_cnt);
+                let exp_auth = expected_auth.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(sock);
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let http_cnt = Arc::clone(&http_cnt);
+                        let conn_cnt = Arc::clone(&conn_cnt);
+                        let exp_auth = exp_auth.clone();
+                        async move {
+                            let auth_ok = req
+                                .headers()
+                                .get("proxy-authorization")
+                                .and_then(|v| v.to_str().ok())
+                                == Some(exp_auth.as_str());
+                            if !auth_ok {
+                                return Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+                                        .body(boxed_full(Bytes::from_static(b"407 Auth Required")))
+                                        .unwrap(),
+                                );
+                            }
+
+                            if req.method() == http::Method::CONNECT {
+                                conn_cnt.fetch_add(1, Ordering::SeqCst);
+                                let authority = req.uri().authority().unwrap().to_string();
+                                let mut target_tcp = TcpStream::connect(&authority).await.unwrap();
+                                tokio::spawn(async move {
+                                    if let Ok(upgraded) = hyper::upgrade::on(req).await {
+                                        let mut client_io = TokioIo::new(upgraded);
+                                        let _ = tokio::io::copy_bidirectional(
+                                            &mut client_io,
+                                            &mut target_tcp,
+                                        )
+                                        .await;
+                                    }
+                                });
+                                return Ok(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(boxed_full(Bytes::new()))
+                                    .unwrap());
+                            }
+
+                            http_cnt.fetch_add(1, Ordering::SeqCst);
+                            let authority = req
+                                .uri()
+                                .authority()
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|| {
+                                    req.headers()
+                                        .get(http::header::HOST)
+                                        .and_then(|v| v.to_str().ok())
+                                        .unwrap_or("")
+                                        .to_string()
+                                });
+                            let path = req
+                                .uri()
+                                .path_and_query()
+                                .map(|p| p.as_str())
+                                .unwrap_or("/");
+                            let mut target_tcp = TcpStream::connect(&authority).await.unwrap();
+                            let raw_req = format!(
+                                "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                                req.method(),
+                                path,
+                                authority
+                            );
+                            target_tcp.write_all(raw_req.as_bytes()).await.unwrap();
+                            let mut raw_resp = Vec::new();
+                            let _ = target_tcp.read_to_end(&mut raw_resp).await;
+                            let body_bytes = raw_resp
+                                .windows(4)
+                                .position(|w| w == b"\r\n\r\n")
+                                .map(|pos| raw_resp[pos + 4..].to_vec())
+                                .unwrap_or_default();
+                            Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .body(boxed_full(Bytes::from(body_bytes)))
+                                .unwrap())
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-upstream-chain-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        filters.update_config(ProxyFilterBackendConfig {
+            tls_intercept_mode: TlsInterceptMode::InterceptAll,
+            tls_bypass_enabled: true,
+            tls_bypass_rules: vec![TlsBypassRule {
+                id: "bypass-raw-connect".into(),
+                enabled: true,
+                pattern: "127.0.0.1".into(),
+                category: "Test".into(),
+                description: "Test passthrough CONNECT".into(),
+            }],
+            ..crate::proxy::filters::default_backend_config()
+        });
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("upstream-chain.sqlite")).unwrap());
+        let upstream_proxy = Arc::new(UpstreamProxyManager::new());
+        upstream_proxy
+            .set_config(UpstreamProxyConfig {
+                enabled: true,
+                protocol: UpstreamProxyProtocol::Http,
+                host: "127.0.0.1".into(),
+                port: upstream_addr.port(),
+                username: Some("user".into()),
+                password: Some("secret".into()),
+                has_password: true,
+                bypass_list: vec![format!("127.0.0.1:{}", bypassed_addr.port())],
+            })
+            .unwrap();
+
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy,
+            throttle: Arc::new(ThrottleEngine::new()),
+            store: store.clone(),
+            upstream_http_client: test_upstream_http_client(None),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(0),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+        ctx.rebuild_upstream_clients();
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_ctx = ctx.clone();
+
+        tokio::spawn(async move {
+            while let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await {
+                let c = proxy_ctx.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let inner_c = c.clone();
+                        async move {
+                            Ok::<_, Infallible>(
+                                handle_outer_proxy_request(
+                                    req,
+                                    client_addr,
+                                    None,
+                                    ClientConnContext::new(),
+                                    inner_c,
+                                )
+                                .await,
+                            )
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, service)
+                        .await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap();
+
+        // A. Non-bypassed HTTP request -> routed through upstream HTTP proxy
+        let resp_http = client
+            .get(format!("http://{target_addr}/hello"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp_http.status(), StatusCode::OK);
+        assert_eq!(resp_http.text().await.unwrap(), "target-http-ok");
+        assert_eq!(upstream_http_hits.load(Ordering::SeqCst), 1);
+
+        // B. Bypassed HTTP request -> goes directly to bypassed_addr
+        let resp_bypass = client
+            .get(format!("http://{bypassed_addr}/bypass"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp_bypass.status(), StatusCode::OK);
+        assert_eq!(resp_bypass.text().await.unwrap(), "bypass-direct-ok");
+        assert_eq!(upstream_http_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(bypassed_hits.load(Ordering::SeqCst), 1);
+
+        // C. CONNECT Passthrough tunnel -> routed via upstream proxy CONNECT
+        let mut connect_tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        let connect_req = format!("CONNECT {raw_addr} HTTP/1.1\r\nHost: {raw_addr}\r\n\r\n");
+        connect_tcp.write_all(connect_req.as_bytes()).await.unwrap();
+        let mut connect_resp = Vec::new();
+        let mut b = [0u8; 1];
+        while !connect_resp.ends_with(b"\r\n\r\n") {
+            connect_tcp.read_exact(&mut b).await.unwrap();
+            connect_resp.push(b[0]);
+        }
+        assert!(String::from_utf8_lossy(&connect_resp).starts_with("HTTP/1.1 200"));
+        connect_tcp.write_all(b"TUNNEL_OK").await.unwrap();
+        let mut echo = [0u8; 9];
+        connect_tcp.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"TUNNEL_OK");
+        assert_eq!(upstream_connect_hits.load(Ordering::SeqCst), 1);
+
+        // D. WebSocket ws:// -> routed via upstream proxy CONNECT
+        let mut ws_tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        let ws_upgrade = format!(
+            "GET http://{target_addr}/ws HTTP/1.1\r\n\
+             Host: {target_addr}\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        ws_tcp.write_all(ws_upgrade.as_bytes()).await.unwrap();
+        let mut ws_hs = Vec::new();
+        while !ws_hs.ends_with(b"\r\n\r\n") {
+            ws_tcp.read_exact(&mut b).await.unwrap();
+            ws_hs.push(b[0]);
+        }
+        assert!(String::from_utf8_lossy(&ws_hs).starts_with("HTTP/1.1 101"));
+        assert_eq!(upstream_connect_hits.load(Ordering::SeqCst), 2);
+
+        let mut ws_client = WebSocketStream::from_raw_socket(ws_tcp, Role::Client, None).await;
+        ws_client
+            .send(Message::Text("ws-via-proxy".into()))
+            .await
+            .unwrap();
+        let ws_reply = ws_client.next().await.unwrap().unwrap().into_text().unwrap();
+        assert_eq!(ws_reply.as_str(), "echo:ws-via-proxy");
+        let _ = ws_client.close(None).await;
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

@@ -282,6 +282,7 @@ pub(super) fn handle_builtin_portal_request(
         wire_body_size: None,
         server_ip: None,
         server_conn_reused: None,
+        ws_open: None,
     };
     summary.apply_telemetry(Some(&timings), Some(&transfer_stats));
 

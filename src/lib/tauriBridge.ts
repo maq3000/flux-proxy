@@ -32,10 +32,17 @@ import type {
   StorageStats,
   ThrottleConfig,
   ThrottlePreset,
+  UpstreamProxyConfig,
+  UpstreamProxyProtocol,
+  WebSocketFrameRecord,
+  WsInjectDirection,
+  WsInjectOpcode,
 } from "../types/proxy";
 import {
   DEFAULT_SESSION_RETENTION_LIMIT,
   DEFAULT_THROTTLE_CONFIG,
+  DEFAULT_UPSTREAM_PROXY_BYPASS_LIST,
+  DEFAULT_UPSTREAM_PROXY_CONFIG,
   THROTTLE_PRESET_DEFINITIONS,
 } from "../types/proxy";
 import {
@@ -69,6 +76,7 @@ import {
   PREVIEW_SQLITE_ARCHIVE_STORAGE_KEY,
   PREVIEW_SQLITE_COUNT_STORAGE_KEY,
   PREVIEW_THROTTLE_CONFIG_STORAGE_KEY,
+  PREVIEW_UPSTREAM_PROXY_CONFIG_STORAGE_KEY,
   sanitizeSessionsInPreview,
 } from "./mockTraffic";
 import { browserPreviewCodecTransform } from "./textWizard";
@@ -358,6 +366,92 @@ function normalizeThrottleConfigPreview(cfg: ThrottleConfig): ThrottleConfig {
     : { ...DEFAULT_THROTTLE_CONFIG };
 }
 
+function normalizeUpstreamProxyConfigPreview(
+  cfg: Partial<UpstreamProxyConfig> | null | undefined,
+  validateEnabled = false,
+  listenPort?: number
+): UpstreamProxyConfig {
+  const rawProto = typeof cfg?.protocol === "string" ? cfg.protocol.toLowerCase() : "http";
+  const protocol: UpstreamProxyProtocol =
+    rawProto === "https" || rawProto === "socks5" ? rawProto : "http";
+  const enabled = Boolean(cfg?.enabled);
+  const host = typeof cfg?.host === "string" ? cfg.host.trim() : "";
+  const defaultPort = protocol === "https" ? 8443 : protocol === "socks5" ? 1080 : 8080;
+  const rawPort = Number(cfg?.port);
+  const port =
+    Number.isInteger(rawPort) && rawPort >= 1 && rawPort <= 65535
+      ? rawPort
+      : defaultPort;
+  const rawUsername =
+    typeof cfg?.username === "string" ? cfg.username.trim() : "";
+  const username = rawUsername.length > 0 ? rawUsername : null;
+  const rawBypass = Array.isArray(cfg?.bypassList)
+    ? cfg.bypassList
+    : DEFAULT_UPSTREAM_PROXY_BYPASS_LIST;
+  const seen = new Set<string>();
+  const bypassList: string[] = [];
+  for (const item of rawBypass) {
+    if (typeof item !== "string") continue;
+    const clean = item.trim();
+    if (!clean) continue;
+    const dedup = clean.toLowerCase();
+    if (!seen.has(dedup)) {
+      seen.add(dedup);
+      bypassList.push(clean);
+    }
+  }
+
+  if (validateEnabled && enabled) {
+    if (!host) {
+      throw new Error("Укажите хост вышестоящего прокси.");
+    }
+    if (!Number.isInteger(rawPort) || rawPort < 1 || rawPort > 65535) {
+      throw new Error("Укажите корректный порт (1–65535).");
+    }
+    const cleanHost = host.replace(/^\[|\]$/g, "").toLowerCase();
+    if (
+      listenPort &&
+      port === listenPort &&
+      (cleanHost === "localhost" || cleanHost === "127.0.0.1" || cleanHost === "::1")
+    ) {
+      throw new Error(
+        `Обнаружена петля каскадирования: вышестоящий прокси указывает на локальный порт FluxProxy (:${listenPort}).`
+      );
+    }
+  }
+
+  return {
+    enabled,
+    protocol,
+    host,
+    port,
+    username,
+    bypassList,
+  };
+}
+
+function parseHexPayloadPreview(raw: string): Uint8Array {
+  const cleanedParts: string[] = [];
+  for (const tok of raw.split(/[\s:\-,]+/)) {
+    if (!tok) continue;
+    const stripped =
+      tok.startsWith("0x") || tok.startsWith("0X") ? tok.slice(2) : tok;
+    cleanedParts.push(stripped);
+  }
+  const hexChars = cleanedParts.join("");
+  if (hexChars.length === 0) return new Uint8Array(0);
+  if (hexChars.length % 2 !== 0 || !/^[0-9a-fA-F]+$/.test(hexChars)) {
+    throw new Error(
+      "Некорректный Hex payload: ожидается чётное количество шестнадцатеричных символов (0-9, a-f)."
+    );
+  }
+  const out = new Uint8Array(hexChars.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = Number.parseInt(hexChars.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
 class BrowserPreviewEngine {
   private running = true;
   private bindMode: BindHostMode = "loopback";
@@ -395,6 +489,11 @@ class BrowserPreviewEngine {
     buildDefaultPreviewClientCertificates();
   private hostRemapRules: HostRemapRule[] = [...DEFAULT_HOST_REMAP_RULES];
   private throttleConfig: ThrottleConfig = { ...DEFAULT_THROTTLE_CONFIG };
+  private upstreamProxyConfig: UpstreamProxyConfig = {
+    ...DEFAULT_UPSTREAM_PROXY_CONFIG,
+    bypassList: [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST],
+  };
+  private upstreamProxyPassword: string | null = null;
   private listeners = new Set<(batch: SessionSummary[]) => void>();
   private removedListeners = new Set<(ids: number[]) => void>();
   private bpListeners = new Set<(items: PausedBreakpointItem[]) => void>();
@@ -559,6 +658,17 @@ class BrowserPreviewEngine {
           if (parsedThrottle && typeof parsedThrottle === "object") {
             this.throttleConfig = normalizeThrottleConfigPreview(
               parsedThrottle as ThrottleConfig
+            );
+          }
+        }
+        const rawUpstream = window.localStorage.getItem(
+          PREVIEW_UPSTREAM_PROXY_CONFIG_STORAGE_KEY
+        );
+        if (rawUpstream !== null) {
+          const parsedUpstream = JSON.parse(rawUpstream);
+          if (parsedUpstream && typeof parsedUpstream === "object") {
+            this.upstreamProxyConfig = normalizeUpstreamProxyConfigPreview(
+              parsedUpstream as Partial<UpstreamProxyConfig>
             );
           }
         }
@@ -3055,6 +3165,93 @@ class BrowserPreviewEngine {
     }
     return { ...normalized };
   }
+
+  getUpstreamProxyConfig(): UpstreamProxyConfig {
+    return {
+      ...this.upstreamProxyConfig,
+      bypassList: [...this.upstreamProxyConfig.bypassList],
+      hasPassword: Boolean(this.upstreamProxyPassword),
+    };
+  }
+
+  setUpstreamProxyConfig(config: UpstreamProxyConfig): UpstreamProxyConfig {
+    const normalized = normalizeUpstreamProxyConfigPreview(
+      config,
+      true,
+      this.port
+    );
+    if (config.password === "" || config.password === null) {
+      this.upstreamProxyPassword = null;
+    } else if (typeof config.password === "string" && config.password.length > 0) {
+      this.upstreamProxyPassword = config.password;
+    }
+    this.upstreamProxyConfig = normalized;
+    if (typeof window !== "undefined") {
+      try {
+        window.localStorage.setItem(
+          PREVIEW_UPSTREAM_PROXY_CONFIG_STORAGE_KEY,
+          JSON.stringify(normalized)
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+    }
+    return this.getUpstreamProxyConfig();
+  }
+
+  injectWebSocketFrame(
+    sessionId: number,
+    direction: WsInjectDirection,
+    opcode: WsInjectOpcode,
+    payload: string
+  ): WebSocketFrameRecord {
+    const detail = this.store.get(sessionId);
+    if (!detail || !detail.summary.wsOpen) {
+      throw new Error(
+        `Активное WebSocket-соединение для сессии #${sessionId} не найдено или уже закрыто.`
+      );
+    }
+
+    let byteLength = 0;
+    let payloadPreview = "";
+    if (opcode === "binary") {
+      const bytes = parseHexPayloadPreview(payload);
+      byteLength = bytes.length;
+      const hexHead = Array.from(bytes.slice(0, 24))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      payloadPreview = `<${bytes.length} bytes: ${hexHead}>`;
+    } else {
+      byteLength = new TextEncoder().encode(payload).length;
+      payloadPreview = Array.from(payload).slice(0, 512).join("");
+    }
+
+    const prevFrames = detail.websocketFrames ?? [];
+    const nextIndex =
+      (prevFrames.length > 0 ? prevFrames[prevFrames.length - 1].index : 0) + 1;
+    const frame: WebSocketFrameRecord = {
+      index: nextIndex,
+      direction: direction === "server" ? "outbound" : "inbound",
+      opcode,
+      payloadPreview,
+      byteLength,
+      timestamp: new Date().toISOString(),
+      injected: true,
+    };
+
+    const nextSummary: SessionSummary = {
+      ...detail.summary,
+      bodySize: detail.summary.bodySize + byteLength,
+    };
+    const nextDetail: SessionDetail = {
+      ...detail,
+      summary: nextSummary,
+      websocketFrames: [...prevFrames, frame],
+    };
+    this.store.set(sessionId, nextDetail);
+    this.emitBatch([nextSummary]);
+    return frame;
+  }
 }
 
 let previewEngineInstance: BrowserPreviewEngine | null = null;
@@ -3954,6 +4151,46 @@ export const proxyBridge = {
       return invoke<ThrottleConfig>("set_throttle_config", { config });
     }
     return getPreviewEngine().setThrottleConfig(config);
+  },
+
+  async getUpstreamProxyConfig(): Promise<UpstreamProxyConfig> {
+    if (isTauriRuntime()) {
+      return invoke<UpstreamProxyConfig>("get_upstream_proxy_config");
+    }
+    return getPreviewEngine().getUpstreamProxyConfig();
+  },
+
+  async setUpstreamProxyConfig(
+    config: UpstreamProxyConfig
+  ): Promise<UpstreamProxyConfig> {
+    if (isTauriRuntime()) {
+      return invoke<UpstreamProxyConfig>("set_upstream_proxy_config", {
+        config,
+      });
+    }
+    return getPreviewEngine().setUpstreamProxyConfig(config);
+  },
+
+  async injectWebSocketFrame(
+    sessionId: number,
+    direction: WsInjectDirection,
+    opcode: WsInjectOpcode,
+    payload: string
+  ): Promise<WebSocketFrameRecord> {
+    if (isTauriRuntime()) {
+      return invoke<WebSocketFrameRecord>("inject_websocket_frame", {
+        sessionId,
+        direction,
+        opcode,
+        payload,
+      });
+    }
+    return getPreviewEngine().injectWebSocketFrame(
+      sessionId,
+      direction,
+      opcode,
+      payload
+    );
   },
 
   triggerSimulatedTrafficHit(): void {

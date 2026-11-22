@@ -114,6 +114,8 @@ interface MenuBarProps {
   onOpenClientCertificates: () => void;
   onOpenHostRemap?: () => void;
   activeHostRemapCount?: number;
+  onOpenUpstreamProxy?: () => void;
+  upstreamProxyActiveLabel?: string | null;
   onGenerateStress10k: () => void;
   // Help
   onOpenCommandPalette: () => void;
@@ -356,6 +358,8 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onOpenClientCertificates,
   onOpenHostRemap,
   activeHostRemapCount = 0,
+  onOpenUpstreamProxy,
+  upstreamProxyActiveLabel = null,
   onGenerateStress10k,
   onOpenCommandPalette,
   onOpenShortcutsModal,
@@ -1916,6 +1920,22 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                   </span>
                   <span className="hint" aria-hidden="true">
                     Ctrl+Shift+H
+                  </span>
+                </button>
+              )}
+              {onOpenUpstreamProxy && (
+                <button
+                  type="button"
+                  onClick={(e) => activateCommand(e, onOpenUpstreamProxy)}
+                >
+                  <span>
+                    Upstream Proxy…
+                    {upstreamProxyActiveLabel
+                      ? ` (${upstreamProxyActiveLabel})`
+                      : ""}
+                  </span>
+                  <span className="hint" aria-hidden="true">
+                    Ctrl+Shift+U
                   </span>
                 </button>
               )}

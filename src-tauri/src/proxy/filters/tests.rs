@@ -394,6 +394,7 @@ fn make_summary_for_filter(
         wire_body_size: None,
         server_ip: None,
         server_conn_reused: None,
+        ws_open: None,
     }
 }
 

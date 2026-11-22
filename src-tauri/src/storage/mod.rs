@@ -1128,6 +1128,7 @@ impl TrafficStore {
                 wire_body_size: Some(body_size),
                 server_ip: Some("93.184.216.34".to_string()),
                 server_conn_reused: Some(i % 4 != 0),
+                ws_open: None,
             };
 
             if !filters.evaluate_should_store_session(&summary) {
@@ -1304,6 +1305,7 @@ mod tests {
                 wire_body_size: None,
                 server_ip: None,
                 server_conn_reused: None,
+                ws_open: None,
             },
             request_headers: vec![HeaderPair {
                 name: "Host".into(),
@@ -1732,6 +1734,7 @@ mod tests {
             payload_preview: "ping".into(),
             byte_length: 4,
             timestamp: "2026-11-15T10:00:02Z".into(),
+            injected: false,
         };
         let ws_sum = store
             .append_ws_frame(ws_id, Some(frame1), 4, 256)

@@ -859,7 +859,7 @@ export function buildSimulatedSession(id: number): SessionDetail {
     serverCertIssuer: isHttps ? "CN=Cloudflare TLS Issuing ECC CA 1" : null,
     serverMtlsCn: null,
     remappedTarget: null,
-    isStreaming: tpl.contentType.includes("text/event-stream"),
+    isStreaming: tpl.contentType.includes("text/event-stream") || tpl.scheme === "wss",
   };
 
   return {
@@ -896,6 +896,7 @@ export function buildSimulatedSession(id: number): SessionDetail {
       wireBodySize: responseWireBodyBytes,
       serverIp,
       serverConnReused,
+      wsOpen: tpl.scheme === "wss" ? true : undefined,
     },
     requestHeaders,
     responseHeaders,
@@ -1030,6 +1031,8 @@ export const PREVIEW_HOST_REMAP_RULES_STORAGE_KEY =
   "fluxproxy.previewHostRemapRules.v1";
 export const PREVIEW_THROTTLE_CONFIG_STORAGE_KEY =
   "fluxproxy.previewThrottleConfig.v1";
+export const PREVIEW_UPSTREAM_PROXY_CONFIG_STORAGE_KEY =
+  "fluxproxy.previewUpstreamProxyConfig.v1";
 
 export const DEFAULT_HOST_REMAP_RULES: HostRemapRule[] = [];
 
