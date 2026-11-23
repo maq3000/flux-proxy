@@ -109,7 +109,7 @@
 
 ## 📋 Матрица приоритетов и порядок выполнения
 
-> *Номера этапов (`35`, `39`, `36`, `37`, `38`, `40`, `41`, `12`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз. Завершенные этапы Спринта 1 (Этапы 14, 15, 20, 21, 25–28) выполнены в релизе `v0.2.0`, этапы Спринта 2 (Этапы 5, 16, 17, 23, 24, 29, 30) выполнены в релизе `v0.3.0`, этапы Спринта 3 (Этапы 6, 7, 8, 9, 18, 19, 22) выполнены в релизе `v0.4.0`, стабилизационный Спринт 4 (Этапы 31–33) выполнен в релизе `v0.4.1`, а этапы Спринта 5 (Этапы 10, 11, 13, 34) выполнены в релизе `v0.5.0` и перенесены в раздел реализованных этапов выше.*
+> *Номера этапов (`35`, `39`, `36`, `37`, `38`, `40`, `42`, `41`, `12`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз. Завершенные этапы Спринта 1 (Этапы 14, 15, 20, 21, 25–28) выполнены в релизе `v0.2.0`, этапы Спринта 2 (Этапы 5, 16, 17, 23, 24, 29, 30) выполнены в релизе `v0.3.0`, этапы Спринта 3 (Этапы 6, 7, 8, 9, 18, 19, 22) выполнены в релизе `v0.4.0`, стабилизационный Спринт 4 (Этапы 31–33) выполнен в релизе `v0.4.1`, а этапы Спринта 5 (Этапы 10, 11, 13, 34) выполнены в релизе `v0.5.0` и перенесены в раздел реализованных этапов выше.*
 
 | # | Этап | Приоритет | Спринт | Зависимости | Ключевая ценность |
 | :-: | :--- | :--- | :--- | :--- | :--- |
@@ -117,10 +117,11 @@
 | 2 | **[Этап 39](#этап-39-разделение-и-настройка-upstream-таймаутов-прозрачное-ожидание-ответа-сервера-ttfb-и-raii-финализация-отменённых-запросов-499)** | **P1 (Core Proxy Transparency & Timeouts)** | Спринт 6 | Этапы 4 ✅, 21 ✅, 33 ✅, 34 ✅, 35 | Разделение жёсткого 15-с лимита на настраиваемые `connectTimeoutSec` (15 с) и `responseHeaderTimeoutSec` (по умолчанию `0` = Unlimited / ожидание реального ответа или ошибки сервера), отдельный `composerTimeoutSec` (120 с) + кнопка отмены `Cancel`, RAII-гард `InFlightSessionGuard` (финализация обрывов клиента как `499`) и диагностический заголовок `X-FluxProxy-Error` |
 | 3 | **[Этап 36](#этап-36-защита-ключей-mtls-dpapi--in-memory-lan-client-allowlist-чистота-zustand-сторов-очистка-техдолга-и-синхронизация-документации)** | **P1 / P2 (Security, State & Hygiene)** | Спринт 6 | Этапы 11 ✅, 18 ✅, 35 | Шифрование ключей mTLS/CA через Windows DPAPI + режим `Session-only (In-Memory)` (`SEC-03`), белый список `LAN Client Allowlist`, фильтрация `SAFE_RASTER_IMAGE_MIMES` в Multipart (`SEC-02`), устранение сброса сессий в `syncFromLocalStorage` (`CONC-01`) и $O(N)$ аллокаций (`PERF-03`), удаление мёртвого кода `reqwest` (`ARCH-01`), вынос `BrowserPreviewEngine` (`ARCH-02`) и синхронизация документации с кодом |
 | 4 | **[Этап 37](#этап-37-исправление-ui-багов-инспектора-hexviewer-и-timing-breakdown-и-редизайн-command-palette-20)** | **P1 (UI Bugfixes & UX Ergonomics)** | Спринт 6 | Этапы 22 ✅, 30 ✅, 34 ✅ | Устранение сдвига колонок и наложения байтов на `DECODED ASCII` во вкладке `Hex` (`HexViewer.tsx`), устранение мелькания тултипа при наведении на легенду `TIMING BREAKDOWN` (`SessionStatisticsPanel.tsx`, показ только на таймлайне без layout shift) и крупная понятная `Command Palette 2.0` (`max-w-3xl`, категории, описания, статусы, чипы синтаксиса `bpu`/`jwt`) |
-| 5 | **[Этап 38](#этап-38-единый-полноэкранный-центр-настроек-unified-fullscreen-settings-hub-реорганизация-вкладок-дедупликация-панелей-и-система-подсказок)** | **P1 / P2 (UI Architecture & Discoverability)** | Спринт 6 | Этапы 4 ✅, 10 ✅, 11 ✅, 13 ✅, 18 ✅, 22 ✅, 37, 39 | Консолидация всех разрозненных модалок настроек (`FilterDrawer`, `HOSTS`, `Upstream Proxy`, `Root CA`, `mTLS`, `Mobile`, `Throttling`, `Proxy Doctor`) в единый полноэкранный `Settings Hub` (`Ctrl+,`), сохранение/перенос `Upstream Timeouts`, перевод конфигурационных модалок в fullscreen, удаление устаревшего свитча темы и дубликатов кнопок между `MenuBar`/`TopToolbar`/`Sidebar`/`Inspector`, наглядный доступ к `Throttling` и контекстные подсказки (`HelpTooltip`) |
+| 5 | **[Этап 38](#этап-38-единый-полноэкранный-центр-настроек-unified-fullscreen-settings-hub-реорганизация-вкладок-дедупликация-панелей-и-система-подсказок)** | **P1 / P2 (UI Architecture & Discoverability)** | Спринт 6 | Этапы 4 ✅, 10 ✅, 11 ✅, 13 ✅, 18 ✅, 22 ✅, 37, 39 | Консолидация разрозненных экранов настроек (`FilterDrawer`, `Mobile Setup`, `HOSTS`, `Upstream Proxy`, `mTLS`, `Throttling`, `Proxy Doctor`) в единый полноэкранный `Settings Hub` (`Ctrl+,`) с сохранением компактного диалога `Root CA`, перенос `Upstream Timeouts`, удаление устаревшего свитча темы и дубликатов кнопок между `MenuBar`/`TopToolbar`/`Sidebar`/`Inspector`, наглядный доступ к `Throttling` и контекстные подсказки (`HelpTooltip`) |
 | 6 | **[Этап 40](#этап-40-эргономика-request-composer-хоткей-e-отдельная-вкладка-и-отказ-от-split-сайдбара-и-панель-возврата-свёрнутого-session-inspector)** | **P1 (UX Navigation & Workspace Layout)** | Спринт 6 | Этапы 8 ✅, 23 ✅, 35, 36, 38, 39 | Хоткей `E` (как в Fiddler) и открытие сессий в отдельной полноэкранной вкладке `Composer` вместо узкого Split-сайдбара, упразднение обрезанного `dockedComposer` + апгрейд вкладки `Composer` (`← Back to Traffic`, сплит Request/Response) и постоянная кликабельная панель/рельса возврата свёрнутого `Session Inspector` (`CollapsedInspectorBar`) + drag-to-collapse |
-| 7 | **[Этап 41](#этап-41-контекстно-зависимые-пкм-меню-по-всему-приложению-context-aware-right-click-menus)** | **P1 / P2 (UI Architecture & Context Menus)** | Спринт 6 | Этапы 37, 38, 40 | Единая декларативная система ПКМ-меню (`ContextMenuProvider` / `useContextMenu`), подавление «сырого» браузерного меню WebView2 (с сохранением меню Monaco Editor и редактирования в полях ввода) и осмысленные контекстные меню для всех зон: таблица трафика (строки, шапка, пустая область), `SessionInspector` (URL-бар, Headers/Params/Cookies, WS/SSE/Hex/Image/Statistics, выделенный текст), `Composer`, `AutoResponder`, консоль Python и каркас интерфейса (тулбар, сайдбар, сплиттеры, футер) |
-| 8 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 6 | Этапы 34 ✅, 35, 39, 36, 37, 38, 40, 41 | Виртуализированная многофазная каскадная диаграмма (Waterfall) и сводный Markdown-отчет по всей выборке (P95, TTFB, статусы, MIME) |
+| 7 | **[Этап 42](#этап-42-архитектура-экранов-полноценные-вкладки-полноэкранные-экраны-и-компактные-диалоги-и-единые-лаконичные-заголовки-разделов)** | **P1 (UI Architecture & Information Design)** | Спринт 6 | Этапы 37, 38, 40 | Перевод тяжёлых рабочих инструментов (`Breakpoints`, `Session Diff`, `TextWizard`) из модальных окон в полноценные неблокирующие вкладки (`ActiveNavSection`), полноэкранные экраны для разовых инструментов (`OpenAPI Export`, `Sanitized Export`, `Code Generator`, `Shortcuts`), явное сохранение компактных диалогов (`Root CA`, `Comment & Mark`, `Import cURL`) и единый реестр лаконичных заголовков (`sectionRegistry.ts` + `SectionHeader.tsx`) по всему приложению |
+| 8 | **[Этап 41](#этап-41-контекстно-зависимые-пкм-меню-по-всему-приложению-context-aware-right-click-menus)** | **P1 / P2 (UI Architecture & Context Menus)** | Спринт 6 | Этапы 37, 38, 40, 42 | Единая декларативная система ПКМ-меню (`ContextMenuProvider` / `useContextMenu`), подавление «сырого» браузерного меню WebView2 (с сохранением меню Monaco Editor и редактирования в полях ввода) и осмысленные контекстные меню для всех зон: таблица трафика (строки, шапка, пустая область), `SessionInspector` (URL-бар, Headers/Params/Cookies, WS/SSE/Hex/Image/Statistics, выделенный текст), `Composer`, `AutoResponder`, консоль Python и каркас интерфейса (тулбар, сайдбар, сплиттеры, футер) |
+| 9 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 6 | Этапы 34 ✅, 35, 39, 36, 37, 38, 40, 42, 41 | Виртуализированная многофазная каскадная диаграмма (Waterfall) и сводный Markdown-отчет по всей выборке (P95, TTFB, статусы, MIME) |
 
 ---
 
@@ -165,7 +166,7 @@
 
 ---
 
-## 🔴 Спринт 6 — P1 / P2 (Audit `v0.5.0` Remediation, UX Redesign & Analytics): Стабилизация сетевого ядра, настраиваемые upstream-таймауты, защита ключей, единый полноэкранный Settings Hub, Command Palette 2.0, эргономика Composer / Inspector, ПКМ-меню и Waterfall Timeline
+## 🔴 Спринт 6 — P1 / P2 (Audit `v0.5.0` Remediation, UX Redesign & Analytics): Стабилизация сетевого ядра, настраиваемые upstream-таймауты, защита ключей, единый полноэкранный Settings Hub, Command Palette 2.0, эргономика Composer / Inspector, вкладки и единые заголовки разделов, ПКМ-меню и Waterfall Timeline
 
 ---
 
@@ -482,18 +483,19 @@
   - Все настройки приложения собраны в **единой точке входа** за счёт прямого встраивания полнофункциональных компонентов вместо урезанных копий и отдельных модалок:
     1. **`general` (Прокси, Интерфейсы и Буфер):** TCP-порт, `Act as System Proxy on startup`, привязка к сетевым адаптерам `BindConfigSection` (**строго в одном месте**, дубликат из `RulesProxySettingsTab` удалён; устаревший блок `Theme` из `GeneralSettingsTab` удалён), `Follow Tail`, лимит `Ring Buffer (Keep)`, `Drop Non-Matching` и управление базой `SQLite (VACUUM / Clear on Exit)`.
     2. **`networkRouting` (Троттлинг, HOSTS, Upstream Proxy и Таймауты):** полноценная панель управления **Bandwidth Throttling & Latency** (пресеты + кастомный профиль `↓/↑ Kbps, RTT ms`), встроенный полный редактор **HOSTS Remapping (Virtual DNS)**, встроенная настройка **Upstream Proxy Chaining (`HTTP/HTTPS/SOCKS5`)** и встроенная секция **Upstream Timeouts** из Этапа 39 (`Connect` / `Response Headers` / `Composer`).
-    3. **`tlsCertificates` (HTTPS MITM, Сертификаты и Мобильные устройства):** встроенный менеджер **Root CA Certificate** (статус доверия ОС, установка, экспорт форматов), **полный редактор Selective TLS MITM & Bypass 2.0** (`TlsBypassTab` с 11 Quick-Packs, `Hits: N` и `Table View ↔ Bulk Text Editor` вместо прежнего урезанного списка), встроенное хранилище **Client Certificates (mTLS)** и встроенный мастер **Mobile Device Setup (QR / iOS & Android)**.
+    3. **`tlsCertificates` (HTTPS MITM, Сертификаты и Мобильные устройства):** встроенная карточка статуса **Root CA** (доверие ОС, отпечаток SHA-256, быстрый переход к компактному диалогу `CertificateModal.tsx`, который сохраняется как лёгкое быстрое окно без перегруза элементами управления согласно Этапу 42), **полный редактор Selective TLS MITM & Bypass 2.0** (`TlsBypassTab` с 11 Quick-Packs, `Hits: N` и `Table View ↔ Bulk Text Editor` вместо прежнего урезанного списка), встроенное хранилище **Client Certificates (mTLS)** и встроенный мастер **Mobile Device Setup (QR / iOS & Android)**.
     4. **`filters` (Матрица фильтров, Списки хостов, Пороги шума и Заголовки):** встроенные полнофункциональные вкладки `FilterMatrixTab` (матрица условий и пресеты), `HostFiltersTab` (массовый Whitelist/Blacklist доменов), `ThresholdsTab` (`Noise & Time Heat`) и `HeaderMutationsTab` (мутации заголовков и `Force No-Cache`) — отдельный дублирующий диалог `FilterDrawer` упразднён, а все вызовы `openFilterDrawerAt(...)` открывают соответствующую подвкладку в едином полноэкранном `Settings Hub`.
     5. **`uiColumns` (Внешний вид, Темы, Панели и Колонки):** единственная точка управления темой (8 пресетов + режим `Dark / Light / System` + детальный редактор палитры), настройка компоновки панелей, групп тулбара и видимости/ширины колонок `TrafficGrid`.
     6. **`diagnosticsBackup` (Диагностика Proxy Doctor и Профили настроек):** встроенная панель самодиагностики **Proxy Doctor** (6 проверок + 1-click fix) и управление профилем `FluxUserSettingsProfile` (`schemaVersion: 1`, экспорт/импорт JSON, сброс к дефолтам).
   - Все триггеры настроек из `TopToolbar`, `MenuBar`, `Sidebar`, `Footer`, контекстного меню и `CommandPalette` (`Ctrl+,`, `Alt+4`, `Ctrl+Shift+H`, `Ctrl+Shift+U`, `Ctrl+Shift+C`, `Ctrl+Shift+M`, `Ctrl+Shift+D`) открывают **единый полноэкранный Settings Hub** на нужном разделе (`openPreferencesAt(tab, subTab)`), без открытия разрозненных маленьких окон.
-- **2. Полноэкранный режим для всех остальных модальных окон инструментов (Замечание №4):**
-  - Инструментальные модальные окна (`BreakpointModal.tsx`, `TextWizardModal.tsx`, `SessionDiffView.tsx` в модальном режиме, `OpenApiExportModal.tsx`, `SanitizedExportModal.tsx`, `CodeSnippetModal.tsx`, `ShortcutsModal.tsx`) переведены на полноэкранный контейнер (`h-screen w-screen max-h-none max-w-none m-0 rounded-none border-0`). Компактными оставлены только диалоги подтверждения деструктивных действий (`Purge SQLite`, `Reset Settings`) и поповер аннотации сессии (`SessionAnnotationModal`).
+- **2. Разграничение полноэкранных настроек и перехода инструментов во вкладки (Замечание №4 → совместно с Этапом 42):**
+  - В рамках Этапа 38 в полноэкранный режим переводится единый `Settings Hub` (включая встроенные полнофункциональные разделы `Filters / Rules & Filter Matrix` и `Mobile Setup`), устраняя узкие модалки настроек `FilterDrawer` и `MobileSetupModal`.
+  - Дальнейший перевод рабочих инструментов (`Breakpoints`, `Session Diff`, `TextWizard`) в **полноценные вкладки приложения** (`ActiveNavSection`) и перевод разовых экранов (`OpenApiExportModal`, `SanitizedExportModal`, `CodeSnippetModal`, `ShortcutsModal`) в полноэкранный формат (при сохранении компактных диалогов `Root CA` `CertificateModal.tsx`, `SessionAnnotationModal`, `Import cURL` и подтверждений `Purge SQLite`/`Reset Settings`) выполняются в **Этапе 42**.
 - **3. Переработка системы вкладок, удаление свитча темы и устранение дублирования кнопок (Замечания №3.1, №3.2, №3.5):**
   - **`Sidebar.tsx` (Левая панель рабочих вкладок):**
     - Полностью удалена неактуальная кнопка переключения темы `Sun`/`Moon` (`onToggleTheme`).
-    - Из `Sidebar` удалены дублирующие кнопки вызова модалок (`FilterDrawer`, `Session Diff`, `Mobile Setup`, `Root CA Certificates`, `Command Palette`).
-    - В `Sidebar` оставлены только чётко структурированные **рабочие вкладки и инструменты** с иконками, бейджами активности и понятными тултипами: `Traffic` (`Alt+1`), `Composer` (`Alt+2`), `AutoResponder` (`Alt+3`), `Python Scripts` (`Alt+5`), `Breakpoints` (`F11`) и `TextWizard` (`Ctrl+E`), а внизу — единая кнопка **Settings Hub (`Ctrl+,`)** и кнопка сворачивания панели (`Ctrl+B`).
+    - Из `Sidebar` удалены дублирующие кнопки вызова модалок настроек и утилит (`FilterDrawer`, `Mobile Setup`, `Root CA Certificates`, `Command Palette`).
+    - В `Sidebar` оставлены только чётко структурированные **рабочие вкладки и инструменты** с иконками, бейджами активности и короткими унифицированными названиями (в Этапе 42 `Breakpoints`, `Session Diff` и `TextWizard` переводятся в полноценные вкладки `ActiveNavSection`): `Traffic` (`Alt+1`), `Composer` (`Alt+2`), `AutoResponder` (`Alt+3`), `Breakpoints` (`F11` / `Alt+6`), `Scripts` (`Alt+5`), `Session Diff` (`Ctrl+D`) и `TextWizard` (`Ctrl+E`), а внизу — единая кнопка **Settings (`Ctrl+,`)** и кнопка сворачивания панели (`Ctrl+B`).
   - **`TopToolbar.tsx` (Верхняя панель управления захватом и сетью):**
     - Селектор **Throttling** (`Gauge` + текстовая метка `Throttle: Off` или имя активного пресета) всегда виден в сетевой группе тулбара рядом с `SysProxy` и `HTTPS MITM`, обеспечивая мгновенную обнаружимость троттлинга.
     - Рядом добавлена компактная кнопка-индикатор сетевых правил (`Routing / Certs`), отображающая число активных правил `HOSTS Remapping` / `Upstream Proxy` / `mTLS` и открывающая вкладку `Network & Routing` в едином центре настроек.
@@ -516,17 +518,17 @@
    - Перевести `SettingsModal.tsx` в полноэкранный режим (`fixed inset-0 h-screen w-screen max-h-none max-w-none m-0 rounded-none border-0`) с боковой навигацией по 6 разделам и поиском по настройкам:
      1) `general` (Proxy, Interfaces & Storage): порт, автопривязка SysProxy, единственный экземпляр `BindConfigSection`, `Follow Tail`, `Ring Buffer (Keep)`, `Drop Non-Matching`, `SQLite Archive (VACUUM / Clear on Exit)`. Удалить из `GeneralSettingsTab.tsx` дублирующий блок выбора темы `Dark/Light/System`.
      2) `networkRouting` (Throttling, HOSTS, Upstream Proxy & Timeouts): встроить полноценное управление `Bandwidth Throttling & Latency` (пресеты + Custom `↓/↑ Kbps, RTT ms`), полный редактор `HOSTS Remapping`, форму `Upstream Proxy Chaining (HTTP/HTTPS/SOCKS5)` и секцию `Upstream Timeouts` из Этапа 39.
-     3) `tlsCertificates` (HTTPS MITM, Certificates & Mobile): встроить полный редактор `TlsBypassTab` (Selective MITM, 11 Quick-Packs, Bulk Editor, Hit Counters), управление `Root CA Certificate`, хранилище `Client Certificates (mTLS)` и `Mobile Device Setup (QR / iOS & Android)`.
+     3) `tlsCertificates` (HTTPS MITM, Certificates & Mobile): встроить полный редактор `TlsBypassTab` (Selective MITM, 11 Quick-Packs, Bulk Editor, Hit Counters), карточку статуса `Root CA` (с быстрым переходом к компактному диалогу `CertificateModal.tsx`, сохраняемому по Этапу 42), хранилище `Client Certificates (mTLS)` и `Mobile Device Setup (QR / iOS & Android)`.
      4) `filters` (Filter Matrix, Hosts List, Thresholds & Headers): встроить полные вкладки `FilterMatrixTab`, `HostFiltersTab`, `ThresholdsTab` и `HeaderMutationsTab` напрямую (заменив урезанные списки из старых `FiltersSettingsTab`/`RulesProxySettingsTab` и отдельный диалог `FilterDrawer`).
      5) `uiColumns` (Appearance, Themes, Layout & Columns): галерея из 8 тем-пресетов + базовая схема `Dark/Light/System` + редактор палитры, компоновка панелей, группы тулбара и колонки `TrafficGrid`.
      6) `diagnosticsBackup` (Proxy Doctor & Settings Profile): встроенная панель самопроверки `Proxy Doctor` и экспорт/импорт/сброс `FluxUserSettingsProfile (schemaVersion: 1)`.
    - Направить все вызовы настроек из `TopToolbar`, `MenuBar`, `Sidebar`, `Footer` и `CommandPalette` в единый `SettingsModal` с переходом на нужную вкладку/подвкладку.
 
-2. Полноэкранный режим для инструментальных модальных окон:
-   - Перевести `BreakpointModal.tsx`, `TextWizardModal.tsx`, `SessionDiffView.tsx` (modal), `OpenApiExportModal.tsx`, `SanitizedExportModal.tsx`, `CodeSnippetModal.tsx` и `ShortcutsModal.tsx` на полноэкранный контейнер (`h-screen w-screen max-h-none max-w-none m-0 rounded-none border-0`).
+2. Разграничение с Этапом 42 (вкладки и полноэкранные экраны):
+   - В Этапе 38 полноэкранный контейнер применяется для `SettingsModal.tsx` (включая встроенные `Filters` и `Mobile Setup`); перевод рабочих инструментов (`Breakpoints`, `Session Diff`, `TextWizard`) в полноценные вкладки `ActiveNavSection` и перевод разовых экранов (`OpenApiExportModal.tsx`, `SanitizedExportModal.tsx`, `CodeSnippetModal.tsx`, `ShortcutsModal.tsx`) в полноэкранные при сохранении компактного `CertificateModal.tsx` (`Root CA`) выполняются в Этапе 42.
 
 3. Реорганизация навигации и устранение дублирования кнопок (`src/components/Sidebar.tsx`, `src/components/TopToolbar.tsx`, `src/components/MenuBar.tsx`, `src/components/SessionInspector.tsx`):
-   - В `Sidebar.tsx`: удалить кнопку свитча темы (`Sun`/`Moon`), удалить дублирующие кнопки `FilterDrawer`, `Session Diff`, `Mobile Setup`, `Root CA`, `Command Palette`; оставить рабочие секции `Traffic (Alt+1)`, `Composer (Alt+2)`, `AutoResponder (Alt+3)`, `Python Scripts (Alt+5)`, `Breakpoints (F11)`, `TextWizard (Ctrl+E)` и внизу кнопку `Settings (Ctrl+,)` + `Collapse Sidebar (Ctrl+B)`.
+   - В `Sidebar.tsx`: удалить кнопку свитча темы (`Sun`/`Moon`), удалить дублирующие кнопки `FilterDrawer`, `Mobile Setup`, `Root CA`, `Command Palette`; оставить рабочие секции `Traffic (Alt+1)`, `Composer (Alt+2)`, `AutoResponder (Alt+3)`, `Breakpoints (F11 / Alt+6)`, `Scripts (Alt+5)`, `Session Diff (Ctrl+D)`, `TextWizard (Ctrl+E)` (которые в Этапе 42 становятся полноценными вкладками с едиными короткими названиями) и внизу кнопку `Settings (Ctrl+,)` + `Collapse Sidebar (Ctrl+B)`.
    - В `TopToolbar.tsx`: сделать селектор `Throttling` (`Throttle: Off / Fast 3G / ...`) всегда видимым и подписанным в сетевой группе; удалить дублирующие кнопки `Mobile Setup`, `Session Diff`, `Hex`, `TextWizard`, `Save SQLite`, переключатели докинга инспектора `PanelBottom`/`PanelRight` (с учётом последующего добавления `CollapsedInspectorBar` и удаления `Split Composer` в Этапе 40), дубликат `Drop Non-Matching` в меню `Keep`, дубликат `Customize Toolbar` в поповере `Columns` и меню переполнения `•••`.
    - В `MenuBar.tsx`: удалить дублирующий индикатор `SysProxy: ON/OFF` справа и радио-пункты `Theme: Dark/Light/System` из меню `View`.
    - В `SessionInspector.tsx`: удалить дублирующую кнопку `Wizard` из верхней полосы сводки.
@@ -605,8 +607,94 @@
 
 ---
 
+## Этап 42: Архитектура экранов (полноценные вкладки, полноэкранные экраны и компактные диалоги) и единые лаконичные заголовки разделов
+**Приоритет: P1 (UI Architecture & Information Design) | Спринт 6 | Зависимости: Этапы 37, 38, 40**
+
+### Цель и контекст
+По итогам анализа кодовой базы и пользовательских UX-замечаний выявлены две системные проблемы информационной архитектуры интерфейса:
+1. **Громоздкие рабочие экраны зажаты в блокирующие модальные окна `<dialog>` (Замечание №1):**
+   - Аудит 15 диалогов `<dialog>` показывает, что многие полноценные рабочие инструменты и пошаговые руководства открываются как ограниченные модальные окна, мешая параллельной работе с трафиком:
+     - `BreakpointModal.tsx` (`970` строк, `h-[84vh] w-full max-w-5xl` в строке `321` — Monaco Editor, очередь перехваченных пакетов и конструктор `bpu`-правил);
+     - `SessionDiffView.tsx` (`677` строк, `h-[90vh] w-[95vw] max-w-7xl` в строке `633` — Monaco `DiffEditor` и сравнение двух сессий);
+     - `TextWizardModal.tsx` (`1098` строк, `w-full max-w-4xl` в строке `330`, `max-h-[74vh]` в строке `384` — 6 утилит: JWT, Base64, URL, HTML, Hex, Compression Codec);
+     - `FilterDrawer.tsx` (`422` строки + 5 вкладок в `src/components/filters/`, `h-[84vh] max-w-4xl` в строке `228`) и `MobileSetupModal.tsx` (`1137` строк, `max-h-[90vh] w-[min(880px,95vw)]` в строке `304` — пошаговые инструкции iOS/Android, XML-шаблон, QR-коды) — в Этапе 38 уже переносятся из узких модалок в полноэкранные разделы `Settings Hub`;
+     - `OpenApiExportModal.tsx`, `SanitizedExportModal.tsx`, `CodeSnippetModal.tsx` и `ShortcutsModal.tsx` — разовые экраны с Monaco Editor или многоколоночными справочниками, которым также тесно в узких окнах.
+   - При этом действительно компактные окна без перегруза элементами управления — в частности **`CertificateModal.tsx`** (*«HTTPS MITM Root Certificate Authority»*, `301` строка, `w-full max-w-xl` в строке `140`: статус доверия ОС, SHA-256, путь к `.cer` и две кнопки Trust/Uninstall), а также `SessionAnnotationModal.tsx`, `Import cURL` (`ComposerPanel.tsx:560`), `Quick Paste` (`TlsBypassTab.tsx:2099`), `CommandPalette.tsx` и диалоги подтверждения (`Purge SQLite`, `Reset Settings`, `Import Preview`) — удобны именно в виде компактных диалогов и не требуют растягивания на весь экран.
+   - *Утверждённая 3-уровневая архитектура экранов:*
+     - **Уровень 1 — Полноценные рабочие вкладки (`ActiveNavSection` в `<main>` и `Sidebar`):** `Traffic`, `Composer`, `AutoResponder`, **`Breakpoints`**, **`Scripts`**, **`Session Diff`**, **`TextWizard`** — неблокирующее переключение, сохранение черновиков и состояния при возврате в `Traffic`.
+     - **Уровень 2 — Полноэкранные экраны (`fixed inset-0 h-screen w-screen`):** `Settings` (`SettingsModal` из Этапа 38, включая полноэкранные `Filters` и `Mobile Setup`), `OpenAPI Export`, `Sanitized Export`, `Code Generator`, `Shortcuts`.
+     - **Уровень 3 — Компактные диалоги (`<dialog>`):** `Root CA` (`CertificateModal.tsx`), `Comment & Mark`, `Import cURL`, `Quick Paste`, `Command Palette`, подтверждения деструктивных действий.
+2. **Разнобой, билингвальные дубли и перегруженность заголовков разделов (Замечание №2):**
+   - В разных точках UI одни и те же разделы называются по-разному, смешивают русский и английский, включают технические библиотеки, подсказки или многоточия:
+     - `BreakpointModal.tsx:331` / `Sidebar.tsx:198`: `Интерактивные точки останова — Live Breakpoints` (билингвальный дубль);
+     - `SessionDiffView.tsx:639` / `MenuBar.tsx:1735`: `Session Diff — Сравнение двух HTTP/HTTPS сессий (Monaco DiffEditor)` vs `Session Diff (Compare)…`;
+     - `FilterDrawer.tsx:238` / `Sidebar.tsx:159` / `MenuBar.tsx:1311`: `Rules & Filter Matrix` / `Таблицы фильтров, Пресеты, Пороги шума & TLS Bypass` / `Filter Matrix & Header Mutations…`;
+     - `ComposerPanel.tsx:291` / `Sidebar.tsx:124` / `MenuBar.tsx:1624`: `API Composer — Click or Drag & Drop…` vs `Request Composer`;
+     - `ScriptingPanel.tsx:184` / `Sidebar.tsx:178` / `MenuBar.tsx:1322`: `Python Scripting Engine` vs `Python Scripting Engine — on_request / on_response`;
+     - `TextWizardModal.tsx:340` / `MenuBar.tsx:1744`: `TextWizard & JWT Decoder` vs `Text Wizard & JWT Decoder…`;
+     - `MobileSetupModal.tsx:317` / `Sidebar.tsx:246` / `MenuBar.tsx:1890`: `Connect Mobile Device` vs `Connect Mobile Device — iOS & Android Wi-Fi Proxy + QR Code`;
+     - `CertificateModal.tsx:149` / `Sidebar.tsx:266` / `MenuBar.tsx:1899`: `HTTPS MITM Root Certificate Authority` vs `HTTPS Root CA Certificate…`;
+     - `UpstreamProxyModal.tsx:331` (`Upstream Proxy Chaining…` с многоточием прямо в `<h2>`), `ProxyDoctorModal.tsx:215` (`Proxy Doctor — Диагностика сети и прокси`), `SettingsModal.tsx:609` vs `MenuBar.tsx:1089` (`Preferences & Settings Profile` vs `Preferences...`), `SessionAnnotationModal.tsx:136` (`Комментарий и цветовой маркер сессии (Comment / Mark)`), `ShortcutsModal.tsx:146` vs `MenuBar.tsx:1980` (`Горячие клавиши FluxProxy` vs `Keyboard Shortcuts…`).
+   - В результате в навигации и заголовках нет единой лаконичной системы, а подробную справку о назначении раздела негде прочитать внутри самой страницы.
+
+### Критерии приемки (DoD)
+- **1. Перевод `Breakpoints`, `Session Diff` и `TextWizard` в полноценные вкладки (`src/types/proxy.ts`, `src/stores/uiStore.ts`, `src/components/BreakpointsPanel.tsx`, `src/components/TextWizardPanel.tsx`, `src/components/SessionDiffView.tsx`, `src/components/Sidebar.tsx`, `src/App.tsx`):**
+  - Тип `ActiveNavSection` в `src/types/proxy.ts:413` расширен до `"traffic" | "composer" | "rules" | "breakpoints" | "scripts" | "diff" | "wizard"`.
+  - Из `BreakpointModal.tsx` и `TextWizardModal.tsx` выделены чистые панельные компоненты `src/components/BreakpointsPanel.tsx` и `src/components/TextWizardPanel.tsx`, а `SessionDiffView.tsx` используется в полноразмерном вкладочном режиме внутри `<main>` (оставляя при необходимости тонкую обёртку обратной совместимости или удаляя устаревшие модалки).
+  - Переключение между всеми 7 вкладками неблокирующее и **сохраняет рабочее состояние** (введённые данные в `TextWizard`, выбранную пару `A/B` в `Session Diff`, редактируемый пакет и правила в `Breakpoints`) при переходе обратно в `Traffic` и возврате.
+  - При срабатывании live breakpoint верхний `BreakpointBanner` виден на любой вкладке и ведёт в 1 клик на вкладку `Breakpoints` (опциональное автопереключение без блокирующего backdrop позволяет свободно сверяться с `Traffic` или `TextWizard` прямо во время паузы запроса).
+  - Горячие клавиши и навигация: `Alt+1` Traffic, `Alt+2` Composer, `Alt+3` AutoResponder, `Alt+4` Settings → Filters, `Alt+5` Scripts, `Alt+6` Breakpoints (сохраняя `F11` / `Alt+F11` / `Shift+F11` для arm/disarm), `Ctrl+D` → вкладка `Session Diff` (повторное нажатие возвращает в `Traffic`), `Ctrl+E` → вкладка `TextWizard`.
+- **2. Полноэкранные экраны и сохранение компактных диалогов:**
+  - Разовые тяжёлые экраны `OpenApiExportModal.tsx`, `SanitizedExportModal.tsx`, `CodeSnippetModal.tsx` и `ShortcutsModal.tsx` переведены на полноэкранный контейнер (`fixed inset-0 h-screen w-screen max-h-none max-w-none m-0 rounded-none border-0`), как и `SettingsModal.tsx` (Этап 38, включая встроенные `Filters` и `Mobile Setup`).
+  - Компактные диалоги без перегруза элементами управления сохраняют компактный размер: `CertificateModal.tsx` (`Root CA`, `max-w-xl`), `SessionAnnotationModal.tsx` (`Comment & Mark`), `Import cURL` в `ComposerPanel.tsx`, `Quick Paste` в `TlsBypassTab.tsx`, `CommandPalette.tsx` и подтверждения деструктивных действий (`Purge SQLite`, `Reset Settings`, `Import Preview`).
+- **3. Единый реестр лаконичных заголовков (`src/lib/sectionRegistry.ts`) и компонент шапки (`src/components/ui/SectionHeader.tsx`):**
+  - Создан централизованный реестр `SECTION_REGISTRY` с полями `id`, `title` (короткий заголовок из 1–2 слов без билингвальных дублей, скобок и многоточий), `shortcut`, `summary` (1-строчное описание на странице) и `details` (подробная справка *«О разделе»* с возможностями и сценариями работы, доступная прямо на странице).
+  - Утверждённые канонические названия во всём приложении (`Sidebar`, `MenuBar`, `CommandPalette`, `ShortcutsModal`, `SettingsModal`, `<h1>`/`<h2>`):
+    - **Рабочие вкладки:** `Traffic`, `Composer`, `AutoResponder`, `Breakpoints`, `Scripts`, `Session Diff`, `TextWizard`;
+    - **Разделы `Settings` (`Ctrl+,`):** `General`, `Network & Routing` (`Throttling`, `HOSTS Remapping`, `Upstream Proxy`, `Timeouts`), `TLS & Mobile` (`TLS Bypass`, `Client Certificates`, `Mobile Setup`), `Filters` (`Filter Matrix`, `Hosts List`, `Thresholds`, `Header Mutations`), `Appearance & Layout`, `Diagnostics & Backup` (`Proxy Doctor`, `Settings Profile`);
+    - **Полноэкранные экраны и компактные диалоги:** `Settings`, `Root CA`, `OpenAPI Export`, `Sanitized Export`, `Code Generator`, `Shortcuts`, `Comment & Mark`, `Import cURL`.
+  - Создан переиспользуемый компонент `src/components/ui/SectionHeader.tsx` (иконка, короткий `title`, однострочный `summary`, кнопка/поповер *«О разделе»* для раскрытия `details` и шорткатов прямо на экране, слот `actions`), внедрённый на всех вкладках и полноэкранных экранах.
+  - Обновлены тултипы `Sidebar.tsx`, пункты `MenuBar.tsx`, команды `CommandPalette.tsx` и таблица `ShortcutsModal.tsx` так, чтобы везде использовались только канонические заголовки из `SECTION_REGISTRY`.
+- **4. Тесты (`src/lib/sectionRegistry.test.ts`, `src/components/ui/SectionHeader.test.tsx`, `src/stores/uiStore.test.ts`):**
+  - Проверка контракта `SECTION_REGISTRY` (уникальные `id`, лаконичные `title` без `…` и смешения языков, непустые `summary` и `details`).
+  - Тесты `SectionHeader` (рендер канонического `title`/`summary`, раскрытие подробной справки по клику).
+  - Тест `uiStore` на переключение всех 7 значений `ActiveNavSection` (`traffic`, `composer`, `rules`, `breakpoints`, `scripts`, `diff`, `wizard`).
+
+### 📝 Промпт для Antigravity (Этап 42)
+
+```markdown
+Роль: Principal UI/UX Architect & Senior React/TypeScript Engineer (React 19 + TypeScript + Zustand 5 + Tailwind CSS).
+Проект: FluxProxy (Tauri v2 + Rust + React 19).
+
+Задача: Выполнить Этап 42 из ROADMAP.md — внедрить 3-уровневую архитектуру экранов (перевести `Breakpoints`, `Session Diff` и `TextWizard` в полноценные вкладки приложения, разовые тяжёлые инструменты — в полноэкранные экраны, сохранив компактным `CertificateModal` / `Root CA` и лёгкие поповеры) и привести все названия разделов к единым лаконичным заголовкам через `SECTION_REGISTRY` и `SectionHeader`.
+
+1. Перевод тяжёлых инструментов в полноценные вкладки (`src/types/proxy.ts`, `src/stores/uiStore.ts`, `src/components/BreakpointsPanel.tsx`, `src/components/TextWizardPanel.tsx`, `src/components/SessionDiffView.tsx`, `src/App.tsx`, `src/components/Sidebar.tsx`, `src/hooks/useGlobalShortcuts.ts`):
+   - Расширить `ActiveNavSection` до `"traffic" | "composer" | "rules" | "breakpoints" | "scripts" | "diff" | "wizard"`.
+   - Извлечь неблокирующие панельные компоненты `BreakpointsPanel.tsx` и `TextWizardPanel.tsx` из `BreakpointModal.tsx` и `TextWizardModal.tsx`, а `SessionDiffView.tsx` рендерить как полноценную вкладку в `<main>` с сохранением рабочего состояния при переключении вкладок.
+   - Настроить навигацию `Sidebar` и шорткаты: `Alt+1` Traffic, `Alt+2` Composer, `Alt+3` AutoResponder, `Alt+4` Settings → Filters, `Alt+5` Scripts, `Alt+6` Breakpoints (`F11`/`Alt+F11`/`Shift+F11` для arm/disarm), `Ctrl+D` → вкладка `Session Diff`, `Ctrl+E` → вкладка `TextWizard`.
+   - Обеспечить переход по клику на `BreakpointBanner` во вкладку `Breakpoints` без блокировки остального интерфейса при паузе запроса.
+
+2. Полноэкранные экраны и сохранение компактных диалогов:
+   - Перевести `OpenApiExportModal.tsx`, `SanitizedExportModal.tsx`, `CodeSnippetModal.tsx` и `ShortcutsModal.tsx` на полноэкранный контейнер (`fixed inset-0 h-screen w-screen max-h-none max-w-none m-0 rounded-none border-0`), дополняя полноэкранный `SettingsModal` из Этапа 38 (включая `Filters` и `Mobile Setup`).
+   - Явно сохранить компактными диалоги без перегруза элементами управления: `CertificateModal.tsx` (`Root CA`, `max-w-xl`), `SessionAnnotationModal.tsx` (`Comment & Mark`), `Import cURL`, `Quick Paste`, `CommandPalette` и диалоги подтверждения (`Purge SQLite`, `Reset Settings`, `Import Preview`).
+
+3. Единый реестр коротких заголовков и `SectionHeader` (`src/lib/sectionRegistry.ts`, `src/components/ui/SectionHeader.tsx`, `src/components/Sidebar.tsx`, `src/components/MenuBar.tsx`, `src/components/CommandPalette.tsx`, `src/components/ShortcutsModal.tsx`):
+   - Создать `SECTION_REGISTRY` (`id`, короткий `title`, `shortcut`, `summary`, `details`) с каноническими названиями:
+     - Вкладки: `Traffic`, `Composer`, `AutoResponder`, `Breakpoints`, `Scripts`, `Session Diff`, `TextWizard`;
+     - `Settings`: `General`, `Network & Routing`, `TLS & Mobile`, `Filters`, `Appearance & Layout`, `Diagnostics & Backup`;
+     - Экраны и диалоги: `Settings`, `Root CA`, `OpenAPI Export`, `Sanitized Export`, `Code Generator`, `Shortcuts`, `Comment & Mark`, `Import cURL`.
+   - Создать компонент `SectionHeader.tsx` с коротким заголовком, однострочным описанием и кнопкой/поповером «О разделе» (раскрывающим подробности на странице), встроить его во все вкладки и полноэкранные экраны и убрать из `<h1>`/`<h2>` и навигации билингвальные дубли, многоточия и названия внутренних библиотек.
+
+4. Тесты (Vitest):
+   - Добавить тесты контракта `SECTION_REGISTRY` (`sectionRegistry.test.ts`), рендера и справки `SectionHeader.tsx` и переключения всех 7 вкладок `ActiveNavSection` в `uiStore`.
+
+Проверка: `npm run typecheck`, `npm run test`, `npm run build`.
+```
+
+---
+
 ## Этап 41: Контекстно-зависимые ПКМ-меню по всему приложению (Context-Aware Right-Click Menus)
-**Приоритет: P1 / P2 (UI Architecture & Context Menus) | Спринт 6 | Зависимости: Этапы 37, 38, 40**
+**Приоритет: P1 / P2 (UI Architecture & Context Menus) | Спринт 6 | Зависимости: Этапы 37, 38, 40, 42**
 
 ### Цель и контекст
 По результатам аудита кодовой базы `src/` правый клик мыши (ПКМ) сейчас обработан только в двух точках таблицы трафика (`TrafficGrid.tsx:1027` — `handleHeaderContextMenu` на шапке колонок и `TrafficGrid.tsx:1207` — `handleRowContextMenu` на строке сессии), где вручную используются два отдельных `[popover="auto"]` элемента с жёсткими оценочными габаритами (`288×396` в `TrafficGrid.tsx:488-489`).
@@ -661,7 +749,7 @@
     - на записи лога и в области консоли: `Copy Log Line`, `Copy All Visible Logs`, переключатели фильтра (`All` / `stdout` / `stderr / errors`), `Toggle Auto-Scroll`, `Clear Console`.
   - **Каркас интерфейса (`TopToolbar`, `Sidebar`, `PanelResizeHandle`, `CollapsedInspectorBar`, `Footer`):**
     - `TopToolbar`: `Toggle Slim Toolbar (Ctrl+Shift+T)`, `Toggle Sidebar (Ctrl+B)`, `Reset Panel Layout`, `Customize UI & Columns… (Ctrl+,)` (плюс в поле поиска `Quick Filter`: `Cut / Copy / Paste / Select All`, `Clear Filter`, `Toggle RegExp`);
-    - `Sidebar`: `Open Section`, `Collapse Sidebar (Ctrl+B)`, `Open Settings Hub (Ctrl+,)`;
+    - `Sidebar` и новые вкладки из Этапа 42 (`Breakpoints`, `Session Diff`, `TextWizard`): пункты с каноническими названиями из `SECTION_REGISTRY` (`Open Section`, `Collapse Sidebar (Ctrl+B)`, `Open Settings (Ctrl+,)`), а также действия для элементов правил `Breakpoints` (`Enable / Disable Rule`, `Copy Pattern`, `Delete Rule`), панелей `Session Diff` (`Swap A ↔ B`, `Copy Diff Header`) и результатов `TextWizard` (`Copy Output`, `Clear Input`);
     - `PanelResizeHandle` и `CollapsedInspectorBar`: `Expand / Collapse Session Inspector`, `Dock Inspector at Bottom / Right`, `Toggle Request/Response Split`, `Reset Panel Layout`;
     - `Footer`: `Toggle Capture (F12)`, `Toggle System Proxy`, `Copy Proxy Address (127.0.0.1:<port>)`, `Copy CLI Proxy Env (HTTP_PROXY / HTTPS_PROXY)`, `Run Proxy Doctor (Ctrl+Shift+D)`, `Purge SQLite Archive…`.
 - **3. Тесты (`src/components/ui/ContextMenu.test.tsx`, `src/lib/contextMenuBuilders.test.ts`):**
@@ -691,7 +779,7 @@
    - `src/components/ComposerPanel.tsx`: контекстное меню для поля URL (`Paste & Import cURL`, `Copy as cURL`, `Clear`, операции буфера обмена) и строк заголовков (`Copy`, `Duplicate`, `Move Up/Down`, `Remove`, `Add`).
    - `src/components/AutoResponderPanel.tsx`: ПКМ-меню на карточке правила (`Enable/Disable`, `Duplicate`, `Copy Pattern`, `Delete`) и на пустом списке (`Add Rule`, `Toggle AutoResponder`).
    - `src/components/ScriptingPanel.tsx`: ПКМ-меню консоли логов (`Copy Line`, `Copy All Visible`, фильтр `All/stdout/errors`, `Auto-Scroll`, `Clear`).
-   - Каркас приложения (`TopToolbar.tsx`, `Sidebar.tsx`, `PanelResizeHandle`, `CollapsedInspectorBar.tsx`, `Footer` в `App.tsx`): релевантные действия для каждой зоны (`Slim Toolbar`, `Toggle Sidebar`, `Expand/Collapse/Dock Inspector`, `Reset Panel Layout`, `Copy Proxy Address`, `Copy CLI Env`, `Run Proxy Doctor`, `Purge SQLite`).
+   - Каркас приложения и новые вкладки (`TopToolbar.tsx`, `Sidebar.tsx`, `BreakpointsPanel.tsx`, `SessionDiffView.tsx`, `TextWizardPanel.tsx`, `PanelResizeHandle`, `CollapsedInspectorBar.tsx`, `Footer` в `App.tsx`): релевантные действия для каждой зоны с едиными названиями из `SECTION_REGISTRY` (`Slim Toolbar`, `Toggle Sidebar`, `Expand/Collapse/Dock Inspector`, `Reset Panel Layout`, `Copy Proxy Address`, `Copy CLI Env`, `Run Proxy Doctor`, `Purge SQLite`, действия правил `Breakpoints` и результатов `TextWizard`).
 
 3. Тесты (Vitest):
    - Протестировать позиционирование/клавиатурную навигацию `ContextMenu`, игнорирование `.monaco-editor` и состав пунктов меню для разных контекстных зон.
@@ -702,7 +790,7 @@
 ---
 
 ## Этап 12: Аналитика и визуализация: Waterfall Timeline и статистика трафика
-**Приоритет: P2 (Feature) | Спринт 6 | Зависимости: Этапы 34 ✅, 35, 39, 36, 37, 38, 40, 41**
+**Приоритет: P2 (Feature) | Спринт 6 | Зависимости: Этапы 34 ✅, 35, 39, 36, 37, 38, 40, 42, 41**
 
 ### Цель и контекст
 Для поиска узких мест производительности (последовательные «лесенки» запросов, тяжелые эндпоинты, всплески 4xx/5xx и P95-латентность) нужна наглядная временная диаграмма и агрегированная статистика по выборке сессий.
