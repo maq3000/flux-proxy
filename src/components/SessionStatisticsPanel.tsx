@@ -876,10 +876,12 @@ export const SessionStatisticsPanel: React.FC<SessionStatisticsPanelProps> = ({
                   Proxy ↔ Server
                 </span>
                 <span className="text-right text-fg">
-                  {transferStats?.serverAddr ||
-                    (transferStats?.serverIp && transferStats?.serverPort
-                      ? `${transferStats.serverIp}:${transferStats.serverPort}`
-                      : transferStats?.serverIp || summary.serverIp || "—")}
+                  {transferStats?.viaProxyAddr
+                    ? transferStats?.serverIp || summary.serverIp || "—"
+                    : transferStats?.serverAddr ||
+                      (transferStats?.serverIp && transferStats?.serverPort
+                        ? `${transferStats.serverIp}:${transferStats.serverPort}`
+                        : transferStats?.serverIp || summary.serverIp || "—")}
                   {transferStats?.serverConnId != null
                     ? ` (conn #${transferStats.serverConnId}`
                     : ""}
@@ -895,6 +897,15 @@ export const SessionStatisticsPanel: React.FC<SessionStatisticsPanelProps> = ({
                     : ""}
                 </span>
               </div>
+
+              {transferStats?.viaProxyAddr && (
+                <div className="flex items-start justify-between gap-2">
+                  <span className="text-muted">Upstream Proxy</span>
+                  <span className="text-right text-accent">
+                    {transferStats.viaProxyAddr}
+                  </span>
+                </div>
+              )}
 
               {(transferStats?.serverTlsVersion ||
                 transferStats?.serverTlsCipher ||

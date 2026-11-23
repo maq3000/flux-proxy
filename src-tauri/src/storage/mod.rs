@@ -706,6 +706,43 @@ impl TrafficStore {
         Some(detail_mut.summary.clone())
     }
 
+    /// Atomically appends a WebSocket frame in $O(1)$ and returns `(updated_summary, assigned_index)`
+    /// (`None` index if `max_frames` was already reached or no frame was supplied).
+    pub fn append_ws_frame_with_index(
+        &self,
+        id: u64,
+        frame: Option<WebSocketFrameRecord>,
+        total_bytes: usize,
+        max_frames: usize,
+    ) -> Option<(SessionSummary, Option<usize>)> {
+        if !self.sessions.contains_key(&id) {
+            return None;
+        }
+
+        let assigned_index = {
+            let mut acc = self.ws_streams.entry(id).or_default();
+            let idx = if let Some(mut rec) = frame {
+                if acc.frames.len() < max_frames {
+                    let next_idx = acc.frames.len() + 1;
+                    rec.index = next_idx;
+                    acc.frames.push(rec);
+                    Some(next_idx)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            acc.total_bytes = acc.total_bytes.max(total_bytes);
+            idx
+        };
+
+        let mut entry = self.sessions.get_mut(&id)?;
+        let detail_mut = Arc::make_mut(entry.value_mut());
+        detail_mut.summary.body_size = detail_mut.summary.body_size.max(total_bytes);
+        Some((detail_mut.summary.clone(), assigned_index))
+    }
+
     /// Incrementally appends a WebSocket frame in $O(1)$ without re-serializing all frames
     /// to JSON on every message. JSON preview is generated lazily on inspect or once on close.
     pub fn append_ws_frame(
@@ -715,25 +752,8 @@ impl TrafficStore {
         total_bytes: usize,
         max_frames: usize,
     ) -> Option<SessionSummary> {
-        if !self.sessions.contains_key(&id) {
-            return None;
-        }
-
-        {
-            let mut acc = self.ws_streams.entry(id).or_default();
-            if let Some(mut rec) = frame {
-                if acc.frames.len() < max_frames {
-                    rec.index = acc.frames.len() + 1;
-                    acc.frames.push(rec);
-                }
-            }
-            acc.total_bytes = acc.total_bytes.max(total_bytes);
-        }
-
-        let mut entry = self.sessions.get_mut(&id)?;
-        let detail_mut = Arc::make_mut(entry.value_mut());
-        detail_mut.summary.body_size = detail_mut.summary.body_size.max(total_bytes);
-        Some(detail_mut.summary.clone())
+        self.append_ws_frame_with_index(id, frame, total_bytes, max_frames)
+            .map(|(summary, _)| summary)
     }
 
     /// Updates an in-RAM paused session when its breakpoint await is cancelled (e.g., client disconnect),
@@ -824,7 +844,16 @@ impl TrafficStore {
         let prev_dur = detail_mut.summary.duration_ms;
         let next_dur = prev_dur.max(rounded_overall.round() as u64);
         detail_mut.summary.duration_ms = next_dur;
-        Some((detail_mut.summary.clone(), next_dur != prev_dur))
+        let timings_clone = detail_mut.timings.clone();
+        let stats_clone = detail_mut.transfer_stats.clone();
+        detail_mut
+            .summary
+            .apply_telemetry(timings_clone.as_ref(), stats_clone.as_ref());
+        let summary_clone = detail_mut.summary.clone();
+        let snapshot = detail_mut.clone();
+        drop(entry);
+        let _ = self.sqlite.sync_session_if_archived(&snapshot);
+        Some((summary_clone, next_dur != prev_dur))
     }
 
     pub fn get_in_ram(&self, id: u64) -> Option<SessionDetail> {
@@ -1956,6 +1985,52 @@ mod tests {
         }
         assert_eq!(store.len(), 512);
         assert_eq!(store.sqlite.count_sessions().unwrap(), 65);
+
+        drop(store);
+        cleanup_temp_db(&db_path);
+    }
+
+    #[test]
+    fn update_client_send_timing_syncs_summary_telemetry_and_duration_changed() {
+        let db_path = unique_temp_db("client_send_telemetry");
+        cleanup_temp_db(&db_path);
+
+        let store = TrafficStore::new(db_path.clone()).expect("init TrafficStore");
+        let id = store.allocate_id();
+        let mut detail = make_session(id, br#"{"ok":true}"#);
+        detail.summary.duration_ms = 10;
+        detail.timings = Some(crate::models::SessionTimings {
+            server_wait_ms: Some(12.5),
+            content_download_ms: Some(3.0),
+            ..Default::default()
+        });
+        detail.transfer_stats = Some(crate::models::SessionTransferStats {
+            request_headers_bytes: Some(100),
+            request_body_bytes: Some(25),
+            server_ip: Some("93.184.216.34".into()),
+            server_conn_reused: Some(false),
+            ..Default::default()
+        });
+        store.insert(detail);
+
+        let (summary, duration_changed) = store
+            .update_client_send_timing(
+                id,
+                "2026-11-23T12:00:01.000000Z".into(),
+                4.5,
+                25.0,
+            )
+            .expect("session exists");
+        assert!(duration_changed);
+        assert_eq!(summary.duration_ms, 25);
+        assert_eq!(summary.ttfb_ms, Some(12.5));
+        assert_eq!(summary.receive_ms, Some(3.0));
+        assert_eq!(summary.request_size, Some(125));
+        assert_eq!(summary.server_ip.as_deref(), Some("93.184.216.34"));
+        assert_eq!(summary.server_conn_reused, Some(false));
+
+        let stored = store.get(id).unwrap();
+        assert_eq!(stored.timings.unwrap().client_send_ms, Some(4.5));
 
         drop(store);
         cleanup_temp_db(&db_path);

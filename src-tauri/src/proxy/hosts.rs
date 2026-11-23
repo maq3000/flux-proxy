@@ -190,18 +190,66 @@ pub fn source_pattern_matches_host(pattern: &str, host: &str) -> bool {
     compile_glob_regex(&norm_pattern).is_some_and(|re| re.is_match(&norm_host))
 }
 
-fn match_specificity_rank(pattern: &str) -> (u8, usize) {
-    let norm = pattern.trim().trim_end_matches('.');
-    if !norm.contains('*') && !norm.contains('?') {
-        (2, norm.len())
-    } else if let Some(suffix) = norm.strip_prefix("*.") {
-        if !suffix.contains('*') && !suffix.contains('?') {
-            (1, suffix.len())
+#[derive(Debug, Clone)]
+struct CompiledHostRemapRule {
+    rule: HostRemapRule,
+    /// Precompiled glob regex for patterns containing `*`/`?` other than simple `*.suffix`.
+    glob_regex: Option<Regex>,
+    /// Precomputed `(tier, len)` specificity rank.
+    specificity: (u8, usize),
+}
+
+impl CompiledHostRemapRule {
+    fn compile(rule: HostRemapRule) -> Self {
+        let pat = rule
+            .source_pattern
+            .trim()
+            .trim_matches(['[', ']'])
+            .trim_end_matches('.');
+        let (glob_regex, specificity) = if !pat.contains('*') && !pat.contains('?') {
+            (None, (2, pat.len()))
+        } else if let Some(suffix) = pat.strip_prefix("*.") {
+            if !suffix.is_empty() && !suffix.contains('*') && !suffix.contains('?') {
+                (None, (1, suffix.len()))
+            } else {
+                (compile_glob_regex(pat), (0, pat.len()))
+            }
         } else {
-            (0, norm.len())
+            (compile_glob_regex(pat), (0, pat.len()))
+        };
+        Self {
+            rule,
+            glob_regex,
+            specificity,
         }
-    } else {
-        (0, norm.len())
+    }
+
+    fn matches_normalized(&self, norm_host: &str) -> bool {
+        if norm_host.is_empty() {
+            return false;
+        }
+        let pat = self.rule.source_pattern.as_str();
+        if pat.is_empty() {
+            return false;
+        }
+        if !pat.contains('*') && !pat.contains('?') {
+            return norm_host == pat;
+        }
+        if let Some(suffix) = pat.strip_prefix("*.") {
+            if !suffix.is_empty() && !suffix.contains('*') && !suffix.contains('?') {
+                if norm_host.len() <= suffix.len() + 1 {
+                    return false;
+                }
+                let Some(prefix_len) = norm_host.len().checked_sub(suffix.len()) else {
+                    return false;
+                };
+                return norm_host.ends_with(suffix)
+                    && norm_host.as_bytes().get(prefix_len - 1) == Some(&b'.');
+            }
+        }
+        self.glob_regex
+            .as_ref()
+            .is_some_and(|re| re.is_match(norm_host))
     }
 }
 
@@ -210,7 +258,7 @@ fn match_specificity_rank(pattern: &str) -> (u8, usize) {
 /// `Host` header & TLS SNI while opening TCP connections to the remapped target IP/port.
 #[derive(Debug, Default)]
 pub struct HostRemapRegistry {
-    rules: RwLock<Vec<HostRemapRule>>,
+    rules: RwLock<Vec<CompiledHostRemapRule>>,
 }
 
 impl HostRemapRegistry {
@@ -221,12 +269,13 @@ impl HostRemapRegistry {
     pub fn list_rules(&self) -> Vec<HostRemapRule> {
         self.rules
             .read()
-            .map(|g| g.clone())
+            .map(|g| g.iter().map(|c| c.rule.clone()).collect())
             .unwrap_or_default()
     }
 
     pub fn set_rules(&self, rules: Vec<HostRemapRule>) -> Result<Vec<HostRemapRule>, ProxyError> {
         let mut normalized = Vec::with_capacity(rules.len());
+        let mut compiled = Vec::with_capacity(rules.len());
         for (idx, rule) in rules.into_iter().enumerate() {
             let source_pattern = normalize_source_pattern(&rule.source_pattern)?;
             let target_host = normalize_target_host(&rule.target_host)?;
@@ -243,7 +292,7 @@ impl HostRemapRegistry {
                     trimmed.to_string()
                 }
             };
-            normalized.push(HostRemapRule {
+            let normalized_rule = HostRemapRule {
                 id,
                 enabled: rule.enabled,
                 source_pattern,
@@ -251,13 +300,15 @@ impl HostRemapRegistry {
                 target_port: rule.target_port,
                 preserve_host_header: rule.preserve_host_header,
                 comment: rule.comment.trim().to_string(),
-            });
+            };
+            compiled.push(CompiledHostRemapRule::compile(normalized_rule.clone()));
+            normalized.push(normalized_rule);
         }
 
         let mut guard = self.rules.write().map_err(|_| {
             ProxyError::Custom("Ошибка блокировки реестра HOSTS Remapping.".into())
         })?;
-        *guard = normalized.clone();
+        *guard = compiled;
         Ok(normalized)
     }
 
@@ -269,14 +320,14 @@ impl HostRemapRegistry {
         }
         let guard = self.rules.read().ok()?;
         let mut best: Option<((u8, usize), &HostRemapRule)> = None;
-        for rule in guard.iter() {
-            if !rule.enabled {
+        for compiled in guard.iter() {
+            if !compiled.rule.enabled {
                 continue;
             }
-            if source_pattern_matches_host(&rule.source_pattern, &norm_host) {
-                let rank = match_specificity_rank(&rule.source_pattern);
+            if compiled.matches_normalized(&norm_host) {
+                let rank = compiled.specificity;
                 if best.as_ref().map(|(best_rank, _)| rank > *best_rank).unwrap_or(true) {
-                    best = Some((rank, rule));
+                    best = Some((rank, &compiled.rule));
                 }
             }
         }
@@ -474,5 +525,43 @@ mod tests {
             .unwrap()
             .collect();
         assert!(!fallback_addrs.is_empty());
+    }
+
+    #[test]
+    fn precompiled_glob_and_wildcard_matching_and_rule_replacement() {
+        let registry = HostRemapRegistry::new();
+        registry
+            .set_rules(vec![
+                sample_rule("glob-q", "api-?.corp.local", "10.0.1.1", Some(8001)),
+                sample_rule("glob-star", "edge-*.corp.local", "10.0.1.2", Some(8002)),
+                sample_rule("wild", "*.svc.corp.local", "10.0.1.3", Some(8003)),
+            ])
+            .unwrap();
+
+        assert_eq!(registry.match_host("API-7.CORP.LOCAL").unwrap().id, "glob-q");
+        assert!(registry.match_host("api-12.corp.local").is_none());
+        assert_eq!(
+            registry.match_host("edge-eu-west.corp.local:8443").unwrap().id,
+            "glob-star"
+        );
+        assert_eq!(
+            registry.match_host("pay.svc.corp.local").unwrap().id,
+            "wild"
+        );
+
+        // Replacing rules via `set_rules` compiles new rules and drops old ones.
+        registry
+            .set_rules(vec![sample_rule(
+                "new-glob",
+                "svc-*-v2.corp.local",
+                "127.0.0.1",
+                Some(9001),
+            )])
+            .unwrap();
+        assert!(registry.match_host("api-7.corp.local").is_none());
+        assert_eq!(
+            registry.match_host("svc-auth-v2.corp.local").unwrap().id,
+            "new-glob"
+        );
     }
 }

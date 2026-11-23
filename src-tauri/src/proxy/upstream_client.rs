@@ -26,8 +26,8 @@ use tower_service::Service;
 use crate::models::{HeaderPair, UpstreamProxyProtocol};
 use crate::proxy::hosts::HostRemapRegistry;
 use crate::proxy::upstream_proxy::{
-    connect_http_proxy_direct, connect_tunnel_via_upstream, proxy_authorization_header_value,
-    UpstreamProxyManager, UpstreamTransportStream,
+    connect_http_proxy_direct, connect_tunnel_via_upstream, format_via_proxy_telemetry,
+    proxy_authorization_header_value, UpstreamProxyManager, UpstreamTransportStream,
 };
 
 const CONNECT_TIMEOUT_DEFAULT: Duration = Duration::from_secs(15);
@@ -178,6 +178,7 @@ pub struct UpstreamConnMeta {
     pub cert_issuer: Option<String>,
     pub mtls_cn: Option<String>,
     pub remapped_target: Option<String>,
+    pub via_proxy_addr: Option<String>,
     pub is_tls: bool,
     pub via_http_proxy: bool,
     claimed: AtomicBool,
@@ -494,10 +495,12 @@ impl Service<Uri> for InstrumentedConnector {
                     }
                     .map_err(UpstreamConnectorError)?;
 
+                    let (via_proxy_addr, via_server_ip) =
+                        format_via_proxy_telemetry(proxy_cfg.protocol, tunnel.proxy_addr);
                     let meta = Arc::new(UpstreamConnMeta {
                         conn_id,
                         server_addr: tunnel.proxy_addr,
-                        server_ip: tunnel.proxy_addr.ip().to_string(),
+                        server_ip: via_server_ip,
                         server_port: tunnel.proxy_addr.port(),
                         dns_ms: tunnel.dns_ms,
                         tcp_connect_ms: tunnel.tcp_connect_ms,
@@ -511,6 +514,7 @@ impl Service<Uri> for InstrumentedConnector {
                         cert_issuer: None,
                         mtls_cn,
                         remapped_target,
+                        via_proxy_addr: Some(via_proxy_addr),
                         is_tls: false,
                         via_http_proxy: is_http_proxy,
                         claimed: AtomicBool::new(false),
@@ -563,10 +567,12 @@ impl Service<Uri> for InstrumentedConnector {
                     cert_issuer,
                 } = extract_tls_conn_details(tls_stream.get_ref().1);
 
+                let (via_proxy_addr, via_server_ip) =
+                    format_via_proxy_telemetry(proxy_cfg.protocol, tunnel.proxy_addr);
                 let meta = Arc::new(UpstreamConnMeta {
                     conn_id,
                     server_addr: tunnel.proxy_addr,
-                    server_ip: tunnel.proxy_addr.ip().to_string(),
+                    server_ip: via_server_ip,
                     server_port: tunnel.proxy_addr.port(),
                     dns_ms: tunnel.dns_ms,
                     tcp_connect_ms: tunnel.tcp_connect_ms,
@@ -580,6 +586,7 @@ impl Service<Uri> for InstrumentedConnector {
                     cert_issuer,
                     mtls_cn,
                     remapped_target,
+                    via_proxy_addr: Some(via_proxy_addr),
                     is_tls: true,
                     via_http_proxy: false,
                     claimed: AtomicBool::new(false),
@@ -683,6 +690,7 @@ impl Service<Uri> for InstrumentedConnector {
                     cert_issuer: None,
                     mtls_cn,
                     remapped_target,
+                    via_proxy_addr: None,
                     is_tls: false,
                     via_http_proxy: false,
                     claimed: AtomicBool::new(false),
@@ -742,6 +750,7 @@ impl Service<Uri> for InstrumentedConnector {
                 cert_issuer,
                 mtls_cn,
                 remapped_target,
+                via_proxy_addr: None,
                 is_tls: true,
                 via_http_proxy: false,
                 claimed: AtomicBool::new(false),
@@ -1016,28 +1025,13 @@ impl UpstreamHttpClient {
         let proxy_begin_request_utc = Utc::now();
         let proxy_begin_request_at = format_rfc3339_micros(proxy_begin_request_utc);
 
-        let (tracked_body, send_tracker) = TrackedRequestBody::new(body);
-        let mut builder = Request::builder().method(method).uri(uri.clone());
+        let mut request_uri = uri.clone();
+        let mut effective_host_override = host_header_override.map(str::to_owned);
+        let mut proxy_auth_header: Option<String> = None;
 
-        for (name, value) in headers {
-            if let (Ok(hn), Ok(hv)) = (
-                HeaderName::from_bytes(name.as_bytes()),
-                HeaderValue::from_str(value),
-            ) {
-                builder = builder.header(hn, hv);
-            }
-        }
-        if let Some(host_val) = host_header_override {
-            if let Ok(hv) = HeaderValue::from_str(host_val) {
-                builder = builder.header(HOST, hv);
-            }
-        }
         if uri
             .scheme_str()
             .is_some_and(|s| s.eq_ignore_ascii_case("http"))
-            && !headers
-                .iter()
-                .any(|(n, _)| n.eq_ignore_ascii_case(PROXY_AUTHORIZATION.as_str()))
         {
             if let (Some(ref mgr), Some(orig_host)) = (&self.upstream_proxy, uri.host()) {
                 let orig_port = uri.port_u16().unwrap_or(80);
@@ -1045,23 +1039,80 @@ impl UpstreamHttpClient {
                     .host_remap
                     .as_ref()
                     .and_then(|reg| reg.match_host(orig_host));
+                let remap_target_port = remap_rule
+                    .as_ref()
+                    .map(|r| r.target_port.unwrap_or(orig_port));
                 if let Some(proxy_cfg) = mgr.resolve_for_target(
                     orig_host,
                     orig_port,
                     remap_rule.as_ref().map(|r| r.target_host.as_str()),
-                    remap_rule.as_ref().and_then(|r| r.target_port),
+                    remap_target_port,
                 ) {
                     if matches!(
                         proxy_cfg.protocol,
                         UpstreamProxyProtocol::Http | UpstreamProxyProtocol::Https
                     ) {
-                        if let Some(auth_val) = proxy_authorization_header_value(&proxy_cfg) {
-                            if let Ok(hv) = HeaderValue::from_str(&auth_val) {
-                                builder = builder.header(PROXY_AUTHORIZATION, hv);
+                        if !headers
+                            .iter()
+                            .any(|(n, _)| n.eq_ignore_ascii_case(PROXY_AUTHORIZATION.as_str()))
+                        {
+                            proxy_auth_header = proxy_authorization_header_value(&proxy_cfg);
+                        }
+                        if let Some(rule) = remap_rule {
+                            let target_port = rule.target_port.unwrap_or(orig_port);
+                            let target_host_fmt =
+                                HostRemapRegistry::format_host_for_authority(&rule.target_host);
+                            let target_authority = if target_port == 80 {
+                                target_host_fmt
+                            } else {
+                                format!("{target_host_fmt}:{target_port}")
+                            };
+                            let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+                            if let Ok(remapped_uri) =
+                                format!("http://{target_authority}{pq}").parse::<Uri>()
+                            {
+                                request_uri = remapped_uri;
+                            }
+                            if rule.preserve_host_header {
+                                if effective_host_override.is_none()
+                                    && !headers
+                                        .iter()
+                                        .any(|(n, _)| n.eq_ignore_ascii_case(HOST.as_str()))
+                                {
+                                    effective_host_override =
+                                        uri.authority().map(|a| a.as_str().to_string());
+                                }
+                            } else if effective_host_override.is_none() {
+                                effective_host_override = Some(target_authority);
                             }
                         }
                     }
                 }
+            }
+        }
+
+        let (tracked_body, send_tracker) = TrackedRequestBody::new(body);
+        let mut builder = Request::builder().method(method).uri(request_uri);
+
+        for (name, value) in headers {
+            if effective_host_override.is_some() && name.eq_ignore_ascii_case(HOST.as_str()) {
+                continue;
+            }
+            if let (Ok(hn), Ok(hv)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                builder = builder.header(hn, hv);
+            }
+        }
+        if let Some(host_val) = effective_host_override.as_deref() {
+            if let Ok(hv) = HeaderValue::from_str(host_val) {
+                builder = builder.header(HOST, hv);
+            }
+        }
+        if let Some(auth_val) = proxy_auth_header.as_deref() {
+            if let Ok(hv) = HeaderValue::from_str(auth_val) {
+                builder = builder.header(PROXY_AUTHORIZATION, hv);
             }
         }
 
@@ -1249,10 +1300,14 @@ impl UpstreamHttpClient {
                 ))
             })?;
 
-            // Strip sensitive headers on cross-origin redirect
-            let same_origin = base.scheme() == next_parsed.scheme()
-                && base.host_str() == next_parsed.host_str()
+            // Strip stale Host on authority change and sensitive headers on cross-origin redirect
+            let same_authority = base.host_str() == next_parsed.host_str()
                 && base.port_or_known_default() == next_parsed.port_or_known_default();
+            if !same_authority {
+                current_headers.retain(|(name, _)| !name.eq_ignore_ascii_case(HOST.as_str()));
+                current_host_override = None;
+            }
+            let same_origin = base.scheme() == next_parsed.scheme() && same_authority;
             if !same_origin {
                 current_headers.retain(|(name, _)| {
                     !name.eq_ignore_ascii_case(AUTHORIZATION.as_str())
@@ -1326,6 +1381,7 @@ mod tests {
             cert_issuer: Some("CN=Example CA".into()),
             mtls_cn: None,
             remapped_target: None,
+            via_proxy_addr: None,
             is_tls: true,
             via_http_proxy: false,
             claimed: AtomicBool::new(false),
@@ -1411,5 +1467,268 @@ mod tests {
         assert_eq!(second_claimed.dns_ms, 0.0);
         assert_eq!(second_claimed.tcp_connect_ms, 0.0);
         assert_eq!(second_claimed.tls_handshake_ms, None);
+    }
+
+    #[tokio::test]
+    async fn send_following_redirects_strips_host_header_on_authority_change() {
+        use std::sync::Mutex;
+
+        let seen_hosts: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+        let seen_b = Arc::clone(&seen_hosts);
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener_b.accept().await {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let seen = Arc::clone(&seen_b);
+                    async move {
+                        let host = req
+                            .headers()
+                            .get(HOST)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        seen.lock().unwrap().push(host.clone());
+                        let body = format!("host={}", host.unwrap_or_default());
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(body))))
+                    }
+                });
+                let _ = AutoConnBuilder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
+            }
+        });
+
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener_a.accept().await {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(move |_req: Request<Incoming>| async move {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::FOUND)
+                            .header(http::header::LOCATION, format!("http://{addr_b}/dest"))
+                            .body(Full::new(Bytes::new()))
+                            .unwrap(),
+                    )
+                });
+                let _ = AutoConnBuilder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
+            }
+        });
+
+        let client = UpstreamHttpClient::build(None, None, None).unwrap();
+        let headers = vec![("Host".to_string(), addr_a.to_string())];
+        let ex = client
+            .send_following_redirects(
+                Method::GET,
+                &format!("http://{addr_a}/start"),
+                &headers,
+                Some(&addr_a.to_string()),
+                Bytes::new(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ex.response.status(), StatusCode::OK);
+        use http_body_util::BodyExt;
+        let body = ex.response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            format!("host={addr_b}")
+        );
+        assert_eq!(
+            seen_hosts.lock().unwrap().as_slice(),
+            &[Some(addr_b.to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_via_http_proxy_with_host_remap_rewrites_target_and_sets_via_telemetry() {
+        use crate::models::{HostRemapRule, UpstreamProxyConfig};
+        use std::sync::Mutex;
+
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = target_listener.accept().await {
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(|req: Request<Incoming>| async move {
+                        let host = req
+                            .headers()
+                            .get(HOST)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(format!(
+                            "host={host};path={}",
+                            req.uri().path()
+                        )))))
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        type RecordedProxyRequests = Arc<Mutex<Vec<(String, Option<String>)>>>;
+        let recorded_proxy_uris: RecordedProxyRequests = Arc::new(Mutex::new(Vec::new()));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let recorded_srv = Arc::clone(&recorded_proxy_uris);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = proxy_listener.accept().await {
+                let recorded = Arc::clone(&recorded_srv);
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let recorded = Arc::clone(&recorded);
+                        async move {
+                            let uri_str = req.uri().to_string();
+                            let host_hdr = req
+                                .headers()
+                                .get(HOST)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_owned);
+                            recorded.lock().unwrap().push((uri_str, host_hdr.clone()));
+
+                            let authority = req.uri().authority().unwrap().as_str().to_string();
+                            let path = req
+                                .uri()
+                                .path_and_query()
+                                .map(|p| p.as_str())
+                                .unwrap_or("/");
+                            let mut target_tcp = TcpStream::connect(&authority).await.unwrap();
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                            let raw_req = format!(
+                                "GET {path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                                host_hdr.unwrap_or(authority)
+                            );
+                            target_tcp.write_all(raw_req.as_bytes()).await.unwrap();
+                            let mut raw_resp = Vec::new();
+                            let _ = target_tcp.read_to_end(&mut raw_resp).await;
+                            let body_bytes = raw_resp
+                                .windows(4)
+                                .position(|w| w == b"\r\n\r\n")
+                                .map(|pos| raw_resp[pos + 4..].to_vec())
+                                .unwrap_or_default();
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(body_bytes))))
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        let host_remap = Arc::new(HostRemapRegistry::new());
+        host_remap
+            .set_rules(vec![HostRemapRule {
+                id: "http-proxy-remap".into(),
+                enabled: true,
+                source_pattern: "api.virtual-proxy.invalid".into(),
+                target_host: "127.0.0.1".into(),
+                target_port: Some(target_addr.port()),
+                preserve_host_header: true,
+                comment: String::new(),
+            }])
+            .unwrap();
+
+        let upstream_proxy = Arc::new(UpstreamProxyManager::new());
+        upstream_proxy
+            .set_config(UpstreamProxyConfig {
+                enabled: true,
+                protocol: UpstreamProxyProtocol::Http,
+                host: "127.0.0.1".into(),
+                port: proxy_addr.port(),
+                username: None,
+                password: None,
+                has_password: false,
+                bypass_list: Vec::new(),
+            })
+            .unwrap();
+
+        let client = UpstreamHttpClient::build(
+            Some(Arc::clone(&host_remap)),
+            Some(Arc::clone(&upstream_proxy)),
+            None,
+        )
+        .unwrap();
+
+        let ex1 = client
+            .send_request(
+                Method::GET,
+                "http://api.virtual-proxy.invalid/probe",
+                &[],
+                None,
+                Bytes::new(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let meta1 = ex1.conn_meta.as_ref().unwrap().clone();
+        assert_eq!(meta1.server_ip, format!("via {proxy_addr}"));
+        assert_eq!(
+            meta1.via_proxy_addr.as_deref(),
+            Some(format!("HTTP {proxy_addr}").as_str())
+        );
+        use http_body_util::BodyExt;
+        let body1 = ex1.response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            String::from_utf8_lossy(&body1),
+            "host=api.virtual-proxy.invalid;path=/probe"
+        );
+
+        // Now with preserve_host_header = false
+        host_remap
+            .set_rules(vec![HostRemapRule {
+                id: "http-proxy-remap".into(),
+                enabled: true,
+                source_pattern: "api.virtual-proxy.invalid".into(),
+                target_host: "127.0.0.1".into(),
+                target_port: Some(target_addr.port()),
+                preserve_host_header: false,
+                comment: String::new(),
+            }])
+            .unwrap();
+
+        let ex2 = client
+            .send_request(
+                Method::GET,
+                "http://api.virtual-proxy.invalid/override",
+                &[],
+                None,
+                Bytes::new(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let body2 = ex2.response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            String::from_utf8_lossy(&body2),
+            format!("host={target_addr};path=/override")
+        );
+
+        let recorded = recorded_proxy_uris.lock().unwrap();
+        assert_eq!(
+            recorded[0],
+            (
+                format!("http://{target_addr}/probe"),
+                Some("api.virtual-proxy.invalid".to_string())
+            )
+        );
+        assert_eq!(
+            recorded[1],
+            (
+                format!("http://{target_addr}/override"),
+                Some(target_addr.to_string())
+            )
+        );
     }
 }

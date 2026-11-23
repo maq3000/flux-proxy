@@ -1033,9 +1033,15 @@ export function formatFiddlerStatisticsText(
   lines.push(
     `  Client:               ${detail.clientAddr || "—"} (reused=${stats?.clientConnReused ?? "—"}, proto=${stats?.clientHttpVersion || s.protocol})`
   );
+  const serverDisplay = stats?.viaProxyAddr
+    ? stats?.serverIp || s.serverIp || s.host
+    : stats?.serverAddr || stats?.serverIp || s.serverIp || s.host;
   lines.push(
-    `  Server:               ${stats?.serverAddr || stats?.serverIp || s.serverIp || s.host} (reused=${stats?.serverConnReused ?? s.serverConnReused ?? "—"}, proto=${stats?.serverHttpVersion || "—"})`
+    `  Server:               ${serverDisplay} (reused=${stats?.serverConnReused ?? s.serverConnReused ?? "—"}, proto=${stats?.serverHttpVersion || "—"})`
   );
+  if (stats?.viaProxyAddr) {
+    lines.push(`  Upstream Proxy:       ${stats.viaProxyAddr}`);
+  }
   if (stats?.serverTlsVersion || stats?.serverTlsCipher || detail.tlsVersion) {
     lines.push(
       `  Server TLS:           ${stats?.serverTlsVersion || detail.tlsVersion || "—"} ${stats?.serverTlsCipher ? `(${stats.serverTlsCipher})` : ""} ${stats?.serverTlsAlpn ? `ALPN=${stats.serverTlsAlpn}` : ""}`.trimEnd()

@@ -84,6 +84,7 @@ export interface SessionTransferStats {
   serverCertIssuer?: string | null;
   serverMtlsCn?: string | null;
   remappedTarget?: string | null;
+  viaProxyAddr?: string | null;
   isStreaming?: boolean | null;
 }
 
@@ -341,6 +342,7 @@ export interface ComposedRequest {
   body: string;
   bodyBase64?: string | null;
   followRedirects: boolean;
+  skipPythonScripts?: boolean;
 }
 
 export interface CaCertificateInfo {

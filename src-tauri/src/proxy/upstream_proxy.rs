@@ -574,6 +574,20 @@ impl UpstreamProxyManager {
     }
 }
 
+/// Formats `(via_proxy_addr, server_ip_label)` for upstream proxy telemetry:
+/// e.g. `("SOCKS5 127.0.0.1:1080", "via 127.0.0.1:1080")`.
+pub fn format_via_proxy_telemetry(
+    protocol: UpstreamProxyProtocol,
+    proxy_addr: SocketAddr,
+) -> (String, String) {
+    let proto = match protocol {
+        UpstreamProxyProtocol::Http => "HTTP",
+        UpstreamProxyProtocol::Https => "HTTPS",
+        UpstreamProxyProtocol::Socks5 => "SOCKS5",
+    };
+    (format!("{proto} {proxy_addr}"), format!("via {proxy_addr}"))
+}
+
 /// Formats `Basic <base64(user:pass)>` for `Proxy-Authorization` when credentials are configured.
 pub fn proxy_authorization_header_value(cfg: &UpstreamProxyConfig) -> Option<String> {
     if !cfg.has_credentials() {

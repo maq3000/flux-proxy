@@ -307,5 +307,16 @@ describe("requestStatistics", () => {
     expect(tip).toContain("DNS 12.40 ms");
     expect(tip).toContain("TTFB 24.50 ms");
     expect(tip).toContain("Server IP: 93.184.216.34");
+
+    const proxiedDetail = makeSampleDetail();
+    proxiedDetail.summary.serverIp = "via 10.0.0.2:8080";
+    if (proxiedDetail.transferStats) {
+      proxiedDetail.transferStats.serverAddr = null;
+      proxiedDetail.transferStats.serverIp = "via 10.0.0.2:8080";
+      proxiedDetail.transferStats.viaProxyAddr = "HTTP 10.0.0.2:8080";
+    }
+    const proxiedTxt = formatFiddlerStatisticsText(proxiedDetail);
+    expect(proxiedTxt).toContain("via 10.0.0.2:8080");
+    expect(proxiedTxt).toContain("Upstream Proxy:       HTTP 10.0.0.2:8080");
   });
 });

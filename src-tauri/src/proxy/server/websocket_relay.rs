@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,24 +24,26 @@ use tokio_tungstenite::WebSocketStream;
 
 use crate::models::{
     HeaderMutationDirection, HeaderPair, ProxyError, SessionDetail, SessionSummary, SessionTimings,
-    SessionTransferStats, WebSocketFrameRecord, WsInjectDirection,
+    SessionTransferStats, UpstreamProxyProtocol, WebSocketFrameRecord, WsInjectDirection,
 };
 use crate::proxy::filters::is_alt_svc_header;
+use crate::proxy::hosts::HostRemapRegistry;
 use crate::proxy::network::normalize_client_ip;
 use crate::proxy::process::ClientProcessInfo;
+use crate::proxy::throttle::ThrottledStream;
 use crate::proxy::upstream_client::{
     default_root_store, duration_ms_f64, elapsed_ms, estimate_request_headers_bytes,
     estimate_response_headers_bytes, extract_peer_cert_subject_issuer, format_rfc3339_micros,
     format_tls_cipher, format_tls_protocol, timestamp_at_instant,
 };
-use crate::proxy::upstream_proxy::connect_tunnel_via_upstream;
+use crate::proxy::upstream_proxy::{connect_tunnel_via_upstream, format_via_proxy_telemetry};
 
 use super::http_handler::format_error_chain;
 use super::{
     boxed_full, extract_hyper_headers, format_mitm_tls_display, format_raw_http_version,
     is_hop_by_hop_header, parse_host_and_optional_port, plain_response, record_and_return_error,
-    record_completed_session, ClientConnContext, ProxyBoxBody, SharedProxyContext,
-    MAX_CAPTURED_BODY_BYTES,
+    record_and_return_error_with_opts, record_completed_session, should_use_host_mtls_for_peer,
+    ClientConnContext, ProxyBoxBody, SharedProxyContext, MAX_CAPTURED_BODY_BYTES,
 };
 
 pub const MAX_WS_INJECT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024; // 16 MiB safety cap
@@ -97,97 +99,264 @@ struct WsServerConnTelemetry {
     server_addr: Option<String>,
     server_ip: Option<String>,
     server_port: Option<u16>,
+    via_proxy_addr: Option<String>,
+    dns_ms: Option<f64>,
+    tcp_connect_ms: Option<f64>,
+    tls_handshake_ms: Option<f64>,
+    server_connected_at: Option<String>,
     server_tls_version: Option<String>,
     server_tls_cipher: Option<String>,
     server_tls_alpn: Option<String>,
     server_cert_subject: Option<String>,
     server_cert_issuer: Option<String>,
+    server_mtls_cn: Option<String>,
 }
 
-fn extract_ws_server_telemetry(
-    stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-) -> WsServerConnTelemetry {
-    match stream {
-        tokio_tungstenite::MaybeTlsStream::Plain(tcp) => {
-            let peer = tcp.peer_addr().ok();
-            WsServerConnTelemetry {
-                server_addr: peer.map(|a| a.to_string()),
-                server_ip: peer.map(|a| a.ip().to_string()),
-                server_port: peer.map(|a| a.port()),
-                server_tls_version: None,
-                server_tls_cipher: None,
-                server_tls_alpn: None,
-                server_cert_subject: None,
-                server_cert_issuer: None,
-            }
+struct WsTcpConnectResult {
+    stream: tokio::net::TcpStream,
+    peer_addr: SocketAddr,
+    dns_ms: f64,
+    tcp_connect_ms: f64,
+}
+
+async fn measure_ws_tcp_connect(
+    connect_host: &str,
+    connect_port: u16,
+    timeout: Duration,
+) -> Result<WsTcpConnectResult, String> {
+    let deadline = Instant::now() + timeout;
+    let clean_host = connect_host.trim().trim_matches(['[', ']']);
+    let (addrs, dns_ms): (Vec<SocketAddr>, f64) = if let Ok(ip) = clean_host.parse::<IpAddr>() {
+        (vec![SocketAddr::new(ip, connect_port)], 0.0)
+    } else {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "WebSocket DNS lookup timed out for {connect_host}:{connect_port}"
+            ));
         }
-        tokio_tungstenite::MaybeTlsStream::Rustls(tls) => {
-            let (tcp, conn) = tls.get_ref();
-            let peer = tcp.peer_addr().ok();
-            let (cert_subject, cert_issuer) = conn
-                .peer_certificates()
-                .and_then(|certs| certs.first())
-                .map(|leaf| extract_peer_cert_subject_issuer(leaf.as_ref()))
-                .unwrap_or((None, None));
-            WsServerConnTelemetry {
-                server_addr: peer.map(|a| a.to_string()),
-                server_ip: peer.map(|a| a.ip().to_string()),
-                server_port: peer.map(|a| a.port()),
-                server_tls_version: conn.protocol_version().map(format_tls_protocol),
-                server_tls_cipher: conn.negotiated_cipher_suite().map(format_tls_cipher),
-                server_tls_alpn: conn
-                    .alpn_protocol()
-                    .map(|b| String::from_utf8_lossy(b).into_owned()),
-                server_cert_subject: cert_subject,
-                server_cert_issuer: cert_issuer,
-            }
+        let dns_start = Instant::now();
+        let resolved_iter = tokio::time::timeout(
+            remaining,
+            tokio::net::lookup_host((clean_host, connect_port)),
+        )
+        .await
+        .map_err(|_| {
+            format!("WebSocket DNS lookup timed out for {connect_host}:{connect_port}")
+        })?
+        .map_err(|e| {
+            format!("WebSocket DNS lookup failed for {connect_host}:{connect_port}: {e}")
+        })?;
+        let collected: Vec<SocketAddr> = resolved_iter.collect();
+        if collected.is_empty() {
+            return Err(format!(
+                "WebSocket DNS lookup returned no addresses for {connect_host}:{connect_port}"
+            ));
         }
-        _ => WsServerConnTelemetry {
-            server_addr: None,
-            server_ip: None,
-            server_port: None,
-            server_tls_version: None,
-            server_tls_cipher: None,
-            server_tls_alpn: None,
-            server_cert_subject: None,
-            server_cert_issuer: None,
-        },
+        (collected, elapsed_ms(dns_start))
+    };
+
+    let tcp_start = Instant::now();
+    let mut tcp_opt = None;
+    let mut last_err = None;
+    for addr in addrs {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            last_err = Some(format!("timed out after {}s", timeout.as_secs()));
+            break;
+        }
+        match tokio::time::timeout(remaining, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => {
+                let _ = stream.set_nodelay(true);
+                tcp_opt = Some(stream);
+                break;
+            }
+            Ok(Err(e)) => last_err = Some(format!("{addr}: {e}")),
+            Err(_) => last_err = Some(format!("{addr}: timed out")),
+        }
     }
+
+    let stream = tcp_opt.ok_or_else(|| {
+        format!(
+            "WebSocket TCP connect failed for {connect_host}:{connect_port}: {}",
+            last_err.unwrap_or_else(|| "no reachable address".to_string())
+        )
+    })?;
+    let tcp_connect_ms = elapsed_ms(tcp_start);
+    let peer_addr = stream
+        .peer_addr()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], connect_port)));
+    Ok(WsTcpConnectResult {
+        stream,
+        peer_addr,
+        dns_ms,
+        tcp_connect_ms,
+    })
 }
 
-fn extract_proxied_ws_tls_telemetry(
-    proxy_addr: SocketAddr,
+fn build_ws_tls_config(
+    ctx: &SharedProxyContext,
+    target_host: &str,
+    client_addr: SocketAddr,
+    ws_scheme: &str,
+) -> Result<(Arc<rustls::ClientConfig>, Option<String>), String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|err| format!("WebSocket TLS config error: {err}"))?
+        .with_root_certificates(default_root_store());
+
+    let (mut tls_cfg, mtls_cn) = if should_use_host_mtls_for_peer(client_addr, ws_scheme) {
+        match ctx.client_certs.load_rustls_client_auth_for_host(target_host) {
+            Ok(Some((certs, key, entry))) => {
+                let cfg = builder.with_client_auth_cert(certs, key).map_err(|err| {
+                    format!("WebSocket mTLS client certificate error for '{target_host}': {err}")
+                })?;
+                (cfg, Some(entry.common_name))
+            }
+            Ok(None) => (builder.with_no_client_auth(), None),
+            Err(err) => {
+                return Err(format!(
+                    "WebSocket mTLS client certificate error for '{target_host}': {err}"
+                ));
+            }
+        }
+    } else {
+        (builder.with_no_client_auth(), None)
+    };
+
+    tls_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok((Arc::new(tls_cfg), mtls_cn))
+}
+
+#[allow(clippy::type_complexity)]
+fn extract_ws_tls_fields(
     conn: &rustls::ClientConnection,
-) -> WsServerConnTelemetry {
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     let (cert_subject, cert_issuer) = conn
         .peer_certificates()
         .and_then(|certs| certs.first())
         .map(|leaf| extract_peer_cert_subject_issuer(leaf.as_ref()))
         .unwrap_or((None, None));
-    WsServerConnTelemetry {
-        server_addr: Some(proxy_addr.to_string()),
-        server_ip: Some(proxy_addr.ip().to_string()),
-        server_port: Some(proxy_addr.port()),
-        server_tls_version: conn.protocol_version().map(format_tls_protocol),
-        server_tls_cipher: conn.negotiated_cipher_suite().map(format_tls_cipher),
-        server_tls_alpn: conn
-            .alpn_protocol()
+    (
+        conn.protocol_version().map(format_tls_protocol),
+        conn.negotiated_cipher_suite().map(format_tls_cipher),
+        conn.alpn_protocol()
             .map(|b| String::from_utf8_lossy(b).into_owned()),
-        server_cert_subject: cert_subject,
-        server_cert_issuer: cert_issuer,
-    }
+        cert_subject,
+        cert_issuer,
+    )
 }
 
-fn extract_proxied_ws_plain_telemetry(proxy_addr: SocketAddr) -> WsServerConnTelemetry {
+struct WsConnTimingInput {
+    dns_ms: f64,
+    tcp_connect_ms: f64,
+    tls_handshake_ms: Option<f64>,
+    server_connected_at: String,
+}
+
+fn extract_direct_ws_plain_telemetry(
+    peer_addr: SocketAddr,
+    timing: WsConnTimingInput,
+) -> WsServerConnTelemetry {
     WsServerConnTelemetry {
-        server_addr: Some(proxy_addr.to_string()),
-        server_ip: Some(proxy_addr.ip().to_string()),
-        server_port: Some(proxy_addr.port()),
+        server_addr: Some(peer_addr.to_string()),
+        server_ip: Some(peer_addr.ip().to_string()),
+        server_port: Some(peer_addr.port()),
+        via_proxy_addr: None,
+        dns_ms: Some(timing.dns_ms),
+        tcp_connect_ms: Some(timing.tcp_connect_ms),
+        tls_handshake_ms: timing.tls_handshake_ms,
+        server_connected_at: Some(timing.server_connected_at),
         server_tls_version: None,
         server_tls_cipher: None,
         server_tls_alpn: None,
         server_cert_subject: None,
         server_cert_issuer: None,
+        server_mtls_cn: None,
+    }
+}
+
+fn extract_direct_ws_tls_telemetry(
+    peer_addr: SocketAddr,
+    conn: &rustls::ClientConnection,
+    timing: WsConnTimingInput,
+    mtls_cn: Option<String>,
+) -> WsServerConnTelemetry {
+    let (tls_ver, tls_cipher, tls_alpn, cert_subject, cert_issuer) = extract_ws_tls_fields(conn);
+    WsServerConnTelemetry {
+        server_addr: Some(peer_addr.to_string()),
+        server_ip: Some(peer_addr.ip().to_string()),
+        server_port: Some(peer_addr.port()),
+        via_proxy_addr: None,
+        dns_ms: Some(timing.dns_ms),
+        tcp_connect_ms: Some(timing.tcp_connect_ms),
+        tls_handshake_ms: timing.tls_handshake_ms,
+        server_connected_at: Some(timing.server_connected_at),
+        server_tls_version: tls_ver,
+        server_tls_cipher: tls_cipher,
+        server_tls_alpn: tls_alpn,
+        server_cert_subject: cert_subject,
+        server_cert_issuer: cert_issuer,
+        server_mtls_cn: mtls_cn,
+    }
+}
+
+fn extract_proxied_ws_tls_telemetry(
+    proxy_protocol: UpstreamProxyProtocol,
+    proxy_addr: SocketAddr,
+    conn: &rustls::ClientConnection,
+    timing: WsConnTimingInput,
+    mtls_cn: Option<String>,
+) -> WsServerConnTelemetry {
+    let (via_proxy_addr, via_server_ip) = format_via_proxy_telemetry(proxy_protocol, proxy_addr);
+    let (tls_ver, tls_cipher, tls_alpn, cert_subject, cert_issuer) = extract_ws_tls_fields(conn);
+    WsServerConnTelemetry {
+        server_addr: None,
+        server_ip: Some(via_server_ip),
+        server_port: None,
+        via_proxy_addr: Some(via_proxy_addr),
+        dns_ms: Some(timing.dns_ms),
+        tcp_connect_ms: Some(timing.tcp_connect_ms),
+        tls_handshake_ms: timing.tls_handshake_ms,
+        server_connected_at: Some(timing.server_connected_at),
+        server_tls_version: tls_ver,
+        server_tls_cipher: tls_cipher,
+        server_tls_alpn: tls_alpn,
+        server_cert_subject: cert_subject,
+        server_cert_issuer: cert_issuer,
+        server_mtls_cn: mtls_cn,
+    }
+}
+
+fn extract_proxied_ws_plain_telemetry(
+    proxy_protocol: UpstreamProxyProtocol,
+    proxy_addr: SocketAddr,
+    timing: WsConnTimingInput,
+) -> WsServerConnTelemetry {
+    let (via_proxy_addr, via_server_ip) = format_via_proxy_telemetry(proxy_protocol, proxy_addr);
+    WsServerConnTelemetry {
+        server_addr: None,
+        server_ip: Some(via_server_ip),
+        server_port: None,
+        via_proxy_addr: Some(via_proxy_addr),
+        dns_ms: Some(timing.dns_ms),
+        tcp_connect_ms: Some(timing.tcp_connect_ms),
+        tls_handshake_ms: timing.tls_handshake_ms,
+        server_connected_at: Some(timing.server_connected_at),
+        server_tls_version: None,
+        server_tls_cipher: None,
+        server_tls_alpn: None,
+        server_cert_subject: None,
+        server_cert_issuer: None,
+        server_mtls_cn: None,
     }
 }
 
@@ -412,10 +581,14 @@ where
         got_request_headers: Some(hs.req_begin_at.clone()),
         client_done_request: Some(hs.req_begin_at),
         proxy_begin_request: Some(hs.proxy_begin_at),
+        server_connected: server_tel.server_connected_at,
         got_response_headers: Some(got_resp_at.clone()),
         client_begin_response: Some(got_resp_at),
         client_read_ms: Some(0.0),
         client_tls_handshake_ms: hs.client_tls_ms,
+        dns_ms: server_tel.dns_ms,
+        tcp_connect_ms: server_tel.tcp_connect_ms,
+        tls_handshake_ms: server_tel.tls_handshake_ms,
         server_wait_ms: Some(handshake_ms),
         overall_elapsed_ms: Some(overall_init_ms),
         net_elapsed_ms: Some(overall_init_ms),
@@ -444,7 +617,9 @@ where
         server_tls_alpn: server_tel.server_tls_alpn,
         server_cert_subject: server_tel.server_cert_subject,
         server_cert_issuer: server_tel.server_cert_issuer,
+        server_mtls_cn: server_tel.server_mtls_cn.clone(),
         remapped_target: hs.remapped_to.clone(),
+        via_proxy_addr: server_tel.via_proxy_addr,
         is_streaming: Some(true),
         ..Default::default()
     };
@@ -500,7 +675,7 @@ where
             hs.ws_scheme,
             hs.client_conn.client_tls_version.as_deref(),
             Some("WSS"),
-            None,
+            server_tel.server_mtls_cn.as_deref(),
         ),
         client_addr: hs.client_addr.to_string(),
         websocket_frames: Vec::new(),
@@ -528,10 +703,10 @@ where
 
     tokio::spawn(async move {
         let _ws_guard = ws_guard;
-        let recorded_count = Arc::new(AtomicUsize::new(0));
         let total_bytes = Arc::new(AtomicUsize::new(0));
         let tx_bytes = Arc::new(AtomicUsize::new(0));
         let rx_bytes = Arc::new(AtomicUsize::new(0));
+        let last_ipc_emit = Arc::new(std::sync::Mutex::new(None::<Instant>));
 
         if let Ok(upgraded) = hyper::upgrade::on(req).await {
             let client_ws =
@@ -540,21 +715,28 @@ where
             let (mut client_sink, mut client_stream) = client_ws.split();
             let (mut upstream_sink, mut upstream_stream) = upstream_ws.split();
 
-            const MAX_WS_FRAMES: usize = 256;
-            fn try_claim_ws_frame_index(counter: &AtomicUsize, limit: usize) -> Option<usize> {
-                let mut curr = counter.load(Ordering::Relaxed);
-                while curr < limit {
-                    match counter.compare_exchange_weak(
-                        curr,
-                        curr + 1,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(prev) => return Some(prev),
-                        Err(actual) => curr = actual,
-                    }
+            const MAX_WS_FRAMES: usize = 500;
+            const WS_IPC_THROTTLE_MS: u64 = 75;
+            fn should_emit_ws_ipc(
+                last_emit: &std::sync::Mutex<Option<Instant>>,
+                force: bool,
+            ) -> bool {
+                let mut guard = match last_emit.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let now = Instant::now();
+                if force
+                    || guard.map_or(true, |prev| {
+                        now.saturating_duration_since(prev)
+                            >= Duration::from_millis(WS_IPC_THROTTLE_MS)
+                    })
+                {
+                    *guard = Some(now);
+                    true
+                } else {
+                    false
                 }
-                None
             }
 
             let (to_server_tx, to_server_rx) = mpsc::unbounded_channel::<WsInjectCommand>();
@@ -578,10 +760,10 @@ where
                 std::future::pending::<()>().await;
             };
 
-            let c2u_recorded = Arc::clone(&recorded_count);
             let c2u_bytes = Arc::clone(&total_bytes);
             let c2u_tx = Arc::clone(&tx_bytes);
             let c2u_ctx = Arc::clone(&relay_ctx);
+            let c2u_last_emit = Arc::clone(&last_ipc_emit);
             let client_to_upstream = async move {
                 loop {
                     tokio::select! {
@@ -597,19 +779,20 @@ where
                             }
                             c2u_tx.fetch_add(msg_len, Ordering::Relaxed);
                             let new_total = c2u_bytes.fetch_add(msg_len, Ordering::Relaxed) + msg_len;
-                            let claimed_idx = try_claim_ws_frame_index(&c2u_recorded, MAX_WS_FRAMES)
-                                .map(|prev| prev + 1);
-                            let stored_frame = claimed_idx.map(|idx| {
-                                frame.index = idx;
-                                frame.clone()
-                            });
-                            if let Some(updated_summary) = c2u_ctx.store.append_ws_frame(
-                                session_id,
-                                stored_frame,
-                                new_total,
-                                MAX_WS_FRAMES,
-                            ) {
-                                let _ = c2u_ctx.event_tx.send(updated_summary);
+                            if let Some((updated_summary, assigned_idx)) =
+                                c2u_ctx.store.append_ws_frame_with_index(
+                                    session_id,
+                                    Some(frame.clone()),
+                                    new_total,
+                                    MAX_WS_FRAMES,
+                                )
+                            {
+                                if let Some(idx) = assigned_idx {
+                                    frame.index = idx;
+                                }
+                                if should_emit_ws_ipc(&c2u_last_emit, true) {
+                                    let _ = c2u_ctx.event_tx.send(updated_summary);
+                                }
                             }
                             let _ = cmd.ack_tx.send(Ok(frame));
                         }
@@ -620,15 +803,18 @@ where
                             let msg_len = msg.len();
                             c2u_tx.fetch_add(msg_len, Ordering::Relaxed);
                             let new_total = c2u_bytes.fetch_add(msg_len, Ordering::Relaxed) + msg_len;
-                            let frame = try_claim_ws_frame_index(&c2u_recorded, MAX_WS_FRAMES)
-                                .map(|prev| record_ws_frame(prev + 1, "outbound", &msg, false));
-                            if let Some(updated_summary) = c2u_ctx.store.append_ws_frame(
-                                session_id,
-                                frame,
-                                new_total,
-                                MAX_WS_FRAMES,
-                            ) {
-                                let _ = c2u_ctx.event_tx.send(updated_summary);
+                            let frame = record_ws_frame(0, "outbound", &msg, false);
+                            if let Some((updated_summary, _)) =
+                                c2u_ctx.store.append_ws_frame_with_index(
+                                    session_id,
+                                    Some(frame),
+                                    new_total,
+                                    MAX_WS_FRAMES,
+                                )
+                            {
+                                if should_emit_ws_ipc(&c2u_last_emit, false) {
+                                    let _ = c2u_ctx.event_tx.send(updated_summary);
+                                }
                             }
                             if upstream_sink.send(msg).await.is_err() {
                                 break;
@@ -643,10 +829,10 @@ where
                 .await;
             };
 
-            let u2c_recorded = Arc::clone(&recorded_count);
             let u2c_bytes = Arc::clone(&total_bytes);
             let u2c_rx = Arc::clone(&rx_bytes);
             let u2c_ctx = Arc::clone(&relay_ctx);
+            let u2c_last_emit = Arc::clone(&last_ipc_emit);
             let upstream_to_client = async move {
                 loop {
                     tokio::select! {
@@ -662,19 +848,20 @@ where
                             }
                             u2c_rx.fetch_add(msg_len, Ordering::Relaxed);
                             let new_total = u2c_bytes.fetch_add(msg_len, Ordering::Relaxed) + msg_len;
-                            let claimed_idx = try_claim_ws_frame_index(&u2c_recorded, MAX_WS_FRAMES)
-                                .map(|prev| prev + 1);
-                            let stored_frame = claimed_idx.map(|idx| {
-                                frame.index = idx;
-                                frame.clone()
-                            });
-                            if let Some(updated_summary) = u2c_ctx.store.append_ws_frame(
-                                session_id,
-                                stored_frame,
-                                new_total,
-                                MAX_WS_FRAMES,
-                            ) {
-                                let _ = u2c_ctx.event_tx.send(updated_summary);
+                            if let Some((updated_summary, assigned_idx)) =
+                                u2c_ctx.store.append_ws_frame_with_index(
+                                    session_id,
+                                    Some(frame.clone()),
+                                    new_total,
+                                    MAX_WS_FRAMES,
+                                )
+                            {
+                                if let Some(idx) = assigned_idx {
+                                    frame.index = idx;
+                                }
+                                if should_emit_ws_ipc(&u2c_last_emit, true) {
+                                    let _ = u2c_ctx.event_tx.send(updated_summary);
+                                }
                             }
                             let _ = cmd.ack_tx.send(Ok(frame));
                         }
@@ -685,15 +872,18 @@ where
                             let msg_len = msg.len();
                             u2c_rx.fetch_add(msg_len, Ordering::Relaxed);
                             let new_total = u2c_bytes.fetch_add(msg_len, Ordering::Relaxed) + msg_len;
-                            let frame = try_claim_ws_frame_index(&u2c_recorded, MAX_WS_FRAMES)
-                                .map(|prev| record_ws_frame(prev + 1, "inbound", &msg, false));
-                            if let Some(updated_summary) = u2c_ctx.store.append_ws_frame(
-                                session_id,
-                                frame,
-                                new_total,
-                                MAX_WS_FRAMES,
-                            ) {
-                                let _ = u2c_ctx.event_tx.send(updated_summary);
+                            let frame = record_ws_frame(0, "inbound", &msg, false);
+                            if let Some((updated_summary, _)) =
+                                u2c_ctx.store.append_ws_frame_with_index(
+                                    session_id,
+                                    Some(frame),
+                                    new_total,
+                                    MAX_WS_FRAMES,
+                                )
+                            {
+                                if should_emit_ws_ipc(&u2c_last_emit, false) {
+                                    let _ = u2c_ctx.event_tx.send(updated_summary);
+                                }
                             }
                             if client_sink.send(msg).await.is_err() {
                                 break;
@@ -820,7 +1010,7 @@ pub(super) async fn handle_websocket_intercept(
     let req_headers_bytes =
         estimate_request_headers_bytes("GET", &path_and_query, &client_http_ver, &req_headers);
 
-    let ws_req = match build_upstream_websocket_request(&ws_url, &req_headers) {
+    let mut ws_req = match build_upstream_websocket_request(&ws_url, &req_headers) {
         Ok(request) => request,
         Err(err) => {
             return record_and_return_error(
@@ -850,16 +1040,53 @@ pub(super) async fn handle_websocket_intercept(
         .host_remap
         .resolve_connect_target(&target_host, target_port);
     let (connect_host, connect_port, remapped_to) = match &remapped {
-        Some((h, p, rule)) => (
-            h.clone(),
-            *p,
-            Some(crate::proxy::hosts::HostRemapRegistry::format_remap_target(
-                rule,
-                rule.target_port,
-            )),
-        ),
+        Some((h, p, rule)) => {
+            if !rule.preserve_host_header {
+                let default_ws_port = if ws_scheme == "wss" { 443 } else { 80 };
+                let h_fmt = HostRemapRegistry::format_host_for_authority(h);
+                let new_host_val = if *p != default_ws_port {
+                    format!("{h_fmt}:{p}")
+                } else {
+                    h_fmt
+                };
+                if let Ok(hv) = http::header::HeaderValue::from_str(&new_host_val) {
+                    ws_req.headers_mut().insert(http::header::HOST, hv);
+                }
+            }
+            (
+                h.clone(),
+                *p,
+                Some(HostRemapRegistry::format_remap_target(
+                    rule,
+                    rule.target_port,
+                )),
+            )
+        }
         None => (target_host.clone(), target_port, None),
     };
+
+    if let Err(err) = ctx.throttle.apply_latency().await {
+        return record_and_return_error_with_opts(
+            &ctx,
+            session_id,
+            ws_scheme,
+            "GET",
+            &host_header,
+            &path_and_query,
+            &full_url,
+            req_headers,
+            Bytes::new(),
+            start,
+            timestamp,
+            client_addr,
+            client_proc.as_ref(),
+            false,
+            req_mutated,
+            StatusCode::SERVICE_UNAVAILABLE,
+            remapped_to,
+            err.to_string(),
+        );
+    }
 
     let active_upstream_proxy = ctx.upstream_proxy.resolve_for_target(
         &target_host,
@@ -930,35 +1157,34 @@ pub(super) async fn handle_websocket_intercept(
             }
         };
 
+        let throttled_tunnel =
+            ThrottledStream::new_without_initial_delay(tunnel_res.stream, Arc::clone(&ctx.throttle));
+
         if ws_scheme == "wss" {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-            let provider = Arc::new(rustls::crypto::ring::default_provider());
-            let mut tls_cfg = match rustls::ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-            {
-                Ok(b) => b.with_root_certificates(default_root_store()).with_no_client_auth(),
-                Err(err) => {
-                    return record_and_return_error(
-                        &ctx,
-                        session_id,
-                        ws_scheme,
-                        "GET",
-                        &host_header,
-                        &path_and_query,
-                        &full_url,
-                        req_headers,
-                        Bytes::new(),
-                        start,
-                        timestamp,
-                        client_addr,
-                        client_proc.as_ref(),
-                        false,
-                        req_mutated,
-                        format!("WebSocket TLS config error: {err}"),
-                    );
-                }
-            };
-            tls_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let (tls_cfg, mtls_cn) =
+                match build_ws_tls_config(&ctx, &target_host, client_addr, ws_scheme) {
+                    Ok(pair) => pair,
+                    Err(err_msg) => {
+                        return record_and_return_error(
+                            &ctx,
+                            session_id,
+                            ws_scheme,
+                            "GET",
+                            &host_header,
+                            &path_and_query,
+                            &full_url,
+                            req_headers,
+                            Bytes::new(),
+                            start,
+                            timestamp,
+                            client_addr,
+                            client_proc.as_ref(),
+                            false,
+                            req_mutated,
+                            err_msg,
+                        );
+                    }
+                };
 
             let sni_clean = target_host.trim_matches(['[', ']']).to_string();
             let server_name = match ServerName::try_from(sni_clean.clone()) {
@@ -1010,9 +1236,10 @@ pub(super) async fn handle_websocket_intercept(
                 );
             }
 
+            let tls_start = Instant::now();
             let tls_stream = match tokio::time::timeout(
                 remaining,
-                TlsConnector::from(Arc::new(tls_cfg)).connect(server_name, tunnel_res.stream),
+                TlsConnector::from(tls_cfg).connect(server_name, throttled_tunnel),
             )
             .await
             {
@@ -1061,9 +1288,21 @@ pub(super) async fn handle_websocket_intercept(
                     );
                 }
             };
+            let tls_handshake_ms = elapsed_ms(tls_start);
+            let server_connected_at = timestamp_at_instant(start, start_utc, Instant::now());
 
-            let server_tel =
-                extract_proxied_ws_tls_telemetry(tunnel_res.proxy_addr, tls_stream.get_ref().1);
+            let server_tel = extract_proxied_ws_tls_telemetry(
+                proxy_cfg.protocol,
+                tunnel_res.proxy_addr,
+                tls_stream.get_ref().1,
+                WsConnTimingInput {
+                    dns_ms: tunnel_res.dns_ms,
+                    tcp_connect_ms: tunnel_res.tcp_connect_ms,
+                    tls_handshake_ms: Some(tls_handshake_ms),
+                    server_connected_at,
+                },
+                mtls_cn,
+            );
             let remaining_ws = deadline.saturating_duration_since(Instant::now());
             if remaining_ws.is_zero() {
                 return record_and_return_error(
@@ -1155,7 +1394,17 @@ pub(super) async fn handle_websocket_intercept(
             );
         }
 
-        let server_tel = extract_proxied_ws_plain_telemetry(tunnel_res.proxy_addr);
+        let server_connected_at = timestamp_at_instant(start, start_utc, Instant::now());
+        let server_tel = extract_proxied_ws_plain_telemetry(
+            proxy_cfg.protocol,
+            tunnel_res.proxy_addr,
+            WsConnTimingInput {
+                dns_ms: tunnel_res.dns_ms,
+                tcp_connect_ms: tunnel_res.tcp_connect_ms,
+                tls_handshake_ms: None,
+                server_connected_at,
+            },
+        );
         let remaining_ws = deadline.saturating_duration_since(Instant::now());
         if remaining_ws.is_zero() {
             return record_and_return_error(
@@ -1183,7 +1432,7 @@ pub(super) async fn handle_websocket_intercept(
 
         let (upstream_ws, upstream_handshake_resp) = match tokio::time::timeout(
             remaining_ws,
-            tokio_tungstenite::client_async(ws_req, tunnel_res.stream),
+            tokio_tungstenite::client_async(ws_req, throttled_tunnel),
         )
         .await
         {
@@ -1247,9 +1496,305 @@ pub(super) async fn handle_websocket_intercept(
         );
     }
 
+    // Direct WebSocket connection (honoring HOSTS Remapping, Bandwidth Throttling, and mTLS)
+    let deadline = Instant::now() + connect_timeout;
+    let tcp_res = match measure_ws_tcp_connect(&connect_host, connect_port, connect_timeout).await {
+        Ok(res) => res,
+        Err(err_msg) => {
+            return record_and_return_error(
+                &ctx,
+                session_id,
+                ws_scheme,
+                "GET",
+                &host_header,
+                &path_and_query,
+                &full_url,
+                req_headers,
+                Bytes::new(),
+                start,
+                timestamp,
+                client_addr,
+                client_proc.as_ref(),
+                false,
+                req_mutated,
+                err_msg,
+            );
+        }
+    };
+    let throttled_tcp =
+        ThrottledStream::new_without_initial_delay(tcp_res.stream, Arc::clone(&ctx.throttle));
+
+    if ws_scheme == "wss" {
+        let (tls_cfg, mtls_cn) =
+            match build_ws_tls_config(&ctx, &target_host, client_addr, ws_scheme) {
+                Ok(pair) => pair,
+                Err(err_msg) => {
+                    return record_and_return_error(
+                        &ctx,
+                        session_id,
+                        ws_scheme,
+                        "GET",
+                        &host_header,
+                        &path_and_query,
+                        &full_url,
+                        req_headers,
+                        Bytes::new(),
+                        start,
+                        timestamp,
+                        client_addr,
+                        client_proc.as_ref(),
+                        false,
+                        req_mutated,
+                        err_msg,
+                    );
+                }
+            };
+
+        let sni_clean = target_host.trim_matches(['[', ']']).to_string();
+        let server_name = match ServerName::try_from(sni_clean.clone()) {
+            Ok(sn) => sn,
+            Err(_) => {
+                return record_and_return_error(
+                    &ctx,
+                    session_id,
+                    ws_scheme,
+                    "GET",
+                    &host_header,
+                    &path_and_query,
+                    &full_url,
+                    req_headers,
+                    Bytes::new(),
+                    start,
+                    timestamp,
+                    client_addr,
+                    client_proc.as_ref(),
+                    false,
+                    req_mutated,
+                    format!("Invalid TLS ServerName '{sni_clean}' for WSS"),
+                );
+            }
+        };
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return record_and_return_error(
+                &ctx,
+                session_id,
+                ws_scheme,
+                "GET",
+                &host_header,
+                &path_and_query,
+                &full_url,
+                req_headers,
+                Bytes::new(),
+                start,
+                timestamp,
+                client_addr,
+                client_proc.as_ref(),
+                false,
+                req_mutated,
+                format!(
+                    "WebSocket TLS handshake timed out after {}s",
+                    connect_timeout.as_secs()
+                ),
+            );
+        }
+
+        let tls_start = Instant::now();
+        let tls_stream = match tokio::time::timeout(
+            remaining,
+            TlsConnector::from(tls_cfg).connect(server_name, throttled_tcp),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(err)) => {
+                return record_and_return_error(
+                    &ctx,
+                    session_id,
+                    ws_scheme,
+                    "GET",
+                    &host_header,
+                    &path_and_query,
+                    &full_url,
+                    req_headers,
+                    Bytes::new(),
+                    start,
+                    timestamp,
+                    client_addr,
+                    client_proc.as_ref(),
+                    false,
+                    req_mutated,
+                    format!("WebSocket upstream TLS handshake failed: {err}"),
+                );
+            }
+            Err(_) => {
+                return record_and_return_error(
+                    &ctx,
+                    session_id,
+                    ws_scheme,
+                    "GET",
+                    &host_header,
+                    &path_and_query,
+                    &full_url,
+                    req_headers,
+                    Bytes::new(),
+                    start,
+                    timestamp,
+                    client_addr,
+                    client_proc.as_ref(),
+                    false,
+                    req_mutated,
+                    format!(
+                        "WebSocket upstream TLS handshake timed out after {}s",
+                        connect_timeout.as_secs()
+                    ),
+                );
+            }
+        };
+        let tls_handshake_ms = elapsed_ms(tls_start);
+        let server_connected_at = timestamp_at_instant(start, start_utc, Instant::now());
+        let server_tel = extract_direct_ws_tls_telemetry(
+            tcp_res.peer_addr,
+            tls_stream.get_ref().1,
+            WsConnTimingInput {
+                dns_ms: tcp_res.dns_ms,
+                tcp_connect_ms: tcp_res.tcp_connect_ms,
+                tls_handshake_ms: Some(tls_handshake_ms),
+                server_connected_at,
+            },
+            mtls_cn,
+        );
+
+        let remaining_ws = deadline.saturating_duration_since(Instant::now());
+        if remaining_ws.is_zero() {
+            return record_and_return_error(
+                &ctx,
+                session_id,
+                ws_scheme,
+                "GET",
+                &host_header,
+                &path_and_query,
+                &full_url,
+                req_headers,
+                Bytes::new(),
+                start,
+                timestamp,
+                client_addr,
+                client_proc.as_ref(),
+                false,
+                req_mutated,
+                format!(
+                    "WebSocket upstream connect timed out after {}s",
+                    connect_timeout.as_secs()
+                ),
+            );
+        }
+
+        let (upstream_ws, upstream_handshake_resp) = match tokio::time::timeout(
+            remaining_ws,
+            tokio_tungstenite::client_async(ws_req, tls_stream),
+        )
+        .await
+        {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(tokio_tungstenite::tungstenite::Error::Http(http_resp))) => {
+                return handle_ws_handshake_http_rejection(&ctx, hs, http_resp);
+            }
+            Ok(Err(err)) => {
+                let chain = format_error_chain(&err);
+                return record_and_return_error(
+                    &ctx,
+                    session_id,
+                    ws_scheme,
+                    "GET",
+                    &host_header,
+                    &path_and_query,
+                    &full_url,
+                    req_headers,
+                    Bytes::new(),
+                    start,
+                    timestamp,
+                    client_addr,
+                    client_proc.as_ref(),
+                    false,
+                    req_mutated,
+                    format!("WebSocket upstream connect failed: {chain}"),
+                );
+            }
+            Err(_) => {
+                return record_and_return_error(
+                    &ctx,
+                    session_id,
+                    ws_scheme,
+                    "GET",
+                    &host_header,
+                    &path_and_query,
+                    &full_url,
+                    req_headers,
+                    Bytes::new(),
+                    start,
+                    timestamp,
+                    client_addr,
+                    client_proc.as_ref(),
+                    false,
+                    req_mutated,
+                    format!(
+                        "WebSocket upstream connect timed out after {}s",
+                        connect_timeout.as_secs()
+                    ),
+                );
+            }
+        };
+
+        return finish_ws_handshake_and_spawn(
+            req,
+            upstream_ws,
+            upstream_handshake_resp,
+            server_tel,
+            hs,
+            ctx,
+        );
+    }
+
+    let server_connected_at = timestamp_at_instant(start, start_utc, Instant::now());
+    let server_tel = extract_direct_ws_plain_telemetry(
+        tcp_res.peer_addr,
+        WsConnTimingInput {
+            dns_ms: tcp_res.dns_ms,
+            tcp_connect_ms: tcp_res.tcp_connect_ms,
+            tls_handshake_ms: None,
+            server_connected_at,
+        },
+    );
+    let remaining_ws = deadline.saturating_duration_since(Instant::now());
+    if remaining_ws.is_zero() {
+        return record_and_return_error(
+            &ctx,
+            session_id,
+            ws_scheme,
+            "GET",
+            &host_header,
+            &path_and_query,
+            &full_url,
+            req_headers,
+            Bytes::new(),
+            start,
+            timestamp,
+            client_addr,
+            client_proc.as_ref(),
+            false,
+            req_mutated,
+            format!(
+                "WebSocket upstream connect timed out after {}s",
+                connect_timeout.as_secs()
+            ),
+        );
+    }
+
     let (upstream_ws, upstream_handshake_resp) = match tokio::time::timeout(
-        connect_timeout,
-        tokio_tungstenite::connect_async(ws_req),
+        remaining_ws,
+        tokio_tungstenite::client_async(ws_req, throttled_tcp),
     )
     .await
     {
@@ -1303,7 +1848,6 @@ pub(super) async fn handle_websocket_intercept(
         }
     };
 
-    let server_tel = extract_ws_server_telemetry(upstream_ws.get_ref());
     finish_ws_handshake_and_spawn(
         req,
         upstream_ws,

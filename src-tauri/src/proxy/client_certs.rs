@@ -953,6 +953,33 @@ impl ClientCertificateStore {
         self.upstream_client_cache.invalidate_all();
     }
 
+    /// Resolves and parses the matching mTLS certificate & private key for `host` as raw `rustls` types.
+    #[allow(clippy::type_complexity)]
+    pub fn load_rustls_client_auth_for_host(
+        &self,
+        host: &str,
+    ) -> Result<
+        Option<(
+            Vec<CertificateDer<'static>>,
+            PrivateKeyDer<'static>,
+            ClientCertificateEntry,
+        )>,
+        ProxyError,
+    > {
+        let Some(entry) = self.match_certificate_for_host(host) else {
+            return Ok(None);
+        };
+        let identity_path = self.resolve_identity_pem_path(&entry)?;
+        let pem_bytes = fs::read(&identity_path).map_err(|e| {
+            ProxyError::Custom(format!(
+                "Не удалось прочитать файл mTLS-идентичности '{}': {e}",
+                identity_path.display()
+            ))
+        })?;
+        let (certs, key) = parse_rustls_client_auth_from_pem(&pem_bytes)?;
+        Ok(Some((certs, key, entry)))
+    }
+
     /// Returns a cached or freshly constructed instrumented `UpstreamHttpClient` configured with
     /// the matching mTLS client certificate for `host`, or `Ok(None)` if no enabled certificate matches.
     pub fn get_or_build_upstream_client(

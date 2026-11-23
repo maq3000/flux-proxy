@@ -43,6 +43,7 @@ use crate::storage::{TrafficStore, BODY_OFFLOAD_THRESHOLD_BYTES};
 
 const MAX_CAPTURED_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB safety cap per body (> 2 MiB offloaded to SQLite)
 pub const MAX_CAPTURED_REQUEST_BODY_BYTES: usize = MAX_CAPTURED_BODY_BYTES;
+pub const MAX_BUFFERED_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB OOM cap for buffered responses
 const ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES: usize = 256 * 1024; // 256 KiB
 const STREAM_TEXT_PREVIEW_MAX_BYTES: usize = 64 * 1024; // 64 KiB cap for text/* or application/* large-stream previews
 const DEFAULT_UPSTREAM_TIMEOUT_SEC: u64 = 15;
@@ -769,6 +770,14 @@ async fn shutdown_listeners(
     }
 }
 
+pub(crate) fn push_or_replace_summary(buffer: &mut Vec<SessionSummary>, item: SessionSummary) {
+    if let Some(existing) = buffer.iter_mut().find(|s| s.id == item.id) {
+        *existing = item;
+    } else {
+        buffer.push(item);
+    }
+}
+
 pub struct ProxyEngineController {
     pub context: Arc<SharedProxyContext>,
     pub sysproxy: Arc<SystemProxyManager>,
@@ -818,7 +827,7 @@ impl ProxyEngineController {
                                 // Drain any buffered/queued Phase 1 events sent before removal so a
                                 // removed session can never be flushed to the UI after `sessions-removed`.
                                 while let Ok(item) = event_rx.try_recv() {
-                                    buffer.push(item);
+                                    push_or_replace_summary(&mut buffer, item);
                                 }
                                 buffer.retain(|s| !removed_ids.contains(&s.id));
                                 let _ = ipc_app.emit("proxy://sessions-removed", removed_ids);
@@ -829,7 +838,7 @@ impl ProxyEngineController {
                     maybe_item = event_rx.recv() => {
                         match maybe_item {
                             Some(item) => {
-                                buffer.push(item);
+                                push_or_replace_summary(&mut buffer, item);
                                 if buffer.len() >= 250 {
                                     let batch = std::mem::take(&mut buffer);
                                     let _ = ipc_app.emit("proxy://sessions-batch", batch);
@@ -2016,7 +2025,8 @@ fn request_targets_loopback_or_unspecified(host_header: &str, full_url: &str) ->
 }
 
 fn should_use_host_mtls_for_peer(peer_addr: SocketAddr, scheme: &str) -> bool {
-    scheme.eq_ignore_ascii_case("https") && is_loopback_ip(peer_addr.ip())
+    (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss"))
+        && is_loopback_ip(peer_addr.ip())
 }
 
 
@@ -3257,7 +3267,14 @@ mod tests {
         assert_eq!(emitted_phase2.id, emitted_phase1.id);
         assert_eq!(emitted_phase2.path, "/api/orders");
         assert_eq!(emitted_phase2.status, 200);
-        assert!(event_rx.try_recv().is_err(), "no dropped session may be emitted");
+        while let Ok(extra) = event_rx.try_recv() {
+            assert_eq!(
+                extra.id, emitted_phase1.id,
+                "no dropped session may be emitted (unexpected session {} path={})",
+                extra.id, extra.path
+            );
+            assert_eq!(extra.path, "/api/orders");
+        }
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
@@ -3484,10 +3501,17 @@ mod tests {
             .await
             .expect("upstream received 304 request");
 
-        let p1_304 = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
-            .await
-            .expect("phase 1 for 304 arrives before response")
-            .expect("summary");
+        let p1_304 = loop {
+            let ev = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .expect("phase 1 for 304 arrives before response")
+                .expect("summary");
+            if ev.id == phase1.id {
+                assert_eq!(ev.status, 200);
+                continue;
+            }
+            break ev;
+        };
         assert_eq!(p1_304.status, 0);
         assert!(store.get(p1_304.id).is_some());
 
@@ -5048,6 +5072,7 @@ def on_response(response, request):
                 body: "payload".into(),
                 body_base64: None,
                 follow_redirects: false,
+                skip_python_scripts: None,
             })
             .await;
         assert!(composed_res.is_err());
@@ -6913,6 +6938,916 @@ def on_response(response, request):
         let ws_reply = ws_client.next().await.unwrap().unwrap().into_text().unwrap();
         assert_eq!(ws_reply.as_str(), "echo:ws-via-proxy");
         let _ = ws_client.close(None).await;
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let expected_via_ip = format!("via {upstream_addr}");
+        let expected_via_proxy = format!("HTTP {upstream_addr}");
+        let summaries = store.list_summaries();
+        assert_eq!(summaries.len(), 4);
+
+        let http_proxied = summaries
+            .iter()
+            .find(|s| s.path == "/hello")
+            .expect("proxied HTTP summary");
+        assert_eq!(
+            http_proxied.server_ip.as_deref(),
+            Some(expected_via_ip.as_str())
+        );
+        assert_eq!(
+            store
+                .get(http_proxied.id)
+                .unwrap()
+                .transfer_stats
+                .as_ref()
+                .and_then(|st| st.via_proxy_addr.as_deref()),
+            Some(expected_via_proxy.as_str())
+        );
+
+        let http_bypassed = summaries
+            .iter()
+            .find(|s| s.path == "/bypass")
+            .expect("bypassed HTTP summary");
+        assert_eq!(http_bypassed.server_ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(
+            store
+                .get(http_bypassed.id)
+                .unwrap()
+                .transfer_stats
+                .as_ref()
+                .and_then(|st| st.via_proxy_addr.as_deref()),
+            None
+        );
+
+        let connect_proxied = summaries
+            .iter()
+            .find(|s| s.method == "CONNECT")
+            .expect("proxied CONNECT summary");
+        assert_eq!(
+            connect_proxied.server_ip.as_deref(),
+            Some(expected_via_ip.as_str())
+        );
+        assert_eq!(
+            store
+                .get(connect_proxied.id)
+                .unwrap()
+                .transfer_stats
+                .as_ref()
+                .and_then(|st| st.via_proxy_addr.as_deref()),
+            Some(expected_via_proxy.as_str())
+        );
+
+        let ws_proxied = summaries
+            .iter()
+            .find(|s| s.path == "/ws")
+            .expect("proxied WS summary");
+        assert_eq!(
+            ws_proxied.server_ip.as_deref(),
+            Some(expected_via_ip.as_str())
+        );
+        assert_eq!(
+            store
+                .get(ws_proxied.id)
+                .unwrap()
+                .transfer_stats
+                .as_ref()
+                .and_then(|st| st.via_proxy_addr.as_deref()),
+            Some(expected_via_proxy.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn push_or_replace_summary_coalesces_duplicate_session_ids_in_place() {
+        let make_sum = |id: u64, status: u16, body_size: usize| SessionSummary {
+            id,
+            status,
+            protocol: "HTTP/1.1".into(),
+            scheme: "http".into(),
+            method: "GET".into(),
+            host: "example.test".into(),
+            path: format!("/s/{id}"),
+            url: format!("http://example.test/s/{id}"),
+            content_type: "text/plain".into(),
+            body_size,
+            duration_ms: 1,
+            timestamp: "2026-11-23T00:00:00Z".into(),
+            is_mocked: false,
+            matched_rule_id: None,
+            error: None,
+            process_name: None,
+            process_pid: None,
+            tls_bypassed: false,
+            headers_mutated: false,
+            breakpoint_paused: None,
+            breakpoint_modified: false,
+            comment: None,
+            marked_color: None,
+            client_ip: None,
+            remapped_to: None,
+            ttfb_ms: None,
+            dns_ms: None,
+            connect_ms: None,
+            tls_ms: None,
+            receive_ms: None,
+            request_size: None,
+            wire_body_size: None,
+            server_ip: None,
+            server_conn_reused: None,
+            ws_open: None,
+        };
+
+        let mut buf = Vec::new();
+        push_or_replace_summary(&mut buf, make_sum(1, 0, 0));
+        push_or_replace_summary(&mut buf, make_sum(2, 200, 10));
+        push_or_replace_summary(&mut buf, make_sum(1, 200, 50));
+        push_or_replace_summary(&mut buf, make_sum(1, 200, 120));
+
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0].id, 1);
+        assert_eq!(buf[0].status, 200);
+        assert_eq!(buf[0].body_size, 120);
+        assert_eq!(buf[1].id, 2);
+    }
+
+    #[tokio::test]
+    async fn direct_websocket_with_hosts_remap_and_interleaved_injection_preserves_frames() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        // 1. Local WS server capturing incoming Host header and controlling inbound server frames
+        let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let (server_send_tx, mut server_send_rx) = mpsc::unbounded_channel::<String>();
+        let (server_got_tx, mut server_got_rx) = mpsc::unbounded_channel::<String>();
+        let (ws_host_tx, ws_host_rx) = oneshot::channel::<Option<String>>();
+
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = ws_listener.accept().await {
+                let mut req_buf = Vec::new();
+                let mut b = [0u8; 1];
+                while !req_buf.ends_with(b"\r\n\r\n") {
+                    if sock.read_exact(&mut b).await.is_err() {
+                        return;
+                    }
+                    req_buf.push(b[0]);
+                }
+                let req_str = String::from_utf8_lossy(&req_buf);
+                let host_hdr = req_str
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("host:"))
+                    .map(|l| l.split_once(':').map(|x| x.1.trim().to_string()).unwrap_or_default());
+                let _ = ws_host_tx.send(host_hdr);
+
+                let key = req_str
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+                    .and_then(|l| l.split_once(':').map(|x| x.1.trim().to_string()))
+                    .unwrap_or_default();
+                let accept =
+                    tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+                let resp = format!(
+                    "HTTP/1.1 101 Switching Protocols\r\n\
+                     Upgrade: websocket\r\n\
+                     Connection: Upgrade\r\n\
+                     Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                let ws_stream = WebSocketStream::from_raw_socket(sock, Role::Server, None).await;
+                let (mut sink, mut stream) = ws_stream.split();
+
+                tokio::spawn(async move {
+                    while let Some(msg) = server_send_rx.recv().await {
+                        if sink.send(Message::Text(msg.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                while let Some(Ok(msg)) = stream.next().await {
+                    match msg {
+                        Message::Text(t) => {
+                            let _ = server_got_tx.send(t.to_string());
+                        }
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        // 2. Local TLS listener capturing SNI from direct wss:// connection via HostRemapRegistry
+        let wss_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let wss_addr = wss_listener.local_addr().unwrap();
+        let (wss_sni_tx, wss_sni_rx) = oneshot::channel::<Option<String>>();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = wss_listener.accept().await {
+                let acceptor = tokio_rustls::LazyConfigAcceptor::new(
+                    rustls::server::Acceptor::default(),
+                    stream,
+                );
+                tokio::pin!(acceptor);
+                let sni = match acceptor.as_mut().await {
+                    Ok(start) => start.client_hello().server_name().map(str::to_owned),
+                    Err(_) => None,
+                };
+                let _ = wss_sni_tx.send(sni);
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-ws-remap-inject-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let host_remap = Arc::new(HostRemapRegistry::new());
+        host_remap
+            .set_rules(vec![
+                crate::models::HostRemapRule {
+                    id: "ws-remap".into(),
+                    enabled: true,
+                    source_pattern: "api.virtual-ws.invalid".into(),
+                    target_host: "127.0.0.1".into(),
+                    target_port: Some(ws_addr.port()),
+                    preserve_host_header: true,
+                    comment: "WS remap".into(),
+                },
+                crate::models::HostRemapRule {
+                    id: "wss-remap".into(),
+                    enabled: true,
+                    source_pattern: "wss-remap.virtual.invalid".into(),
+                    target_host: "127.0.0.1".into(),
+                    target_port: Some(wss_addr.port()),
+                    preserve_host_header: true,
+                    comment: "WSS SNI remap".into(),
+                },
+            ])
+            .unwrap();
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("ws-remap.sqlite")).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+
+        let ctx = Arc::new(SharedProxyContext {
+            ca: ca.clone(),
+            rules,
+            filters,
+            breakpoints,
+            host_remap: Arc::clone(&host_remap),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
+            store: store.clone(),
+            upstream_http_client: test_upstream_http_client(Some(host_remap)),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(0),
+            upstream_timeout_sec: 3,
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_ctx = ctx.clone();
+
+        tokio::spawn(async move {
+            while let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await {
+                let c = proxy_ctx.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let inner_c = c.clone();
+                        async move {
+                            Ok::<_, Infallible>(
+                                handle_outer_proxy_request(
+                                    req,
+                                    client_addr,
+                                    None,
+                                    ClientConnContext::new(),
+                                    inner_c,
+                                )
+                                .await,
+                            )
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, service)
+                        .await;
+                });
+            }
+        });
+
+        // A. Direct ws:// to non-existent virtual domain remapped to local server
+        let mut client_tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        let raw_upgrade = "GET http://api.virtual-ws.invalid/live HTTP/1.1\r\n\
+             Host: api.virtual-ws.invalid\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+        client_tcp.write_all(raw_upgrade.as_bytes()).await.unwrap();
+        let mut hs_buf = Vec::new();
+        let mut b = [0u8; 1];
+        while !hs_buf.ends_with(b"\r\n\r\n") {
+            client_tcp.read_exact(&mut b).await.unwrap();
+            hs_buf.push(b[0]);
+        }
+        assert!(String::from_utf8_lossy(&hs_buf).starts_with("HTTP/1.1 101"));
+        assert_eq!(
+            ws_host_rx.await.unwrap().as_deref(),
+            Some("api.virtual-ws.invalid")
+        );
+
+        let mut client_ws = WebSocketStream::from_raw_socket(client_tcp, Role::Client, None).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        // 1) Normal inbound frame before injection
+        server_send_tx.send("srv-before".into()).unwrap();
+        let f1 = tokio::time::timeout(Duration::from_secs(2), client_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(f1.into_text().unwrap().as_str(), "srv-before");
+
+        // 2) Manual injected outbound frame + manual injected inbound frame
+        let inj_srv = ctx
+            .inject_websocket_frame(
+                1,
+                WsInjectDirection::Server,
+                WsInjectOpcode::Text,
+                "injected-to-srv".into(),
+            )
+            .await
+            .unwrap();
+        assert!(inj_srv.injected);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), server_got_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            "injected-to-srv"
+        );
+
+        let inj_cli = ctx
+            .inject_websocket_frame(
+                1,
+                WsInjectDirection::Client,
+                WsInjectOpcode::Text,
+                "injected-to-cli".into(),
+            )
+            .await
+            .unwrap();
+        assert!(inj_cli.injected);
+        let f_inj = tokio::time::timeout(Duration::from_secs(2), client_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(f_inj.into_text().unwrap().as_str(), "injected-to-cli");
+
+        // 3) New normal inbound frames AFTER injection must NOT overwrite injected frames!
+        server_send_tx.send("srv-after-1".into()).unwrap();
+        server_send_tx.send("srv-after-2".into()).unwrap();
+        let f_after1 = tokio::time::timeout(Duration::from_secs(2), client_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let f_after2 = tokio::time::timeout(Duration::from_secs(2), client_ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(f_after1.into_text().unwrap().as_str(), "srv-after-1");
+        assert_eq!(f_after2.into_text().unwrap().as_str(), "srv-after-2");
+
+        let _ = client_ws.close(None).await;
+        drop(client_ws);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let ws_detail = store.get(1).expect("remapped WS session stored");
+        assert_eq!(
+            ws_detail.summary.remapped_to.as_deref(),
+            Some(format!("127.0.0.1:{}", ws_addr.port()).as_str())
+        );
+        assert_eq!(ws_detail.summary.server_ip.as_deref(), Some("127.0.0.1"));
+        let payloads: Vec<&str> = ws_detail
+            .websocket_frames
+            .iter()
+            .map(|f| f.payload_preview.as_str())
+            .collect();
+        assert!(payloads.contains(&"srv-before"));
+        assert!(payloads.contains(&"injected-to-srv"));
+        assert!(payloads.contains(&"injected-to-cli"));
+        assert!(payloads.contains(&"srv-after-1"));
+        assert!(payloads.contains(&"srv-after-2"));
+        for (pos, rec) in ws_detail.websocket_frames.iter().enumerate() {
+            assert_eq!(rec.index, pos + 1, "frame indices must be strictly 1..=N");
+        }
+
+        // B. Direct wss:// via HostRemapRegistry preserves original TLS SNI
+        let mut wss_tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        wss_tcp
+            .write_all(
+                b"CONNECT wss-remap.virtual.invalid:443 HTTP/1.1\r\nHost: wss-remap.virtual.invalid:443\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut conn_buf = [0u8; 256];
+        let n = wss_tcp.read(&mut conn_buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&conn_buf[..n]).starts_with("HTTP/1.1 200"));
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store
+            .add(rustls::pki_types::CertificateDer::from(
+                ca.root_ca_der().to_vec(),
+            ))
+            .unwrap();
+        let mut tls_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        tls_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_cfg));
+        let server_name =
+            rustls::pki_types::ServerName::try_from("wss-remap.virtual.invalid").unwrap();
+        let mut mitm_tls = connector.connect(server_name, wss_tcp).await.unwrap();
+        mitm_tls
+            .write_all(
+                b"GET /sni-ws HTTP/1.1\r\n\
+                  Host: wss-remap.virtual.invalid\r\n\
+                  Connection: Upgrade\r\n\
+                  Upgrade: websocket\r\n\
+                  Sec-WebSocket-Version: 13\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut _drain = [0u8; 256];
+        let _ = tokio::time::timeout(Duration::from_secs(2), mitm_tls.read(&mut _drain)).await;
+
+        let captured_sni = tokio::time::timeout(Duration::from_secs(2), wss_sni_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(captured_sni.as_deref(), Some("wss-remap.virtual.invalid"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn execute_composed_runs_override_status_hop_by_hop_filter_and_python_hooks() {
+        use crate::models::{AutoResponderRule, RuleMatchTarget};
+
+        type ObservedHeaders = Arc<std::sync::Mutex<Vec<(Option<String>, bool)>>>;
+        let received_headers: ObservedHeaders = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec_srv = Arc::clone(&received_headers);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let rec = Arc::clone(&rec_srv);
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let rec = Arc::clone(&rec);
+                        async move {
+                            let py_hdr = req
+                                .headers()
+                                .get("x-from-composer-py")
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_owned);
+                            let has_hop_by_hop = req.headers().contains_key("keep-alive")
+                                || req.headers().contains_key("proxy-connection");
+                            rec.lock().unwrap().push((py_hdr, has_hop_by_hop));
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(CONTENT_TYPE, "application/json")
+                                    .body(Full::new(Bytes::from_static(br#"{"upstream":true}"#)))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-composer-parity-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        rules.set_rules(vec![AutoResponderRule {
+            id: "override-201".into(),
+            enabled: true,
+            name: "Override Status 201".into(),
+            match_target: RuleMatchTarget::UrlContains,
+            pattern: "/composer-parity".into(),
+            method_filter: None,
+            header_name: None,
+            action: RuleActionType::OverrideStatus,
+            status_code: 201,
+            latency_ms: 0,
+            response_headers: Vec::new(),
+            response_body: String::new(),
+        }]);
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("composer-parity.sqlite")).unwrap());
+        let sysproxy = Arc::new(SystemProxyManager::with_backend(
+            &tmp_dir,
+            RecordingOsProxyBackend::new(),
+        ));
+        let controller =
+            ProxyEngineController::new_for_test(ca, rules, filters, store, sysproxy).unwrap();
+
+        let py_available = controller
+            .context
+            .script_runner
+            .get_status()
+            .await
+            .available;
+        if py_available {
+            let py_code = r#"
+import json
+
+def on_request(request):
+    request["headers"]["X-From-Composer-Py"] = "hmac-ok"
+
+def on_response(response, request):
+    response["headers"]["X-Py-Resp"] = "hooked"
+    data = json.loads(response["body"])
+    data["py_hooked"] = True
+    response["body"] = json.dumps(data)
+"#;
+            controller
+                .context
+                .script_runner
+                .set_script(py_code.to_string(), true)
+                .await
+                .unwrap();
+        }
+
+        // 1. Default run (skip_python_scripts = None -> Python runs when available + OverrideStatus + hop-by-hop stripped)
+        let detail1 = controller
+            .execute_composed(ComposedRequest {
+                method: "GET".into(),
+                url: format!("http://{addr}/composer-parity"),
+                headers: vec![
+                    HeaderPair {
+                        name: "Keep-Alive".into(),
+                        value: "timeout=5".into(),
+                    },
+                    HeaderPair {
+                        name: "Proxy-Connection".into(),
+                        value: "keep-alive".into(),
+                    },
+                    HeaderPair {
+                        name: "X-Custom".into(),
+                        value: "1".into(),
+                    },
+                ],
+                body: String::new(),
+                body_base64: None,
+                follow_redirects: false,
+                skip_python_scripts: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(detail1.summary.status, 201);
+        assert!(detail1.summary.is_mocked);
+        assert_eq!(
+            detail1.summary.matched_rule_id.as_deref(),
+            Some("override-201")
+        );
+
+        // 2. Explicit skip_python_scripts = Some(true) bypasses hooks while keeping OverrideStatus & hop-by-hop filter
+        let detail2 = controller
+            .execute_composed(ComposedRequest {
+                method: "GET".into(),
+                url: format!("http://{addr}/composer-parity"),
+                headers: vec![HeaderPair {
+                    name: "Proxy-Connection".into(),
+                    value: "keep-alive".into(),
+                }],
+                body: String::new(),
+                body_base64: None,
+                follow_redirects: false,
+                skip_python_scripts: Some(true),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(detail2.summary.status, 201);
+        assert!(detail2.summary.is_mocked);
+
+        let recorded = received_headers.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert!(!recorded[0].1, "hop-by-hop headers must be stripped");
+        assert!(!recorded[1].1, "hop-by-hop headers must be stripped");
+
+        if py_available {
+            assert_eq!(recorded[0].0.as_deref(), Some("hmac-ok"));
+            assert_eq!(recorded[1].0, None);
+            assert!(detail1
+                .response_headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("x-py-resp") && h.value == "hooked"));
+            assert!(detail1
+                .response_body_text
+                .as_deref()
+                .unwrap_or("")
+                .contains("\"py_hooked\": true"));
+            assert!(detail1.timings.as_ref().and_then(|t| t.script_hook_ms).is_some());
+            assert!(!detail2
+                .response_headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("x-py-resp")));
+            controller.context.script_runner.shutdown_sync();
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn collect_response_body_limited_and_http_handler_enforce_64mib_cap() {
+        use crate::models::{ThrottleConfig, ThrottlePreset};
+        use super::http_handler::{collect_response_body_limited, ResponseBodyReadError};
+
+        // 1. Unit check on collect_response_body_limited (both unthrottled and throttled paths)
+        let make_chunks = || {
+            vec![
+                Ok::<_, Infallible>(Frame::data(Bytes::from(vec![b'A'; 600]))),
+                Ok(Frame::data(Bytes::from(vec![b'B'; 600]))),
+            ]
+        };
+        let throttle = ThrottleEngine::new();
+        let body_unthrottled = StreamBody::new(futures_util::stream::iter(make_chunks()));
+        let err1 = collect_response_body_limited(body_unthrottled, &throttle, 1024)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err1,
+            ResponseBodyReadError::PayloadTooLarge { limit: 1024, .. }
+        ));
+
+        throttle.set_config(ThrottleConfig {
+            preset: ThrottlePreset::Custom,
+            download_kbps: 1_000_000,
+            upload_kbps: 1_000_000,
+            latency_ms: 0,
+        });
+        let body_throttled = StreamBody::new(futures_util::stream::iter(make_chunks()));
+        let err2 = collect_response_body_limited(body_throttled, &throttle, 1024)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err2,
+            ResponseBodyReadError::PayloadTooLarge { limit: 1024, .. }
+        ));
+
+        // 2. Full proxy HTTP chunked response exceeding MAX_BUFFERED_RESPONSE_BODY_BYTES (64 MiB) returns 502 cleanly
+        static CHUNK_64K: [u8; 64 * 1024] = [b'Z'; 64 * 1024];
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = upstream_listener.accept().await {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(|_req: Request<Incoming>| async move {
+                    let s = futures_util::stream::iter((0..1026).map(|_| {
+                        Ok::<_, Infallible>(Frame::data(Bytes::from_static(&CHUNK_64K)))
+                    }));
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(StreamBody::new(s))
+                            .unwrap(),
+                    )
+                });
+                let _ = AutoConnBuilder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-oom-cap-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("oom-cap.sqlite")).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
+            store: store.clone(),
+            upstream_http_client: test_upstream_http_client(None),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(0),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_ctx = ctx.clone();
+        tokio::spawn(async move {
+            if let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await {
+                let io = TokioIo::new(tcp_stream);
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let inner_c = proxy_ctx.clone();
+                    async move {
+                        Ok::<_, Infallible>(
+                            handle_outer_proxy_request(
+                                req,
+                                client_addr,
+                                None,
+                                ClientConnContext::new(),
+                                inner_c,
+                            )
+                            .await,
+                        )
+                    }
+                });
+                let _ = AutoConnBuilder::new(TokioExecutor::new())
+                    .serve_connection_with_upgrades(io, service)
+                    .await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap();
+        let resp = client
+            .get(format!("http://{upstream_addr}/huge-chunked"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let err_body = resp.text().await.unwrap();
+        assert!(err_body.contains("exceeds maximum buffered limit"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn ip_source_hosts_remap_preserves_host_and_remapped_target_telemetry() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(|req: Request<Incoming>| async move {
+                        let host = req
+                            .headers()
+                            .get(http::header::HOST)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(format!(
+                            "host={host};path={}",
+                            req.uri().path()
+                        )))))
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-ip-remap-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let host_remap = Arc::new(HostRemapRegistry::new());
+        host_remap
+            .set_rules(vec![crate::models::HostRemapRule {
+                id: "ip-remap".into(),
+                enabled: true,
+                source_pattern: "198.51.100.42".into(),
+                target_host: "127.0.0.1".into(),
+                target_port: Some(upstream_addr.port()),
+                preserve_host_header: true,
+                comment: "IP source remap".into(),
+            }])
+            .unwrap();
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("ip-remap.sqlite")).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            host_remap: Arc::clone(&host_remap),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
+            store: store.clone(),
+            upstream_http_client: test_upstream_http_client(Some(host_remap)),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(0),
+            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_ctx = ctx.clone();
+        tokio::spawn(async move {
+            if let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await {
+                let io = TokioIo::new(tcp_stream);
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let inner_c = proxy_ctx.clone();
+                    async move {
+                        Ok::<_, Infallible>(
+                            handle_outer_proxy_request(
+                                req,
+                                client_addr,
+                                None,
+                                ClientConnContext::new(),
+                                inner_c,
+                            )
+                            .await,
+                        )
+                    }
+                });
+                let _ = AutoConnBuilder::new(TokioExecutor::new())
+                    .serve_connection_with_upgrades(io, service)
+                    .await;
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap();
+        let resp = client
+            .get("http://198.51.100.42:8080/ip-remap")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "host=198.51.100.42:8080;path=/ip-remap"
+        );
+
+        let detail = store.get(1).expect("IP remap session recorded");
+        assert_eq!(
+            detail.transfer_stats.as_ref().and_then(|s| s.remapped_target.as_deref()),
+            Some(format!("127.0.0.1:{}", upstream_addr.port()).as_str())
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

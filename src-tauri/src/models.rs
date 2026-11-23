@@ -215,6 +215,8 @@ pub struct SessionTransferStats {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remapped_target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_proxy_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_streaming: Option<bool>,
 }
 
@@ -479,6 +481,8 @@ pub struct ComposedRequest {
     #[serde(default)]
     pub body_base64: Option<String>,
     pub follow_redirects: bool,
+    #[serde(default)]
+    pub skip_python_scripts: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

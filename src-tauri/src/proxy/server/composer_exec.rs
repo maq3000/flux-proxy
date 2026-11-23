@@ -4,27 +4,29 @@ use base64::Engine as _;
 use bytes::Bytes;
 use chrono::Utc;
 use http::StatusCode;
-use http_body_util::BodyExt;
 
 use crate::models::{
     BreakpointStage, ComposedRequest, HeaderMutationDirection, ProxyError, RuleActionType,
     SessionDetail, SessionSummary, SessionTimings, SessionTransferStats,
 };
-use crate::proxy::throttle::BandwidthPacer;
 use crate::proxy::upstream_client::{
     duration_ms_f64, elapsed_ms, estimate_request_headers_bytes, estimate_response_headers_bytes,
     format_rfc3339_micros, round_ms, timestamp_at_instant,
 };
+use crate::scripting::{apply_header_diff, ScriptRequestOutcome, ScriptResponseOutcome};
 
 use super::http_handler::{
-    build_autoresponder_mock_detail, compute_timings_summary, format_error_chain, maybe_decompress_content_encodings, parse_sse_events_from_bytes,
-    prepare_remapped_upstream_target, run_request_breakpoint_stage, run_response_breakpoint_stage,
-    AutoResponderMockInput, RequestBreakpointStageInput, ResponseBreakpointStageInput,
+    apply_script_request_edits, build_autoresponder_mock_detail, collect_response_body_limited,
+    compute_timings_summary, format_error_chain, maybe_decompress_content_encodings,
+    parse_sse_events_from_bytes, prepare_remapped_upstream_target, run_request_breakpoint_stage,
+    run_response_breakpoint_stage, AutoResponderMockInput, RequestBreakpointStageInput,
+    ResponseBodyReadError, ResponseBreakpointStageInput,
 };
 use super::{
     encode_inline_or_offload, extract_hyper_headers, format_http_version, format_raw_http_version,
-    record_completed_session, record_error_session_with_telemetry,
-    record_in_flight_session_with_remap, ProxyEngineController, MAX_CAPTURED_BODY_BYTES,
+    is_hop_by_hop_header, record_completed_session, record_error_session_with_telemetry,
+    record_in_flight_session_with_remap, ProxyEngineController, MAX_BUFFERED_RESPONSE_BODY_BYTES,
+    MAX_CAPTURED_BODY_BYTES,
 };
 
 impl ProxyEngineController {
@@ -37,6 +39,7 @@ impl ProxyEngineController {
         let session_id = self.context.store.allocate_id();
         let self_pid = std::process::id();
 
+        let skip_python_scripts = composed.skip_python_scripts.unwrap_or(false);
         let mut method_str = composed.method;
         let mut full_url = composed.url;
         let mut req_headers = composed.headers;
@@ -53,6 +56,7 @@ impl ProxyEngineController {
         };
         let mut bp_modified = false;
         let mut total_bp_pause_ms = 0.0_f64;
+        let mut total_script_hook_ms = 0.0_f64;
         let mut autoresponder_delay_ms = 0.0_f64;
 
         let parsed_initial = url::Url::parse(&full_url)
@@ -64,7 +68,7 @@ impl ProxyEngineController {
             None => parsed_initial.path().to_string(),
         };
 
-        let req_mutated = self.context.filters.apply_header_mutations(
+        let mut req_mutated = self.context.filters.apply_header_mutations(
             HeaderMutationDirection::Request,
             &full_url,
             &mut req_headers,
@@ -166,17 +170,207 @@ impl ProxyEngineController {
                 estimate_request_headers_bytes(&method_str, &path, "HTTP/1.1", &req_headers);
         }
 
+        // Python Scripting Engine: on_request(request)
+        if !skip_python_scripts && self.context.script_runner.should_run_request() {
+            let py_req_start = Instant::now();
+            let outcome = self
+                .context
+                .script_runner
+                .run_on_request(session_id, &method_str, &full_url, &req_headers, &req_bytes)
+                .await;
+            total_script_hook_ms += elapsed_ms(py_req_start);
+            match outcome {
+                ScriptRequestOutcome::Unchanged => {}
+                ScriptRequestOutcome::Modified(edits) => {
+                    let mut body_buf = Bytes::from(std::mem::take(&mut req_bytes));
+                    apply_script_request_edits(
+                        edits,
+                        &mut method_str,
+                        &mut full_url,
+                        &mut scheme,
+                        &mut host,
+                        &mut path,
+                        &mut req_headers,
+                        &mut body_buf,
+                        &mut req_mutated,
+                    );
+                    req_bytes = body_buf.to_vec();
+                    req_headers_bytes = estimate_request_headers_bytes(
+                        &method_str,
+                        &path,
+                        "HTTP/1.1",
+                        &req_headers,
+                    );
+                }
+                ScriptRequestOutcome::MockResponse { edits, mock } => {
+                    let mut body_buf = Bytes::from(std::mem::take(&mut req_bytes));
+                    apply_script_request_edits(
+                        edits,
+                        &mut method_str,
+                        &mut full_url,
+                        &mut scheme,
+                        &mut host,
+                        &mut path,
+                        &mut req_headers,
+                        &mut body_buf,
+                        &mut req_mutated,
+                    );
+                    req_bytes = body_buf.to_vec();
+                    req_headers_bytes = estimate_request_headers_bytes(
+                        &method_str,
+                        &path,
+                        "HTTP/1.1",
+                        &req_headers,
+                    );
+
+                    let mock_bytes = mock.body;
+                    let mut mock_resp_headers = mock.headers;
+                    let resp_mutated = self.context.filters.apply_header_mutations(
+                        HeaderMutationDirection::Response,
+                        &full_url,
+                        &mut mock_resp_headers,
+                    );
+                    let content_type = mock_resp_headers
+                        .iter()
+                        .find(|h| h.name.eq_ignore_ascii_case("content-type"))
+                        .map(|h| h.value.clone())
+                        .unwrap_or_else(|| "application/json; charset=utf-8".to_string());
+                    let sse_events = if content_type
+                        .to_ascii_lowercase()
+                        .starts_with("text/event-stream")
+                    {
+                        parse_sse_events_from_bytes(
+                            &mock_bytes,
+                            start.elapsed().as_millis() as u64,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+
+                    let now = Instant::now();
+                    let resp_at = timestamp_at_instant(start, start_utc, now);
+                    let mut mock_timings = SessionTimings {
+                        client_begin_request: Some(req_begin_at.clone()),
+                        got_request_headers: Some(req_begin_at.clone()),
+                        client_done_request: Some(req_begin_at),
+                        client_begin_response: Some(resp_at.clone()),
+                        client_done_response: Some(resp_at),
+                        client_read_ms: Some(0.0),
+                        breakpoint_pause_ms: (total_bp_pause_ms > 0.0)
+                            .then(|| round_ms(total_bp_pause_ms)),
+                        script_hook_ms: Some(round_ms(total_script_hook_ms)),
+                        ..Default::default()
+                    };
+                    compute_timings_summary(
+                        &mut mock_timings,
+                        duration_ms_f64(now.saturating_duration_since(start)),
+                    );
+                    let mock_stats = SessionTransferStats {
+                        request_headers_bytes: Some(req_headers_bytes),
+                        request_body_bytes: Some(req_bytes.len()),
+                        request_wire_body_bytes: Some(req_bytes.len()),
+                        response_headers_bytes: Some(estimate_response_headers_bytes(
+                            mock.status,
+                            "HTTP/1.1",
+                            &mock_resp_headers,
+                        )),
+                        response_body_bytes: Some(mock_bytes.len()),
+                        response_wire_body_bytes: Some(mock_bytes.len()),
+                        client_conn_reused: Some(false),
+                        client_http_version: Some("HTTP/1.1".into()),
+                        ..Default::default()
+                    };
+
+                    let protocol_label = if scheme == "https" {
+                        "HTTPS/2".to_string()
+                    } else {
+                        "HTTP/1.1".to_string()
+                    };
+                    let mut summary = SessionSummary {
+                        id: session_id,
+                        status: mock.status,
+                        protocol: protocol_label,
+                        scheme: scheme.clone(),
+                        method: method_str,
+                        host,
+                        path,
+                        url: full_url,
+                        content_type,
+                        body_size: mock_bytes.len(),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        timestamp,
+                        is_mocked: true,
+                        matched_rule_id: Some("python-script".to_string()),
+                        error: None,
+                        process_name: Some("flux-proxy (Composer)".into()),
+                        process_pid: Some(self_pid),
+                        tls_bypassed: false,
+                        headers_mutated: req_mutated || resp_mutated,
+                        breakpoint_paused: None,
+                        breakpoint_modified: bp_modified,
+                        comment: None,
+                        marked_color: None,
+                        client_ip: Some("127.0.0.1".into()),
+                        remapped_to: None,
+                        ttfb_ms: None,
+                        dns_ms: None,
+                        connect_ms: None,
+                        tls_ms: None,
+                        receive_ms: None,
+                        request_size: None,
+                        wire_body_size: None,
+                        server_ip: None,
+                        server_conn_reused: None,
+                        ws_open: None,
+                    };
+                    summary.apply_telemetry(Some(&mock_timings), Some(&mock_stats));
+
+                    let capped_req = &req_bytes[..req_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
+                    let capped_mock = &mock_bytes[..mock_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
+                    let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
+                    let (resp_b64, resp_txt, resp_offloaded) = encode_inline_or_offload(capped_mock);
+                    let detail = SessionDetail {
+                        summary,
+                        request_headers: req_headers,
+                        response_headers: mock_resp_headers,
+                        request_body_base64: req_b64,
+                        response_body_base64: resp_b64,
+                        request_body_text: req_txt,
+                        response_body_text: resp_txt,
+                        tls_version: (scheme == "https")
+                            .then(|| "TLS (Composer · Python Mock)".to_string()),
+                        client_addr: "Composer (Local)".into(),
+                        websocket_frames: Vec::new(),
+                        sse_events,
+                        body_offloaded: resp_offloaded,
+                        request_body_offloaded: req_offloaded,
+                        timings: Some(mock_timings),
+                        transfer_stats: Some(mock_stats),
+                    };
+
+                    let _ = record_completed_session(
+                        &self.context,
+                        detail.clone(),
+                        Some(capped_req),
+                        Some(capped_mock),
+                    );
+                    let stored = self.context.store.get(session_id).unwrap_or(detail);
+                    return Ok(stored);
+                }
+            }
+        }
+
         let parsed_url = url::Url::parse(&full_url)
             .map_err(|e| ProxyError::Custom(format!("Invalid URL '{full_url}': {e}")))?;
         let method = http::Method::from_bytes(method_str.as_bytes())
             .map_err(|e| ProxyError::Custom(format!("Invalid HTTP method: {e}")))?;
 
         // Check AutoResponder rules for composed requests too
-        if let Some(rule) =
-            self.context
-                .rules
-                .find_matching_rule(&method_str, &full_url, &req_headers)
-        {
+        let matched_rule = self
+            .context
+            .rules
+            .find_matching_rule(&method_str, &full_url, &req_headers);
+        if let Some(ref rule) = matched_rule {
             if rule.latency_ms > 0 {
                 let delay_t = Instant::now();
                 tokio::time::sleep(Duration::from_millis(rule.latency_ms)).await;
@@ -187,7 +381,7 @@ impl ProxyEngineController {
                     &self.context,
                     AutoResponderMockInput {
                         session_id,
-                        rule: &rule,
+                        rule,
                         protocol: if scheme == "https" {
                             "HTTPS/2".into()
                         } else {
@@ -222,6 +416,8 @@ impl ProxyEngineController {
                     client_read_ms: Some(0.0),
                     breakpoint_pause_ms: (total_bp_pause_ms > 0.0)
                         .then(|| round_ms(total_bp_pause_ms)),
+                    script_hook_ms: (total_script_hook_ms > 0.0)
+                        .then(|| round_ms(total_script_hook_ms)),
                     autoresponder_delay_ms: (autoresponder_delay_ms > 0.0)
                         .then(|| round_ms(autoresponder_delay_ms)),
                     ..Default::default()
@@ -458,6 +654,7 @@ impl ProxyEngineController {
             .filter(|h| {
                 let name = h.name.trim();
                 !name.is_empty()
+                    && !is_hop_by_hop_header(name)
                     && !name.eq_ignore_ascii_case("content-length")
                     && !(upstream_target.host_header_override.is_some()
                         && name.eq_ignore_ascii_case("host"))
@@ -537,6 +734,15 @@ impl ProxyEngineController {
         let upstream_resp = exchange.response;
 
         let mut status = upstream_resp.status().as_u16();
+        let mut is_mocked = false;
+        let mut matched_rule_id = None;
+        if let Some(ref rule) = matched_rule {
+            matched_rule_id = Some(rule.id.clone());
+            if matches!(rule.action, RuleActionType::OverrideStatus) {
+                status = rule.status_code;
+                is_mocked = true;
+            }
+        }
         let upstream_version = upstream_resp.version();
         let version_str = format_http_version(&scheme, upstream_version);
         let server_http_ver = format_raw_http_version(upstream_version).to_string();
@@ -552,125 +758,57 @@ impl ProxyEngineController {
             &full_url,
             &mut resp_headers,
         );
-        let mut upstream_resp_body = upstream_resp.into_body();
+        let upstream_resp_body = upstream_resp.into_body();
 
-        let raw_resp_bytes = if self
-            .context
-            .throttle
-            .get_config()
-            .download_bytes_per_sec()
-            .is_some()
-            || self.context.throttle.is_offline()
+        let raw_resp_bytes = match collect_response_body_limited(
+            upstream_resp_body,
+            &self.context.throttle,
+            MAX_BUFFERED_RESPONSE_BODY_BYTES,
+        )
+        .await
         {
-            let mut collected = Vec::new();
-            let mut pacer = BandwidthPacer::new();
-            loop {
-                match upstream_resp_body.frame().await {
-                    Some(Ok(frame)) => {
-                        let Some(chunk) = frame.into_data().ok().filter(|c| !c.is_empty()) else {
-                            continue;
-                        };
-                        if let Err(err) = pacer.pace(&self.context.throttle, chunk.len(), true).await {
-                            let err_msg = err.to_string();
-                            record_error_session_with_telemetry(
-                                &self.context,
-                                session_id,
-                                version_str,
-                                &scheme,
-                                &method_str,
-                                &host,
-                                &path,
-                                &full_url,
-                                req_headers,
-                                &req_bytes,
-                                start.elapsed().as_millis() as u64,
-                                timestamp,
-                                Some("flux-proxy (Composer)".into()),
-                                Some(self_pid),
-                                false,
-                                req_mutated || resp_mutated,
-                                bp_modified,
-                                Some("127.0.0.1".into()),
-                                "Composer (Local)".into(),
-                                503,
-                                upstream_target.remapped_to.clone(),
-                                None,
-                                None,
-                                &err_msg,
-                            );
-                            return Err(ProxyError::Custom(err_msg));
-                        }
-                        collected.extend_from_slice(&chunk);
-                    }
-                    None => break,
-                    Some(Err(err)) => {
-                        let chain = format_error_chain(&err);
-                        let msg = format!("Failed reading upstream response body: {chain}");
-                        record_error_session_with_telemetry(
-                            &self.context,
-                            session_id,
-                            version_str,
-                            &scheme,
-                            &method_str,
-                            &host,
-                            &path,
-                            &full_url,
-                            req_headers,
-                            &req_bytes,
-                            start.elapsed().as_millis() as u64,
-                            timestamp,
-                            Some("flux-proxy (Composer)".into()),
-                            Some(self_pid),
-                            false,
-                            req_mutated || resp_mutated,
-                            bp_modified,
-                            Some("127.0.0.1".into()),
-                            "Composer (Local)".into(),
-                            502,
-                            upstream_target.remapped_to.clone(),
-                            None,
-                            None,
-                            &msg,
-                        );
-                        return Err(ProxyError::Custom(msg));
-                    }
-                }
-            }
-            Bytes::from(collected)
-        } else {
-            match upstream_resp_body.collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(err) => {
-                    let chain = format_error_chain(&err);
-                    let msg = format!("Failed reading upstream response body: {chain}");
-                    record_error_session_with_telemetry(
-                        &self.context,
-                        session_id,
-                        version_str,
-                        &scheme,
-                        &method_str,
-                        &host,
-                        &path,
-                        &full_url,
-                        req_headers,
-                        &req_bytes,
-                        start.elapsed().as_millis() as u64,
-                        timestamp,
-                        Some("flux-proxy (Composer)".into()),
-                        Some(self_pid),
-                        false,
-                        req_mutated || resp_mutated,
-                        bp_modified,
-                        Some("127.0.0.1".into()),
-                        "Composer (Local)".into(),
-                        502,
-                        upstream_target.remapped_to.clone(),
-                        None,
-                        None,
-                        &msg,
-                    );
-                    return Err(ProxyError::Custom(msg));
-                }
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let (err_status, msg) = match err {
+                    ResponseBodyReadError::PayloadTooLarge { limit, .. } => (
+                        StatusCode::BAD_GATEWAY.as_u16(),
+                        format!(
+                            "Upstream response body exceeds maximum buffered limit ({limit} bytes)"
+                        ),
+                    ),
+                    ResponseBodyReadError::Throttle { message, .. } => (503, message),
+                    ResponseBodyReadError::Transport { message, .. } => (
+                        StatusCode::BAD_GATEWAY.as_u16(),
+                        format!("Failed reading upstream response body: {message}"),
+                    ),
+                };
+                record_error_session_with_telemetry(
+                    &self.context,
+                    session_id,
+                    version_str,
+                    &scheme,
+                    &method_str,
+                    &host,
+                    &path,
+                    &full_url,
+                    req_headers,
+                    &req_bytes,
+                    start.elapsed().as_millis() as u64,
+                    timestamp,
+                    Some("flux-proxy (Composer)".into()),
+                    Some(self_pid),
+                    false,
+                    req_mutated || resp_mutated,
+                    bp_modified,
+                    Some("127.0.0.1".into()),
+                    "Composer (Local)".into(),
+                    err_status,
+                    upstream_target.remapped_to.clone(),
+                    None,
+                    None,
+                    &msg,
+                );
+                return Err(ProxyError::Custom(msg));
             }
         };
 
@@ -690,6 +828,66 @@ impl ProxyEngineController {
                 .to_vec()
         };
 
+        let mut content_type = resp_headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case("content-type"))
+            .map(|h| h.value.clone())
+            .unwrap_or_else(|| "text/plain".to_string());
+        let ct_lower = content_type.to_ascii_lowercase();
+        let is_streaming_response = status == 206
+            || ct_lower.starts_with("text/event-stream")
+            || ct_lower.starts_with("video/")
+            || ct_lower.starts_with("audio/");
+
+        // Python Scripting Engine: on_response(response)
+        if !skip_python_scripts
+            && !is_streaming_response
+            && self.context.script_runner.should_run_response()
+        {
+            let py_resp_start = Instant::now();
+            let outcome = self
+                .context
+                .script_runner
+                .run_on_response(
+                    session_id,
+                    &method_str,
+                    &full_url,
+                    status,
+                    &resp_headers,
+                    &resp_bytes,
+                )
+                .await;
+            total_script_hook_ms += elapsed_ms(py_resp_start);
+            if let ScriptResponseOutcome::Modified(edits) = outcome {
+                if let Some(next_status) = edits.status {
+                    if (100..=599).contains(&next_status) && next_status != status {
+                        status = next_status;
+                        resp_mutated = true;
+                    }
+                }
+                if edits.headers_changed
+                    && apply_header_diff(
+                        &mut resp_headers,
+                        &edits.headers_removed,
+                        &edits.headers_set,
+                    )
+                {
+                    let _ = self.context.filters.strip_alt_svc_headers(&mut resp_headers);
+                    if let Some(ct_hdr) = resp_headers
+                        .iter()
+                        .find(|h| h.name.eq_ignore_ascii_case("content-type"))
+                    {
+                        content_type = ct_hdr.value.clone();
+                    }
+                    resp_mutated = true;
+                }
+                if let Some(next_body) = edits.body {
+                    resp_bytes = next_body;
+                    resp_mutated = true;
+                }
+            }
+        }
+
         // Live Breakpoint: After Response (Alt+F11 / `bpafter`)
         if self
             .context
@@ -707,7 +905,7 @@ impl ProxyEngineController {
                     host: host.clone(),
                     path: path.clone(),
                     url: full_url.clone(),
-                    content_type: String::new(),
+                    content_type: content_type.clone(),
                     timestamp: timestamp.clone(),
                     start,
                     process_name: Some("flux-proxy (Composer)".into()),
@@ -715,8 +913,8 @@ impl ProxyEngineController {
                     client_ip: Some("127.0.0.1".into()),
                     client_addr: "Composer (Local)".into(),
                     tls_version: None,
-                    is_mocked: false,
-                    matched_rule_id: None,
+                    is_mocked,
+                    matched_rule_id: matched_rule_id.clone(),
                     req_headers: req_headers.clone(),
                     req_bytes: req_bytes.clone(),
                     req_mutated,
@@ -760,15 +958,18 @@ impl ProxyEngineController {
                 );
                 return Err(ProxyError::Custom(msg.into()));
             }
+            if bp_outcome.headers_changed {
+                if let Some(ct_hdr) = resp_headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case("content-type"))
+                {
+                    content_type = ct_hdr.value.clone();
+                }
+            }
         }
 
         let finish_instant = Instant::now();
         let finish_at = timestamp_at_instant(start, start_utc, finish_instant);
-        let content_type = resp_headers
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case("content-type"))
-            .map(|h| h.value.clone())
-            .unwrap_or_else(|| "text/plain".to_string());
         let sse_events = if content_type.to_ascii_lowercase().starts_with("text/event-stream") {
             parse_sse_events_from_bytes(&resp_bytes, start.elapsed().as_millis() as u64)
         } else {
@@ -797,6 +998,7 @@ impl ProxyEngineController {
             content_download_ms: Some(content_download_ms),
             client_send_ms: Some(0.0),
             breakpoint_pause_ms: (total_bp_pause_ms > 0.0).then(|| round_ms(total_bp_pause_ms)),
+            script_hook_ms: (total_script_hook_ms > 0.0).then(|| round_ms(total_script_hook_ms)),
             autoresponder_delay_ms: (autoresponder_delay_ms > 0.0)
                 .then(|| round_ms(autoresponder_delay_ms)),
             ..Default::default()
@@ -806,6 +1008,7 @@ impl ProxyEngineController {
             duration_ms_f64(finish_instant.saturating_duration_since(start)),
         );
 
+        let is_proxied = conn_meta.as_ref().is_some_and(|m| m.via_proxy_addr.is_some());
         let transfer_stats = SessionTransferStats {
             request_headers_bytes: Some(req_headers_bytes),
             request_body_bytes: Some(req_bytes.len()),
@@ -816,9 +1019,17 @@ impl ProxyEngineController {
             response_content_encoding: raw_response_content_encoding,
             client_conn_reused: Some(false),
             client_http_version: Some("HTTP/1.1".into()),
-            server_addr: conn_meta.as_ref().map(|m| m.server_addr.to_string()),
+            server_addr: if is_proxied {
+                None
+            } else {
+                conn_meta.as_ref().map(|m| m.server_addr.to_string())
+            },
             server_ip: conn_meta.as_ref().map(|m| m.server_ip.clone()),
-            server_port: conn_meta.as_ref().map(|m| m.server_port),
+            server_port: if is_proxied {
+                None
+            } else {
+                conn_meta.as_ref().map(|m| m.server_port)
+            },
             server_conn_id: conn_meta.as_ref().map(|m| m.conn_id),
             server_conn_reused: claimed.as_ref().map(|c| c.reused),
             server_http_version: Some(server_http_ver),
@@ -832,6 +1043,7 @@ impl ProxyEngineController {
                 .remapped_to
                 .clone()
                 .or_else(|| conn_meta.as_ref().and_then(|m| m.remapped_target.clone())),
+            via_proxy_addr: conn_meta.as_ref().and_then(|m| m.via_proxy_addr.clone()),
             ..Default::default()
         };
 
@@ -848,8 +1060,8 @@ impl ProxyEngineController {
             body_size: resp_bytes.len(),
             duration_ms,
             timestamp,
-            is_mocked: false,
-            matched_rule_id: None,
+            is_mocked,
+            matched_rule_id,
             error: None,
             process_name: Some("flux-proxy (Composer)".into()),
             process_pid: Some(self_pid),

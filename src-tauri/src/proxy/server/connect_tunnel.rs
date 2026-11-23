@@ -28,7 +28,9 @@ use crate::proxy::upstream_client::{
     duration_ms_f64, elapsed_ms, estimate_request_headers_bytes, estimate_response_headers_bytes,
     format_rfc3339_micros, format_tls_cipher, format_tls_protocol, timestamp_at_instant,
 };
-use crate::proxy::upstream_proxy::{connect_tunnel_via_upstream, UpstreamTransportStream};
+use crate::proxy::upstream_proxy::{
+    connect_tunnel_via_upstream, format_via_proxy_telemetry, UpstreamTransportStream,
+};
 
 use super::http_handler::handle_intercepted_request;
 use super::mobile_portal::{is_builtin_portal_target, is_virtual_portal_domain};
@@ -168,11 +170,18 @@ pub(super) async fn handle_outer_proxy_request(
                 remapped_connect.as_ref().map(|_| connect_port),
             );
 
-            let (upstream_tcp, dns_ms, tcp_connect_ms, upstream_proxy_label): (
+            let (
+                upstream_tcp,
+                dns_ms,
+                tcp_connect_ms,
+                upstream_proxy_label,
+                upstream_proxy_telemetry,
+            ): (
                 UpstreamTransportStream,
                 f64,
                 f64,
                 Option<String>,
+                Option<(String, String)>,
             ) = if let Some(proxy_cfg) = active_upstream_proxy {
                 let connect_timeout = Duration::from_secs(ctx.upstream_timeout_sec.max(1));
                 let tunnel_res = match connect_tunnel_via_upstream(
@@ -215,11 +224,14 @@ pub(super) async fn handle_outer_proxy_request(
                     UpstreamProxyProtocol::Socks5 => "socks5",
                 };
                 let label = format!("{proto_label}://{}:{}", proxy_cfg.host, proxy_cfg.port);
+                let via_telemetry =
+                    format_via_proxy_telemetry(proxy_cfg.protocol, tunnel_res.proxy_addr);
                 (
                     tunnel_res.stream,
                     tunnel_res.dns_ms,
                     tunnel_res.tcp_connect_ms,
                     Some(label),
+                    Some(via_telemetry),
                 )
             } else {
                 let connect_host_clean = connect_host.trim_matches(['[', ']']);
@@ -305,6 +317,7 @@ pub(super) async fn handle_outer_proxy_request(
                     dns_ms,
                     elapsed_ms(tcp_start),
                     None,
+                    None,
                 )
             };
             let tunnel_start_instant = Instant::now();
@@ -388,6 +401,16 @@ pub(super) async fn handle_outer_proxy_request(
                 net_elapsed_ms: Some(initial_overall),
                 ..Default::default()
             };
+            let (server_addr, server_ip, server_port, via_proxy_addr) =
+                match upstream_proxy_telemetry {
+                    Some((via_addr, via_ip)) => (None, Some(via_ip), None, Some(via_addr)),
+                    None => (
+                        server_sock.map(|a| a.to_string()),
+                        server_sock.map(|a| a.ip().to_string()),
+                        server_sock.map(|a| a.port()),
+                        None,
+                    ),
+                };
             let initial_stats = SessionTransferStats {
                 request_headers_bytes: Some(req_headers_bytes),
                 request_body_bytes: Some(0),
@@ -398,11 +421,12 @@ pub(super) async fn handle_outer_proxy_request(
                 client_conn_id: Some(client_conn.conn_id),
                 client_conn_reused: Some(client_reused),
                 client_http_version: Some(client_http_ver),
-                server_addr: server_sock.map(|a| a.to_string()),
-                server_ip: server_sock.map(|a| a.ip().to_string()),
-                server_port: server_sock.map(|a| a.port()),
+                server_addr,
+                server_ip,
+                server_port,
                 server_conn_reused: Some(false),
                 remapped_target: remapped_to.clone(),
+                via_proxy_addr,
                 is_streaming: Some(true),
                 ..Default::default()
             };

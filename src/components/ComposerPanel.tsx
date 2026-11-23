@@ -56,6 +56,7 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
   const curlDialogRef = useRef<HTMLDialogElement>(null);
   const curlTextareaRef = useRef<HTMLTextAreaElement>(null);
   const curlTitleId = useId();
+  const runScriptsId = useId();
 
   const [method, setMethod] = useState("POST");
   const [url, setUrl] = useState("https://auth.internal.corp/oauth2/token");
@@ -75,6 +76,7 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
     )
   );
   const [followRedirects, setFollowRedirects] = useState(true);
+  const [runPythonScripts, setRunPythonScripts] = useState(true);
   const [activeTab, setActiveTab] = useState<"headers" | "body">("body");
   const [sending, setSending] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -154,6 +156,7 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
     );
     setBody(draftRequest.body);
     setFollowRedirects(draftRequest.followRedirects);
+    setRunPythonScripts(!draftRequest.skipPythonScripts);
     setErrorMessage(null);
   }, [draftRequest]);
 
@@ -246,6 +249,7 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
         headers: headers.filter((h) => h.name.trim().length > 0),
         body,
         followRedirects,
+        skipPythonScripts: !runPythonScripts,
       });
       setLastResponse(detail);
       onSessionCreated(detail);
@@ -324,10 +328,23 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
               type="checkbox"
               checked={followRedirects}
               onChange={(e) => setFollowRedirects(e.target.checked)}
-              className="rounded"
+              className="rounded accent-sky-500"
             />
             <span>Follow redirects</span>
           </label>
+
+          <span className="inline-flex items-center gap-1.5 text-xs text-muted">
+            <input
+              id={runScriptsId}
+              type="checkbox"
+              checked={runPythonScripts}
+              onChange={(e) => setRunPythonScripts(e.target.checked)}
+              className="rounded accent-sky-500"
+            />
+            <label htmlFor={runScriptsId} className="cursor-pointer select-none">
+              Run Python Scripts
+            </label>
+          </span>
         </div>
       </div>
 
