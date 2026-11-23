@@ -7,9 +7,11 @@ import {
   type ImperativePanelGroupHandle,
 } from "react-resizable-panels";
 import {
+  AlertTriangle,
   BarChart2,
   ChevronDown,
   ChevronRight,
+  Clock,
   Columns3,
   Copy,
   Cpu,
@@ -113,6 +115,7 @@ interface SessionInspectorProps {
   canResumePairDiff?: boolean;
   onResumePairDiff?: () => void;
   onSaveBodyFile?: (sessionId: number, isResponse: boolean) => void;
+  onOpenTimeoutSettings?: () => void;
 }
 
 const REQUEST_TABS: { id: InspectorTab; label: string }[] = [
@@ -171,6 +174,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
   canResumePairDiff,
   onResumePairDiff,
   onSaveBodyFile,
+  onOpenTimeoutSettings,
 }) => {
   const [reqTab, setReqTab] = useState<InspectorTab>("headers");
   const [respTab, setRespTab] = useState<InspectorTab>("json");
@@ -1142,6 +1146,45 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
               className="shrink-0 rounded border border-hairline bg-surface/80 px-2 py-0.5 font-mono text-[10px] text-muted hover:border-strong hover:text-fg"
             >
               Изменить (M)
+            </button>
+          )}
+        </div>
+      )}
+
+      {effectiveDetail.responseHeaders.some(
+        (h) =>
+          h.name.toLowerCase() === "x-fluxproxy-error" &&
+          h.value.trim().toLowerCase() === "upstream-response-timeout"
+      ) && (
+        <div
+          role="status"
+          className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-status4xx-fg/40 bg-status4xx-bg px-3 py-1.5 text-xs text-status4xx-fg"
+        >
+          <div className="flex min-w-0 items-start gap-2">
+            <AlertTriangle
+              className="mt-0.5 h-3.5 w-3.5 shrink-0"
+              aria-hidden="true"
+            />
+            <div className="min-w-0">
+              <span className="font-semibold">
+                Upstream Response Timeout (TTFB):
+              </span>{" "}
+              <span className="text-[11px]">
+                Соединение установлено, но сервер не прислал заголовки ответа в
+                течение настроенного лимита. Увеличьте лимит или выберите{" "}
+                <code className="font-mono font-semibold">Unlimited (0)</code>,
+                чтобы видеть реальные медленные ответы сервера.
+              </span>
+            </div>
+          </div>
+          {onOpenTimeoutSettings && (
+            <button
+              type="button"
+              onClick={onOpenTimeoutSettings}
+              className="inline-flex shrink-0 items-center gap-1 rounded border border-status4xx-fg/50 bg-surface/90 px-2 py-1 text-[11px] font-medium text-fg transition-colors hover:border-strong hover:bg-hover"
+            >
+              <Clock className="h-3 w-3 text-accent" aria-hidden="true" />
+              <span>Настроить таймауты</span>
             </button>
           )}
         </div>

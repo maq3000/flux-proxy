@@ -340,7 +340,15 @@ fn parse_rustls_client_auth_from_pem(
 
 fn validate_identity_pem_with_reqwest(pem_bytes: &[u8]) -> Result<(), ProxyError> {
     let (certs, key) = parse_rustls_client_auth_from_pem(pem_bytes)?;
-    UpstreamHttpClient::build(None, None, Some((certs, key, "validation".to_string()))).map_err(|e| {
+    UpstreamHttpClient::build(
+        None,
+        None,
+        Some((certs, key, "validation".to_string())),
+        Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::models::DEFAULT_CONNECT_TIMEOUT_SEC,
+        )),
+    )
+    .map_err(|e| {
         ProxyError::Custom(format!(
             "Сертификат и закрытый ключ не прошли проверку TLS-клиента (rustls): {e}"
         ))
@@ -987,6 +995,7 @@ impl ClientCertificateStore {
         host: &str,
         host_remap: Option<Arc<HostRemapRegistry>>,
         upstream_proxy: Option<Arc<UpstreamProxyManager>>,
+        connect_timeout_sec: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<Option<(Arc<UpstreamHttpClient>, ClientCertificateEntry)>, ProxyError> {
         let Some(entry) = self.match_certificate_for_host(host) else {
             return Ok(None);
@@ -1011,6 +1020,7 @@ impl ClientCertificateStore {
             host_remap,
             upstream_proxy,
             Some((certs, key, entry.common_name.clone())),
+            connect_timeout_sec,
         )
         .map_err(|e| {
             ProxyError::Custom(format!(

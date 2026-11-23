@@ -1033,6 +1033,8 @@ export const PREVIEW_THROTTLE_CONFIG_STORAGE_KEY =
   "fluxproxy.previewThrottleConfig.v1";
 export const PREVIEW_UPSTREAM_PROXY_CONFIG_STORAGE_KEY =
   "fluxproxy.previewUpstreamProxyConfig.v1";
+export const PREVIEW_UPSTREAM_TIMEOUTS_STORAGE_KEY =
+  "fluxproxy.preview.upstreamTimeouts.v1";
 
 export const DEFAULT_HOST_REMAP_RULES: HostRemapRule[] = [];
 

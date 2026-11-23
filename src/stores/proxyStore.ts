@@ -11,6 +11,8 @@ import {
   DEFAULT_THROTTLE_CONFIG,
   DEFAULT_UPSTREAM_PROXY_BYPASS_LIST,
   DEFAULT_UPSTREAM_PROXY_CONFIG,
+  DEFAULT_UPSTREAM_TIMEOUT_CONFIG,
+  UPSTREAM_TIMEOUT_LIMITS,
   type AutoResponderRule,
   type BindHostMode,
   type BreakpointConfig,
@@ -24,6 +26,7 @@ import {
   type StorageStats,
   type ThrottleConfig,
   type UpstreamProxyConfig,
+  type UpstreamTimeoutConfig,
 } from "../types/proxy";
 import type { FluxUserSettingsProfile } from "../types/settings";
 
@@ -41,6 +44,40 @@ export const LS_CLEAR_DB_ON_EXIT_KEY = PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY;
 export const LS_HOST_REMAP_RULES_KEY = "fluxproxy-host-remap-rules-v1";
 export const LS_THROTTLE_CONFIG_KEY = "fluxproxy-throttle-config-v1";
 export const LS_UPSTREAM_PROXY_CONFIG_KEY = "fluxproxy-upstream-proxy-config-v1";
+export const LS_UPSTREAM_TIMEOUTS_KEY = "fluxproxy-upstream-timeouts-v1";
+
+function sanitizeUpstreamTimeoutsForStore(
+  raw: Partial<UpstreamTimeoutConfig> | null | undefined
+): UpstreamTimeoutConfig {
+  const c = raw?.connectTimeoutSec;
+  const r = raw?.responseHeaderTimeoutSec;
+  const cmp = raw?.composerTimeoutSec;
+  return {
+    connectTimeoutSec:
+      typeof c === "number" &&
+      Number.isInteger(c) &&
+      c >= UPSTREAM_TIMEOUT_LIMITS.connectMin &&
+      c <= UPSTREAM_TIMEOUT_LIMITS.connectMax
+        ? c
+        : DEFAULT_UPSTREAM_TIMEOUT_CONFIG.connectTimeoutSec,
+    responseHeaderTimeoutSec:
+      r === 0 ||
+      (typeof r === "number" &&
+        Number.isInteger(r) &&
+        r >= UPSTREAM_TIMEOUT_LIMITS.responseHeaderMin &&
+        r <= UPSTREAM_TIMEOUT_LIMITS.responseHeaderMax)
+        ? r
+        : DEFAULT_UPSTREAM_TIMEOUT_CONFIG.responseHeaderTimeoutSec,
+    composerTimeoutSec:
+      cmp === 0 ||
+      (typeof cmp === "number" &&
+        Number.isInteger(cmp) &&
+        cmp >= UPSTREAM_TIMEOUT_LIMITS.composerMin &&
+        cmp <= UPSTREAM_TIMEOUT_LIMITS.composerMax)
+        ? cmp
+        : DEFAULT_UPSTREAM_TIMEOUT_CONFIG.composerTimeoutSec,
+  };
+}
 
 function sanitizeUpstreamConfigForStore(
   raw: Partial<UpstreamProxyConfig> | null | undefined,
@@ -325,6 +362,12 @@ function readInitialProxySlice() {
     savedUpstreamProxy,
     false
   );
+  const savedUpstreamTimeouts = loadProxyJson<Partial<UpstreamTimeoutConfig> | null>(
+    LS_UPSTREAM_TIMEOUTS_KEY,
+    null
+  );
+  const upstreamTimeouts: UpstreamTimeoutConfig =
+    sanitizeUpstreamTimeoutsForStore(savedUpstreamTimeouts);
 
   return {
     sessions: [] as SessionSummary[],
@@ -352,6 +395,7 @@ function readInitialProxySlice() {
     hostRemapRules,
     throttleConfig,
     upstreamProxyConfig,
+    upstreamTimeouts,
   };
 }
 
@@ -383,6 +427,7 @@ export interface ProxyStoreState {
   hostRemapRules: HostRemapRule[];
   throttleConfig: ThrottleConfig;
   upstreamProxyConfig: UpstreamProxyConfig;
+  upstreamTimeouts: UpstreamTimeoutConfig;
 
   // AutoResponder & Python Scripting state
   autoResponderEnabled: boolean;
@@ -413,6 +458,7 @@ export interface ProxyStoreState {
   setHostRemapRules: (updater: Updater<HostRemapRule[]>) => void;
   setThrottleConfig: (updater: Updater<ThrottleConfig>) => void;
   setUpstreamProxyConfig: (updater: Updater<UpstreamProxyConfig>) => void;
+  setUpstreamTimeouts: (updater: Updater<UpstreamTimeoutConfig>) => void;
 
   setAutoResponderEnabled: (updater: Updater<boolean>) => void;
   setRules: (updater: Updater<AutoResponderRule[]>) => void;
@@ -600,6 +646,22 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
     });
   },
 
+  setUpstreamTimeouts: (updater) => {
+    set((state) => {
+      const nextRaw = resolveUpdater(updater, state.upstreamTimeouts);
+      const upstreamTimeouts = sanitizeUpstreamTimeoutsForStore(nextRaw);
+      try {
+        window.localStorage.setItem(
+          LS_UPSTREAM_TIMEOUTS_KEY,
+          JSON.stringify(upstreamTimeouts)
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+      return { upstreamTimeouts };
+    });
+  },
+
   setScriptCode: (updater) => {
     set((state) => ({ scriptCode: resolveUpdater(updater, state.scriptCode) }));
   },
@@ -722,6 +784,9 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
             ...DEFAULT_UPSTREAM_PROXY_CONFIG,
             bypassList: [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST],
           };
+      const nextUpstreamTimeouts = sanitizeUpstreamTimeoutsForStore(
+        detail.proxy.upstreamTimeouts
+      );
 
       return {
         followTail: nextFollowTail,
@@ -734,6 +799,7 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
         hostRemapRules: nextHostRemapRules,
         throttleConfig: nextThrottleConfig,
         upstreamProxyConfig: nextUpstreamProxyConfig,
+        upstreamTimeouts: nextUpstreamTimeouts,
       };
     });
   },

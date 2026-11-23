@@ -483,6 +483,10 @@ pub struct ComposedRequest {
     pub follow_redirects: bool,
     #[serde(default)]
     pub skip_python_scripts: Option<bool>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub timeout_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1007,4 +1011,93 @@ pub enum WsInjectDirection {
 pub enum WsInjectOpcode {
     Text,
     Binary,
+}
+
+pub const DEFAULT_CONNECT_TIMEOUT_SEC: u64 = 15;
+pub const MIN_CONNECT_TIMEOUT_SEC: u64 = 1;
+pub const MAX_CONNECT_TIMEOUT_SEC: u64 = 300;
+
+/// `0` = Unlimited (wait transparently for slow server headers/responses).
+pub const DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC: u64 = 0;
+pub const MIN_RESPONSE_HEADER_TIMEOUT_SEC: u64 = 5;
+pub const MAX_RESPONSE_HEADER_TIMEOUT_SEC: u64 = 3600;
+
+pub const DEFAULT_COMPOSER_TIMEOUT_SEC: u64 = 120;
+pub const MIN_COMPOSER_TIMEOUT_SEC: u64 = 1;
+pub const MAX_COMPOSER_TIMEOUT_SEC: u64 = 3600;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UpstreamTimeoutConfig {
+    pub connect_timeout_sec: u64,
+    pub response_header_timeout_sec: u64,
+    pub composer_timeout_sec: u64,
+}
+
+impl Default for UpstreamTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_sec: DEFAULT_CONNECT_TIMEOUT_SEC,
+            response_header_timeout_sec: DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            composer_timeout_sec: DEFAULT_COMPOSER_TIMEOUT_SEC,
+        }
+    }
+}
+
+impl UpstreamTimeoutConfig {
+    pub fn normalized(&self) -> Self {
+        let connect_timeout_sec = self
+            .connect_timeout_sec
+            .clamp(MIN_CONNECT_TIMEOUT_SEC, MAX_CONNECT_TIMEOUT_SEC);
+        let response_header_timeout_sec = if self.response_header_timeout_sec == 0 {
+            0
+        } else {
+            self.response_header_timeout_sec.clamp(
+                MIN_RESPONSE_HEADER_TIMEOUT_SEC,
+                MAX_RESPONSE_HEADER_TIMEOUT_SEC,
+            )
+        };
+        let composer_timeout_sec = if self.composer_timeout_sec == 0 {
+            0
+        } else {
+            self.composer_timeout_sec
+                .clamp(MIN_COMPOSER_TIMEOUT_SEC, MAX_COMPOSER_TIMEOUT_SEC)
+        };
+        Self {
+            connect_timeout_sec,
+            response_header_timeout_sec,
+            composer_timeout_sec,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ProxyError> {
+        if !(MIN_CONNECT_TIMEOUT_SEC..=MAX_CONNECT_TIMEOUT_SEC).contains(&self.connect_timeout_sec) {
+            return Err(ProxyError::Custom(format!(
+                "connectTimeoutSec must be between {MIN_CONNECT_TIMEOUT_SEC} and {MAX_CONNECT_TIMEOUT_SEC} seconds (got {})",
+                self.connect_timeout_sec
+            )));
+        }
+        if self.response_header_timeout_sec != 0
+            && !(MIN_RESPONSE_HEADER_TIMEOUT_SEC..=MAX_RESPONSE_HEADER_TIMEOUT_SEC)
+                .contains(&self.response_header_timeout_sec)
+        {
+            return Err(ProxyError::Custom(format!(
+                "responseHeaderTimeoutSec must be 0 (Unlimited) or between {MIN_RESPONSE_HEADER_TIMEOUT_SEC} and {MAX_RESPONSE_HEADER_TIMEOUT_SEC} seconds (got {})",
+                self.response_header_timeout_sec
+            )));
+        }
+        validate_composer_timeout_sec(self.composer_timeout_sec)?;
+        Ok(())
+    }
+}
+
+pub fn validate_composer_timeout_sec(timeout_sec: u64) -> Result<(), ProxyError> {
+    if timeout_sec != 0
+        && !(MIN_COMPOSER_TIMEOUT_SEC..=MAX_COMPOSER_TIMEOUT_SEC).contains(&timeout_sec)
+    {
+        return Err(ProxyError::Custom(format!(
+            "composerTimeoutSec must be 0 (Unlimited) or between {MIN_COMPOSER_TIMEOUT_SEC} and {MAX_COMPOSER_TIMEOUT_SEC} seconds (got {timeout_sec})"
+        )));
+    }
+    Ok(())
 }

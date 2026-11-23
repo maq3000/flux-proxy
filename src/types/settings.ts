@@ -24,6 +24,7 @@ import type {
   TlsInterceptMode,
   ToolbarGroupId,
   UpstreamProxyConfig,
+  UpstreamTimeoutConfig,
 } from "./proxy";
 
 export type { CustomColorOverrides, ThemePresetId, ThemeTokenKey };
@@ -92,6 +93,8 @@ export interface FluxUserProxySettings {
   throttleConfig?: ThrottleConfig;
   /** Upstream Proxy Chaining configuration (password is NEVER exported or stored in profiles) */
   upstreamProxy?: FluxUserUpstreamProxySettings;
+  /** Split upstream timeout configuration (Connect / TTFB / Composer) */
+  upstreamTimeouts?: UpstreamTimeoutConfig;
 }
 
 /** Security: Upstream proxy password is omitted by type and never exported in settings profiles. */
@@ -156,6 +159,7 @@ export interface SettingsImportPreviewSummary {
   hostRemapCount?: number;
   throttlePreset?: ThrottlePreset;
   upstreamProxySummary?: string | null;
+  upstreamTimeoutsSummary?: string;
   autoResponderEnabled: boolean;
   totalRulesCount: number;
   currentTotalRulesCount: number;

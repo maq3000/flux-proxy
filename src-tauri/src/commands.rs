@@ -9,8 +9,8 @@ use crate::models::{
     CaCertificateInfo, CodecOperation, CodecTransformResult, ComposedRequest, DoctorCheckResult,
     HostRemapRule, LoadedSessionBody, NetworkInterfaceInfo, PausedBreakpointItem, ProxyError,
     ProxyFilterBackendConfig, ProxyStatus, PythonRunnerStatus, SanitizationOptions, SessionDetail,
-    SessionSummary, StorageStats, ThrottleConfig, UpstreamProxyConfig, WebSocketFrameRecord,
-    WsInjectDirection, WsInjectOpcode,
+    SessionSummary, StorageStats, ThrottleConfig, UpstreamProxyConfig, UpstreamTimeoutConfig,
+    WebSocketFrameRecord, WsInjectDirection, WsInjectOpcode,
 };
 use crate::proxy::client_certs::{AddClientCertificateRequest, ClientCertificateEntry};
 use crate::proxy::codec::execute_codec_transform;
@@ -976,6 +976,29 @@ pub async fn set_upstream_proxy_config(
     state: State<'_, AppState>,
 ) -> Result<UpstreamProxyConfig, ProxyError> {
     state.controller.set_upstream_proxy_config(config)
+}
+
+#[tauri::command]
+pub async fn get_upstream_timeouts(
+    state: State<'_, AppState>,
+) -> Result<UpstreamTimeoutConfig, ProxyError> {
+    Ok(state.controller.get_upstream_timeouts())
+}
+
+#[tauri::command]
+pub async fn set_upstream_timeouts(
+    config: UpstreamTimeoutConfig,
+    state: State<'_, AppState>,
+) -> Result<UpstreamTimeoutConfig, ProxyError> {
+    state.controller.set_upstream_timeouts(config)
+}
+
+#[tauri::command]
+pub async fn cancel_composed_request(
+    request_id: String,
+    state: State<'_, AppState>,
+) -> Result<bool, ProxyError> {
+    Ok(state.controller.cancel_composed_request(&request_id))
 }
 
 #[tauri::command]

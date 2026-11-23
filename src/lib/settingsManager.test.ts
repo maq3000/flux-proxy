@@ -9,6 +9,7 @@ import type {
   StorageStats,
   ThrottleConfig,
   UpstreamProxyConfig,
+  UpstreamTimeoutConfig,
 } from "../types/proxy";
 import {
   CURRENT_SETTINGS_SCHEMA_VERSION,
@@ -87,6 +88,11 @@ const { mockState, mockProxyBridge, mockDefaultBpConfig } = vi.hoisted(() => {
       hasPassword: false,
       bypassList: ["localhost", "127.0.0.1", "::1", "<local>"],
     } as UpstreamProxyConfig,
+    upstreamTimeouts: {
+      connectTimeoutSec: 15,
+      responseHeaderTimeoutSec: 0,
+      composerTimeoutSec: 120,
+    } as UpstreamTimeoutConfig,
   };
 
   const bridge = {
@@ -128,6 +134,13 @@ const { mockState, mockProxyBridge, mockDefaultBpConfig } = vi.hoisted(() => {
       };
       state.upstreamProxyConfig = structuredClone(next);
       return structuredClone(next);
+    }),
+    getUpstreamTimeouts: vi.fn(async () =>
+      structuredClone(state.upstreamTimeouts)
+    ),
+    setUpstreamTimeouts: vi.fn(async (cfg: UpstreamTimeoutConfig) => {
+      state.upstreamTimeouts = structuredClone(cfg);
+      return structuredClone(cfg);
     }),
     injectWebSocketFrame: vi.fn(async () => {
       throw new Error("not implemented in settingsManager mock");
@@ -307,6 +320,11 @@ function resetMockState(): void {
     username: null,
     hasPassword: false,
     bypassList: ["localhost", "127.0.0.1", "::1", "<local>"],
+  };
+  mockState.upstreamTimeouts = {
+    connectTimeoutSec: 15,
+    responseHeaderTimeoutSec: 0,
+    composerTimeoutSec: 120,
   };
 }
 
@@ -1051,5 +1069,111 @@ describe("settingsManager — applySettingsProfile & transactional rollback", ()
     );
     expect(mockState.upstreamProxyConfig.host).toBe("proxy.corp.local");
     expect(mockState.upstreamProxyConfig.port).toBe(8443);
+  });
+
+  it("stage 39: validates, migrates, previews, applies and rolls back upstreamTimeouts", async () => {
+    // 1. Defaults match Stage 39 spec (connect=15, TTFB=0 Unlimited, composer=120)
+    const defaults = createDefaultSettingsProfile();
+    expect(defaults.proxy.upstreamTimeouts).toEqual({
+      connectTimeoutSec: 15,
+      responseHeaderTimeoutSec: 0,
+      composerTimeoutSec: 120,
+    });
+
+    // 2. Legacy schemaVersion: 1 profile without upstreamTimeouts migrates silently (0 warnings)
+    const legacyRaw = JSON.parse(JSON.stringify(defaults)) as Record<
+      string,
+      unknown
+    >;
+    delete (legacyRaw.proxy as Record<string, unknown>).upstreamTimeouts;
+    const legacyReport = validateAndMigrateSettingsProfileWithReport(legacyRaw);
+    expect(legacyReport.warnings).toEqual([]);
+    expect(legacyReport.profile.proxy.upstreamTimeouts).toEqual({
+      connectTimeoutSec: 15,
+      responseHeaderTimeoutSec: 0,
+      composerTimeoutSec: 120,
+    });
+
+    // 3. Out-of-bounds values are clamped and reported as warnings
+    const invalidIncoming: Record<string, unknown> = {
+      ...legacyRaw,
+      proxy: {
+        ...(legacyRaw.proxy as Record<string, unknown>),
+        upstreamTimeouts: {
+          connectTimeoutSec: 0,
+          responseHeaderTimeoutSec: 3,
+          composerTimeoutSec: 9999,
+        },
+      },
+    };
+    const invalidReport =
+      validateAndMigrateSettingsProfileWithReport(invalidIncoming);
+    expect(invalidReport.profile.proxy.upstreamTimeouts).toEqual({
+      connectTimeoutSec: 1,
+      responseHeaderTimeoutSec: 5,
+      composerTimeoutSec: 3600,
+    });
+    expect(
+      invalidReport.warnings.some((w) => w.includes("connectTimeoutSec"))
+    ).toBe(true);
+    expect(
+      invalidReport.warnings.some((w) => w.includes("responseHeaderTimeoutSec"))
+    ).toBe(true);
+    expect(
+      invalidReport.warnings.some((w) => w.includes("composerTimeoutSec"))
+    ).toBe(true);
+
+    // 4. Valid profile + preview summary
+    const customProfile = createDefaultSettingsProfile();
+    customProfile.proxy.upstreamTimeouts = {
+      connectTimeoutSec: 20,
+      responseHeaderTimeoutSec: 0,
+      composerTimeoutSec: 240,
+    };
+    const preview = buildSettingsImportPreview(customProfile);
+    expect(preview.upstreamTimeoutsSummary).toBe(
+      "Connect 20s / TTFB Unlimited / Composer 240s"
+    );
+
+    // 5. Transactional apply + localStorage persistence + rollback on failure
+    vi.useFakeTimers();
+    await applySettingsProfile(customProfile);
+    vi.runOnlyPendingTimers();
+    expect(mockProxyBridge.setUpstreamTimeouts).toHaveBeenCalledWith({
+      connectTimeoutSec: 20,
+      responseHeaderTimeoutSec: 0,
+      composerTimeoutSec: 240,
+    });
+    expect(mockState.upstreamTimeouts).toEqual({
+      connectTimeoutSec: 20,
+      responseHeaderTimeoutSec: 0,
+      composerTimeoutSec: 240,
+    });
+    expect(
+      JSON.parse(
+        window.localStorage.getItem(SETTINGS_STORAGE_KEYS.upstreamTimeouts) ??
+          "null"
+      )
+    ).toEqual({
+      connectTimeoutSec: 20,
+      responseHeaderTimeoutSec: 0,
+      composerTimeoutSec: 240,
+    });
+
+    const failingProfile = createDefaultSettingsProfile();
+    failingProfile.proxy.upstreamTimeouts = {
+      connectTimeoutSec: 5,
+      responseHeaderTimeoutSec: 60,
+      composerTimeoutSec: 30,
+    };
+    mockProxyBridge.setPythonScript.mockRejectedValueOnce(new Error("boom-t"));
+    await expect(applySettingsProfile(failingProfile)).rejects.toThrow(
+      "boom-t"
+    );
+    expect(mockState.upstreamTimeouts).toEqual({
+      connectTimeoutSec: 20,
+      responseHeaderTimeoutSec: 0,
+      composerTimeoutSec: 240,
+    });
   });
 });

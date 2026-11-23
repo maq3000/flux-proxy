@@ -29,6 +29,7 @@ import type {
 interface ComposerPanelProps {
   draftRequest: ComposedRequest | null;
   resolvedTheme: "dark" | "light";
+  defaultComposerTimeoutSec?: number;
   onLoadSessionIntoComposer: (sessionId: number) => void;
   onSessionCreated: (detail: SessionDetail) => void;
   onGenerateCode?: (request: ComposedRequest) => void;
@@ -48,6 +49,7 @@ const HTTP_METHODS = [
 export const ComposerPanel: React.FC<ComposerPanelProps> = ({
   draftRequest,
   resolvedTheme,
+  defaultComposerTimeoutSec = 120,
   onLoadSessionIntoComposer,
   onSessionCreated,
   onGenerateCode,
@@ -55,8 +57,10 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
 }) => {
   const curlDialogRef = useRef<HTMLDialogElement>(null);
   const curlTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const activeRequestIdRef = useRef<string | null>(null);
   const curlTitleId = useId();
   const runScriptsId = useId();
+  const timeoutSelectId = useId();
 
   const [method, setMethod] = useState("POST");
   const [url, setUrl] = useState("https://auth.internal.corp/oauth2/token");
@@ -77,8 +81,13 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
   );
   const [followRedirects, setFollowRedirects] = useState(true);
   const [runPythonScripts, setRunPythonScripts] = useState(true);
+  const [timeoutOption, setTimeoutOption] = useState<
+    "default" | "0" | "30" | "60" | "120" | "300" | "custom"
+  >("default");
+  const [customTimeoutInput, setCustomTimeoutInput] = useState("120");
   const [activeTab, setActiveTab] = useState<"headers" | "body">("body");
   const [sending, setSending] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [lastResponse, setLastResponse] = useState<SessionDetail | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
@@ -240,7 +249,32 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
   const handleExecute = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!url.trim() || sending) return;
+
+    let resolvedTimeoutSec: number | undefined;
+    if (timeoutOption === "custom") {
+      const clean = customTimeoutInput.trim();
+      const parsed = /^\d+$/.test(clean) ? Number(clean) : NaN;
+      if (
+        !Number.isInteger(parsed) ||
+        (parsed !== 0 && (parsed < 1 || parsed > 3600))
+      ) {
+        setErrorMessage(
+          "Укажите корректный Composer Timeout: 0 (Unlimited) или от 1 до 3600 секунд."
+        );
+        return;
+      }
+      resolvedTimeoutSec = parsed;
+    } else if (timeoutOption !== "default") {
+      resolvedTimeoutSec = Number(timeoutOption);
+    }
+
+    const requestId =
+      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `cmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    activeRequestIdRef.current = requestId;
     setSending(true);
+    setCancelling(false);
     setErrorMessage(null);
     try {
       const detail = await proxyBridge.executeComposedRequest({
@@ -250,6 +284,8 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
         body,
         followRedirects,
         skipPythonScripts: !runPythonScripts,
+        requestId,
+        timeoutSec: resolvedTimeoutSec,
       });
       setLastResponse(detail);
       onSessionCreated(detail);
@@ -260,7 +296,20 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
           : String(err ?? "Не удалось выполнить запрос")
       );
     } finally {
+      activeRequestIdRef.current = null;
       setSending(false);
+      setCancelling(false);
+    }
+  };
+
+  const handleCancel = async () => {
+    const reqId = activeRequestIdRef.current;
+    if (!reqId || !sending || cancelling) return;
+    setCancelling(true);
+    try {
+      await proxyBridge.cancelComposedRequest(reqId);
+    } catch {
+      // request may have finished concurrently
     }
   };
 
@@ -345,6 +394,58 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
               Run Python Scripts
             </label>
           </span>
+
+          <div className="inline-flex items-center gap-1 text-xs text-muted">
+            <label htmlFor={timeoutSelectId} className="select-none">
+              Timeout:
+            </label>
+            <select
+              id={timeoutSelectId}
+              value={timeoutOption}
+              disabled={sending}
+              onChange={(e) =>
+                setTimeoutOption(
+                  e.target.value as
+                    | "default"
+                    | "0"
+                    | "30"
+                    | "60"
+                    | "120"
+                    | "300"
+                    | "custom"
+                )
+              }
+              aria-label="Composer request timeout"
+              className="h-6 rounded border border-hairline bg-surface px-1.5 font-mono text-[11px] text-fg focus:border-sky-500 focus:outline-none disabled:opacity-50"
+            >
+              <option value="default">
+                {defaultComposerTimeoutSec === 0
+                  ? "Default (Unlimited)"
+                  : `Default (${defaultComposerTimeoutSec}s)`}
+              </option>
+              <option value="0">Unlimited</option>
+              <option value="30">30 s</option>
+              <option value="60">60 s</option>
+              <option value="120">120 s</option>
+              <option value="300">300 s</option>
+              <option value="custom">Custom…</option>
+            </select>
+            {timeoutOption === "custom" && (
+              <input
+                type="text"
+                inputMode="numeric"
+                autoCorrect="off"
+                autoCapitalize="none"
+                spellCheck={false}
+                disabled={sending}
+                value={customTimeoutInput}
+                onChange={(e) => setCustomTimeoutInput(e.target.value)}
+                aria-label="Custom Composer timeout in seconds"
+                placeholder="sec (0=∞)"
+                className="h-6 w-16 rounded border border-strong bg-surface px-1.5 font-mono text-[11px] text-fg tabular-nums focus:border-sky-500 focus:outline-none"
+              />
+            )}
+          </div>
         </div>
       </div>
 
@@ -389,6 +490,18 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
           )}
           <span>Execute</span>
         </button>
+
+        {sending && (
+          <button
+            type="button"
+            disabled={cancelling}
+            onClick={() => void handleCancel()}
+            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-status5xx-fg/50 bg-status5xx-bg px-3 text-xs font-semibold text-status5xx-fg transition-colors hover:brightness-110 disabled:opacity-50"
+          >
+            <X className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>{cancelling ? "Cancelling…" : "Cancel"}</span>
+          </button>
+        )}
       </form>
 
       {errorMessage && (

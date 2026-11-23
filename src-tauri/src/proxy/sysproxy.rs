@@ -5,11 +5,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::models::{BindHostMode, ProxyError};
+use crate::models::{BindHostMode, ProxyError, UpstreamTimeoutConfig};
 
 pub const BACKUP_FILE_NAME: &str = "system-proxy-backup.json";
 pub const PREFS_FILE_NAME: &str = "system-proxy-prefs.json";
 pub const PROXY_PORT_PREF_FILE_NAME: &str = "proxy_port.pref";
+pub const UPSTREAM_TIMEOUTS_PREF_FILE_NAME: &str = "upstream_timeouts.pref";
 pub const LEGACY_ALLOW_REMOTE_FILE_NAME: &str = "allow_remote.pref";
 pub const DEFAULT_WINDOWS_PROXY_OVERRIDE: &str = "localhost;127.*;10.*;192.168.*;<local>";
 
@@ -425,6 +426,51 @@ impl SystemProxyManager {
             }
             let _ = fs::write(port_pref_path, format!("{port}\n"));
         }
+    }
+
+    fn upstream_timeouts_pref_path(&self) -> Option<PathBuf> {
+        self.prefs_path
+            .parent()
+            .map(|dir| dir.join(UPSTREAM_TIMEOUTS_PREF_FILE_NAME))
+    }
+
+    pub fn load_upstream_timeouts_pref(&self) -> UpstreamTimeoutConfig {
+        let Some(path) = self.upstream_timeouts_pref_path() else {
+            return UpstreamTimeoutConfig::default();
+        };
+        let Ok(raw) = fs::read_to_string(path) else {
+            return UpstreamTimeoutConfig::default();
+        };
+        serde_json::from_str::<UpstreamTimeoutConfig>(&raw)
+            .map(|cfg| cfg.normalized())
+            .unwrap_or_default()
+    }
+
+    pub fn save_upstream_timeouts_pref(&self, config: &UpstreamTimeoutConfig) -> Result<(), ProxyError> {
+        let normalized = config.normalized();
+        let Some(path) = self.upstream_timeouts_pref_path() else {
+            return Err(ProxyError::Custom(
+                "Unable to resolve upstream_timeouts.pref path".to_string(),
+            ));
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                ProxyError::Custom(format!(
+                    "Failed to create preferences directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let json = serde_json::to_string_pretty(&normalized).map_err(|e| {
+            ProxyError::Custom(format!("Failed to serialize upstream timeout config: {e}"))
+        })?;
+        fs::write(&path, format!("{json}\n")).map_err(|e| {
+            ProxyError::Custom(format!(
+                "Failed to write {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(())
     }
 
     /// Enables the OS system proxy pointing to `normalize_sysproxy_host(host):port`.

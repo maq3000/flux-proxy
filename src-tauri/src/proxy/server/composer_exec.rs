@@ -1,4 +1,71 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
+use tokio::sync::oneshot;
+
+struct ActiveComposerRequestGuard {
+    map: Arc<DashMap<String, oneshot::Sender<()>>>,
+    request_id: Option<String>,
+}
+
+impl Drop for ActiveComposerRequestGuard {
+    fn drop(&mut self) {
+        if let Some(ref id) = self.request_id {
+            self.map.remove(id);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_composer_cancelled(
+    ctx: &super::SharedProxyContext,
+    session_id: u64,
+    protocol: String,
+    scheme: &str,
+    method_str: &str,
+    host: &str,
+    path: &str,
+    full_url: &str,
+    req_headers: Vec<crate::models::HeaderPair>,
+    req_bytes: &[u8],
+    start: Instant,
+    timestamp: String,
+    self_pid: u32,
+    headers_mutated: bool,
+    bp_modified: bool,
+    remapped_to: Option<String>,
+) -> ProxyError {
+    let msg = "Composer request cancelled by user";
+    super::record_error_session_with_telemetry_and_code(
+        ctx,
+        session_id,
+        protocol,
+        scheme,
+        method_str,
+        host,
+        path,
+        full_url,
+        req_headers,
+        req_bytes,
+        start.elapsed().as_millis() as u64,
+        timestamp,
+        Some("flux-proxy (Composer)".into()),
+        Some(self_pid),
+        false,
+        headers_mutated,
+        bp_modified,
+        Some("127.0.0.1".into()),
+        "Composer (Local)".into(),
+        499,
+        remapped_to,
+        None,
+        None,
+        msg,
+        Some(super::FLUXPROXY_ERR_COMPOSER_CANCELLED),
+    );
+    ProxyError::Custom(msg.to_string())
+}
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -38,6 +105,34 @@ impl ProxyEngineController {
         let req_begin_at = format_rfc3339_micros(start_utc);
         let session_id = self.context.store.allocate_id();
         let self_pid = std::process::id();
+
+        let timeout_override = composed.timeout_sec;
+        if let Some(sec) = timeout_override {
+            crate::models::validate_composer_timeout_sec(sec)?;
+        }
+        let clean_request_id = composed
+            .request_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let cancel_rx = clean_request_id.as_ref().map(|req_id| {
+            let (tx, rx) = oneshot::channel::<()>();
+            self.active_composer_requests.insert(req_id.clone(), tx);
+            rx
+        });
+        let _composer_cancel_guard = ActiveComposerRequestGuard {
+            map: Arc::clone(&self.active_composer_requests),
+            request_id: clean_request_id,
+        };
+        let mut cancel_fut = Box::pin(async move {
+            match cancel_rx {
+                Some(rx) => {
+                    let _ = rx.await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        });
 
         let skip_python_scripts = composed.skip_python_scripts.unwrap_or(false);
         let mut method_str = composed.method;
@@ -512,6 +607,7 @@ impl ProxyEngineController {
                 &target_host,
                 Some(self.context.host_remap.clone()),
                 Some(self.context.upstream_proxy.clone()),
+                Arc::clone(&self.context.connect_timeout_sec),
             ) {
                 Ok(Some((mtls_client, entry))) => (mtls_client, Some(entry.common_name)),
                 Ok(None) => (self.context.upstream_http_client(), None),
@@ -580,8 +676,36 @@ impl ProxyEngineController {
             &req_bytes,
             upstream_target.remapped_to.clone(),
         );
+        let mut in_flight_guard =
+            super::InFlightSessionGuard::new_composer(Arc::clone(&self.context), session_id, start);
 
-        if let Err(err) = self.context.throttle.apply_latency().await {
+        let throttle_latency_res = tokio::select! {
+            biased;
+            _ = &mut cancel_fut => {
+                in_flight_guard.disarm();
+                return Err(record_composer_cancelled(
+                    &self.context,
+                    session_id,
+                    in_flight_proto,
+                    &scheme,
+                    &method_str,
+                    &host,
+                    &path,
+                    &full_url,
+                    req_headers,
+                    &req_bytes,
+                    start,
+                    timestamp,
+                    self_pid,
+                    req_mutated,
+                    bp_modified,
+                    upstream_target.remapped_to.clone(),
+                ));
+            }
+            res = self.context.throttle.apply_latency() => res,
+        };
+        if let Err(err) = throttle_latency_res {
+            in_flight_guard.disarm();
             let err_msg = err.to_string();
             record_error_session_with_telemetry(
                 &self.context,
@@ -612,12 +736,33 @@ impl ProxyEngineController {
             return Err(ProxyError::Custom(err_msg));
         }
         if !req_bytes.is_empty() {
-            if let Err(err) = self
-                .context
-                .throttle
-                .throttle_bytes(req_bytes.len(), false)
-                .await
-            {
+            let throttle_upload_res = tokio::select! {
+                biased;
+                _ = &mut cancel_fut => {
+                    in_flight_guard.disarm();
+                    return Err(record_composer_cancelled(
+                        &self.context,
+                        session_id,
+                        in_flight_proto,
+                        &scheme,
+                        &method_str,
+                        &host,
+                        &path,
+                        &full_url,
+                        req_headers,
+                        &req_bytes,
+                        start,
+                        timestamp,
+                        self_pid,
+                        req_mutated,
+                        bp_modified,
+                        upstream_target.remapped_to.clone(),
+                    ));
+                }
+                res = self.context.throttle.throttle_bytes(req_bytes.len(), false) => res,
+            };
+            if let Err(err) = throttle_upload_res {
+                in_flight_guard.disarm();
                 let err_msg = err.to_string();
                 record_error_session_with_telemetry(
                     &self.context,
@@ -661,39 +806,74 @@ impl ProxyEngineController {
             })
             .map(|h| (h.name.clone(), h.value.clone()))
             .collect();
-        let req_timeout = Duration::from_secs(self.context.upstream_timeout_sec.max(1));
+        let req_timeout = self.context.composer_timeout(timeout_override);
         let req_body_bytes = Bytes::from(req_bytes.clone());
 
-        let exchange = if composed.follow_redirects {
-            client
-                .send_following_redirects(
-                    method,
-                    &upstream_target.upstream_url,
-                    &outbound_headers,
-                    upstream_target.host_header_override.as_deref(),
-                    req_body_bytes,
-                    req_timeout,
-                )
-                .await
-        } else {
-            client
-                .send_with_idempotent_retry(
-                    method,
-                    &upstream_target.upstream_url,
-                    &outbound_headers,
-                    upstream_target.host_header_override.as_deref(),
-                    req_body_bytes,
-                    req_timeout,
-                )
-                .await
+        let send_fut = async {
+            if composed.follow_redirects {
+                client
+                    .send_following_redirects(
+                        method,
+                        &upstream_target.upstream_url,
+                        &outbound_headers,
+                        upstream_target.host_header_override.as_deref(),
+                        req_body_bytes,
+                        req_timeout,
+                    )
+                    .await
+            } else {
+                client
+                    .send_with_idempotent_retry(
+                        method,
+                        &upstream_target.upstream_url,
+                        &outbound_headers,
+                        upstream_target.host_header_override.as_deref(),
+                        req_body_bytes,
+                        req_timeout,
+                    )
+                    .await
+            }
+        };
+
+        let exchange = tokio::select! {
+            biased;
+            _ = &mut cancel_fut => {
+                in_flight_guard.disarm();
+                return Err(record_composer_cancelled(
+                    &self.context,
+                    session_id,
+                    in_flight_proto,
+                    &scheme,
+                    &method_str,
+                    &host,
+                    &path,
+                    &full_url,
+                    req_headers,
+                    &req_bytes,
+                    start,
+                    timestamp,
+                    self_pid,
+                    req_mutated,
+                    bp_modified,
+                    upstream_target.remapped_to.clone(),
+                ));
+            }
+            res = send_fut => res,
         };
 
         let exchange = match exchange {
             Ok(ex) => ex,
             Err(err) => {
+                in_flight_guard.disarm();
                 let chain = format_error_chain(&err);
-                let msg = format!("Upstream connection error: {chain}");
-                record_error_session_with_telemetry(
+                let proxy_err_code = err.proxy_error_code();
+                let msg = match &err {
+                    crate::proxy::upstream_client::UpstreamClientError::Timeout(_) => {
+                        format!("Upstream response timeout: {chain}")
+                    }
+                    _ => format!("Upstream connection error: {chain}"),
+                };
+                super::record_error_session_with_telemetry_and_code(
                     &self.context,
                     session_id,
                     in_flight_proto,
@@ -718,6 +898,7 @@ impl ProxyEngineController {
                     None,
                     None,
                     &msg,
+                    Some(proxy_err_code),
                 );
                 return Err(ProxyError::Custom(msg));
             }
@@ -760,15 +941,40 @@ impl ProxyEngineController {
         );
         let upstream_resp_body = upstream_resp.into_body();
 
-        let raw_resp_bytes = match collect_response_body_limited(
-            upstream_resp_body,
-            &self.context.throttle,
-            MAX_BUFFERED_RESPONSE_BODY_BYTES,
-        )
-        .await
-        {
+        let body_collect_res = tokio::select! {
+            biased;
+            _ = &mut cancel_fut => {
+                in_flight_guard.disarm();
+                return Err(record_composer_cancelled(
+                    &self.context,
+                    session_id,
+                    version_str,
+                    &scheme,
+                    &method_str,
+                    &host,
+                    &path,
+                    &full_url,
+                    req_headers,
+                    &req_bytes,
+                    start,
+                    timestamp,
+                    self_pid,
+                    req_mutated || resp_mutated,
+                    bp_modified,
+                    upstream_target.remapped_to.clone(),
+                ));
+            }
+            res = collect_response_body_limited(
+                upstream_resp_body,
+                &self.context.throttle,
+                MAX_BUFFERED_RESPONSE_BODY_BYTES,
+            ) => res,
+        };
+
+        let raw_resp_bytes = match body_collect_res {
             Ok(bytes) => bytes,
             Err(err) => {
+                in_flight_guard.disarm();
                 let (err_status, msg) = match err {
                     ResponseBodyReadError::PayloadTooLarge { limit, .. } => (
                         StatusCode::BAD_GATEWAY.as_u16(),
@@ -929,6 +1135,7 @@ impl ProxyEngineController {
             .await;
             total_bp_pause_ms += elapsed_ms(bp_resp_start);
             if bp_outcome.aborted {
+                in_flight_guard.disarm();
                 let msg = "Response aborted at Live Breakpoint";
                 record_error_session_with_telemetry(
                     &self.context,
@@ -1117,6 +1324,7 @@ impl ProxyEngineController {
             transfer_stats: Some(transfer_stats),
         };
 
+        in_flight_guard.disarm();
         let _ = record_completed_session(
             &self.context,
             detail.clone(),

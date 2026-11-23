@@ -30,7 +30,6 @@ use crate::proxy::upstream_proxy::{
     proxy_authorization_header_value, UpstreamProxyManager, UpstreamTransportStream,
 };
 
-const CONNECT_TIMEOUT_DEFAULT: Duration = Duration::from_secs(15);
 const MAX_REDIRECT_HOPS: usize = 10;
 
 static NEXT_UPSTREAM_CONN_ID: AtomicU64 = AtomicU64::new(1);
@@ -351,7 +350,7 @@ pub struct InstrumentedConnector {
     tls_config: Arc<rustls::ClientConfig>,
     host_remap: Option<Arc<HostRemapRegistry>>,
     upstream_proxy: Option<Arc<UpstreamProxyManager>>,
-    connect_timeout: Duration,
+    connect_timeout_sec: Arc<AtomicU64>,
     mtls_cn: Option<String>,
 }
 
@@ -360,7 +359,7 @@ impl InstrumentedConnector {
         host_remap: Option<Arc<HostRemapRegistry>>,
         upstream_proxy: Option<Arc<UpstreamProxyManager>>,
         client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, String)>,
-        connect_timeout: Duration,
+        connect_timeout_sec: Arc<AtomicU64>,
     ) -> Result<Self, String> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let roots = default_root_store();
@@ -385,7 +384,7 @@ impl InstrumentedConnector {
             tls_config: Arc::new(tls_config),
             host_remap,
             upstream_proxy,
-            connect_timeout,
+            connect_timeout_sec,
             mtls_cn,
         })
     }
@@ -434,10 +433,12 @@ impl Service<Uri> for InstrumentedConnector {
         let tls_config = Arc::clone(&self.tls_config);
         let host_remap = self.host_remap.clone();
         let upstream_proxy = self.upstream_proxy.clone();
-        let connect_timeout = self.connect_timeout;
+        let connect_timeout_sec = self.connect_timeout_sec.load(Ordering::Relaxed).max(1);
+        let connect_timeout = Duration::from_secs(connect_timeout_sec);
         let mtls_cn = self.mtls_cn.clone();
 
         Box::pin(async move {
+            let connect_deadline = Instant::now() + connect_timeout;
             let scheme = dst.scheme_str().unwrap_or("http");
             let is_tls = scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss");
             let orig_host = dst
@@ -447,6 +448,17 @@ impl Service<Uri> for InstrumentedConnector {
             let orig_port = dst
                 .port_u16()
                 .unwrap_or(if is_tls { 443 } else { 80 });
+            let remaining_connect_budget = |phase: &str| -> Result<Duration, UpstreamConnectorError> {
+                let remaining = connect_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    Err(UpstreamConnectorError(format!(
+                        "{phase} timed out after {} s connect deadline for {orig_host}:{orig_port}",
+                        connect_timeout.as_secs()
+                    )))
+                } else {
+                    Ok(remaining)
+                }
+            };
 
             let remap_rule = host_remap.as_ref().and_then(|reg| reg.match_host(&orig_host));
             let (connect_host, connect_port, remapped_target) = if let Some(ref rule) = remap_rule
@@ -482,14 +494,15 @@ impl Service<Uri> for InstrumentedConnector {
                         proxy_cfg.protocol,
                         UpstreamProxyProtocol::Http | UpstreamProxyProtocol::Https
                     );
+                    let tunnel_timeout = remaining_connect_budget("Upstream proxy connect")?;
                     let tunnel = if is_http_proxy {
-                        connect_http_proxy_direct(&proxy_cfg, connect_timeout).await
+                        connect_http_proxy_direct(&proxy_cfg, tunnel_timeout).await
                     } else {
                         connect_tunnel_via_upstream(
                             &proxy_cfg,
                             &connect_host,
                             connect_port,
-                            connect_timeout,
+                            tunnel_timeout,
                         )
                         .await
                     }
@@ -526,11 +539,12 @@ impl Service<Uri> for InstrumentedConnector {
                 }
 
                 // HTTPS over upstream proxy (`CONNECT` or `SOCKS5` tunnel + inner TLS with original SNI & mTLS)
+                let tunnel_timeout = remaining_connect_budget("Upstream proxy tunnel")?;
                 let tunnel = connect_tunnel_via_upstream(
                     &proxy_cfg,
                     &connect_host,
                     connect_port,
-                    connect_timeout,
+                    tunnel_timeout,
                 )
                 .await
                 .map_err(UpstreamConnectorError)?;
@@ -540,16 +554,18 @@ impl Service<Uri> for InstrumentedConnector {
                     UpstreamConnectorError(format!("Invalid TLS ServerName for '{sni_clean}'"))
                 })?;
 
+                let tls_timeout = remaining_connect_budget("TLS handshake via upstream proxy")?;
                 let tls_start = Instant::now();
                 let tls_connector = TlsConnector::from(tls_config);
                 let tls_stream = tokio::time::timeout(
-                    connect_timeout,
+                    tls_timeout,
                     tls_connector.connect(server_name, tunnel.stream),
                 )
                 .await
                 .map_err(|_| {
                     UpstreamConnectorError(format!(
-                        "TLS handshake timed out via upstream proxy for {orig_host}:{orig_port}"
+                        "TLS handshake timed out via upstream proxy after {} s connect deadline for {orig_host}:{orig_port}",
+                        connect_timeout.as_secs()
                     ))
                 })?
                 .map_err(|e| {
@@ -602,16 +618,18 @@ impl Service<Uri> for InstrumentedConnector {
                 if let Ok(ip) = connect_host.parse::<IpAddr>() {
                     (vec![SocketAddr::new(ip, connect_port)], 0.0)
                 } else {
+                    let dns_timeout = remaining_connect_budget("DNS lookup")?;
                     let dns_start = Instant::now();
                     let resolved_iter =
                         tokio::time::timeout(
-                            connect_timeout,
+                            dns_timeout,
                             tokio::net::lookup_host((connect_host.as_str(), connect_port)),
                         )
                         .await
                         .map_err(|_| {
                             UpstreamConnectorError(format!(
-                                "DNS lookup timed out for {connect_host}:{connect_port}"
+                                "DNS lookup timed out after {} s connect deadline for {connect_host}:{connect_port}",
+                                connect_timeout.as_secs()
                             ))
                         })?
                         .map_err(|e| {
@@ -630,16 +648,15 @@ impl Service<Uri> for InstrumentedConnector {
 
             // 2. TCP Connect phase
             let tcp_start = Instant::now();
-            let deadline = tcp_start + connect_timeout;
             let mut tcp_stream_opt: Option<TcpStream> = None;
             let mut last_tcp_err: Option<String> = None;
 
             for addr in addrs {
-                let remaining = deadline.saturating_duration_since(Instant::now());
+                let remaining = connect_deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     last_tcp_err = Some(format!(
-                        "TCP connect timed out after {} ms",
-                        connect_timeout.as_millis()
+                        "TCP connect timed out after {} s connect deadline",
+                        connect_timeout.as_secs()
                     ));
                     break;
                 }
@@ -653,7 +670,10 @@ impl Service<Uri> for InstrumentedConnector {
                         last_tcp_err = Some(format!("{addr}: {e}"));
                     }
                     Err(_) => {
-                        last_tcp_err = Some(format!("{addr}: timed out"));
+                        last_tcp_err = Some(format!(
+                            "{addr}: timed out after {} s connect deadline",
+                            connect_timeout.as_secs()
+                        ));
                     }
                 }
             }
@@ -707,16 +727,18 @@ impl Service<Uri> for InstrumentedConnector {
                 UpstreamConnectorError(format!("Invalid TLS ServerName for '{sni_clean}'"))
             })?;
 
+            let tls_timeout = remaining_connect_budget("TLS handshake")?;
             let tls_start = Instant::now();
             let tls_connector = TlsConnector::from(tls_config);
             let tls_stream = tokio::time::timeout(
-                connect_timeout,
+                tls_timeout,
                 tls_connector.connect(server_name, tcp_stream),
             )
             .await
             .map_err(|_| {
                 UpstreamConnectorError(format!(
-                    "TLS handshake timed out for {orig_host}:{orig_port}"
+                    "TLS handshake timed out after {} s connect deadline for {orig_host}:{orig_port}",
+                    connect_timeout.as_secs()
                 ))
             })?
             .map_err(|e| {
@@ -944,6 +966,21 @@ impl UpstreamClientError {
             Self::Connect(_) | Self::Transport(_) => StatusCode::BAD_GATEWAY,
         }
     }
+
+    pub fn proxy_error_code(&self) -> &'static str {
+        match self {
+            Self::Timeout(_) => "upstream-response-timeout",
+            Self::Connect(msg) => {
+                if msg.to_ascii_lowercase().contains("timed out") {
+                    "upstream-connect-timeout"
+                } else {
+                    "upstream-connect-error"
+                }
+            }
+            Self::Transport(_) => "upstream-connect-error",
+            Self::InvalidRequest(_) => "upstream-invalid-request",
+        }
+    }
 }
 
 pub struct UpstreamExchange {
@@ -975,13 +1012,14 @@ impl UpstreamHttpClient {
         host_remap: Option<Arc<HostRemapRegistry>>,
         upstream_proxy: Option<Arc<UpstreamProxyManager>>,
         client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, String)>,
+        connect_timeout_sec: Arc<AtomicU64>,
     ) -> Result<Self, String> {
         let mtls_cn = client_auth.as_ref().map(|(_, _, cn)| cn.clone());
         let connector = InstrumentedConnector::new(
             host_remap.clone(),
             upstream_proxy.clone(),
             client_auth,
-            CONNECT_TIMEOUT_DEFAULT,
+            connect_timeout_sec,
         )?;
         let client = Client::builder(TokioExecutor::new())
             .timer(TokioTimer::new())
@@ -1015,7 +1053,7 @@ impl UpstreamHttpClient {
         headers: &[(String, String)],
         host_header_override: Option<&str>,
         body: Bytes,
-        timeout: Duration,
+        response_timeout: Option<Duration>,
     ) -> Result<UpstreamExchange, UpstreamClientError> {
         let uri: Uri = url
             .parse()
@@ -1120,7 +1158,11 @@ impl UpstreamHttpClient {
             .body(tracked_body)
             .map_err(|e| UpstreamClientError::InvalidRequest(format!("Failed building upstream request: {e}")))?;
 
-        let response = match tokio::time::timeout(timeout, self.client.request(req)).await {
+        let req_result = match response_timeout {
+            None => Ok(self.client.request(req).await),
+            Some(timeout) => tokio::time::timeout(timeout, self.client.request(req)).await,
+        };
+        let response = match req_result {
             Ok(Ok(resp)) => resp,
             Ok(Err(err)) => {
                 let chain = format_hyper_client_error(&err);
@@ -1130,9 +1172,9 @@ impl UpstreamHttpClient {
                 return Err(UpstreamClientError::Transport(chain));
             }
             Err(_) => {
+                let timeout_ms = response_timeout.map(|d| d.as_millis()).unwrap_or(0);
                 return Err(UpstreamClientError::Timeout(format!(
-                    "Upstream request timed out after {} ms",
-                    timeout.as_millis()
+                    "Upstream response headers (TTFB) timed out after {timeout_ms} ms while waiting for {url}. Connect completed; the upstream server did not send HTTP response headers in time (increase Response Header Timeout or set it to Unlimited in Settings)."
                 )));
             }
         };
@@ -1202,7 +1244,7 @@ impl UpstreamHttpClient {
         headers: &[(String, String)],
         host_header_override: Option<&str>,
         body: Bytes,
-        timeout: Duration,
+        response_timeout: Option<Duration>,
     ) -> Result<UpstreamExchange, UpstreamClientError> {
         let can_retry = matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
         match self
@@ -1212,7 +1254,7 @@ impl UpstreamHttpClient {
                 headers,
                 host_header_override,
                 body.clone(),
-                timeout,
+                response_timeout,
             )
             .await
         {
@@ -1224,8 +1266,15 @@ impl UpstreamHttpClient {
                     url,
                     first_err
                 );
-                self.send_request(method, url, headers, host_header_override, body, timeout)
-                    .await
+                self.send_request(
+                    method,
+                    url,
+                    headers,
+                    host_header_override,
+                    body,
+                    response_timeout,
+                )
+                .await
             }
             Err(err) => Err(err),
         }
@@ -1238,7 +1287,7 @@ impl UpstreamHttpClient {
         initial_headers: &[(String, String)],
         initial_host_override: Option<&str>,
         initial_body: Bytes,
-        timeout: Duration,
+        response_timeout: Option<Duration>,
     ) -> Result<UpstreamExchange, UpstreamClientError> {
         let mut current_method = initial_method;
         let mut current_url = initial_url.to_string();
@@ -1258,7 +1307,7 @@ impl UpstreamHttpClient {
                     &current_headers,
                     current_host_override.as_deref(),
                     current_body.clone(),
-                    timeout,
+                    response_timeout,
                 )
                 .await?;
 
@@ -1355,6 +1404,7 @@ fn format_hyper_client_error(err: &dyn std::error::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::DEFAULT_CONNECT_TIMEOUT_SEC;
     use bytes::Bytes;
     use http::Response;
     use http_body_util::Full;
@@ -1421,7 +1471,13 @@ mod tests {
             }
         });
 
-        let client = UpstreamHttpClient::build(None, None, None).unwrap();
+        let client = UpstreamHttpClient::build(
+            None,
+            None,
+            None,
+            Arc::new(AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_SEC)),
+        )
+        .unwrap();
         let url = format!("http://{addr}/hello");
 
         let first = client
@@ -1431,7 +1487,7 @@ mod tests {
                 &[],
                 None,
                 Bytes::new(),
-                Duration::from_secs(5),
+                Some(Duration::from_secs(5)),
             )
             .await
             .unwrap();
@@ -1456,7 +1512,7 @@ mod tests {
                 &[],
                 None,
                 Bytes::new(),
-                Duration::from_secs(5),
+                Some(Duration::from_secs(5)),
             )
             .await
             .unwrap();
@@ -1520,7 +1576,13 @@ mod tests {
             }
         });
 
-        let client = UpstreamHttpClient::build(None, None, None).unwrap();
+        let client = UpstreamHttpClient::build(
+            None,
+            None,
+            None,
+            Arc::new(AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_SEC)),
+        )
+        .unwrap();
         let headers = vec![("Host".to_string(), addr_a.to_string())];
         let ex = client
             .send_following_redirects(
@@ -1529,7 +1591,7 @@ mod tests {
                 &headers,
                 Some(&addr_a.to_string()),
                 Bytes::new(),
-                Duration::from_secs(5),
+                Some(Duration::from_secs(5)),
             )
             .await
             .unwrap();
@@ -1658,6 +1720,7 @@ mod tests {
             Some(Arc::clone(&host_remap)),
             Some(Arc::clone(&upstream_proxy)),
             None,
+            Arc::new(AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_SEC)),
         )
         .unwrap();
 
@@ -1668,7 +1731,7 @@ mod tests {
                 &[],
                 None,
                 Bytes::new(),
-                Duration::from_secs(5),
+                Some(Duration::from_secs(5)),
             )
             .await
             .unwrap();
@@ -1705,7 +1768,7 @@ mod tests {
                 &[],
                 None,
                 Bytes::new(),
-                Duration::from_secs(5),
+                Some(Duration::from_secs(5)),
             )
             .await
             .unwrap();
@@ -1730,5 +1793,140 @@ mod tests {
                 Some(target_addr.to_string())
             )
         );
+    }
+
+    #[test]
+    fn upstream_timeout_config_validation_and_normalization() {
+        let def = crate::models::UpstreamTimeoutConfig::default();
+        assert_eq!(def.connect_timeout_sec, 15);
+        assert_eq!(def.response_header_timeout_sec, 0);
+        assert_eq!(def.composer_timeout_sec, 120);
+        assert!(def.validate().is_ok());
+
+        let invalid_connect_zero = crate::models::UpstreamTimeoutConfig {
+            connect_timeout_sec: 0,
+            ..def
+        };
+        assert!(invalid_connect_zero.validate().is_err());
+
+        let invalid_ttfb_short = crate::models::UpstreamTimeoutConfig {
+            response_header_timeout_sec: 3,
+            ..def
+        };
+        assert!(invalid_ttfb_short.validate().is_err());
+
+        let invalid_composer_over = crate::models::UpstreamTimeoutConfig {
+            composer_timeout_sec: 4000,
+            ..def
+        };
+        assert!(invalid_composer_over.validate().is_err());
+
+        let boundary = crate::models::UpstreamTimeoutConfig {
+            connect_timeout_sec: 300,
+            response_header_timeout_sec: 3600,
+            composer_timeout_sec: 0,
+        };
+        assert!(boundary.validate().is_ok());
+
+        let out_of_bounds = crate::models::UpstreamTimeoutConfig {
+            connect_timeout_sec: 0,
+            response_header_timeout_sec: 2,
+            composer_timeout_sec: 9999,
+        };
+        let normalized = out_of_bounds.normalized();
+        assert_eq!(normalized.connect_timeout_sec, 1);
+        assert_eq!(normalized.response_header_timeout_sec, 5);
+        assert_eq!(normalized.composer_timeout_sec, 3600);
+    }
+
+    #[tokio::test]
+    async fn stage39_unlimited_ttfb_receives_slow_500_while_finite_timeout_errors() {
+        use http_body_util::BodyExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(|_req: Request<Incoming>| async move {
+                        tokio::time::sleep(Duration::from_millis(450)).await;
+                        let resp = Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(Full::new(Bytes::from("slow-backend-500")))
+                            .unwrap();
+                        Ok::<_, Infallible>(resp)
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        let client = UpstreamHttpClient::build(
+            None,
+            None,
+            None,
+            Arc::new(AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_SEC)),
+        )
+        .unwrap();
+        let url = format!("http://{addr}/slow-500");
+
+        let ex = client
+            .send_request(Method::GET, &url, &[], None, Bytes::new(), None)
+            .await
+            .expect("Unlimited TTFB (None) should transparently wait for slow 500");
+        assert_eq!(ex.response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = ex.response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from("slow-backend-500"));
+
+        let err = match client
+            .send_request(
+                Method::GET,
+                &url,
+                &[],
+                None,
+                Bytes::new(),
+                Some(Duration::from_millis(120)),
+            )
+            .await
+        {
+            Ok(_) => panic!("Finite TTFB timeout should fail before slow server headers"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, UpstreamClientError::Timeout(_)));
+        assert_eq!(err.status_hint(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(err.proxy_error_code(), "upstream-response-timeout");
+    }
+
+    #[tokio::test]
+    async fn stage39_connect_timeout_enforces_stalled_tls_handshake_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((_socket, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        });
+
+        let client = UpstreamHttpClient::build(None, None, None, Arc::new(AtomicU64::new(1))).unwrap();
+        let url = format!("https://{addr}/tls-stall");
+
+        let started = Instant::now();
+        let err = match client
+            .send_request(Method::GET, &url, &[], None, Bytes::new(), None)
+            .await
+        {
+            Ok(_) => panic!("Stalled TLS handshake must fail with connect timeout even when TTFB is Unlimited"),
+            Err(e) => e,
+        };
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(matches!(err, UpstreamClientError::Connect(_)));
+        assert_eq!(err.status_hint(), StatusCode::BAD_GATEWAY);
+        assert_eq!(err.proxy_error_code(), "upstream-connect-timeout");
+        assert!(err.to_string().to_ascii_lowercase().contains("timed out"));
     }
 }

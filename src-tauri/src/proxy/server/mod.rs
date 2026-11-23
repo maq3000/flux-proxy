@@ -46,7 +46,12 @@ pub const MAX_CAPTURED_REQUEST_BODY_BYTES: usize = MAX_CAPTURED_BODY_BYTES;
 pub const MAX_BUFFERED_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB OOM cap for buffered responses
 const ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES: usize = 256 * 1024; // 256 KiB
 const STREAM_TEXT_PREVIEW_MAX_BYTES: usize = 64 * 1024; // 64 KiB cap for text/* or application/* large-stream previews
-const DEFAULT_UPSTREAM_TIMEOUT_SEC: u64 = 15;
+const DEFAULT_UPSTREAM_TIMEOUT_SEC: u64 = crate::models::DEFAULT_CONNECT_TIMEOUT_SEC;
+pub(super) const FLUXPROXY_ERROR_HEADER: &str = "X-FluxProxy-Error";
+pub(super) const FLUXPROXY_ERR_UPSTREAM_CONNECT_TIMEOUT: &str = "upstream-connect-timeout";
+pub(super) const FLUXPROXY_ERR_UPSTREAM_CONNECT_ERROR: &str = "upstream-connect-error";
+pub(super) const FLUXPROXY_ERR_CLIENT_CLOSED_REQUEST: &str = "client-closed-request";
+pub(super) const FLUXPROXY_ERR_COMPOSER_CANCELLED: &str = "composer-cancelled";
 const MAX_CONTENT_ENCODING_LAYERS: usize = 4;
 type ProxyBoxBody = BoxBody<Bytes, Infallible>;
 
@@ -278,59 +283,6 @@ pub(super) fn record_in_flight_session_with_remap(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn record_error_session_with_opts(
-    ctx: &SharedProxyContext,
-    session_id: u64,
-    protocol: String,
-    scheme: &str,
-    method: &str,
-    host: &str,
-    path: &str,
-    url: &str,
-    req_headers: Vec<HeaderPair>,
-    req_body: &[u8],
-    duration_ms: u64,
-    timestamp: String,
-    process_name: Option<String>,
-    process_pid: Option<u32>,
-    tls_bypassed: bool,
-    headers_mutated: bool,
-    breakpoint_modified: bool,
-    client_ip: Option<String>,
-    client_addr: String,
-    status_code: u16,
-    remapped_to: Option<String>,
-    err_msg: &str,
-) {
-    record_error_session_with_telemetry(
-        ctx,
-        session_id,
-        protocol,
-        scheme,
-        method,
-        host,
-        path,
-        url,
-        req_headers,
-        req_body,
-        duration_ms,
-        timestamp,
-        process_name,
-        process_pid,
-        tls_bypassed,
-        headers_mutated,
-        breakpoint_modified,
-        client_ip,
-        client_addr,
-        status_code,
-        remapped_to,
-        None,
-        None,
-        err_msg,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
 pub(super) fn record_error_session_with_telemetry(
     ctx: &SharedProxyContext,
     session_id: u64,
@@ -356,6 +308,63 @@ pub(super) fn record_error_session_with_telemetry(
     timings: Option<SessionTimings>,
     transfer_stats: Option<SessionTransferStats>,
     err_msg: &str,
+) {
+    record_error_session_with_telemetry_and_code(
+        ctx,
+        session_id,
+        protocol,
+        scheme,
+        method,
+        host,
+        path,
+        url,
+        req_headers,
+        req_body,
+        duration_ms,
+        timestamp,
+        process_name,
+        process_pid,
+        tls_bypassed,
+        headers_mutated,
+        breakpoint_modified,
+        client_ip,
+        client_addr,
+        status_code,
+        remapped_to,
+        timings,
+        transfer_stats,
+        err_msg,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_error_session_with_telemetry_and_code(
+    ctx: &SharedProxyContext,
+    session_id: u64,
+    protocol: String,
+    scheme: &str,
+    method: &str,
+    host: &str,
+    path: &str,
+    url: &str,
+    req_headers: Vec<HeaderPair>,
+    req_body: &[u8],
+    duration_ms: u64,
+    timestamp: String,
+    process_name: Option<String>,
+    process_pid: Option<u32>,
+    tls_bypassed: bool,
+    headers_mutated: bool,
+    breakpoint_modified: bool,
+    client_ip: Option<String>,
+    client_addr: String,
+    status_code: u16,
+    remapped_to: Option<String>,
+    timings: Option<SessionTimings>,
+    transfer_stats: Option<SessionTransferStats>,
+    err_msg: &str,
+    proxy_error_code: Option<&str>,
 ) {
     let mut summary = SessionSummary {
         id: session_id,
@@ -398,13 +407,20 @@ pub(super) fn record_error_session_with_telemetry(
 
     let capped_req = &req_body[..req_body.len().min(MAX_CAPTURED_BODY_BYTES)];
     let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
+    let mut response_headers = vec![HeaderPair {
+        name: "Content-Type".into(),
+        value: "text/plain; charset=utf-8".into(),
+    }];
+    if let Some(code) = proxy_error_code {
+        response_headers.push(HeaderPair {
+            name: FLUXPROXY_ERROR_HEADER.into(),
+            value: code.to_string(),
+        });
+    }
     let detail = SessionDetail {
         summary,
         request_headers: req_headers,
-        response_headers: vec![HeaderPair {
-            name: "Content-Type".into(),
-            value: "text/plain; charset=utf-8".into(),
-        }],
+        response_headers,
         request_body_base64: req_b64,
         response_body_base64: base64::engine::general_purpose::STANDARD.encode(err_msg.as_bytes()),
         request_body_text: req_txt,
@@ -438,9 +454,75 @@ pub struct SharedProxyContext {
     pub event_tx: mpsc::UnboundedSender<SessionSummary>,
     pub removed_tx: mpsc::UnboundedSender<Vec<u64>>,
     pub active_port: AtomicU16,
-    pub upstream_timeout_sec: u64,
+    pub connect_timeout_sec: Arc<std::sync::atomic::AtomicU64>,
+    pub response_header_timeout_sec: Arc<std::sync::atomic::AtomicU64>,
+    pub composer_timeout_sec: Arc<std::sync::atomic::AtomicU64>,
     pub app_handle: Option<AppHandle>,
     pub stats_dirty: Arc<AtomicBool>,
+}
+
+pub(super) struct InFlightSessionGuard {
+    ctx: Arc<SharedProxyContext>,
+    session_id: u64,
+    start: Instant,
+    armed: bool,
+    error_message: &'static str,
+    proxy_error_code: &'static str,
+}
+
+impl InFlightSessionGuard {
+    pub(super) fn new(ctx: Arc<SharedProxyContext>, session_id: u64, start: Instant) -> Self {
+        Self {
+            ctx,
+            session_id,
+            start,
+            armed: true,
+            error_message: "Client closed connection while waiting for upstream response",
+            proxy_error_code: FLUXPROXY_ERR_CLIENT_CLOSED_REQUEST,
+        }
+    }
+
+    pub(super) fn new_composer(
+        ctx: Arc<SharedProxyContext>,
+        session_id: u64,
+        start: Instant,
+    ) -> Self {
+        Self {
+            ctx,
+            session_id,
+            start,
+            armed: true,
+            error_message: "Composer request aborted before completion",
+            proxy_error_code: FLUXPROXY_ERR_COMPOSER_CANCELLED,
+        }
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InFlightSessionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let duration_ms = self.start.elapsed().as_millis() as u64;
+        if let Some(updated_summary) = self.ctx.store.finalize_abandoned_in_flight(
+            self.session_id,
+            499,
+            duration_ms,
+            self.error_message,
+            Some(self.proxy_error_code),
+        ) {
+            if evaluate_should_store_session(&self.ctx, &updated_summary) {
+                let _ = self.ctx.event_tx.send(updated_summary);
+            } else {
+                self.ctx.store.remove_many(&[self.session_id]);
+                let _ = self.ctx.removed_tx.send(vec![self.session_id]);
+            }
+        }
+    }
 }
 
 fn make_breakpoint_guard(
@@ -474,6 +556,44 @@ fn make_breakpoint_guard(
 }
 
 impl SharedProxyContext {
+    pub fn connect_timeout(&self) -> Duration {
+        let secs = self
+            .connect_timeout_sec
+            .load(Ordering::Relaxed)
+            .clamp(
+                crate::models::MIN_CONNECT_TIMEOUT_SEC,
+                crate::models::MAX_CONNECT_TIMEOUT_SEC,
+            );
+        Duration::from_secs(secs)
+    }
+
+    pub fn response_header_timeout(&self) -> Option<Duration> {
+        let secs = self.response_header_timeout_sec.load(Ordering::Relaxed);
+        if secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(secs))
+        }
+    }
+
+    pub fn composer_timeout(&self, override_sec: Option<u64>) -> Option<Duration> {
+        let secs = override_sec.unwrap_or_else(|| self.composer_timeout_sec.load(Ordering::Relaxed));
+        if secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(secs))
+        }
+    }
+
+    pub fn upstream_timeout_config(&self) -> crate::models::UpstreamTimeoutConfig {
+        crate::models::UpstreamTimeoutConfig {
+            connect_timeout_sec: self.connect_timeout_sec.load(Ordering::Relaxed),
+            response_header_timeout_sec: self.response_header_timeout_sec.load(Ordering::Relaxed),
+            composer_timeout_sec: self.composer_timeout_sec.load(Ordering::Relaxed),
+        }
+        .normalized()
+    }
+
     pub fn upstream_http_client(&self) -> Arc<UpstreamHttpClient> {
         self.upstream_http_client
             .read()
@@ -484,7 +604,12 @@ impl SharedProxyContext {
     pub fn rebuild_upstream_clients(&self) {
         let resolver = Arc::clone(&self.host_remap);
         let upstream_proxy = Arc::clone(&self.upstream_proxy);
-        match UpstreamHttpClient::build(Some(resolver), Some(upstream_proxy), None) {
+        match UpstreamHttpClient::build(
+            Some(resolver),
+            Some(upstream_proxy),
+            None,
+            Arc::clone(&self.connect_timeout_sec),
+        ) {
             Ok(client) => {
                 *self
                     .upstream_http_client
@@ -781,6 +906,8 @@ pub(crate) fn push_or_replace_summary(buffer: &mut Vec<SessionSummary>, item: Se
 pub struct ProxyEngineController {
     pub context: Arc<SharedProxyContext>,
     pub sysproxy: Arc<SystemProxyManager>,
+    pub(super) active_composer_requests:
+        Arc<DashMap<String, tokio::sync::oneshot::Sender<()>>>,
     op_lock: Mutex<()>,
     runtime_state: std::sync::Mutex<ControllerRuntimeState>,
 }
@@ -952,12 +1079,23 @@ impl ProxyEngineController {
         let host_remap = Arc::new(HostRemapRegistry::new());
         let upstream_proxy = Arc::new(UpstreamProxyManager::new());
         let throttle = Arc::new(ThrottleEngine::new());
+        let timeouts_pref = sysproxy.load_upstream_timeouts_pref().normalized();
+        let connect_timeout_sec = Arc::new(std::sync::atomic::AtomicU64::new(
+            timeouts_pref.connect_timeout_sec,
+        ));
+        let response_header_timeout_sec = Arc::new(std::sync::atomic::AtomicU64::new(
+            timeouts_pref.response_header_timeout_sec,
+        ));
+        let composer_timeout_sec = Arc::new(std::sync::atomic::AtomicU64::new(
+            timeouts_pref.composer_timeout_sec,
+        ));
         let dns_resolver = Arc::clone(&host_remap);
         let upstream_http_client = Arc::new(
             UpstreamHttpClient::build(
                 Some(dns_resolver),
                 Some(Arc::clone(&upstream_proxy)),
                 None,
+                Arc::clone(&connect_timeout_sec),
             )
             .map_err(ProxyError::Custom)?,
         );
@@ -983,7 +1121,9 @@ impl ProxyEngineController {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(initial_port),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec,
+            response_header_timeout_sec,
+            composer_timeout_sec,
             app_handle,
             stats_dirty,
         });
@@ -1012,6 +1152,7 @@ impl ProxyEngineController {
         Ok(Self {
             context,
             sysproxy,
+            active_composer_requests: Arc::new(DashMap::new()),
             op_lock: Mutex::new(()),
             runtime_state: std::sync::Mutex::new(ControllerRuntimeState {
                 bind_addr: (initial_bind_host, initial_port),
@@ -1653,6 +1794,16 @@ impl ProxyEngineController {
         self.context
             .breakpoints
             .resume_all(BreakpointAction::Continue);
+        let pending_composer_ids: Vec<String> = self
+            .active_composer_requests
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for req_id in pending_composer_ids {
+            if let Some((_, tx)) = self.active_composer_requests.remove(&req_id) {
+                let _ = tx.send(());
+            }
+        }
         self.context.script_runner.shutdown_sync();
         {
             let mut guard = self.lock_runtime();
@@ -1662,6 +1813,38 @@ impl ProxyEngineController {
             guard.listener_handles.clear();
         }
         self.sysproxy.rollback_sync();
+    }
+
+    pub fn get_upstream_timeouts(&self) -> crate::models::UpstreamTimeoutConfig {
+        self.context.upstream_timeout_config()
+    }
+
+    pub fn set_upstream_timeouts(
+        &self,
+        config: crate::models::UpstreamTimeoutConfig,
+    ) -> Result<crate::models::UpstreamTimeoutConfig, ProxyError> {
+        config.validate()?;
+        let normalized = config.normalized();
+        self.context
+            .connect_timeout_sec
+            .store(normalized.connect_timeout_sec, Ordering::Relaxed);
+        self.context
+            .response_header_timeout_sec
+            .store(normalized.response_header_timeout_sec, Ordering::Relaxed);
+        self.context
+            .composer_timeout_sec
+            .store(normalized.composer_timeout_sec, Ordering::Relaxed);
+        self.sysproxy.save_upstream_timeouts_pref(&normalized)?;
+        Ok(normalized)
+    }
+
+    pub fn cancel_composed_request(&self, request_id: &str) -> bool {
+        if let Some((_, tx)) = self.active_composer_requests.remove(request_id) {
+            let _ = tx.send(());
+            true
+        } else {
+            false
+        }
     }
 
     pub fn get_upstream_proxy_config(&self) -> UpstreamProxyConfig {
@@ -1766,12 +1949,57 @@ pub(super) fn record_and_return_error_with_opts(
     remapped_to: Option<String>,
     err_msg: String,
 ) -> Response<ProxyBoxBody> {
+    record_and_return_error_with_opts_and_code(
+        ctx,
+        session_id,
+        scheme,
+        method,
+        host,
+        path,
+        url,
+        req_headers,
+        req_body,
+        start,
+        timestamp,
+        client_addr,
+        client_proc,
+        tls_bypassed,
+        breakpoint_modified,
+        status_code,
+        remapped_to,
+        err_msg,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_and_return_error_with_opts_and_code(
+    ctx: &SharedProxyContext,
+    session_id: u64,
+    scheme: &str,
+    method: &str,
+    host: &str,
+    path: &str,
+    url: &str,
+    req_headers: Vec<HeaderPair>,
+    req_body: Bytes,
+    start: Instant,
+    timestamp: String,
+    client_addr: SocketAddr,
+    client_proc: Option<&ClientProcessInfo>,
+    tls_bypassed: bool,
+    breakpoint_modified: bool,
+    status_code: StatusCode,
+    remapped_to: Option<String>,
+    err_msg: String,
+    proxy_error_code: Option<&str>,
+) -> Response<ProxyBoxBody> {
     let protocol = if tls_bypassed {
         "TLS-BYPASS".into()
     } else {
         scheme.to_ascii_uppercase()
     };
-    record_error_session_with_opts(
+    record_error_session_with_telemetry_and_code(
         ctx,
         session_id,
         protocol,
@@ -1793,21 +2021,34 @@ pub(super) fn record_and_return_error_with_opts(
         client_addr.to_string(),
         status_code.as_u16(),
         remapped_to,
+        None,
+        None,
         &err_msg,
+        proxy_error_code,
     );
-    plain_response(status_code, &err_msg)
+    plain_response_with_proxy_error(status_code, &err_msg, proxy_error_code)
 }
 
 fn boxed_full(bytes: Bytes) -> ProxyBoxBody {
     Full::new(bytes).boxed()
 }
 
-fn plain_response(status: StatusCode, msg: &str) -> Response<ProxyBoxBody> {
-    Response::builder()
+pub(super) fn plain_response(status: StatusCode, msg: &str) -> Response<ProxyBoxBody> {
+    plain_response_with_proxy_error(status, msg, None)
+}
+
+pub(super) fn plain_response_with_proxy_error(
+    status: StatusCode,
+    msg: &str,
+    proxy_error_code: Option<&str>,
+) -> Response<ProxyBoxBody> {
+    let mut builder = Response::builder()
         .status(status)
-        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(boxed_full(Bytes::from(msg.to_owned())))
-        .unwrap()
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8");
+    if let Some(code) = proxy_error_code {
+        builder = builder.header(FLUXPROXY_ERROR_HEADER, code);
+    }
+    builder.body(boxed_full(Bytes::from(msg.to_owned()))).unwrap()
 }
 
 fn split_authority(authority: &str) -> (String, u16) {
@@ -2052,7 +2293,15 @@ mod tests {
         host_remap: Option<Arc<HostRemapRegistry>>,
     ) -> std::sync::RwLock<Arc<UpstreamHttpClient>> {
         std::sync::RwLock::new(Arc::new(
-            UpstreamHttpClient::build(host_remap, None, None).unwrap(),
+            UpstreamHttpClient::build(
+                host_remap,
+                None,
+                None,
+                Arc::new(std::sync::atomic::AtomicU64::new(
+                    crate::models::DEFAULT_CONNECT_TIMEOUT_SEC,
+                )),
+            )
+            .unwrap(),
         ))
     }
 
@@ -2115,7 +2364,13 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -2234,7 +2489,13 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -2487,7 +2748,13 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -2635,7 +2902,13 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -2775,7 +3048,13 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(bound_port),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -2982,7 +3261,13 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -3150,7 +3435,13 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -3378,7 +3669,13 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -3665,7 +3962,13 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -4206,7 +4509,13 @@ mod tests {
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -4568,7 +4877,13 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -4786,7 +5101,13 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(proxy_addr.port()),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -4954,7 +5275,13 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -5073,6 +5400,8 @@ def on_response(response, request):
                 body_base64: None,
                 follow_redirects: false,
                 skip_python_scripts: None,
+                request_id: None,
+                timeout_sec: None,
             })
             .await;
         assert!(composed_res.is_err());
@@ -5161,7 +5490,13 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: 1,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -5359,7 +5694,13 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -5607,7 +5948,13 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -5726,7 +6073,13 @@ def on_response(response, request):
             .unwrap();
 
         let resolver = Arc::clone(&host_remap);
-        let client = UpstreamHttpClient::build(Some(resolver), None, None).unwrap();
+        let client = UpstreamHttpClient::build(
+            Some(resolver),
+            None,
+            None,
+            Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+        )
+        .unwrap();
 
         let _ = client
             .send_request(
@@ -5735,7 +6088,7 @@ def on_response(response, request):
                 &[],
                 None,
                 bytes::Bytes::new(),
-                Duration::from_secs(3),
+                Some(Duration::from_secs(3)),
             )
             .await;
 
@@ -5831,7 +6184,13 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -5973,7 +6332,13 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -6121,7 +6486,13 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -6262,7 +6633,13 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -6430,7 +6807,13 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -6831,7 +7214,13 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -7208,7 +7597,13 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: 3,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(3)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -7526,6 +7921,8 @@ def on_response(response, request):
                 body_base64: None,
                 follow_redirects: false,
                 skip_python_scripts: None,
+                request_id: None,
+                timeout_sec: None,
             })
             .await
             .unwrap();
@@ -7550,6 +7947,8 @@ def on_response(response, request):
                 body_base64: None,
                 follow_redirects: false,
                 skip_python_scripts: Some(true),
+                request_id: None,
+                timeout_sec: None,
             })
             .await
             .unwrap();
@@ -7678,7 +8077,13 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -7796,7 +8201,13 @@ def on_response(response, request):
             event_tx,
             removed_tx,
             active_port: AtomicU16::new(0),
-            upstream_timeout_sec: DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
             app_handle: None,
             stats_dirty: Arc::new(AtomicBool::new(false)),
         });
@@ -7849,6 +8260,490 @@ def on_response(response, request):
             Some(format!("127.0.0.1:{}", upstream_addr.port()).as_str())
         );
 
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn stage39_slow_upstream_500_transparent_at_unlimited_and_504_at_finite_ttfb() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(|req: Request<Incoming>| async move {
+                        let delay_ms = if req.uri().path().contains("very-slow") {
+                            1500
+                        } else {
+                            350
+                        };
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        let resp = Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(Full::new(Bytes::from("backend-real-500")))
+                            .unwrap();
+                        Ok::<_, Infallible>(resp)
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-stage39-ttfb-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("ttfb.sqlite")).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
+            store: store.clone(),
+            upstream_http_client: test_upstream_http_client(None),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(0),
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(5)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(120)),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_ctx = ctx.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await {
+                let c = proxy_ctx.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp_stream);
+                    let service = service_fn(move |req: Request<Incoming>| {
+                        let inner_c = c.clone();
+                        async move {
+                            Ok::<_, Infallible>(
+                                handle_outer_proxy_request(
+                                    req,
+                                    client_addr,
+                                    None,
+                                    ClientConnContext::new(),
+                                    inner_c,
+                                )
+                                .await,
+                            )
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, service)
+                        .await;
+                });
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap();
+
+        // 1. Unlimited TTFB (0) waits and forwards authentic backend 500
+        let ok_slow = client
+            .get(format!("http://{upstream_addr}/slow-500"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_slow.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(ok_slow.headers().get("x-fluxproxy-error").is_none());
+        assert_eq!(ok_slow.text().await.unwrap(), "backend-real-500");
+
+        // 2. Finite TTFB (1s) returns synthetic 504 + X-FluxProxy-Error: upstream-response-timeout
+        ctx.response_header_timeout_sec.store(1, Ordering::Relaxed);
+        let timed_out = client
+            .get(format!("http://{upstream_addr}/very-slow"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(timed_out.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            timed_out
+                .headers()
+                .get("x-fluxproxy-error")
+                .and_then(|v| v.to_str().ok()),
+            Some("upstream-response-timeout")
+        );
+
+        let recorded_timeout = store.get(2).expect("timeout session recorded");
+        assert_eq!(recorded_timeout.summary.status, 504);
+        assert!(recorded_timeout.response_headers.iter().any(|h| {
+            h.name.eq_ignore_ascii_case("x-fluxproxy-error")
+                && h.value == "upstream-response-timeout"
+        }));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn stage39_in_flight_session_guard_finalizes_499_on_client_disconnect() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let release_srv = Arc::clone(&release);
+
+        tokio::spawn(async move {
+            if let Ok((_stream, _)) = upstream_listener.accept().await {
+                release_srv.notified().await;
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-stage39-499-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("499.sqlite")).unwrap());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
+            store: store.clone(),
+            upstream_http_client: test_upstream_http_client(None),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(0),
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(5)),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(120)),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_ctx = ctx.clone();
+        tokio::spawn(async move {
+            if let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await {
+                let io = TokioIo::new(tcp_stream);
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let inner_c = proxy_ctx.clone();
+                    async move {
+                        Ok::<_, Infallible>(
+                            handle_outer_proxy_request(
+                                req,
+                                client_addr,
+                                None,
+                                ClientConnContext::new(),
+                                inner_c,
+                            )
+                            .await,
+                        )
+                    }
+                });
+                let _ = AutoConnBuilder::new(TokioExecutor::new())
+                    .serve_connection_with_upgrades(io, service)
+                    .await;
+            }
+        });
+
+        let mut client_tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        let raw_req = format!(
+            "GET http://{upstream_addr}/hang HTTP/1.1\r\nHost: {upstream_addr}\r\nConnection: close\r\n\r\n"
+        );
+        client_tcp.write_all(raw_req.as_bytes()).await.unwrap();
+
+        let in_flight = tokio::time::timeout(Duration::from_secs(3), event_rx.recv())
+            .await
+            .expect("should emit in-flight session")
+            .unwrap();
+        assert_eq!(in_flight.status, 0);
+
+        // Client aborts TCP connection while proxy is awaiting slow/hanging upstream
+        drop(client_tcp);
+
+        let closed_evt = tokio::time::timeout(Duration::from_secs(3), event_rx.recv())
+            .await
+            .expect("InFlightSessionGuard should emit 499 update on drop")
+            .unwrap();
+        assert_eq!(closed_evt.status, 499);
+        assert!(closed_evt
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Client closed connection"));
+
+        let stored = store.get(in_flight.id).unwrap();
+        assert_eq!(stored.summary.status, 499);
+        assert!(stored.response_headers.iter().any(|h| {
+            h.name.eq_ignore_ascii_case("x-fluxproxy-error") && h.value == "client-closed-request"
+        }));
+
+        release.notify_one();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn stage39_connect_timeout_bounds_stalled_connect_tunnel_and_persists_prefs() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-stage39-connect-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("connect.sqlite")).unwrap());
+        let sysproxy = Arc::new(SystemProxyManager::new(&tmp_dir));
+        let client_certs = Arc::new(ClientCertificateStore::in_memory());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (bp_tx, _bp_rx) = mpsc::unbounded_channel();
+
+        let controller = ProxyEngineController::new_with_channels(
+            ca,
+            rules,
+            filters,
+            store.clone(),
+            sysproxy.clone(),
+            client_certs,
+            event_tx,
+            removed_tx,
+            bp_tx,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+
+        // 1. Default prefs & persistence check
+        assert_eq!(
+            controller.get_upstream_timeouts(),
+            crate::models::UpstreamTimeoutConfig::default()
+        );
+        assert!(controller
+            .set_upstream_timeouts(crate::models::UpstreamTimeoutConfig {
+                connect_timeout_sec: 1,
+                response_header_timeout_sec: 3,
+                composer_timeout_sec: 60,
+            })
+            .is_err());
+
+        let saved = controller
+            .set_upstream_timeouts(crate::models::UpstreamTimeoutConfig {
+                connect_timeout_sec: 1,
+                response_header_timeout_sec: 0,
+                composer_timeout_sec: 45,
+            })
+            .unwrap();
+        assert_eq!(saved.connect_timeout_sec, 1);
+        assert_eq!(saved.response_header_timeout_sec, 0);
+        assert_eq!(saved.composer_timeout_sec, 45);
+        assert_eq!(sysproxy.load_upstream_timeouts_pref(), saved);
+
+        // 2. Stalled upstream proxy CONNECT tunnel times out according to connectTimeoutSec=1
+        let stalled_proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_proxy_addr = stalled_proxy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((_sock, _)) = stalled_proxy_listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        });
+
+        controller
+            .context
+            .upstream_proxy
+            .set_config(crate::models::UpstreamProxyConfig {
+                enabled: true,
+                protocol: crate::models::UpstreamProxyProtocol::Http,
+                host: stalled_proxy_addr.ip().to_string(),
+                port: stalled_proxy_addr.port(),
+                username: None,
+                password: None,
+                has_password: false,
+                bypass_list: Vec::new(),
+            })
+            .unwrap();
+
+        // Bypass MITM on this domain so CONNECT tunnel passthrough executes
+        let mut fcfg = controller.context.filters.get_config();
+        fcfg.tls_bypass_enabled = true;
+        fcfg.tls_bypass_rules.push(crate::models::TlsBypassRule {
+            id: "stalled-connect".into(),
+            enabled: true,
+            pattern: "stalled-connect.example".into(),
+            category: "custom".into(),
+            description: "Stage 39 connect timeout test".into(),
+        });
+        controller.context.filters.update_config(fcfg);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_ctx = Arc::clone(&controller.context);
+        tokio::spawn(async move {
+            if let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await {
+                let io = TokioIo::new(tcp_stream);
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let inner_c = proxy_ctx.clone();
+                    async move {
+                        Ok::<_, Infallible>(
+                            handle_outer_proxy_request(
+                                req,
+                                client_addr,
+                                None,
+                                ClientConnContext::new(),
+                                inner_c,
+                            )
+                            .await,
+                        )
+                    }
+                });
+                let _ = AutoConnBuilder::new(TokioExecutor::new())
+                    .serve_connection_with_upgrades(io, service)
+                    .await;
+            }
+        });
+
+        let started = Instant::now();
+        let mut client_tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        client_tcp
+            .write_all(b"CONNECT stalled-connect.example:443 HTTP/1.1\r\nHost: stalled-connect.example:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 2048];
+        let n = tokio::time::timeout(Duration::from_secs(4), client_tcp.read(&mut buf))
+            .await
+            .expect("CONNECT tunnel timeout should fire cleanly near 1s")
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(4));
+        let resp_str = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp_str.starts_with("HTTP/1.1 502"));
+        assert!(resp_str.to_ascii_lowercase().contains("x-fluxproxy-error: upstream-connect-timeout"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn stage39_composer_cancel_records_499() {
+        let stalled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_addr = stalled_listener.local_addr().unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let release_srv = Arc::clone(&release);
+        tokio::spawn(async move {
+            if let Ok((_sock, _)) = stalled_listener.accept().await {
+                release_srv.notified().await;
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-stage39-composer-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("composer-cancel.sqlite")).unwrap());
+        let sysproxy = Arc::new(SystemProxyManager::new(&tmp_dir));
+        let client_certs = Arc::new(ClientCertificateStore::in_memory());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (bp_tx, _bp_rx) = mpsc::unbounded_channel();
+
+        let controller = Arc::new(
+            ProxyEngineController::new_with_channels(
+                ca,
+                rules,
+                filters,
+                store.clone(),
+                sysproxy,
+                client_certs,
+                event_tx,
+                removed_tx,
+                bp_tx,
+                None,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap(),
+        );
+
+        let ctrl_spawn = Arc::clone(&controller);
+        let url = format!("http://{stalled_addr}/slow-composer");
+        let task = tokio::spawn(async move {
+            ctrl_spawn
+                .execute_composed(ComposedRequest {
+                    method: "GET".into(),
+                    url,
+                    headers: Vec::new(),
+                    body: String::new(),
+                    body_base64: None,
+                    follow_redirects: false,
+                    skip_python_scripts: Some(true),
+                    request_id: Some("cmp-req-cancel-1".into()),
+                    timeout_sec: Some(0),
+                })
+                .await
+        });
+
+        let in_flight = tokio::time::timeout(Duration::from_secs(3), event_rx.recv())
+            .await
+            .expect("Composer should emit in-flight session")
+            .unwrap();
+        assert_eq!(in_flight.status, 0);
+
+        assert!(controller.cancel_composed_request("cmp-req-cancel-1"));
+        assert!(!controller.cancel_composed_request("cmp-req-cancel-1"));
+
+        let res = task.await.unwrap();
+        assert!(res.is_err());
+
+        let cancelled_evt = tokio::time::timeout(Duration::from_secs(3), event_rx.recv())
+            .await
+            .expect("Composer cancel should emit 499 session summary")
+            .unwrap();
+        assert_eq!(cancelled_evt.status, 499);
+        let detail = store.get(in_flight.id).unwrap();
+        assert_eq!(detail.summary.status, 499);
+        assert!(detail.response_headers.iter().any(|h| {
+            h.name.eq_ignore_ascii_case("x-fluxproxy-error") && h.value == "composer-cancelled"
+        }));
+
+        release.notify_one();
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

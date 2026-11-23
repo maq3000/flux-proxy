@@ -53,7 +53,9 @@ import {
   DEFAULT_THROTTLE_CONFIG,
   DEFAULT_UPSTREAM_PROXY_BYPASS_LIST,
   DEFAULT_UPSTREAM_PROXY_CONFIG,
+  DEFAULT_UPSTREAM_TIMEOUT_CONFIG,
   THROTTLE_PRESET_DEFINITIONS,
+  UPSTREAM_TIMEOUT_LIMITS,
 } from "../types/proxy";
 import type {
   AutoResponderRule,
@@ -89,6 +91,7 @@ import type {
   ToolbarGroupId,
   UpstreamProxyConfig,
   UpstreamProxyProtocol,
+  UpstreamTimeoutConfig,
 } from "../types/proxy";
 import {
   CURRENT_SETTINGS_SCHEMA_VERSION,
@@ -134,6 +137,7 @@ export const SETTINGS_STORAGE_KEYS = {
   hostRemapRules: "fluxproxy-host-remap-rules-v1",
   throttleConfig: "fluxproxy-throttle-config-v1",
   upstreamProxyConfig: "fluxproxy-upstream-proxy-config-v1",
+  upstreamTimeouts: "fluxproxy-upstream-timeouts-v1",
 } as const;
 
 const VALID_THEMES = new Set<ThemePreference>(["dark", "light", "system"]);
@@ -325,6 +329,7 @@ export function createDefaultSettingsProfile(): FluxUserSettingsProfile {
         username: null,
         bypassList: [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST],
       },
+      upstreamTimeouts: { ...DEFAULT_UPSTREAM_TIMEOUT_CONFIG },
     },
     autoResponder: {
       enabled: true,
@@ -1047,6 +1052,125 @@ function sanitizeUpstreamProxyConfig(
     port,
     username,
     bypassList,
+  };
+}
+
+function sanitizeUpstreamTimeoutConfig(
+  raw: unknown,
+  warnings: string[]
+): UpstreamTimeoutConfig {
+  const defaultOut: UpstreamTimeoutConfig = {
+    ...DEFAULT_UPSTREAM_TIMEOUT_CONFIG,
+  };
+  if (raw === undefined || raw === null) {
+    return defaultOut;
+  }
+  if (!isPlainObject(raw)) {
+    warnings.push(
+      "Секция «proxy.upstreamTimeouts» повреждена — сброшена к настройкам по умолчанию."
+    );
+    return defaultOut;
+  }
+
+  let connectTimeoutSec = defaultOut.connectTimeoutSec;
+  if (raw.connectTimeoutSec !== undefined) {
+    const n = Number(raw.connectTimeoutSec);
+    if (
+      typeof raw.connectTimeoutSec === "number" &&
+      Number.isInteger(n) &&
+      n >= UPSTREAM_TIMEOUT_LIMITS.connectMin &&
+      n <= UPSTREAM_TIMEOUT_LIMITS.connectMax
+    ) {
+      connectTimeoutSec = n;
+    } else if (
+      typeof raw.connectTimeoutSec === "number" &&
+      Number.isFinite(raw.connectTimeoutSec)
+    ) {
+      connectTimeoutSec = Math.min(
+        UPSTREAM_TIMEOUT_LIMITS.connectMax,
+        Math.max(
+          UPSTREAM_TIMEOUT_LIMITS.connectMin,
+          Math.round(raw.connectTimeoutSec)
+        )
+      );
+      warnings.push(
+        `Поле «proxy.upstreamTimeouts.connectTimeoutSec» (${String(raw.connectTimeoutSec)}) вне диапазона ${UPSTREAM_TIMEOUT_LIMITS.connectMin}..${UPSTREAM_TIMEOUT_LIMITS.connectMax} с — скорректировано до ${connectTimeoutSec} с.`
+      );
+    } else {
+      warnings.push(
+        `Поле «proxy.upstreamTimeouts.connectTimeoutSec» некорректно — использовано ${defaultOut.connectTimeoutSec} с.`
+      );
+    }
+  }
+
+  let responseHeaderTimeoutSec = defaultOut.responseHeaderTimeoutSec;
+  if (raw.responseHeaderTimeoutSec !== undefined) {
+    const n = Number(raw.responseHeaderTimeoutSec);
+    if (
+      typeof raw.responseHeaderTimeoutSec === "number" &&
+      (n === 0 ||
+        (Number.isInteger(n) &&
+          n >= UPSTREAM_TIMEOUT_LIMITS.responseHeaderMin &&
+          n <= UPSTREAM_TIMEOUT_LIMITS.responseHeaderMax))
+    ) {
+      responseHeaderTimeoutSec = n;
+    } else if (
+      typeof raw.responseHeaderTimeoutSec === "number" &&
+      Number.isFinite(raw.responseHeaderTimeoutSec)
+    ) {
+      responseHeaderTimeoutSec = Math.min(
+        UPSTREAM_TIMEOUT_LIMITS.responseHeaderMax,
+        Math.max(
+          UPSTREAM_TIMEOUT_LIMITS.responseHeaderMin,
+          Math.round(raw.responseHeaderTimeoutSec)
+        )
+      );
+      warnings.push(
+        `Поле «proxy.upstreamTimeouts.responseHeaderTimeoutSec» (${String(raw.responseHeaderTimeoutSec)}) должно быть 0 или ${UPSTREAM_TIMEOUT_LIMITS.responseHeaderMin}..${UPSTREAM_TIMEOUT_LIMITS.responseHeaderMax} с — скорректировано до ${responseHeaderTimeoutSec} с.`
+      );
+    } else {
+      warnings.push(
+        "Поле «proxy.upstreamTimeouts.responseHeaderTimeoutSec» некорректно — сброшено к Unlimited (0)."
+      );
+    }
+  }
+
+  let composerTimeoutSec = defaultOut.composerTimeoutSec;
+  if (raw.composerTimeoutSec !== undefined) {
+    const n = Number(raw.composerTimeoutSec);
+    if (
+      typeof raw.composerTimeoutSec === "number" &&
+      (n === 0 ||
+        (Number.isInteger(n) &&
+          n >= UPSTREAM_TIMEOUT_LIMITS.composerMin &&
+          n <= UPSTREAM_TIMEOUT_LIMITS.composerMax))
+    ) {
+      composerTimeoutSec = n;
+    } else if (
+      typeof raw.composerTimeoutSec === "number" &&
+      Number.isFinite(raw.composerTimeoutSec)
+    ) {
+      composerTimeoutSec = Math.min(
+        UPSTREAM_TIMEOUT_LIMITS.composerMax,
+        Math.max(
+          UPSTREAM_TIMEOUT_LIMITS.composerMin,
+          Math.round(raw.composerTimeoutSec)
+        )
+      );
+      warnings.push(
+        `Поле «proxy.upstreamTimeouts.composerTimeoutSec» (${String(raw.composerTimeoutSec)}) вне диапазона 0 или ${UPSTREAM_TIMEOUT_LIMITS.composerMin}..${UPSTREAM_TIMEOUT_LIMITS.composerMax} с — скорректировано до ${composerTimeoutSec} с.`
+      );
+    } else {
+      warnings.push(
+        `Поле «proxy.upstreamTimeouts.composerTimeoutSec» некорректно — использовано ${defaultOut.composerTimeoutSec} с.`
+      );
+    }
+  }
+
+  return {
+    connectTimeoutSec,
+    responseHeaderTimeoutSec,
+    composerTimeoutSec,
   };
 }
 
@@ -2105,6 +2229,10 @@ export function validateAndMigrateSettingsProfileWithReport(
         rawProxy.upstreamProxy,
         warnings
       ),
+      upstreamTimeouts: sanitizeUpstreamTimeoutConfig(
+        rawProxy.upstreamTimeouts,
+        warnings
+      ),
     },
     autoResponder: {
       enabled: sanitizeBoolean(
@@ -2270,6 +2398,10 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
   const storedUpstreamProxyRaw = readLocalStorageJson<unknown>(
     SETTINGS_STORAGE_KEYS.upstreamProxyConfig,
     defaults.proxy.upstreamProxy
+  );
+  const storedUpstreamTimeoutsRaw = readLocalStorageJson<unknown>(
+    SETTINGS_STORAGE_KEYS.upstreamTimeouts,
+    defaults.proxy.upstreamTimeouts
   );
   const storedScripting = readLocalStorageJson<Partial<FluxUserScriptingSettings>>(
     SETTINGS_STORAGE_KEYS.pythonScript,
@@ -2468,6 +2600,10 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
             : [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST],
         };
       })(),
+      upstreamTimeouts: sanitizeUpstreamTimeoutConfig(
+        live.proxy?.upstreamTimeouts ?? storedUpstreamTimeoutsRaw,
+        []
+      ),
     },
     autoResponder: {
       enabled:
@@ -2617,6 +2753,17 @@ export function buildSettingsImportPreview(
       incoming.proxy.upstreamProxy?.enabled && incoming.proxy.upstreamProxy.host
         ? `${incoming.proxy.upstreamProxy.protocol.toUpperCase()} ${incoming.proxy.upstreamProxy.host}:${incoming.proxy.upstreamProxy.port}`
         : null,
+    upstreamTimeoutsSummary: (() => {
+      const t =
+        incoming.proxy.upstreamTimeouts ?? DEFAULT_UPSTREAM_TIMEOUT_CONFIG;
+      const ttfb =
+        t.responseHeaderTimeoutSec === 0
+          ? "Unlimited"
+          : `${t.responseHeaderTimeoutSec}s`;
+      const cmp =
+        t.composerTimeoutSec === 0 ? "Unlimited" : `${t.composerTimeoutSec}s`;
+      return `Connect ${t.connectTimeoutSec}s / TTFB ${ttfb} / Composer ${cmp}`;
+    })(),
     autoResponderEnabled: incoming.autoResponder.enabled,
     totalRulesCount,
     currentTotalRulesCount,
@@ -2845,6 +2992,12 @@ function atomicWriteProfileToLocalStorage(
             }
       ),
     ],
+    [
+      SETTINGS_STORAGE_KEYS.upstreamTimeouts,
+      JSON.stringify(
+        profile.proxy.upstreamTimeouts ?? DEFAULT_UPSTREAM_TIMEOUT_CONFIG
+      ),
+    ],
   ];
 
   // Capture rollback snapshot for atomic recovery if quota is exceeded mid-batch
@@ -2937,6 +3090,11 @@ export async function applySettingsProfile(
     username: null,
     bypassList: [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST],
   };
+  const nextUpstreamTimeouts: UpstreamTimeoutConfig =
+    sanitizeUpstreamTimeoutConfig(
+      normalizedWithBreakpoints.proxy.upstreamTimeouts,
+      []
+    );
 
   // 1. Capture current backend state snapshot for transactional rollback
   const [
@@ -2951,6 +3109,7 @@ export async function applySettingsProfile(
     prevHostRemapRules,
     prevThrottleConfig,
     prevUpstreamProxy,
+    prevUpstreamTimeouts,
   ] = await Promise.all([
     proxyBridge.getStatus(),
     proxyBridge.getFilterBackendConfig(),
@@ -2963,6 +3122,7 @@ export async function applySettingsProfile(
     proxyBridge.getHostRemapRules(),
     proxyBridge.getThrottleConfig(),
     proxyBridge.getUpstreamProxyConfig(),
+    proxyBridge.getUpstreamTimeouts(),
   ]);
 
   const sameUpstreamTarget =
@@ -3008,6 +3168,7 @@ export async function applySettingsProfile(
       proxyBridge.updateHostRemapRules(nextHostRemapRules),
       proxyBridge.setThrottleConfig(nextThrottleConfig),
       proxyBridge.setUpstreamProxyConfig(nextUpstreamPayload),
+      proxyBridge.setUpstreamTimeouts(nextUpstreamTimeouts),
     ]);
 
     if (
@@ -3100,6 +3261,7 @@ export async function applySettingsProfile(
         ...prevUpstreamProxy,
         password: undefined,
       }),
+      proxyBridge.setUpstreamTimeouts(prevUpstreamTimeouts),
     ]);
     const configLabels = [
       "фильтры прокси",
@@ -3112,6 +3274,7 @@ export async function applySettingsProfile(
       "HOSTS Remapping",
       "Bandwidth Throttling",
       "Upstream Proxy",
+      "Upstream Timeouts",
     ];
     configRollback.forEach((res, idx) => {
       if (res.status === "rejected") {

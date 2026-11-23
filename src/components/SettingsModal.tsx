@@ -37,6 +37,7 @@ import type {
   StorageStats,
   TlsInterceptMode,
   ToolbarGroupId,
+  UpstreamTimeoutConfig,
 } from "../types/proxy";
 import {
   CURRENT_SETTINGS_SCHEMA_VERSION,
@@ -146,6 +147,8 @@ export interface SettingsModalProps {
     specificBindIp?: string | null,
     alsoBindLoopback?: boolean
   ) => Promise<void>;
+  upstreamTimeouts: UpstreamTimeoutConfig;
+  onSetUpstreamTimeouts: (config: UpstreamTimeoutConfig) => Promise<void>;
   sessionRetentionLimit: number | null;
   onSetSessionRetentionLimit: (limit: number | null) => Promise<void> | void;
   dropNonMatching: boolean;
@@ -265,6 +268,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onSetAutoSystemProxy,
   onSetAllowRemote: _onSetAllowRemote,
   onSetBindConfiguration,
+  upstreamTimeouts,
+  onSetUpstreamTimeouts,
   sessionRetentionLimit,
   onSetSessionRetentionLimit,
   dropNonMatching,
@@ -699,6 +704,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 sysProxyTargetHost={sysProxyTargetHost}
                 onSetProxyPort={onSetProxyPort}
                 onSetAutoSystemProxy={onSetAutoSystemProxy}
+                upstreamTimeouts={upstreamTimeouts}
+                onSetUpstreamTimeouts={onSetUpstreamTimeouts}
                 sessionRetentionLimit={sessionRetentionLimit}
                 onSetSessionRetentionLimit={onSetSessionRetentionLimit}
                 dropNonMatching={dropNonMatching}
@@ -1128,6 +1135,14 @@ export const SettingsImportPreviewModal: React.FC<
                       "Выкл (пароль не хранится в профиле)"}
                   </span>
                 </div>
+                {preview.upstreamTimeoutsSummary && (
+                  <div>
+                    • Upstream Timeouts:{" "}
+                    <span className="font-mono text-fg">
+                      {preview.upstreamTimeoutsSummary}
+                    </span>
+                  </div>
+                )}
                 <div>
                   • Скрытые группы тулбара:{" "}
                   <span className="font-mono text-fg">

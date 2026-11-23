@@ -170,6 +170,9 @@ pub(super) async fn handle_outer_proxy_request(
                 remapped_connect.as_ref().map(|_| connect_port),
             );
 
+            let connect_timeout = ctx.connect_timeout();
+            let connect_deadline = Instant::now() + connect_timeout;
+
             let (
                 upstream_tcp,
                 dns_ms,
@@ -183,7 +186,6 @@ pub(super) async fn handle_outer_proxy_request(
                 Option<String>,
                 Option<(String, String)>,
             ) = if let Some(proxy_cfg) = active_upstream_proxy {
-                let connect_timeout = Duration::from_secs(ctx.upstream_timeout_sec.max(1));
                 let tunnel_res = match connect_tunnel_via_upstream(
                     &proxy_cfg,
                     &connect_host,
@@ -194,7 +196,12 @@ pub(super) async fn handle_outer_proxy_request(
                 {
                     Ok(res) => res,
                     Err(err_msg) => {
-                        return record_and_return_error_with_opts(
+                        let proxy_err_code = if err_msg.to_ascii_lowercase().contains("timed out") {
+                            super::FLUXPROXY_ERR_UPSTREAM_CONNECT_TIMEOUT
+                        } else {
+                            super::FLUXPROXY_ERR_UPSTREAM_CONNECT_ERROR
+                        };
+                        return super::record_and_return_error_with_opts_and_code(
                             &ctx,
                             session_id,
                             "https",
@@ -215,6 +222,7 @@ pub(super) async fn handle_outer_proxy_request(
                             format!(
                                 "TLS Passthrough upstream proxy connect failed for {connect_host}:{connect_port}: {err_msg}"
                             ),
+                            Some(proxy_err_code),
                         );
                     }
                 };
@@ -239,11 +247,43 @@ pub(super) async fn handle_outer_proxy_request(
                     if let Ok(ip) = connect_host_clean.parse::<IpAddr>() {
                         (vec![SocketAddr::new(ip, connect_port)], 0.0)
                     } else {
+                        let dns_rem = connect_deadline.saturating_duration_since(Instant::now());
+                        if dns_rem.is_zero() {
+                            return super::record_and_return_error_with_opts_and_code(
+                                &ctx,
+                                session_id,
+                                "https",
+                                "CONNECT",
+                                &host,
+                                &tunnel_path,
+                                &target_url,
+                                connect_headers,
+                                Bytes::new(),
+                                start,
+                                timestamp,
+                                client_addr,
+                                client_proc.as_ref(),
+                                true,
+                                false,
+                                StatusCode::BAD_GATEWAY,
+                                remapped_to,
+                                format!(
+                                    "TLS Passthrough DNS lookup timed out after {} s for {connect_host}:{connect_port}",
+                                    connect_timeout.as_secs()
+                                ),
+                                Some(super::FLUXPROXY_ERR_UPSTREAM_CONNECT_TIMEOUT),
+                            );
+                        }
                         let dns_start = Instant::now();
-                        match tokio::net::lookup_host((connect_host_clean, connect_port)).await {
-                            Ok(iter) => (iter.collect(), elapsed_ms(dns_start)),
-                            Err(err) => {
-                                return record_and_return_error_with_opts(
+                        match tokio::time::timeout(
+                            dns_rem,
+                            tokio::net::lookup_host((connect_host_clean, connect_port)),
+                        )
+                        .await
+                        {
+                            Ok(Ok(iter)) => (iter.collect(), elapsed_ms(dns_start)),
+                            Ok(Err(err)) => {
+                                return super::record_and_return_error_with_opts_and_code(
                                     &ctx,
                                     session_id,
                                     "https",
@@ -264,6 +304,33 @@ pub(super) async fn handle_outer_proxy_request(
                                     format!(
                                         "TLS Passthrough DNS lookup failed for {connect_host}:{connect_port}: {err}"
                                     ),
+                                    Some(super::FLUXPROXY_ERR_UPSTREAM_CONNECT_ERROR),
+                                );
+                            }
+                            Err(_) => {
+                                return super::record_and_return_error_with_opts_and_code(
+                                    &ctx,
+                                    session_id,
+                                    "https",
+                                    "CONNECT",
+                                    &host,
+                                    &tunnel_path,
+                                    &target_url,
+                                    connect_headers,
+                                    Bytes::new(),
+                                    start,
+                                    timestamp,
+                                    client_addr,
+                                    client_proc.as_ref(),
+                                    true,
+                                    false,
+                                    StatusCode::BAD_GATEWAY,
+                                    remapped_to,
+                                    format!(
+                                        "TLS Passthrough DNS lookup timed out after {} s for {connect_host}:{connect_port}",
+                                        connect_timeout.as_secs()
+                                    ),
+                                    Some(super::FLUXPROXY_ERR_UPSTREAM_CONNECT_TIMEOUT),
                                 );
                             }
                         }
@@ -271,24 +338,45 @@ pub(super) async fn handle_outer_proxy_request(
 
                 let tcp_start = Instant::now();
                 let mut upstream_tcp_opt = None;
-                let mut last_tcp_err = None;
+                let mut last_tcp_err: Option<String> = None;
+                let mut tcp_timed_out = false;
                 for addr in resolved_addrs {
-                    match TcpStream::connect(addr).await {
-                        Ok(stream) => {
+                    let remaining = connect_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        tcp_timed_out = true;
+                        last_tcp_err = Some(format!(
+                            "timed out after {} s connect deadline",
+                            connect_timeout.as_secs()
+                        ));
+                        break;
+                    }
+                    match tokio::time::timeout(remaining, TcpStream::connect(addr)).await {
+                        Ok(Ok(stream)) => {
                             let _ = stream.set_nodelay(true);
                             upstream_tcp_opt = Some(stream);
                             break;
                         }
-                        Err(err) => last_tcp_err = Some(err),
+                        Ok(Err(err)) => last_tcp_err = Some(format!("{addr}: {err}")),
+                        Err(_) => {
+                            tcp_timed_out = true;
+                            last_tcp_err = Some(format!(
+                                "{addr}: timed out after {} s connect deadline",
+                                connect_timeout.as_secs()
+                            ));
+                        }
                     }
                 }
                 let tcp_stream = match upstream_tcp_opt {
                     Some(stream) => stream,
                     None => {
                         let err_detail = last_tcp_err
-                            .map(|e| e.to_string())
                             .unwrap_or_else(|| "no reachable address".to_string());
-                        return record_and_return_error_with_opts(
+                        let proxy_err_code = if tcp_timed_out {
+                            super::FLUXPROXY_ERR_UPSTREAM_CONNECT_TIMEOUT
+                        } else {
+                            super::FLUXPROXY_ERR_UPSTREAM_CONNECT_ERROR
+                        };
+                        return super::record_and_return_error_with_opts_and_code(
                             &ctx,
                             session_id,
                             "https",
@@ -309,6 +397,7 @@ pub(super) async fn handle_outer_proxy_request(
                             format!(
                                 "TLS Passthrough TCP connect failed for {connect_host}:{connect_port}: {err_detail}"
                             ),
+                            Some(proxy_err_code),
                         );
                     }
                 };

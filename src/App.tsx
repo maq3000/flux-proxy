@@ -132,6 +132,7 @@ import type {
   SessionSummary,
   ThrottleConfig,
   UpstreamProxyConfig,
+  UpstreamTimeoutConfig,
 } from "./types/proxy";
 import type {
   FluxUserSettingsProfile,
@@ -341,6 +342,8 @@ export const App: React.FC = () => {
   const setUpstreamProxyConfig = useProxyStore(
     (s) => s.setUpstreamProxyConfig
   );
+  const upstreamTimeouts = useProxyStore((s) => s.upstreamTimeouts);
+  const setUpstreamTimeouts = useProxyStore((s) => s.setUpstreamTimeouts);
   const activeHostRemapCount = useMemo(
     () => hostRemapRules.filter((r) => r.enabled).length,
     [hostRemapRules]
@@ -377,6 +380,25 @@ export const App: React.FC = () => {
       }
     },
     [setUpstreamProxyConfig, showToast]
+  );
+
+  const handleSaveUpstreamTimeouts = useCallback(
+    async (nextTimeouts: UpstreamTimeoutConfig) => {
+      const saved = await proxyBridge.setUpstreamTimeouts(nextTimeouts);
+      setUpstreamTimeouts(saved);
+      const ttfbText =
+        saved.responseHeaderTimeoutSec === 0
+          ? "Unlimited"
+          : `${saved.responseHeaderTimeoutSec}s`;
+      const composerText =
+        saved.composerTimeoutSec === 0
+          ? "Unlimited"
+          : `${saved.composerTimeoutSec}s`;
+      showToast(
+        `⏱️ Таймауты обновлены: Connect ${saved.connectTimeoutSec}s • TTFB ${ttfbText} • Composer ${composerText}`
+      );
+    },
+    [setUpstreamTimeouts, showToast]
   );
 
   const handleChangeThrottleConfig = useCallback(
@@ -460,12 +482,23 @@ export const App: React.FC = () => {
       } catch {
         // best-effort sync on boot
       }
+      try {
+        const backendTimeouts = await proxyBridge.getUpstreamTimeouts();
+        if (active) setUpstreamTimeouts(backendTimeouts);
+      } catch {
+        // best-effort sync on boot
+      }
     };
     void syncNetworkSimulationOnBoot();
     return () => {
       active = false;
     };
-  }, [setHostRemapRules, setThrottleConfig, setUpstreamProxyConfig]);
+  }, [
+    setHostRemapRules,
+    setThrottleConfig,
+    setUpstreamProxyConfig,
+    setUpstreamTimeouts,
+  ]);
   const [mobileModalOpen, setMobileModalOpen] = useState(false);
   const [proxyDoctorModalOpen, setProxyDoctorModalOpen] = useState(false);
   const [sanitizedExportModalOpen, setSanitizedExportModalOpen] =
@@ -499,6 +532,16 @@ export const App: React.FC = () => {
   const openPreferencesAt = useCallback((tab: SettingsModalTab = "general") => {
     setSettingsInitialTab(tab);
     setSettingsModalOpen(true);
+  }, []);
+
+  const handleOpenTimeoutSettings = useCallback(() => {
+    setSettingsInitialTab("general");
+    setSettingsModalOpen(true);
+    window.requestAnimationFrame(() => {
+      document
+        .getElementById("upstream-timeouts-section")
+        ?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
   }, []);
 
   const openImportPreviewFromJsonText = useCallback(
@@ -1234,6 +1277,7 @@ export const App: React.FC = () => {
         username: upstreamProxyConfig.username ?? null,
         bypassList: upstreamProxyConfig.bypassList,
       },
+      upstreamTimeouts,
     },
     autoResponder: {
       enabled: autoResponderEnabled,
@@ -3029,6 +3073,7 @@ export const App: React.FC = () => {
         onSaveBodyFile={(id, isResponse) =>
           void saveSessionBodyAs(id, isResponse)
         }
+        onOpenTimeoutSettings={handleOpenTimeoutSettings}
       />
     );
 
@@ -3402,6 +3447,9 @@ export const App: React.FC = () => {
                       <ComposerPanel
                         draftRequest={composerDraft}
                         resolvedTheme={resolvedTheme}
+                        defaultComposerTimeoutSec={
+                          upstreamTimeouts.composerTimeoutSec
+                        }
                         onLoadSessionIntoComposer={(id) =>
                           void loadSessionIntoComposer(id, false)
                         }
@@ -3477,6 +3525,9 @@ export const App: React.FC = () => {
                       <ComposerPanel
                         draftRequest={composerDraft}
                         resolvedTheme={resolvedTheme}
+                        defaultComposerTimeoutSec={
+                          upstreamTimeouts.composerTimeoutSec
+                        }
                         onLoadSessionIntoComposer={(id) =>
                           void loadSessionIntoComposer(id, false)
                         }
@@ -3496,6 +3547,7 @@ export const App: React.FC = () => {
               <ComposerPanel
                 draftRequest={composerDraft}
                 resolvedTheme={resolvedTheme}
+                defaultComposerTimeoutSec={upstreamTimeouts.composerTimeoutSec}
                 onLoadSessionIntoComposer={(id) =>
                   void loadSessionIntoComposer(id, true)
                 }
@@ -3901,6 +3953,8 @@ export const App: React.FC = () => {
             onSetAutoSystemProxy={setAutoSystemProxy}
             onSetAllowRemote={setAllowRemote}
             onSetBindConfiguration={setBindConfiguration}
+            upstreamTimeouts={upstreamTimeouts}
+            onSetUpstreamTimeouts={handleSaveUpstreamTimeouts}
             sessionRetentionLimit={sessionRetentionLimit}
             onSetSessionRetentionLimit={setSessionRetentionLimit}
             dropNonMatching={dropNonMatching}

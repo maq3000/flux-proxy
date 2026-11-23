@@ -34,6 +34,7 @@ import type {
   ThrottlePreset,
   UpstreamProxyConfig,
   UpstreamProxyProtocol,
+  UpstreamTimeoutConfig,
   WebSocketFrameRecord,
   WsInjectDirection,
   WsInjectOpcode,
@@ -43,7 +44,9 @@ import {
   DEFAULT_THROTTLE_CONFIG,
   DEFAULT_UPSTREAM_PROXY_BYPASS_LIST,
   DEFAULT_UPSTREAM_PROXY_CONFIG,
+  DEFAULT_UPSTREAM_TIMEOUT_CONFIG,
   THROTTLE_PRESET_DEFINITIONS,
+  UPSTREAM_TIMEOUT_LIMITS,
 } from "../types/proxy";
 import {
   applyHeaderMutationsInPreview,
@@ -77,6 +80,7 @@ import {
   PREVIEW_SQLITE_COUNT_STORAGE_KEY,
   PREVIEW_THROTTLE_CONFIG_STORAGE_KEY,
   PREVIEW_UPSTREAM_PROXY_CONFIG_STORAGE_KEY,
+  PREVIEW_UPSTREAM_TIMEOUTS_STORAGE_KEY,
   sanitizeSessionsInPreview,
 } from "./mockTraffic";
 import { browserPreviewCodecTransform } from "./textWizard";
@@ -430,6 +434,83 @@ function normalizeUpstreamProxyConfigPreview(
   };
 }
 
+function validateUpstreamTimeoutConfigPreview(
+  cfg: UpstreamTimeoutConfig
+): UpstreamTimeoutConfig {
+  const c = cfg.connectTimeoutSec;
+  const r = cfg.responseHeaderTimeoutSec;
+  const cmp = cfg.composerTimeoutSec;
+  if (
+    !Number.isInteger(c) ||
+    c < UPSTREAM_TIMEOUT_LIMITS.connectMin ||
+    c > UPSTREAM_TIMEOUT_LIMITS.connectMax
+  ) {
+    throw new Error(
+      `connectTimeoutSec must be between ${UPSTREAM_TIMEOUT_LIMITS.connectMin} and ${UPSTREAM_TIMEOUT_LIMITS.connectMax} seconds`
+    );
+  }
+  if (
+    !Number.isInteger(r) ||
+    (r !== 0 &&
+      (r < UPSTREAM_TIMEOUT_LIMITS.responseHeaderMin ||
+        r > UPSTREAM_TIMEOUT_LIMITS.responseHeaderMax))
+  ) {
+    throw new Error(
+      `responseHeaderTimeoutSec must be 0 (Unlimited) or between ${UPSTREAM_TIMEOUT_LIMITS.responseHeaderMin} and ${UPSTREAM_TIMEOUT_LIMITS.responseHeaderMax} seconds`
+    );
+  }
+  if (
+    !Number.isInteger(cmp) ||
+    (cmp !== 0 &&
+      (cmp < UPSTREAM_TIMEOUT_LIMITS.composerMin ||
+        cmp > UPSTREAM_TIMEOUT_LIMITS.composerMax))
+  ) {
+    throw new Error(
+      `composerTimeoutSec must be 0 (Unlimited) or between ${UPSTREAM_TIMEOUT_LIMITS.composerMin} and ${UPSTREAM_TIMEOUT_LIMITS.composerMax} seconds`
+    );
+  }
+  return {
+    connectTimeoutSec: c,
+    responseHeaderTimeoutSec: r,
+    composerTimeoutSec: cmp,
+  };
+}
+
+function normalizeUpstreamTimeoutConfigPreview(
+  cfg: Partial<UpstreamTimeoutConfig> | null | undefined
+): UpstreamTimeoutConfig {
+  const rawC = cfg?.connectTimeoutSec;
+  const rawR = cfg?.responseHeaderTimeoutSec;
+  const rawCmp = cfg?.composerTimeoutSec;
+  return {
+    connectTimeoutSec:
+      typeof rawC === "number" && Number.isInteger(rawC)
+        ? Math.min(
+            UPSTREAM_TIMEOUT_LIMITS.connectMax,
+            Math.max(UPSTREAM_TIMEOUT_LIMITS.connectMin, rawC)
+          )
+        : DEFAULT_UPSTREAM_TIMEOUT_CONFIG.connectTimeoutSec,
+    responseHeaderTimeoutSec:
+      rawR === 0
+        ? 0
+        : typeof rawR === "number" && Number.isInteger(rawR)
+          ? Math.min(
+              UPSTREAM_TIMEOUT_LIMITS.responseHeaderMax,
+              Math.max(UPSTREAM_TIMEOUT_LIMITS.responseHeaderMin, rawR)
+            )
+          : DEFAULT_UPSTREAM_TIMEOUT_CONFIG.responseHeaderTimeoutSec,
+    composerTimeoutSec:
+      rawCmp === 0
+        ? 0
+        : typeof rawCmp === "number" && Number.isInteger(rawCmp)
+          ? Math.min(
+              UPSTREAM_TIMEOUT_LIMITS.composerMax,
+              Math.max(UPSTREAM_TIMEOUT_LIMITS.composerMin, rawCmp)
+            )
+          : DEFAULT_UPSTREAM_TIMEOUT_CONFIG.composerTimeoutSec,
+  };
+}
+
 function parseHexPayloadPreview(raw: string): Uint8Array {
   const cleanedParts: string[] = [];
   for (const tok of raw.split(/[\s:\-,]+/)) {
@@ -494,6 +575,10 @@ class BrowserPreviewEngine {
     bypassList: [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST],
   };
   private upstreamProxyPassword: string | null = null;
+  private upstreamTimeouts: UpstreamTimeoutConfig = {
+    ...DEFAULT_UPSTREAM_TIMEOUT_CONFIG,
+  };
+  private activeComposerControllers = new Map<string, AbortController>();
   private listeners = new Set<(batch: SessionSummary[]) => void>();
   private removedListeners = new Set<(ids: number[]) => void>();
   private bpListeners = new Set<(items: PausedBreakpointItem[]) => void>();
@@ -669,6 +754,17 @@ class BrowserPreviewEngine {
           if (parsedUpstream && typeof parsedUpstream === "object") {
             this.upstreamProxyConfig = normalizeUpstreamProxyConfigPreview(
               parsedUpstream as Partial<UpstreamProxyConfig>
+            );
+          }
+        }
+        const rawTimeouts = window.localStorage.getItem(
+          PREVIEW_UPSTREAM_TIMEOUTS_STORAGE_KEY
+        );
+        if (rawTimeouts !== null) {
+          const parsedTimeouts = JSON.parse(rawTimeouts);
+          if (parsedTimeouts && typeof parsedTimeouts === "object") {
+            this.upstreamTimeouts = normalizeUpstreamTimeoutConfigPreview(
+              parsedTimeouts as Partial<UpstreamTimeoutConfig>
             );
           }
         }
@@ -1971,6 +2067,54 @@ class BrowserPreviewEngine {
   }
 
   async executeComposed(req: ComposedRequest): Promise<SessionDetail> {
+    if (
+      req.timeoutSec !== undefined &&
+      (!Number.isInteger(req.timeoutSec) ||
+        (req.timeoutSec !== 0 &&
+          (req.timeoutSec < UPSTREAM_TIMEOUT_LIMITS.composerMin ||
+            req.timeoutSec > UPSTREAM_TIMEOUT_LIMITS.composerMax)))
+    ) {
+      throw new Error(
+        `composerTimeoutSec must be 0 (Unlimited) or between ${UPSTREAM_TIMEOUT_LIMITS.composerMin} and ${UPSTREAM_TIMEOUT_LIMITS.composerMax} seconds`
+      );
+    }
+    const cleanRequestId =
+      typeof req.requestId === "string" && req.requestId.trim().length > 0
+        ? req.requestId.trim()
+        : null;
+    const composerController = new AbortController();
+    if (cleanRequestId) {
+      this.activeComposerControllers.set(cleanRequestId, composerController);
+    }
+    const effectiveTimeoutSec =
+      req.timeoutSec ?? this.upstreamTimeouts.composerTimeoutSec;
+    const timeoutTimer =
+      effectiveTimeoutSec > 0
+        ? window.setTimeout(
+            () => composerController.abort("composer-timeout"),
+            effectiveTimeoutSec * 1000
+          )
+        : null;
+
+    try {
+      return await this.executeComposedInner(req, composerController.signal);
+    } finally {
+      if (timeoutTimer !== null) {
+        window.clearTimeout(timeoutTimer);
+      }
+      if (
+        cleanRequestId &&
+        this.activeComposerControllers.get(cleanRequestId) === composerController
+      ) {
+        this.activeComposerControllers.delete(cleanRequestId);
+      }
+    }
+  }
+
+  private async executeComposedInner(
+    req: ComposedRequest,
+    abortSignal: AbortSignal
+  ): Promise<SessionDetail> {
     const start = performance.now();
     const id = this.nextId++;
     let effectiveMethod = req.method;
@@ -2253,7 +2397,70 @@ class BrowserPreviewEngine {
         clientAddr: "Composer (Local)",
         websocketFrames: [],
       });
-      await new Promise((r) => window.setTimeout(r, 260));
+      await new Promise<void>((resolve, reject) => {
+        if (abortSignal.aborted) {
+          reject(new Error(String(abortSignal.reason ?? "composer-cancelled")));
+          return;
+        }
+        const onAbort = () => {
+          window.clearTimeout(t);
+          reject(new Error(String(abortSignal.reason ?? "composer-cancelled")));
+        };
+        const t = window.setTimeout(() => {
+          abortSignal.removeEventListener("abort", onAbort);
+          resolve();
+        }, 260);
+        abortSignal.addEventListener("abort", onAbort, { once: true });
+      }).catch((abortErr) => {
+        const isTimeout = abortSignal.reason === "composer-timeout";
+        const errMsg = isTimeout
+          ? `Upstream response headers (TTFB) timed out after ${req.timeoutSec ?? this.upstreamTimeouts.composerTimeoutSec} s`
+          : "Composer request cancelled by user";
+        const cancelledDetail: SessionDetail = {
+          summary: {
+            id,
+            status: isTimeout ? 504 : 499,
+            protocol: parsedUrl.protocol === "https:" ? "HTTPS/2" : "HTTP/1.1",
+            scheme: parsedUrl.protocol.replace(":", ""),
+            method: effectiveMethod,
+            host: parsedUrl.host,
+            path: `${parsedUrl.pathname}${parsedUrl.search}`,
+            url: effectiveUrl,
+            contentType: "text/plain; charset=utf-8",
+            bodySize: errMsg.length,
+            durationMs: Math.round(performance.now() - start),
+            timestamp: new Date().toISOString(),
+            isMocked: false,
+            matchedRuleId: null,
+            error: errMsg,
+            processName: "flux-proxy (Composer)",
+            processPid: 9001,
+            tlsBypassed: false,
+            headersMutated: reqMut.mutated,
+            breakpointPaused: null,
+            breakpointModified: bpModified,
+          },
+          requestHeaders: effectiveReqHeaders,
+          responseHeaders: [
+            { name: "Content-Type", value: "text/plain; charset=utf-8" },
+            {
+              name: "X-FluxProxy-Error",
+              value: isTimeout
+                ? "upstream-response-timeout"
+                : "composer-cancelled",
+            },
+          ],
+          requestBodyBase64: effectiveBodyBase64,
+          responseBodyBase64: encodeTextToBase64(errMsg),
+          requestBodyText: effectiveBody || null,
+          responseBodyText: errMsg,
+          tlsVersion: null,
+          clientAddr: "Composer (Local)",
+          websocketFrames: [],
+        };
+        this.commitCompletedSession(cancelledDetail);
+        throw abortErr instanceof Error ? abortErr : new Error(errMsg);
+      });
       // Attempt browser CORS fetch; gracefully fall back to synthetic echoed response if CORS blocks
       try {
         const headersInit: Record<string, string> = {};
@@ -2263,6 +2470,7 @@ class BrowserPreviewEngine {
         const resp = await fetch(effectiveUrl, {
           method: effectiveMethod,
           headers: headersInit,
+          signal: abortSignal,
           body:
             effectiveMethod !== "GET" &&
             effectiveMethod !== "HEAD" &&
@@ -2324,7 +2532,57 @@ class BrowserPreviewEngine {
           clientAddr: "Composer (Browser Fetch)",
           websocketFrames: [],
         };
-      } catch {
+      } catch (fetchErr) {
+        if (abortSignal.aborted) {
+          const isTimeout = abortSignal.reason === "composer-timeout";
+          const errMsg = isTimeout
+            ? "Upstream response headers (TTFB) timed out"
+            : "Composer request cancelled by user";
+          const errDetail: SessionDetail = {
+            summary: {
+              id,
+              status: isTimeout ? 504 : 499,
+              protocol: parsedUrl.protocol === "https:" ? "HTTPS/2" : "HTTP/1.1",
+              scheme: parsedUrl.protocol.replace(":", ""),
+              method: effectiveMethod,
+              host: parsedUrl.host,
+              path: `${parsedUrl.pathname}${parsedUrl.search}`,
+              url: effectiveUrl,
+              contentType: "text/plain; charset=utf-8",
+              bodySize: errMsg.length,
+              durationMs: Math.round(performance.now() - start),
+              timestamp: new Date().toISOString(),
+              isMocked: false,
+              matchedRuleId: null,
+              error: errMsg,
+              processName: "flux-proxy (Composer)",
+              processPid: 9001,
+              tlsBypassed: false,
+              headersMutated: reqMut.mutated,
+              breakpointPaused: null,
+              breakpointModified: bpModified,
+            },
+            requestHeaders: effectiveReqHeaders,
+            responseHeaders: [
+              { name: "Content-Type", value: "text/plain; charset=utf-8" },
+              {
+                name: "X-FluxProxy-Error",
+                value: isTimeout
+                  ? "upstream-response-timeout"
+                  : "composer-cancelled",
+              },
+            ],
+            requestBodyBase64: effectiveBodyBase64,
+            responseBodyBase64: encodeTextToBase64(errMsg),
+            requestBodyText: effectiveBody || null,
+            responseBodyText: errMsg,
+            tlsVersion: null,
+            clientAddr: "Composer (Local)",
+            websocketFrames: [],
+          };
+          this.commitCompletedSession(errDetail);
+          throw fetchErr instanceof Error ? fetchErr : new Error(errMsg);
+        }
         const fallbackBody = JSON.stringify(
           {
             ok: true,
@@ -3197,6 +3455,35 @@ class BrowserPreviewEngine {
       }
     }
     return this.getUpstreamProxyConfig();
+  }
+
+  getUpstreamTimeouts(): UpstreamTimeoutConfig {
+    return { ...this.upstreamTimeouts };
+  }
+
+  setUpstreamTimeouts(config: UpstreamTimeoutConfig): UpstreamTimeoutConfig {
+    const validated = validateUpstreamTimeoutConfigPreview(config);
+    this.upstreamTimeouts = validated;
+    if (typeof window !== "undefined") {
+      try {
+        window.localStorage.setItem(
+          PREVIEW_UPSTREAM_TIMEOUTS_STORAGE_KEY,
+          JSON.stringify(validated)
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+    }
+    return { ...validated };
+  }
+
+  cancelComposedRequest(requestId: string): boolean {
+    const clean = requestId.trim();
+    const ctrl = this.activeComposerControllers.get(clean);
+    if (!ctrl) return false;
+    this.activeComposerControllers.delete(clean);
+    ctrl.abort("composer-cancelled");
+    return true;
   }
 
   injectWebSocketFrame(
@@ -4169,6 +4456,29 @@ export const proxyBridge = {
       });
     }
     return getPreviewEngine().setUpstreamProxyConfig(config);
+  },
+
+  async getUpstreamTimeouts(): Promise<UpstreamTimeoutConfig> {
+    if (isTauriRuntime()) {
+      return invoke<UpstreamTimeoutConfig>("get_upstream_timeouts");
+    }
+    return getPreviewEngine().getUpstreamTimeouts();
+  },
+
+  async setUpstreamTimeouts(
+    config: UpstreamTimeoutConfig
+  ): Promise<UpstreamTimeoutConfig> {
+    if (isTauriRuntime()) {
+      return invoke<UpstreamTimeoutConfig>("set_upstream_timeouts", { config });
+    }
+    return getPreviewEngine().setUpstreamTimeouts(config);
+  },
+
+  async cancelComposedRequest(requestId: string): Promise<boolean> {
+    if (isTauriRuntime()) {
+      return invoke<boolean>("cancel_composed_request", { requestId });
+    }
+    return getPreviewEngine().cancelComposedRequest(requestId);
   },
 
   async injectWebSocketFrame(

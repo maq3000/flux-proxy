@@ -343,6 +343,8 @@ export interface ComposedRequest {
   bodyBase64?: string | null;
   followRedirects: boolean;
   skipPythonScripts?: boolean;
+  requestId?: string;
+  timeoutSec?: number;
 }
 
 export interface CaCertificateInfo {
@@ -826,6 +828,29 @@ export const DEFAULT_UPSTREAM_PROXY_CONFIG: UpstreamProxyConfig = {
   hasPassword: false,
   bypassList: [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST],
 };
+
+export interface UpstreamTimeoutConfig {
+  connectTimeoutSec: number;
+  /** `0` = Unlimited (wait transparently for slow server response headers / TTFB). */
+  responseHeaderTimeoutSec: number;
+  /** `0` = Unlimited. */
+  composerTimeoutSec: number;
+}
+
+export const DEFAULT_UPSTREAM_TIMEOUT_CONFIG: UpstreamTimeoutConfig = {
+  connectTimeoutSec: 15,
+  responseHeaderTimeoutSec: 0,
+  composerTimeoutSec: 120,
+};
+
+export const UPSTREAM_TIMEOUT_LIMITS = {
+  connectMin: 1,
+  connectMax: 300,
+  responseHeaderMin: 5,
+  responseHeaderMax: 3600,
+  composerMin: 1,
+  composerMax: 3600,
+} as const;
 
 export type WsInjectDirection = "server" | "client";
 export type WsInjectOpcode = "text" | "binary";

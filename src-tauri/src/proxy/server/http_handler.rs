@@ -674,12 +674,61 @@ pub(super) fn record_and_return_error_with_telemetry(
     transfer_stats: Option<SessionTransferStats>,
     err_msg: String,
 ) -> Response<ProxyBoxBody> {
+    record_and_return_error_with_telemetry_and_code(
+        ctx,
+        session_id,
+        scheme,
+        method,
+        host,
+        path,
+        url,
+        req_headers,
+        req_body,
+        start,
+        timestamp,
+        client_addr,
+        client_proc,
+        tls_bypassed,
+        breakpoint_modified,
+        status_code,
+        remapped_to,
+        timings,
+        transfer_stats,
+        err_msg,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_and_return_error_with_telemetry_and_code(
+    ctx: &SharedProxyContext,
+    session_id: u64,
+    scheme: &str,
+    method: &str,
+    host: &str,
+    path: &str,
+    url: &str,
+    req_headers: Vec<HeaderPair>,
+    req_body: Bytes,
+    start: Instant,
+    timestamp: String,
+    client_addr: SocketAddr,
+    client_proc: Option<&ClientProcessInfo>,
+    tls_bypassed: bool,
+    breakpoint_modified: bool,
+    status_code: StatusCode,
+    remapped_to: Option<String>,
+    timings: Option<SessionTimings>,
+    transfer_stats: Option<SessionTransferStats>,
+    err_msg: String,
+    proxy_error_code: Option<&str>,
+) -> Response<ProxyBoxBody> {
     let protocol = if tls_bypassed {
         "TLS-BYPASS".into()
     } else {
         scheme.to_ascii_uppercase()
     };
-    super::record_error_session_with_telemetry(
+    super::record_error_session_with_telemetry_and_code(
         ctx,
         session_id,
         protocol,
@@ -704,8 +753,9 @@ pub(super) fn record_and_return_error_with_telemetry(
         timings,
         transfer_stats,
         &err_msg,
+        proxy_error_code,
     );
-    plain_response(status_code, &err_msg)
+    super::plain_response_with_proxy_error(status_code, &err_msg, proxy_error_code)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1474,6 +1524,7 @@ pub(super) async fn handle_intercepted_request(
                 &target_host,
                 Some(ctx.host_remap.clone()),
                 Some(ctx.upstream_proxy.clone()),
+                Arc::clone(&ctx.connect_timeout_sec),
             )
         {
             Ok(Some((mtls_client, entry))) => (mtls_client, Some(entry.common_name)),
@@ -1550,9 +1601,11 @@ pub(super) async fn handle_intercepted_request(
         &body_bytes,
         upstream_target.remapped_to.clone(),
     );
+    let mut in_flight_guard = super::InFlightSessionGuard::new(Arc::clone(&ctx), session_id, start);
 
     // Apply Bandwidth Throttling RTT latency & upload bandwidth pacing before upstream send
     if let Err(err) = ctx.throttle.apply_latency().await {
+        in_flight_guard.disarm();
         let msg = err.to_string();
         let (err_timings, err_stats) = build_error_timings_and_stats(
             start,
@@ -1594,6 +1647,7 @@ pub(super) async fn handle_intercepted_request(
     }
     if !body_bytes.is_empty() {
         if let Err(err) = ctx.throttle.throttle_bytes(body_bytes.len(), false).await {
+            in_flight_guard.disarm();
             let msg = err.to_string();
             let (err_timings, err_stats) = build_error_timings_and_stats(
                 start,
@@ -1644,7 +1698,7 @@ pub(super) async fn handle_intercepted_request(
         })
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
-    let req_timeout = Duration::from_secs(ctx.upstream_timeout_sec.max(1));
+    let response_timeout = ctx.response_header_timeout();
 
     let exchange = match upstream_client
         .send_with_idempotent_retry(
@@ -1653,20 +1707,28 @@ pub(super) async fn handle_intercepted_request(
             &outbound_headers,
             upstream_target.host_header_override.as_deref(),
             body_bytes.clone(),
-            req_timeout,
+            response_timeout,
         )
         .await
     {
         Ok(ex) => ex,
         Err(err) => {
+            in_flight_guard.disarm();
             let chain = format_error_chain(&err);
+            let proxy_err_code = err.proxy_error_code();
             tracing::warn!(
-                "Upstream connection error for {} {}: {}",
+                "Upstream error for {} {} [{}]: {}",
                 method_str,
                 full_url,
+                proxy_err_code,
                 chain
             );
-            let msg = format!("Upstream connection error: {chain}");
+            let msg = match &err {
+                crate::proxy::upstream_client::UpstreamClientError::Timeout(_) => {
+                    format!("Upstream response timeout: {chain}")
+                }
+                _ => format!("Upstream connection error: {chain}"),
+            };
             let (err_timings, err_stats) = build_error_timings_and_stats(
                 start,
                 start_utc,
@@ -1682,7 +1744,7 @@ pub(super) async fn handle_intercepted_request(
                 total_script_hook_ms,
                 upstream_target.remapped_to.clone(),
             );
-            return record_and_return_error_with_telemetry(
+            return record_and_return_error_with_telemetry_and_code(
                 &ctx,
                 session_id,
                 &scheme_str,
@@ -1703,6 +1765,7 @@ pub(super) async fn handle_intercepted_request(
                 Some(err_timings),
                 Some(err_stats),
                 msg,
+                Some(proxy_err_code),
             );
         }
     };
@@ -1921,6 +1984,7 @@ pub(super) async fn handle_intercepted_request(
             transfer_stats: Some(base_stats),
         };
 
+        in_flight_guard.disarm();
         record_completed_session(&ctx, initial_detail, Some(capped_req), None);
 
         let (chunk_tx, chunk_rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(64);
@@ -2267,6 +2331,7 @@ pub(super) async fn handle_intercepted_request(
         };
 
         // Stage 21 Phase 1: publish final response headers & status immediately before streaming chunks
+        in_flight_guard.disarm();
         let initial_recorded =
             record_completed_session(&ctx, initial_detail.clone(), Some(capped_req), None);
         let req_body_for_deferred_end = if initial_recorded {
@@ -2450,6 +2515,7 @@ pub(super) async fn handle_intercepted_request(
             );
             base_stats.response_wire_body_bytes = Some(bytes_read);
             base_stats.response_body_bytes = Some(err_msg.len());
+            in_flight_guard.disarm();
             return record_and_return_error_with_telemetry(
                 &ctx,
                 session_id,
@@ -2617,6 +2683,7 @@ pub(super) async fn handle_intercepted_request(
                 duration_ms_f64(now.saturating_duration_since(start)),
             );
             base_stats.response_body_bytes = Some(msg.len());
+            in_flight_guard.disarm();
             return record_and_return_error_with_telemetry(
                 &ctx,
                 session_id,
@@ -2752,6 +2819,7 @@ pub(super) async fn handle_intercepted_request(
         transfer_stats: Some(base_stats),
     };
 
+    in_flight_guard.disarm();
     record_completed_session(&ctx, detail, Some(capped_req), Some(capped_resp));
 
     let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();

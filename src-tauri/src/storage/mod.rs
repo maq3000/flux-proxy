@@ -780,6 +780,48 @@ impl TrafficStore {
         Some(updated_summary)
     }
 
+    pub fn finalize_abandoned_in_flight(
+        &self,
+        id: u64,
+        status: u16,
+        duration_ms: u64,
+        error_msg: &str,
+        proxy_error_code: Option<&str>,
+    ) -> Option<SessionSummary> {
+        let updated_summary = {
+            let mut entry = self.sessions.get_mut(&id)?;
+            if entry.summary.status != 0
+                || entry.summary.error.is_some()
+                || entry.summary.breakpoint_paused.is_some()
+            {
+                return None;
+            }
+            let detail_mut = Arc::make_mut(entry.value_mut());
+            detail_mut.summary.status = status;
+            detail_mut.summary.duration_ms = duration_ms;
+            detail_mut.summary.error = Some(error_msg.to_string());
+            if detail_mut.summary.content_type.is_empty()
+                || detail_mut.summary.content_type == "pending"
+            {
+                detail_mut.summary.content_type = "text/plain; charset=utf-8".to_string();
+            }
+            if let Some(code) = proxy_error_code {
+                detail_mut
+                    .response_headers
+                    .retain(|h| !h.name.eq_ignore_ascii_case("x-fluxproxy-error"));
+                detail_mut.response_headers.push(crate::models::HeaderPair {
+                    name: "X-FluxProxy-Error".to_string(),
+                    value: code.to_string(),
+                });
+            }
+            if let Some(ref mut timings) = detail_mut.timings {
+                timings.overall_elapsed_ms = Some(duration_ms as f64);
+            }
+            detail_mut.summary.clone()
+        };
+        Some(updated_summary)
+    }
+
     /// Finalizes a WebSocket stream: materializes `websocket_frames` and JSON preview once on close.
     pub fn finalize_ws_stream(&self, id: u64) -> Option<SessionSummary> {
         let (_, acc) = self.ws_streams.remove(&id)?;

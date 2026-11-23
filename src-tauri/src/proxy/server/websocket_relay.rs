@@ -1095,7 +1095,7 @@ pub(super) async fn handle_websocket_intercept(
         remapped.as_ref().map(|_| connect_port),
     );
 
-    let connect_timeout = Duration::from_secs(ctx.upstream_timeout_sec.max(1));
+    let connect_timeout = ctx.connect_timeout();
     let ws_connect_start = Instant::now();
     let proxy_begin_at = timestamp_at_instant(start, start_utc, ws_connect_start);
 
