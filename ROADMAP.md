@@ -109,7 +109,7 @@
 
 ## 📋 Матрица приоритетов и порядок выполнения
 
-> *Номера этапов (`35`, `39`, `36`, `37`, `38`, `12`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз. Завершенные этапы Спринта 1 (Этапы 14, 15, 20, 21, 25–28) выполнены в релизе `v0.2.0`, этапы Спринта 2 (Этапы 5, 16, 17, 23, 24, 29, 30) выполнены в релизе `v0.3.0`, этапы Спринта 3 (Этапы 6, 7, 8, 9, 18, 19, 22) выполнены в релизе `v0.4.0`, стабилизационный Спринт 4 (Этапы 31–33) выполнен в релизе `v0.4.1`, а этапы Спринта 5 (Этапы 10, 11, 13, 34) выполнены в релизе `v0.5.0` и перенесены в раздел реализованных этапов выше.*
+> *Номера этапов (`35`, `39`, `36`, `37`, `38`, `40`, `41`, `12`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз. Завершенные этапы Спринта 1 (Этапы 14, 15, 20, 21, 25–28) выполнены в релизе `v0.2.0`, этапы Спринта 2 (Этапы 5, 16, 17, 23, 24, 29, 30) выполнены в релизе `v0.3.0`, этапы Спринта 3 (Этапы 6, 7, 8, 9, 18, 19, 22) выполнены в релизе `v0.4.0`, стабилизационный Спринт 4 (Этапы 31–33) выполнен в релизе `v0.4.1`, а этапы Спринта 5 (Этапы 10, 11, 13, 34) выполнены в релизе `v0.5.0` и перенесены в раздел реализованных этапов выше.*
 
 | # | Этап | Приоритет | Спринт | Зависимости | Ключевая ценность |
 | :-: | :--- | :--- | :--- | :--- | :--- |
@@ -118,7 +118,9 @@
 | 3 | **[Этап 36](#этап-36-защита-ключей-mtls-dpapi--in-memory-lan-client-allowlist-чистота-zustand-сторов-очистка-техдолга-и-синхронизация-документации)** | **P1 / P2 (Security, State & Hygiene)** | Спринт 6 | Этапы 11 ✅, 18 ✅, 35 | Шифрование ключей mTLS/CA через Windows DPAPI + режим `Session-only (In-Memory)` (`SEC-03`), белый список `LAN Client Allowlist`, фильтрация `SAFE_RASTER_IMAGE_MIMES` в Multipart (`SEC-02`), устранение сброса сессий в `syncFromLocalStorage` (`CONC-01`) и $O(N)$ аллокаций (`PERF-03`), удаление мёртвого кода `reqwest` (`ARCH-01`), вынос `BrowserPreviewEngine` (`ARCH-02`) и синхронизация документации с кодом |
 | 4 | **[Этап 37](#этап-37-исправление-ui-багов-инспектора-hexviewer-и-timing-breakdown-и-редизайн-command-palette-20)** | **P1 (UI Bugfixes & UX Ergonomics)** | Спринт 6 | Этапы 22 ✅, 30 ✅, 34 ✅ | Устранение сдвига колонок и наложения байтов на `DECODED ASCII` во вкладке `Hex` (`HexViewer.tsx`), устранение мелькания тултипа при наведении на легенду `TIMING BREAKDOWN` (`SessionStatisticsPanel.tsx`, показ только на таймлайне без layout shift) и крупная понятная `Command Palette 2.0` (`max-w-3xl`, категории, описания, статусы, чипы синтаксиса `bpu`/`jwt`) |
 | 5 | **[Этап 38](#этап-38-единый-полноэкранный-центр-настроек-unified-fullscreen-settings-hub-реорганизация-вкладок-дедупликация-панелей-и-система-подсказок)** | **P1 / P2 (UI Architecture & Discoverability)** | Спринт 6 | Этапы 4 ✅, 10 ✅, 11 ✅, 13 ✅, 18 ✅, 22 ✅, 37, 39 | Консолидация всех разрозненных модалок настроек (`FilterDrawer`, `HOSTS`, `Upstream Proxy`, `Root CA`, `mTLS`, `Mobile`, `Throttling`, `Proxy Doctor`) в единый полноэкранный `Settings Hub` (`Ctrl+,`), сохранение/перенос `Upstream Timeouts`, перевод конфигурационных модалок в fullscreen, удаление устаревшего свитча темы и дубликатов кнопок между `MenuBar`/`TopToolbar`/`Sidebar`/`Inspector`, наглядный доступ к `Throttling` и контекстные подсказки (`HelpTooltip`) |
-| 6 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 6 | Этапы 34 ✅, 35, 39, 36, 37, 38 | Виртуализированная многофазная каскадная диаграмма (Waterfall) и сводный Markdown-отчет по всей выборке (P95, TTFB, статусы, MIME) |
+| 6 | **[Этап 40](#этап-40-эргономика-request-composer-хоткей-e-отдельная-вкладка-и-отказ-от-split-сайдбара-и-панель-возврата-свёрнутого-session-inspector)** | **P1 (UX Navigation & Workspace Layout)** | Спринт 6 | Этапы 8 ✅, 23 ✅, 35, 36, 38, 39 | Хоткей `E` (как в Fiddler) и открытие сессий в отдельной полноэкранной вкладке `Composer` вместо узкого Split-сайдбара, упразднение обрезанного `dockedComposer` + апгрейд вкладки `Composer` (`← Back to Traffic`, сплит Request/Response) и постоянная кликабельная панель/рельса возврата свёрнутого `Session Inspector` (`CollapsedInspectorBar`) + drag-to-collapse |
+| 7 | **[Этап 41](#этап-41-контекстно-зависимые-пкм-меню-по-всему-приложению-context-aware-right-click-menus)** | **P1 / P2 (UI Architecture & Context Menus)** | Спринт 6 | Этапы 37, 38, 40 | Единая декларативная система ПКМ-меню (`ContextMenuProvider` / `useContextMenu`), подавление «сырого» браузерного меню WebView2 (с сохранением меню Monaco Editor и редактирования в полях ввода) и осмысленные контекстные меню для всех зон: таблица трафика (строки, шапка, пустая область), `SessionInspector` (URL-бар, Headers/Params/Cookies, WS/SSE/Hex/Image/Statistics, выделенный текст), `Composer`, `AutoResponder`, консоль Python и каркас интерфейса (тулбар, сайдбар, сплиттеры, футер) |
+| 8 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 6 | Этапы 34 ✅, 35, 39, 36, 37, 38, 40, 41 | Виртуализированная многофазная каскадная диаграмма (Waterfall) и сводный Markdown-отчет по всей выборке (P95, TTFB, статусы, MIME) |
 
 ---
 
@@ -163,7 +165,7 @@
 
 ---
 
-## 🔴 Спринт 6 — P1 / P2 (Audit `v0.5.0` Remediation, UX Redesign & Analytics): Стабилизация сетевого ядра, настраиваемые upstream-таймауты, защита ключей, единый полноэкранный Settings Hub, Command Palette 2.0 и Waterfall Timeline
+## 🔴 Спринт 6 — P1 / P2 (Audit `v0.5.0` Remediation, UX Redesign & Analytics): Стабилизация сетевого ядра, настраиваемые upstream-таймауты, защита ключей, единый полноэкранный Settings Hub, Command Palette 2.0, эргономика Composer / Inspector, ПКМ-меню и Waterfall Timeline
 
 ---
 
@@ -495,7 +497,7 @@
   - **`TopToolbar.tsx` (Верхняя панель управления захватом и сетью):**
     - Селектор **Throttling** (`Gauge` + текстовая метка `Throttle: Off` или имя активного пресета) всегда виден в сетевой группе тулбара рядом с `SysProxy` и `HTTPS MITM`, обеспечивая мгновенную обнаружимость троттлинга.
     - Рядом добавлена компактная кнопка-индикатор сетевых правил (`Routing / Certs`), отображающая число активных правил `HOSTS Remapping` / `Upstream Proxy` / `mTLS` и открывающая вкладку `Network & Routing` в едином центре настроек.
-    - Из `TopToolbar` удалены дублирующие элементы: кнопка `Mobile Setup` справа (`строки 1586-1605`) и внутри поповера `SysProxy` (`строки 1032-1042`), группа дублирующих иконок `Session Diff / Hex / TextWizard / Save SQLite` (`строки 1607-1660`), переключатели докинга инспектора `PanelBottom / PanelRight` (`строки 1690-1739` — они находятся непосредственно в шапке `SessionInspector`), дублирующий пункт `Drop Non-Matching` внутри меню `Keep` (`строки 902-912`), блок `Customize Toolbar` внутри поповера `Columns` (`строки 1821-1862`) и перегруженное меню переполнения `•••` на 20 дублирующих пунктов (`строки 1867-2104`).
+    - Из `TopToolbar` удалены дублирующие элементы: кнопка `Mobile Setup` справа (`строки 1586-1605`) и внутри поповера `SysProxy` (`строки 1032-1042`), группа дублирующих иконок `Session Diff / Hex / TextWizard / Save SQLite` (`строки 1607-1660`), переключатели докинга инспектора `PanelBottom / PanelRight` (`строки 1690-1739` — они находятся в шапке `SessionInspector`, а возврат свёрнутого инспектора по 1 клику без выпадающих меню обеспечивается постоянной панелью `CollapsedInspectorBar` в Этапе 40; кнопка `Split Composer` упраздняется в Этапе 40), дублирующий пункт `Drop Non-Matching` внутри меню `Keep` (`строки 902-912`), блок `Customize Toolbar` внутри поповера `Columns` (`строки 1821-1862`) и перегруженное меню переполнения `•••` на 20 дублирующих пунктов (`строки 1867-2104`).
   - **`MenuBar.tsx` и `SessionInspector.tsx`:**
     - Из правой части `MenuBar.tsx` удалён дублирующий переключатель `SysProxy: ON/OFF` (`строки 2019-2037`, оставлен счётчик сессий и кнопка `Command Palette Ctrl+K`), а из меню `View` удалены 3 радио-кнопки `Theme: Dark / Light / System` в пользу единого пункта `Theme Presets & Appearance…`.
     - Из шапки `SessionInspector.tsx` удалена дублирующая кнопка `Wizard` (`строки 948-958`, так как контекстная кнопка декодирования уже есть во вкладке `Auth`).
@@ -525,7 +527,7 @@
 
 3. Реорганизация навигации и устранение дублирования кнопок (`src/components/Sidebar.tsx`, `src/components/TopToolbar.tsx`, `src/components/MenuBar.tsx`, `src/components/SessionInspector.tsx`):
    - В `Sidebar.tsx`: удалить кнопку свитча темы (`Sun`/`Moon`), удалить дублирующие кнопки `FilterDrawer`, `Session Diff`, `Mobile Setup`, `Root CA`, `Command Palette`; оставить рабочие секции `Traffic (Alt+1)`, `Composer (Alt+2)`, `AutoResponder (Alt+3)`, `Python Scripts (Alt+5)`, `Breakpoints (F11)`, `TextWizard (Ctrl+E)` и внизу кнопку `Settings (Ctrl+,)` + `Collapse Sidebar (Ctrl+B)`.
-   - В `TopToolbar.tsx`: сделать селектор `Throttling` (`Throttle: Off / Fast 3G / ...`) всегда видимым и подписанным в сетевой группе; удалить дублирующие кнопки `Mobile Setup`, `Session Diff`, `Hex`, `TextWizard`, `Save SQLite`, переключатели докинга инспектора `PanelBottom`/`PanelRight`, дубликат `Drop Non-Matching` в меню `Keep`, дубликат `Customize Toolbar` в поповере `Columns` и меню переполнения `•••`.
+   - В `TopToolbar.tsx`: сделать селектор `Throttling` (`Throttle: Off / Fast 3G / ...`) всегда видимым и подписанным в сетевой группе; удалить дублирующие кнопки `Mobile Setup`, `Session Diff`, `Hex`, `TextWizard`, `Save SQLite`, переключатели докинга инспектора `PanelBottom`/`PanelRight` (с учётом последующего добавления `CollapsedInspectorBar` и удаления `Split Composer` в Этапе 40), дубликат `Drop Non-Matching` в меню `Keep`, дубликат `Customize Toolbar` в поповере `Columns` и меню переполнения `•••`.
    - В `MenuBar.tsx`: удалить дублирующий индикатор `SysProxy: ON/OFF` справа и радио-пункты `Theme: Dark/Light/System` из меню `View`.
    - В `SessionInspector.tsx`: удалить дублирующую кнопку `Wizard` из верхней полосы сводки.
 
@@ -537,8 +539,170 @@
 
 ---
 
+## Этап 40: Эргономика Request Composer (хоткей E, отдельная вкладка и отказ от Split-сайдбара) и панель возврата свёрнутого Session Inspector
+**Приоритет: P1 (UX Navigation & Workspace Layout) | Спринт 6 | Зависимости: Этапы 8 ✅, 23 ✅, 35, 36, 38, 39**
+
+### Цель и контекст
+По итогам анализа пользовательского сценария работы с таблицей трафика, Request Composer и инспектором сессий выявлены два критических дефекта навигации и компоновки панелей:
+1. **Неудобный переход в Request Composer и «застрявший» обрезанный Split-сайдбар (`dockedComposer`):**
+   - В `src/App.tsx:2059-2089` функция `loadSessionIntoComposer(sessionId, openStandalone = false)` по умолчанию открывает узкий боковой сплит `setDockedComposer(true)` вместо переключения на полноценную вкладку `activeSection = "composer"`. Все основные точки входа (`TrafficGrid` ПКМ «Открыть в Composer» в `App.tsx:2948`, кнопка `Composer` в `SessionInspector` в `App.tsx:3018`, `MenuBar → Tools → Edit in Request Composer` в `App.tsx:3168`) передают `openStandalone = false`, и лишь Drag-and-Drop на иконку `Composer` в `Sidebar` (`App.tsx:3202-3204`) открывает отдельную вкладку.
+   - В одиночных горячих клавишах (`App.tsx:1976-2025`, переносимых в `src/hooks/useGlobalShortcuts.ts` в Этапе 36) отсутствует привычный по Fiddler хоткей `E` для редактирования выбранного запроса в `Composer` (при том что `Ctrl+E` занят TextWizard в `App.tsx:1743-1748`, а одиночная клавиша `E` полностью свободна и не конфликтует).
+   - Боковой сплит `dockedComposer` (`App.tsx:3389-3416, 3464-3491`, ширина по умолчанию `26%` или `24%` в 3-колоночной раскладке `[44, 32, 24]`, `minSize={20}` без `collapsible`/`onCollapse`) критически сжимает `ComposerPanel` (у которого в шапке `ComposerPanel.tsx:287-332` нет ни кнопки закрытия `×`, ни разворачивания во вкладку; в таблице заголовков `ComposerPanel.tsx:456` зашита фиксированная ширина `w-44`, а Этапы 35 и 39 добавляют туда же чекбокс *«Run Python Scripts»*, выбор таймаута и кнопку `Cancel`). Закрыть сайдбар нельзя ни кнопкой на самой панели, ни перетягиванием разделителя — при активном `compactToolbar` или скрытой группе тулбара `layout` (`TopToolbar.tsx:1665-1755`) приходится искать пункт в выпадающих меню `MenuBar → View → Split Composer Pane` (`MenuBar.tsx:1409-1417`) или переполнении `•••`.
+   - *Утверждённое архитектурное решение:* **полностью упразднить обрезанный Split-сайдбар `dockedComposer`** и сделать полноэкранную вкладку `Composer` (`activeSection === "composer"`, `Alt+2` / `E`) единым, просторным и быстрым инструментом — с мгновенным возвратом `← Back to Traffic (Alt+1)`, бейджем исходной сессии `From #<id>`, кнопкой перехода к результату `Inspect #<id> in Traffic` и ресайзабельным сплитом `Request | Last Response` внутри самой вкладки `Composer`.
+2. **Невозможность вернуть `Session Inspector` по кнопке после `Collapse Session Inspector`:**
+   - При нажатии `Collapse Session Inspector` (`SessionInspector.tsx:701, 761, 1093`) вызывается `setInspectorCollapsed(true)` (`App.tsx:3012-3015`), после чего ветки `{!inspectorCollapsed && ...}` (`App.tsx:3369-3385, 3446-3462`) полностью размонтируют панель инспектора, не оставляя никакой кликабельной кнопки или полосы возврата на краю рабочей области.
+   - Переключатели `PanelBottom` / `PanelRight` в `TopToolbar.tsx:1665-1739` скрываются в режиме `compactToolbar` или при отключённой группе `layout`, а в Этапе 38 и вовсе удаляются из тулбара как дубликаты. В результате после сворачивания инспектора пользователь вынужден искать его в выпадающем меню `MenuBar → View → Show Session Inspector` (`MenuBar.tsx:1369-1380`).
+
+### Критерии приемки (DoD)
+- **1. Fiddler-style хоткей `E` и единый переход в отдельную вкладку `Composer` (`src/App.tsx`, `src/hooks/useGlobalShortcuts.ts`, `src/components/TrafficGrid.tsx`, `src/components/SessionInspector.tsx`, `src/components/MenuBar.tsx`, `src/components/ShortcutsModal.tsx`, `src/components/CommandPalette.tsx`):**
+  - Функция `loadSessionIntoComposer(sessionId)` упрощена и **всегда** открывает отдельную вкладку `activeSection = "composer"` (параметр `openStandalone` и ветка `setDockedComposer(true)` удалены); все точки входа (`TrafficGrid` ПКМ «Открыть в Composer», кнопка `Composer` в `SessionInspector`, `MenuBar → Tools → Edit in Request Composer`, `CommandPalette`, Drag-and-Drop на `Sidebar` и клавиша `E`) ведут в полноэкранную вкладку `Composer`.
+  - В обработчике глобальных клавиш (`src/hooks/useGlobalShortcuts.ts` / `App.tsx`) в активном разделе `activeSection === "traffic"` добавлена одиночная клавиша **`E`** (`!ctrlOrMeta && !e.altKey && !e.shiftKey && (keyLower === "e" || e.code === "KeyE")`), строго вне редактируемых полей (`INPUT`/`TEXTAREA`/`SELECT`/`[contenteditable]`/`.monaco-editor`), открытых `<dialog[open]>` и открытых `[popover]`: при наличии выбранной сессии (`selectedId ?? effectiveSelectedIds[0]`) она загружается в `Composer` и открывается вкладка `composer` (без конфликта с `Ctrl+E` для `TextWizard`).
+  - Подсказка горячей клавиши `E` добавлена в пункт контекстного меню `TrafficGrid` (*«Открыть в Composer»*), кнопку `Composer` в шапке `SessionInspector`, пункт `MenuBar → Tools → Edit in Request Composer`, `CommandPalette` и справочник `ShortcutsModal.tsx`.
+- **2. Упразднение обрезанного Split-сайдбара `dockedComposer` и улучшение вкладки `Composer` (`src/stores/uiStore.ts`, `src/App.tsx`, `src/components/TopToolbar.tsx`, `src/components/MenuBar.tsx`, `src/components/ComposerPanel.tsx`):**
+  - Из `src/stores/uiStore.ts` удалены состояние `dockedComposer` и экшен `setDockedComposer`; из `src/App.tsx` удалены внешняя обёртка `bottomOuterGroupRef` / `FLUX_PANEL_AUTOSAVE_IDS.bottomOuter`, оба встроенных сайдбара `<ComposerPanel>` и 3-колоночный вариант `rightGroupRef` (старый ключ `react-resizable-panels:flux-layout-bottom-outer-v1` в `localStorage` безопасно игнорируется и очищается при `clearPersistedPanelLayouts`).
+  - Из `TopToolbar.tsx` (`строки 1740-1753`), `MenuBar.tsx` (`строки 1409-1417`) и `CommandPalette` удалены кнопки и пункты `Split Composer Pane`, а из `ToolbarGroupDefinition` для `layout` в `uiStore.ts` убрано упоминание `Composer`.
+  - В `src/components/ComposerPanel.tsx` улучшена эргономика полноэкранной работы:
+    - в шапке добавлена заметная кнопка быстрого возврата **`← Traffic`** (`Alt+1` / `onBackToTraffic`) и информационный бейдж исходной сессии **`From #<id>`** (при открытии из таблицы трафика);
+    - в панели последнего ответа `lastResponse` добавлена кнопка **`Inspect #<id> in Traffic`** (выделяет созданную сессию и возвращает в `traffic` с раскрытым инспектором);
+    - список заголовков адаптирован под широкую вкладку (`minmax(180px, 28%)` / гибкая колонка имени вместо жёсткого `w-44`), а редактор запроса и `lastResponse` разделены перетягиваемым `PanelGroup` (`flux-composer-split-v1`).
+- **3. Постоянная кнопка и панель возврата свёрнутого `Session Inspector` (`src/components/CollapsedInspectorBar.tsx`, `src/App.tsx`):**
+  - Создан компонент `CollapsedInspectorBar.tsx`, который **всегда** отображается в рабочей области `traffic` при `inspectorCollapsed === true` (независимо от режима `compactToolbar` и скрытых групп `TopToolbar`):
+    - при `inspectorPosition === "bottom"`: компактная горизонтальная полоса `h-7` внизу под `TrafficGrid` с заметной кнопкой **`ChevronUp` + `Expand Session Inspector`** (плюс краткое превью текущей сессии `#ID METHOD /path · STATUS` и подсказка `Enter`), а также быстрыми кнопками `Statistics` и `Dock Right` (`PanelRight`);
+    - при `inspectorPosition === "right"`: компактная вертикальная рельса `w-7` у правого края с кнопкой **`ChevronLeft`** (`Expand Session Inspector (Enter)`), кликабельной вертикальной подписью `Session Inspector` и кнопкой `Dock Bottom` (`PanelBottom`).
+  - В `src/App.tsx` панели `SessionInspector` (`session-inspector-bottom` и `session-inspector-right`) настроены с поддержкой `collapsible`, `collapsedSize={0}` и `onCollapse={() => setInspectorCollapsed(true)}`: инспектор можно свернуть как кнопкой `Collapse`, так и перетягиванием разделителя до края, после чего на месте разделителя мгновенно появляется кликабельная панель `CollapsedInspectorBar` для раскрытия в 1 клик.
+- **4. Тесты (`src/components/CollapsedInspectorBar.test.tsx`, `src/stores/uiStore.test.ts`, `src/hooks/useGlobalShortcuts.test.tsx`):**
+  - Vitest-тесты на `CollapsedInspectorBar` (режимы `bottom` и `right`, клики `Expand`, `Open Statistics`, `Dock Bottom/Right`), проверка удаления `dockedComposer` из `uiStore` и проверка хоткея `E` vs `Ctrl+E` (включая отсутствие срабатывания внутри `input`/`textarea`/`.monaco-editor`).
+
+### 📝 Промпт для Antigravity (Этап 40)
+
+```markdown
+Роль: Senior Frontend & UI/UX Engineer (React 19 + TypeScript + Zustand 5 + react-resizable-panels).
+Проект: FluxProxy (Tauri v2 + Rust + React 19).
+
+Задача: Выполнить Этап 40 из ROADMAP.md — перевести открытие запросов в Request Composer на отдельную вкладку по хоткею `E` (как в Fiddler), полностью убрать обрезанный Split-сайдбар `dockedComposer`, доработать полноэкранную вкладку `ComposerPanel` и добавить постоянную панель возврата свёрнутого `Session Inspector` (`CollapsedInspectorBar`).
+
+1. Хоткей `E` и единый переход в отдельную вкладку Composer (`src/App.tsx`, `src/hooks/useGlobalShortcuts.ts`, `src/components/TrafficGrid.tsx`, `src/components/SessionInspector.tsx`, `src/components/MenuBar.tsx`, `src/components/ShortcutsModal.tsx`, `src/components/CommandPalette.tsx`):
+   - Убрать параметр `openStandalone` из `loadSessionIntoComposer(sessionId)`: функция всегда загружает запрос в `composerDraft` (включая `sourceSessionId?: number`) и переключает `setActiveSection("composer")`.
+   - Во всех точках вызова (`TrafficGrid`, `SessionInspector`, `MenuBar`, `CommandPalette`, `Sidebar` Drag-and-Drop) открывать полноэкранную вкладку `Composer`.
+   - Добавить в глобальный обработчик клавиш (`activeSection === "traffic"`, строго вне редактируемых полей, `.monaco-editor`, модалок и поповеров) одиночную клавишу `E` (`!ctrlOrMeta && !e.altKey && !e.shiftKey && (keyLower === "e" || e.code === "KeyE")`) для открытия выбранной сессии в вкладке `Composer`, сохранив `Ctrl+E` для `TextWizard`.
+   - Добавить подсказку хоткея `E` в меню `TrafficGrid`, кнопку `Composer` в `SessionInspector`, `MenuBar`, `CommandPalette` и `ShortcutsModal.tsx`.
+
+2. Упразднение Split-сайдбара `dockedComposer` и улучшение `ComposerPanel.tsx` (`src/stores/uiStore.ts`, `src/App.tsx`, `src/components/TopToolbar.tsx`, `src/components/MenuBar.tsx`, `src/components/ComposerPanel.tsx`):
+   - Удалить `dockedComposer` и `setDockedComposer` из `src/stores/uiStore.ts`, внешнюю обёртку `bottomOuterGroupRef` / 3-колоночную ветку и рендер сплит-сайдбара `<ComposerPanel>` из `src/App.tsx`, а также переключатели `Split Composer Pane` из `TopToolbar.tsx`, `MenuBar.tsx` и `CommandPalette`.
+   - В `ComposerPanel.tsx` добавить кнопку возврата `← Traffic (Alt+1)` (`onBackToTraffic`), бейдж `From #<id>`, кнопку `Inspect #<id> in Traffic` в блоке ответа, гибкую ширину колонки имени заголовка вместо фиксированного `w-44` и ресайзабельный `PanelGroup` между редактором запроса и последним ответом (`flux-composer-split-v1`).
+
+3. Постоянная кнопка возврата свёрнутого `Session Inspector` (`src/components/CollapsedInspectorBar.tsx`, `src/App.tsx`):
+   - Создать компонент `CollapsedInspectorBar` для состояния `inspectorCollapsed === true` на вкладке `traffic`:
+     - для `inspectorPosition === "bottom"`: горизонтальная полоса `h-7` с кнопкой `ChevronUp` + `Expand Session Inspector`, кратким превью выбранной сессии (`#ID METHOD /path · STATUS`, подсказка `Enter`) и быстрыми кнопками `Statistics` и `Dock Right`;
+     - для `inspectorPosition === "right"`: вертикальная рельса `w-7` с кнопкой `ChevronLeft`, вертикальной подписью `Session Inspector` и кнопкой `Dock Bottom`.
+   - В `App.tsx` настроить `collapsible`, `collapsedSize={0}` и `onCollapse={() => setInspectorCollapsed(true)}` у панелей `SessionInspector` (bottom и right), а при `inspectorCollapsed === true` рендерить `CollapsedInspectorBar` так, чтобы инспектор всегда можно было развернуть в 1 клик без выпадающих меню.
+
+4. Тесты (Vitest):
+   - Добавить тесты на `CollapsedInspectorBar` (bottom/right режимы и коллбэки), проверку отсутствия `dockedComposer` в `uiStore` и работу хоткея `E` vs `Ctrl+E`.
+
+Проверка: `npm run typecheck`, `npm run test`, `npm run build`.
+```
+
+---
+
+## Этап 41: Контекстно-зависимые ПКМ-меню по всему приложению (Context-Aware Right-Click Menus)
+**Приоритет: P1 / P2 (UI Architecture & Context Menus) | Спринт 6 | Зависимости: Этапы 37, 38, 40**
+
+### Цель и контекст
+По результатам аудита кодовой базы `src/` правый клик мыши (ПКМ) сейчас обработан только в двух точках таблицы трафика (`TrafficGrid.tsx:1027` — `handleHeaderContextMenu` на шапке колонок и `TrafficGrid.tsx:1207` — `handleRowContextMenu` на строке сессии), где вручную используются два отдельных `[popover="auto"]` элемента с жёсткими оценочными габаритами (`288×396` в `TrafficGrid.tsx:488-489`).
+
+Во всех остальных частях приложения правый клик либо показывает стандартное браузерное меню WebView2 (`Back / Reload / Print / Inspect`), либо не даёт релевантных действий:
+- пустая область таблицы `TrafficGrid` (`TrafficGrid.tsx:1023, 1094`) игнорирует ПКМ;
+- в `SessionInspector.tsx` (`835-844`, таблицы `KeyValueTable` и `CookiesTable` в `1800-1867`, протокольные вкладки `InspectorProtocolPanels.tsx`, `HexViewer.tsx`, `SessionStatisticsPanel.tsx`) нет ПКМ-меню для копирования пар `Name: Value`, декодирования значений в `TextWizard`, быстрого фильтра или создания правил из заголовка/URL;
+- в `ComposerPanel.tsx`, `AutoResponderPanel.tsx` (`115-170`), консоли `ScriptingPanel.tsx` (`531-565`), `TopToolbar`, `Sidebar`, `PanelResizeHandle`, `CollapsedInspectorBar` и нижней строке состояния (`Footer`) отсутствует контекстное меню, соответствующее месту взаимодействия.
+
+При этом внутри встроенных редакторов **Monaco Editor** (`src/lib/monaco.ts:19` подключает `contextmenu.js`) штатное ПКМ-меню должно оставаться полностью рабочим.
+
+### Критерии приемки (DoD)
+- **1. Единый движок контекстных меню (`src/components/ui/ContextMenu.tsx`, `src/hooks/useContextMenu.ts`):**
+  - Реализованы `ContextMenuProvider` (в корне приложения) и хук `useContextMenu()` с единым API `openContextMenu(event, items, options?)`.
+  - Декларативная схема элементов `ContextMenuItem`:
+    - `action`: `id`, `label`, optional `icon`, `shortcut` (`E`, `R`, `Ctrl+C`), `disabled`, `danger`, `checked` (checkbox/radio-индикатор), `onSelect`;
+    - `separator` и опциональный компактный `header` (контекстный заголовок цели клика, например `GET /oauth2/token` или `Header: Authorization`);
+    - поддержка вложенного подменю (submenu) при необходимости группировки второстепенных действий.
+  - Точное viewport-aware позиционирование через `requestAnimationFrame` + измерение реальных размеров меню `getBoundingClientRect()` (автоматический flip влево/вверх и clamping в границах окна вместо хардкода `288×396`), поддержка прокрутки длинных меню на низких экранах, полная клавиатурная навигация (`↑`/`↓`/`Home`/`End`/`Enter`/`Esc`), фокус-менеджмент и гарантия единственного открытого ПКМ-меню.
+  - Глобальный обработчик `onContextMenu` на корневом контейнере `App.tsx`, который подавляет «сырое» браузерное меню WebView2 по умолчанию, но **сохраняет**:
+    - штатное контекстное меню внутри `.monaco-editor`;
+    - работу с текстом в `<input>`, `<textarea>` и `[contenteditable]` (предоставляя десктопное меню редактирования `Cut / Copy / Paste / Select All` с дополнением контекстных действий поля, например *«Paste & Import cURL»* в поле URL `ComposerPanel` и *«Clear Filter»* в поиске `TopToolbar`).
+- **2. Контекстно-зависимый состав ПКМ-меню по зонам взаимодействия:**
+  - **`TrafficGrid` — строка сессии** (миграция с локального popover на `useContextMenu`):
+    - основные действия: `Replay (R)`, `Открыть в Composer (E)`, `Сравнить в Session Diff (Ctrl+D)`, `Открыть Statistics`;
+    - копирование и код: `Copy URL (Ctrl+C)`, `Copy as cURL`, `Generate Client Code…`, `Copy Request Headers`, `Copy Response Headers`;
+    - экспорт: `Save Selected as HAR (.har)`, `Save Selected as Fiddler SAZ (.saz)`, `Export as OpenAPI 3.0 Spec…`, `Save Request Body As…`, `Save Response Body As…`, `Save Full Raw HTTP (.txt)`;
+    - отладка и фильтры: `Комментарий / Маркер (M)`, `Снять метку (U)`, `Создать правило AutoResponder`, `Add Breakpoint (bpu / bpafter)`, `Filter by Host / Process / Client IP / Status`, `Always inspect / Always passthrough`, `Allow only this device IP` (для LAN-клиентов из Этапа 36), `Удалить сессию (Del)`.
+  - **`TrafficGrid` — шапка колонки** (миграция `handleHeaderContextMenu`):
+    - `Sort Ascending / Descending / Clear Sort`, `Auto-fit "<Column>"`, `Auto-fit All Visible Columns`, чекбоксы показа/скрытия всех колонок `TRAFFIC_COLUMNS`, `Reset Columns`.
+  - **`TrafficGrid` — пустая область таблицы (вне строк):**
+    - `Select All Visible Sessions (Ctrl+A)`, `Pause / Resume Capture (F12)`, `Follow Tail (Auto-Scroll)`, `Clear All Sessions (Ctrl+X)`, `Import Archive… (Ctrl+O)`, `Save All Sessions… (Ctrl+S)`, `Reset Active Filters`, `Reset Columns`.
+  - **`SessionInspector` — верхняя полоса сводки (URL / Method / Status):**
+    - `Copy Full URL`, `Copy Host`, `Copy Path & Query`, `Copy as cURL`, `Replay (R)`, `Edit in Composer (E)`, `Add bpu Breakpoint`, `Create AutoResponder Rule`, `Filter by Host`, `Decode URL in TextWizard`, `Dock Bottom / Right`, `Collapse Inspector`.
+  - **`SessionInspector` — таблицы `Headers` / `Params` (`KeyValueTable`) и `Cookies` (`CookiesTable`):**
+    - клик по строке/ячейке: `Copy Value`, `Copy "Name: Value"` (для Cookies — `"Name=Value"`), `Copy Name`, `Copy All Headers/Params/Cookies`;
+    - `Decode Value in TextWizard` (с автоопределением JWT / URL / Base64), `Quick Filter by Value`, а для заголовков — быстрое создание правила `Header Mutation` (*«Set / Override Header…»*, *«Remove Header…»*).
+  - **`SessionInspector` — специализированные вкладки и выделенный текст:**
+    - `WS` (`WebSocketFramesPanel`): `Copy Frame Payload`, `Copy Pretty JSON`, `Copy Hex`, `Reuse Payload in Inject Form`, `Decode in TextWizard`;
+    - `SSE` (`SseInspectorPanel`): `Copy Event Data`, `Copy Full SSE Stream`, `Decode Data in TextWizard`;
+    - `Hex` (`HexViewer`): `Copy Row Hex`, `Copy Row ASCII`, `Copy All as Hex`, `Copy All as Base64`, `Open in TextWizard (Hex)`, `Save Body As…`;
+    - `Image` / SVG: `Save Image / SVG As…`, `Copy Image URL`, `Copy Base64 / SVG Source`;
+    - `Statistics` (`SessionStatisticsPanel`): `Copy Timing Summary (Markdown)`, `Copy Server IP`;
+    - любой выделенный read-only текст (`window.getSelection()`): `Copy Selection`, `Decode Selection in TextWizard (Auto / JWT / Base64 / URL / Hex)`, `Filter Traffic by Selection`.
+  - **`ComposerPanel` (вне Monaco Body):**
+    - в поле URL: `Cut / Copy / Paste / Select All`, `Paste & Import cURL`, `Copy as cURL`, `Clear URL`;
+    - на строках заголовков: `Copy "Name: Value"`, `Duplicate Header`, `Move Up / Down`, `Remove Header`, `Add New Header`.
+  - **`AutoResponderPanel`:**
+    - на карточке правила: `Enable / Disable Rule`, `Duplicate Rule`, `Copy Match Pattern`, `Delete Rule`;
+    - в пустой области списка правил: `Add New Rule`, `Enable / Disable AutoResponder Globally`.
+  - **`ScriptingPanel` (Console Output, вне Monaco Editor):**
+    - на записи лога и в области консоли: `Copy Log Line`, `Copy All Visible Logs`, переключатели фильтра (`All` / `stdout` / `stderr / errors`), `Toggle Auto-Scroll`, `Clear Console`.
+  - **Каркас интерфейса (`TopToolbar`, `Sidebar`, `PanelResizeHandle`, `CollapsedInspectorBar`, `Footer`):**
+    - `TopToolbar`: `Toggle Slim Toolbar (Ctrl+Shift+T)`, `Toggle Sidebar (Ctrl+B)`, `Reset Panel Layout`, `Customize UI & Columns… (Ctrl+,)` (плюс в поле поиска `Quick Filter`: `Cut / Copy / Paste / Select All`, `Clear Filter`, `Toggle RegExp`);
+    - `Sidebar`: `Open Section`, `Collapse Sidebar (Ctrl+B)`, `Open Settings Hub (Ctrl+,)`;
+    - `PanelResizeHandle` и `CollapsedInspectorBar`: `Expand / Collapse Session Inspector`, `Dock Inspector at Bottom / Right`, `Toggle Request/Response Split`, `Reset Panel Layout`;
+    - `Footer`: `Toggle Capture (F12)`, `Toggle System Proxy`, `Copy Proxy Address (127.0.0.1:<port>)`, `Copy CLI Proxy Env (HTTP_PROXY / HTTPS_PROXY)`, `Run Proxy Doctor (Ctrl+Shift+D)`, `Purge SQLite Archive…`.
+- **3. Тесты (`src/components/ui/ContextMenu.test.tsx`, `src/lib/contextMenuBuilders.test.ts`):**
+  - Vitest-тесты на viewport clamping/flip компонента `ContextMenu`, навигацию стрелками/Enter/Escape, сохранение нативного меню внутри `.monaco-editor` и проверку формирования релевантного набора пунктов меню для различных зон (строка таблицы, пустая область, заголовок инспектора, правило AutoResponder, строка лога, футер).
+
+### 📝 Промпт для Antigravity (Этап 41)
+
+```markdown
+Роль: Principal UI/UX Architect & Senior React/TypeScript Engineer (React 19 + TypeScript + Tailwind CSS).
+Проект: FluxProxy (Tauri v2 + Rust + React 19).
+
+Задача: Выполнить Этап 41 из ROADMAP.md — спроектировать и внедрить единую контекстно-зависимую систему ПКМ-меню (Right-Click Context Menus) по всему приложению, заменив точечные поповеры `TrafficGrid` и полностью подавив «сырое» браузерное контекстное меню WebView2 (кроме штатного меню Monaco Editor).
+
+1. Единая инфраструктура ПКМ (`src/components/ui/ContextMenu.tsx`, `src/hooks/useContextMenu.ts`, `src/App.tsx`):
+   - Реализовать `ContextMenuProvider` и `useContextMenu()` (`openContextMenu(event, items, options?)`) с поддержкой `header`, `separator`, `icon`, `shortcut`, `checked`, `disabled`, `danger` и вложенных `submenu`.
+   - Реализовать точное позиционирование по реальному `getBoundingClientRect()` с auto-flip и viewport clamping (без жёстких размеров `288×396`), полную клавиатурную навигацию (`↑`/`↓`/`Home`/`End`/`Enter`/`Esc`) и закрытие по клику вне меню / скроллу / `Escape`.
+   - На корневом контейнере `App.tsx` перехватывать необработанный `onContextMenu` и подавлять стандартное меню браузера, сохраняя:
+     - штатное меню внутри `.monaco-editor`;
+     - корректные операции редактирования (`Cut / Copy / Paste / Select All`) и контекстные действия внутри `<input>` / `<textarea>` / `[contenteditable]`.
+
+2. Контекстные меню по местам взаимодействия:
+   - `src/components/TrafficGrid.tsx`: мигрировать меню строки сессии (с подсказкой `E` для Composer, `bpu`, `Allow only this device IP` и др.) и меню шапки колонки на единый `ContextMenu`; добавить ПКМ-меню для пустой области таблицы (`Select All`, `Pause/Resume Capture`, `Follow Tail`, `Clear All`, `Import/Save`, `Reset Filters`, `Reset Columns`).
+   - `src/components/SessionInspector.tsx`, `src/components/InspectorProtocolPanels.tsx`, `src/components/HexViewer.tsx`, `src/components/SessionStatisticsPanel.tsx`:
+     - полоса сводки сессии (Copy URL/Host/Path/cURL, Replay `R`, Edit in Composer `E`, Breakpoint, AutoResponder, Filter, TextWizard, Dock/Collapse);
+     - `KeyValueTable` (Headers/Params) и `CookiesTable`: `Copy Value`, `Copy Name: Value` / `Name=Value`, `Copy Name`, `Copy All`, `Decode in TextWizard`, `Filter by Value`, `Add Header Mutation Rule`;
+     - вкладки `WS`, `SSE`, `Hex`, `Image/SVG`, `Statistics` и выделенный read-only текст (`window.getSelection()` -> Copy / Decode in TextWizard / Quick Filter).
+   - `src/components/ComposerPanel.tsx`: контекстное меню для поля URL (`Paste & Import cURL`, `Copy as cURL`, `Clear`, операции буфера обмена) и строк заголовков (`Copy`, `Duplicate`, `Move Up/Down`, `Remove`, `Add`).
+   - `src/components/AutoResponderPanel.tsx`: ПКМ-меню на карточке правила (`Enable/Disable`, `Duplicate`, `Copy Pattern`, `Delete`) и на пустом списке (`Add Rule`, `Toggle AutoResponder`).
+   - `src/components/ScriptingPanel.tsx`: ПКМ-меню консоли логов (`Copy Line`, `Copy All Visible`, фильтр `All/stdout/errors`, `Auto-Scroll`, `Clear`).
+   - Каркас приложения (`TopToolbar.tsx`, `Sidebar.tsx`, `PanelResizeHandle`, `CollapsedInspectorBar.tsx`, `Footer` в `App.tsx`): релевантные действия для каждой зоны (`Slim Toolbar`, `Toggle Sidebar`, `Expand/Collapse/Dock Inspector`, `Reset Panel Layout`, `Copy Proxy Address`, `Copy CLI Env`, `Run Proxy Doctor`, `Purge SQLite`).
+
+3. Тесты (Vitest):
+   - Протестировать позиционирование/клавиатурную навигацию `ContextMenu`, игнорирование `.monaco-editor` и состав пунктов меню для разных контекстных зон.
+
+Проверка: `npm run typecheck`, `npm run test`, `npm run build`.
+```
+
+---
+
 ## Этап 12: Аналитика и визуализация: Waterfall Timeline и статистика трафика
-**Приоритет: P2 (Feature) | Спринт 6 | Зависимости: Этапы 34 ✅, 35, 39, 36, 37, 38**
+**Приоритет: P2 (Feature) | Спринт 6 | Зависимости: Этапы 34 ✅, 35, 39, 36, 37, 38, 40, 41**
 
 ### Цель и контекст
 Для поиска узких мест производительности (последовательные «лесенки» запросов, тяжелые эндпоинты, всплески 4xx/5xx и P95-латентность) нужна наглядная временная диаграмма и агрегированная статистика по выборке сессий.
