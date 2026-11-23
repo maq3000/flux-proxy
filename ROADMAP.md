@@ -109,15 +109,16 @@
 
 ## 📋 Матрица приоритетов и порядок выполнения
 
-> *Номера этапов (`35`, `36`, `37`, `38`, `12`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз. Завершенные этапы Спринта 1 (Этапы 14, 15, 20, 21, 25–28) выполнены в релизе `v0.2.0`, этапы Спринта 2 (Этапы 5, 16, 17, 23, 24, 29, 30) выполнены в релизе `v0.3.0`, этапы Спринта 3 (Этапы 6, 7, 8, 9, 18, 19, 22) выполнены в релизе `v0.4.0`, стабилизационный Спринт 4 (Этапы 31–33) выполнен в релизе `v0.4.1`, а этапы Спринта 5 (Этапы 10, 11, 13, 34) выполнены в релизе `v0.5.0` и перенесены в раздел реализованных этапов выше.*
+> *Номера этапов (`35`, `39`, `36`, `37`, `38`, `12`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз. Завершенные этапы Спринта 1 (Этапы 14, 15, 20, 21, 25–28) выполнены в релизе `v0.2.0`, этапы Спринта 2 (Этапы 5, 16, 17, 23, 24, 29, 30) выполнены в релизе `v0.3.0`, этапы Спринта 3 (Этапы 6, 7, 8, 9, 18, 19, 22) выполнены в релизе `v0.4.0`, стабилизационный Спринт 4 (Этапы 31–33) выполнен в релизе `v0.4.1`, а этапы Спринта 5 (Этапы 10, 11, 13, 34) выполнены в релизе `v0.5.0` и перенесены в раздел реализованных этапов выше.*
 
 | # | Этап | Приоритет | Спринт | Зависимости | Ключевая ценность |
 | :-: | :--- | :--- | :--- | :--- | :--- |
 | 1 | **[Этап 35](#этап-35-стабилизация-маршрутизации-hosts--ws--upstream-proxy-атомарная-инъекция-ws-фреймов-паритет-composer-и-защита-от-oom)** | **P1 (Core Reliability & Security)** | Спринт 6 | Этапы 7 ✅, 10 ✅, 13 ✅, 34 ✅ | Починка `HOSTS Remapping` для прямых WebSocket (`BUG-01`) и IP / HTTP-прокси (`BUG-02`), предкомпиляция Regex в `hosts.rs` (`PERF-01`), сохранение инъектированных WS-фреймов (`CONC-02`), лимит 64 MiB для буферизации ответов (`SEC-01`), Python-хуки и `OverrideStatus` в Composer (`BUG-03`), синхронизация `clientSendMs` (`BUG-04`), индикация `via <proxy>` в `Server IP` (`BUG-05`) и дедупликация 16-мс батчера (`PERF-02`) |
-| 2 | **[Этап 36](#этап-36-защита-ключей-mtls-dpapi--in-memory-lan-client-allowlist-чистота-zustand-сторов-очистка-техдолга-и-синхронизация-документации)** | **P1 / P2 (Security, State & Hygiene)** | Спринт 6 | Этапы 11 ✅, 18 ✅, 35 | Шифрование ключей mTLS/CA через Windows DPAPI + режим `Session-only (In-Memory)` (`SEC-03`), белый список `LAN Client Allowlist`, фильтрация `SAFE_RASTER_IMAGE_MIMES` в Multipart (`SEC-02`), устранение сброса сессий в `syncFromLocalStorage` (`CONC-01`) и $O(N)$ аллокаций (`PERF-03`), удаление мёртвого кода `reqwest` (`ARCH-01`), вынос `BrowserPreviewEngine` (`ARCH-02`) и синхронизация документации с кодом |
-| 3 | **[Этап 37](#этап-37-исправление-ui-багов-инспектора-hexviewer-и-timing-breakdown-и-редизайн-command-palette-20)** | **P1 (UI Bugfixes & UX Ergonomics)** | Спринт 6 | Этапы 22 ✅, 30 ✅, 34 ✅ | Устранение сдвига колонок и наложения байтов на `DECODED ASCII` во вкладке `Hex` (`HexViewer.tsx`), устранение мелькания тултипа при наведении на легенду `TIMING BREAKDOWN` (`SessionStatisticsPanel.tsx`, показ только на таймлайне без layout shift) и крупная понятная `Command Palette 2.0` (`max-w-3xl`, категории, описания, статусы, чипы синтаксиса `bpu`/`jwt`) |
-| 4 | **[Этап 38](#этап-38-единый-полноэкранный-центр-настроек-unified-fullscreen-settings-hub-реорганизация-вкладок-дедупликация-панелей-и-система-подсказок)** | **P1 / P2 (UI Architecture & Discoverability)** | Спринт 6 | Этапы 4 ✅, 10 ✅, 11 ✅, 13 ✅, 18 ✅, 22 ✅, 37 | Консолидация всех разрозненных модалок настроек (`FilterDrawer`, `HOSTS`, `Upstream Proxy`, `Root CA`, `mTLS`, `Mobile`, `Throttling`, `Proxy Doctor`) в единый полноэкранный `Settings Hub` (`Ctrl+,`), перевод конфигурационных модалок в fullscreen, удаление устаревшего свитча темы и дубликатов кнопок между `MenuBar`/`TopToolbar`/`Sidebar`/`Inspector`, наглядный доступ к `Throttling` и контекстные подсказки (`HelpTooltip`) |
-| 5 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 6 | Этапы 34 ✅, 35, 36, 37, 38 | Виртуализированная многофазная каскадная диаграмма (Waterfall) и сводный Markdown-отчет по всей выборке (P95, TTFB, статусы, MIME) |
+| 2 | **[Этап 39](#этап-39-разделение-и-настройка-upstream-таймаутов-прозрачное-ожидание-ответа-сервера-ttfb-и-raii-финализация-отменённых-запросов-499)** | **P1 (Core Proxy Transparency & Timeouts)** | Спринт 6 | Этапы 4 ✅, 21 ✅, 33 ✅, 34 ✅, 35 | Разделение жёсткого 15-с лимита на настраиваемые `connectTimeoutSec` (15 с) и `responseHeaderTimeoutSec` (по умолчанию `0` = Unlimited / ожидание реального ответа или ошибки сервера), отдельный `composerTimeoutSec` (120 с) + кнопка отмены `Cancel`, RAII-гард `InFlightSessionGuard` (финализация обрывов клиента как `499`) и диагностический заголовок `X-FluxProxy-Error` |
+| 3 | **[Этап 36](#этап-36-защита-ключей-mtls-dpapi--in-memory-lan-client-allowlist-чистота-zustand-сторов-очистка-техдолга-и-синхронизация-документации)** | **P1 / P2 (Security, State & Hygiene)** | Спринт 6 | Этапы 11 ✅, 18 ✅, 35 | Шифрование ключей mTLS/CA через Windows DPAPI + режим `Session-only (In-Memory)` (`SEC-03`), белый список `LAN Client Allowlist`, фильтрация `SAFE_RASTER_IMAGE_MIMES` в Multipart (`SEC-02`), устранение сброса сессий в `syncFromLocalStorage` (`CONC-01`) и $O(N)$ аллокаций (`PERF-03`), удаление мёртвого кода `reqwest` (`ARCH-01`), вынос `BrowserPreviewEngine` (`ARCH-02`) и синхронизация документации с кодом |
+| 4 | **[Этап 37](#этап-37-исправление-ui-багов-инспектора-hexviewer-и-timing-breakdown-и-редизайн-command-palette-20)** | **P1 (UI Bugfixes & UX Ergonomics)** | Спринт 6 | Этапы 22 ✅, 30 ✅, 34 ✅ | Устранение сдвига колонок и наложения байтов на `DECODED ASCII` во вкладке `Hex` (`HexViewer.tsx`), устранение мелькания тултипа при наведении на легенду `TIMING BREAKDOWN` (`SessionStatisticsPanel.tsx`, показ только на таймлайне без layout shift) и крупная понятная `Command Palette 2.0` (`max-w-3xl`, категории, описания, статусы, чипы синтаксиса `bpu`/`jwt`) |
+| 5 | **[Этап 38](#этап-38-единый-полноэкранный-центр-настроек-unified-fullscreen-settings-hub-реорганизация-вкладок-дедупликация-панелей-и-система-подсказок)** | **P1 / P2 (UI Architecture & Discoverability)** | Спринт 6 | Этапы 4 ✅, 10 ✅, 11 ✅, 13 ✅, 18 ✅, 22 ✅, 37, 39 | Консолидация всех разрозненных модалок настроек (`FilterDrawer`, `HOSTS`, `Upstream Proxy`, `Root CA`, `mTLS`, `Mobile`, `Throttling`, `Proxy Doctor`) в единый полноэкранный `Settings Hub` (`Ctrl+,`), сохранение/перенос `Upstream Timeouts`, перевод конфигурационных модалок в fullscreen, удаление устаревшего свитча темы и дубликатов кнопок между `MenuBar`/`TopToolbar`/`Sidebar`/`Inspector`, наглядный доступ к `Throttling` и контекстные подсказки (`HelpTooltip`) |
+| 6 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 6 | Этапы 34 ✅, 35, 39, 36, 37, 38 | Виртуализированная многофазная каскадная диаграмма (Waterfall) и сводный Markdown-отчет по всей выборке (P95, TTFB, статусы, MIME) |
 
 ---
 
@@ -162,7 +163,7 @@
 
 ---
 
-## 🔴 Спринт 6 — P1 / P2 (Audit `v0.5.0` Remediation, UX Redesign & Analytics): Стабилизация сетевого ядра, защита ключей, единый полноэкранный Settings Hub, Command Palette 2.0 и Waterfall Timeline
+## 🔴 Спринт 6 — P1 / P2 (Audit `v0.5.0` Remediation, UX Redesign & Analytics): Стабилизация сетевого ядра, настраиваемые upstream-таймауты, защита ключей, единый полноэкранный Settings Hub, Command Palette 2.0 и Waterfall Timeline
 
 ---
 
@@ -231,6 +232,97 @@
    - Добавить `via_proxy_addr: Option<String>` (`viaProxyAddr?: string | null`) в `SessionTransferStats`, а при маршрутизации через `UpstreamProxy` записывать в `server_ip` формат `"via <proxy_ip>:<port>"`.
 
 6. Тесты: добавить интеграционные тесты в `src-tauri/src/proxy/server/mod.rs` на прямой WebSocket с `HostRemapRegistry`, сохранение инъектированного WS-фрейма после прихода новых кадров от сервера и работу `OverrideStatus` + Python-хука в `execute_composed`.
+
+Проверка: `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings`, `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run typecheck`, `npm run test`, `npm run build`.
+```
+
+---
+
+## Этап 39: Разделение и настройка upstream-таймаутов, прозрачное ожидание ответа сервера (TTFB) и RAII-финализация отменённых запросов (499)
+**Приоритет: P1 (Core Proxy Transparency & Timeouts) | Спринт 6 | Зависимости: Этапы 4 ✅, 21 ✅, 33 ✅, 34 ✅, 35**
+
+### Цель и контекст
+В текущем сетевом ядре FluxProxy зашит единый неконфигурируемый 15-секундный лимит на ожидание ответа upstream-сервера:
+1. **Единый жёстко зашитый таймаут на соединение и обработку на сервере:**
+   - В `src-tauri/src/proxy/server/mod.rs:48, 977` объявлена константа `DEFAULT_UPSTREAM_TIMEOUT_SEC: u64 = 15`, передаваемая как неизменяемое поле `upstream_timeout_sec` в `SharedProxyContext`, а в `src-tauri/src/proxy/upstream_client.rs:33` — `CONNECT_TIMEOUT_DEFAULT: Duration = Duration::from_secs(15)`.
+   - В `UpstreamHttpClient::send_request` (`src-tauri/src/proxy/upstream_client.rs:1072-1087`) конструкция `tokio::time::timeout(timeout, self.client.request(req))` накрывает одним 15-секундным таймером **и** установку соединения (DNS + TCP + Upstream Proxy + TLS Handshake), **и** ожидание первых заголовков ответа от сервера (TTFB). При превышении 15 000 мс возвращается `UpstreamClientError::Timeout("Upstream request timed out after 15000 ms")` со статусом `504 Gateway Timeout`, который в `http_handler.rs:1598-1659` и `composer_exec.rs:467-527` преобразуется в `"Upstream connection error: Upstream request timed out after 15000 ms"`.
+2. **Почему это ломает диагностику и отладку серверных ошибок:**
+   - Когда бэкенд, БД, LLM-API или вышестоящий reverse proxy (nginx / ALB / Cloudflare / API Gateway с таймаутами 30–60 с) долго обрабатывает запрос (> 15 с) и затем возвращает **реальную ошибку сервера** (`500` со stack trace / JSON error details, `502`/`503`/`504`/`408` с заголовками `X-Request-Id` / `Traceparent`), FluxProxy обрывает запрос ровно на 15 000 мс и подменяет ответ синтетическим `504` с текстом `Upstream connection error: Upstream request timed out after 15000 ms`.
+   - В итоге и клиентское приложение, и разработчик в Traffic Viewer **полностью теряют информацию об ошибке от сервера**, а отладочный прокси нарушает принцип прозрачности (observer effect).
+3. **Почему нельзя ограничиться простым увеличением константы или удалением таймаута:**
+   - **Разделение фаз Connect vs TTFB:** зависания на фазе установления соединения (недоступный IP, firewall drop, зависший TLS handshake) должны продолжать отсекаться быстрым `connectTimeoutSec` (по умолчанию `15` с) с единым дедлайном на DNS → TCP → Upstream Proxy → TLS в `InstrumentedConnector` (а также в прямом пути `connect_tunnel.rs:231, 264`, где сейчас вообще нет таймаута на DNS/TCP). При этом ожидание заголовков ответа (TTFB) после отправки запроса должно управляться отдельно (`responseHeaderTimeoutSec`, по умолчанию `0` = `Unlimited`, т.е. прокси не перебивает таймауты клиента и сервера и дожидается реального ответа или ошибки сервера).
+   - **Риск «вечных Pending-сессий» без RAII-гарда:** при `responseHeaderTimeoutSec = 0` (или большом значении) если сам клиент (браузер/SDK) разорвёт соединение раньше сервера, Hyper отменит future `handle_intercepted_request`. Поскольку сейчас в `server/mod.rs:445-473` RAII-очистка есть только для паузы на Breakpoint (`PendingBreakpointGuard`), но не для активного `send_request`, сессия из Этапа 21 останется в `TrafficStore` в статусе `0 / Pending` навсегда. Нужен `InFlightSessionGuard`, фиксирующий разрыв клиента как `499 Client Closed Request`.
+   - **Автономность Request Composer / Replay:** в Composer нет внешнего сокета клиента, который прервёт запрос по своему таймауту, поэтому Composer нужен отдельный настраиваемый `composerTimeoutSec` (по умолчанию `120` с) и кнопка ручной отмены `Cancel`.
+   - **Диагностическая прозрачность ошибок прокси:** синтетические ответы `504` от FluxProxy сейчас не имеют маркерного заголовка, из-за чего их легко спутать с настоящим `504 Gateway Timeout` от upstream-сервера или CDN.
+
+### Критерии приемки (DoD)
+- **Разделённая модель конфигурации `UpstreamTimeoutConfig` (`src-tauri/src/models.rs` ↔ `src/types/proxy.ts`):**
+  - `connectTimeoutSec: u64` — таймаут установления соединения (DNS + TCP + Upstream Proxy + TLS handshake), по умолчанию `15` с, допустимый диапазон `1..=300` с.
+  - `responseHeaderTimeoutSec: u64` — таймаут ожидания первых заголовков ответа сервера (TTFB), по умолчанию `0` (`0` = Unlimited / не обрывать медленный сервер, либо `5..=3600` с при явном ограничении).
+  - `composerTimeoutSec: u64` — таймаут для запросов из Request Composer и `Replay`, по умолчанию `120` с (`0` = Unlimited, либо `1..=3600` с).
+- **Lock-free обновление на лету и персистентность:**
+  - В `SharedProxyContext` (`src-tauri/src/proxy/server/mod.rs`) плоское поле `upstream_timeout_sec: u64` заменено на `Arc<AtomicU64>` (для `connect_timeout_sec`, `response_header_timeout_sec`, `composer_timeout_sec`), пробрасываемые в `InstrumentedConnector` (включая mTLS-клиенты в `src-tauri/src/proxy/client_certs.rs`) — изменение настроек применяется мгновенно без перезапуска прокси и без сброса пула соединений; устаревший `reqwest`-код в `http_handler.rs:92` остаётся компилируемым до удаления в Этапе 36.
+  - Конфигурация сохраняется в `app_data_dir` (по аналогии с `proxy_port.pref` / `bind_config.pref` в `sysproxy.rs`) и автоматически загружается при инициализации `ProxyEngineController::new`.
+- **Единый Connect Deadline и опциональный TTFB-таймаут (`src-tauri/src/proxy/upstream_client.rs`, `connect_tunnel.rs`, `websocket_relay.rs`):**
+  - `InstrumentedConnector::call` читает актуальный `connect_timeout_sec` и использует единый `connect_deadline = Instant::now() + connect_timeout` на всю цепочку DNS → TCP → Upstream Proxy → TLS handshake с чётким указанием зависшего этапа при ошибке (`UpstreamClientError::Connect`).
+  - В `connect_tunnel.rs:225-279` прямой путь `CONNECT` (DNS lookup и `TcpStream::connect`) также ограничен `connect_timeout_sec`, а в `websocket_relay.rs:871` используется `connect_timeout_sec`.
+  - Сигнатуры `UpstreamHttpClient::send_request`, `send_with_idempotent_retry` и `send_following_redirects` принимают `response_timeout: Option<Duration>`: при `None` (`responseHeaderTimeoutSec == 0`) вызов `self.client.request(req).await` не обрывается прокси по искусственному TTFB-таймеру (оставаясь защищённым `connectTimeoutSec` на уровне коннектора); при `Some(dur)` оборачивается в `tokio::time::timeout`.
+- **RAII-гард `InFlightSessionGuard` (`499 Client Closed Request` в `http_handler.rs`):**
+  - Создаётся сразу после `record_in_flight_session_with_remap` и снимается (`guard.disarm()`) при нормальном завершении ответа, переходе в SSE/Stream или записи ошибки.
+  - Если клиент закрыл соединение во время ожидания ответа upstream-сервера, `Drop` обновляет сессию в `TrafficStore` со статусом `499`, фактическим `duration_ms` и ошибкой `"Client closed connection while waiting for upstream response"` и пушит обновлённый `SessionSummary` в `event_tx`.
+- **Явная диагностика синтетических ошибок FluxProxy (`X-FluxProxy-Error`):**
+  - `record_and_return_error_with_telemetry` / `plain_response` добавляет диагностический заголовок `X-FluxProxy-Error` (`upstream-response-timeout`, `upstream-connect-timeout`, `upstream-connect-error` и т.п.) как в HTTP-ответ клиенту, так и в `SessionDetail.response_headers`.
+  - Текст ошибки таймаута явно называет фазу и настройку (`FluxProxy upstream response timeout after <N> ms while waiting for response headers (TTFB)...`), а в `src/components/SessionInspector.tsx` для сессий с `X-FluxProxy-Error: upstream-response-timeout` отображается информационный баннер с кнопкой перехода к настройкам таймаутов.
+- **Request Composer / Replay: per-request таймаут и ручная отмена (`composer_exec.rs`, `ComposerPanel.tsx`):**
+  - В `ComposedRequest` (`models.rs`, `src/types/proxy.ts`) добавлено опциональное поле `timeoutSec?: number` для разового переопределения таймаута.
+  - В `ProxyEngineController` добавлен реестр активных запросов Composer (`DashMap` с каналом отмены) и Tauri-команда `cancel_composed_request`; в `ComposerPanel.tsx` во время выполнения отображается кнопка `Cancel`, фиксирующая отменённый запрос со статусом `499`.
+- **Tauri IPC, Настройки UI и совместимость `FluxUserSettingsProfile`:**
+  - Новые Tauri-команды `get_upstream_timeouts` и `set_upstream_timeouts` (с fallback-реализацией в `src/lib/tauriBridge.ts` для Browser Preview).
+  - В `FluxUserProxySettings` (`src/types/settings.ts`) добавлено опциональное поле `upstreamTimeouts?: UpstreamTimeoutConfig`, проведённое через все 7 точек регистрации в `src/lib/settingsManager.ts` и `src/App.tsx` с обратной совместимостью при импорте старых профилей `schemaVersion: 1`.
+  - В `src/components/settings/GeneralSettingsTab.tsx` добавлена секция **Upstream Timeouts** с быстрыми пресетами для ожидания ответа сервера (`Unlimited (Recommended)`, `30 s`, `60 s`, `120 s`, `300 s`, `Custom`), полями для Connect / Response Headers / Composer timeouts и предупреждением, если `responseHeaderTimeoutSec` задан в интервале `1..29` с.
+- **Тесты:**
+  - Интеграционные Rust-тесты в `src-tauri/src/proxy/server/mod.rs` и `upstream_client.rs`:
+    1) медленный сервер с задержкой дольше порога при `responseHeaderTimeoutSec == 0` возвращает реальный ответ `500` с JSON-ошибкой целиком без подмены на `504`;
+    2) при конечном `responseHeaderTimeoutSec = 1` прокси возвращает `504` с заголовком `X-FluxProxy-Error: upstream-response-timeout`;
+    3) закрытие сокета клиентом во время ожидания ответа финализирует in-flight сессию в `TrafficStore` со статусом `499` через `InFlightSessionGuard`;
+    4) `connectTimeoutSec` корректно прерывает зависшее TCP/TLS-подключение и прямой `CONNECT`-туннель.
+  - Unit-тесты в `src/lib/settingsManager.test.ts` на дефолтные значения, валидацию границ и миграцию профилей без `upstreamTimeouts`.
+
+### 📝 Промпт для Antigravity (Этап 39)
+
+```markdown
+Роль: Principal Rust Network Systems & Full-Stack Engineer (Tauri v2 + Hyper + Tokio + React 19).
+Проект: FluxProxy (Tauri v2 + Rust + React 19).
+
+Задача: Выполнить Этап 39 из ROADMAP.md — разделить жёсткий 15-секундный таймаут на настраиваемые `connectTimeoutSec` и `responseHeaderTimeoutSec` (по умолчанию `0` = Unlimited для прозрачного ожидания реальных ответов и ошибок медленных серверов), добавить `composerTimeoutSec` + ручную отмену, RAII-гард `InFlightSessionGuard` (`499`) и маркерный заголовок `X-FluxProxy-Error`.
+
+1. Модель конфигурации и хранилище (`src-tauri/src/models.rs`, `src-tauri/src/proxy/sysproxy.rs`, `src-tauri/src/proxy/server/mod.rs`):
+   - Добавить структуру `UpstreamTimeoutConfig` (`connect_timeout_sec: u64`, `response_header_timeout_sec: u64`, `composer_timeout_sec: u64`) с дефолтами `15`, `0` (`Unlimited`) и `120`, а также метод нормализации/валидации границ (`connect: 1..=300`, `response_header: 0 | 5..=3600`, `composer: 0 | 1..=3600`).
+   - Сохранять и загружать `UpstreamTimeoutConfig` в `app_data_dir` (аналогично `proxy_port.pref` / `bind_config.pref`).
+   - В `SharedProxyContext` заменить `upstream_timeout_sec: u64` на атомарные `Arc<AtomicU64>` (connect, response_header, composer), чтобы изменения применялись без перезапуска прокси и сброса connection pool (сохранив компиляцию старого `reqwest`-хелпера в `http_handler.rs:92` до Этапа 36).
+
+2. Разделение Connect Deadline и Response Header (TTFB) Timeout (`src-tauri/src/proxy/upstream_client.rs`, `src-tauri/src/proxy/client_certs.rs`, `src-tauri/src/proxy/server/connect_tunnel.rs`, `src-tauri/src/proxy/server/websocket_relay.rs`):
+   - В `InstrumentedConnector` передавать `Arc<AtomicU64>` для `connect_timeout_sec`; внутри `call()` отслеживать единый `connect_deadline` на всю цепочку DNS → TCP → Upstream Proxy → TLS handshake и возвращать `UpstreamClientError::Connect` с точным описанием зависшего этапа.
+   - В `connect_tunnel.rs` ограничить `connect_timeout_sec` также прямой DNS lookup и `TcpStream::connect`; в `websocket_relay.rs` использовать `connect_timeout_sec`.
+   - В `UpstreamHttpClient::send_request`, `send_with_idempotent_retry` и `send_following_redirects` заменить `timeout: Duration` на `response_timeout: Option<Duration>`: при `None` (`0`) выполнять `self.client.request(req).await` без искусственного TTFB-таймера (под защитой connect timeout в коннекторе), при `Some(dur)` оборачивать в `tokio::time::timeout` и возвращать `UpstreamClientError::Timeout` с информативным текстом фазы TTFB.
+
+3. RAII-гард `InFlightSessionGuard` (499) и диагностика `X-FluxProxy-Error` (`src-tauri/src/proxy/server/http_handler.rs`, `src-tauri/src/proxy/server/mod.rs`):
+   - Добавить `InFlightSessionGuard`: сразу после `record_in_flight_session_with_remap` создавать гард, который снимается (`disarm()`) после записи ответа/ошибки или старта стриминга; при `Drop` без `disarm` (обрыв клиента в ожидании upstream) завершать сессию в `TrafficStore` со статусом `499`, реальным `duration_ms`, ошибкой `"Client closed connection while waiting for upstream response"` и отправкой события в `event_tx`.
+   - При возврате синтетических прокси-ошибок (`UpstreamClientError::Timeout` / `Connect` / `Transport`) прикреплять заголовок `X-FluxProxy-Error` (`upstream-response-timeout`, `upstream-connect-timeout`, `upstream-connect-error`) в `plain_response` и в `SessionDetail.response_headers`.
+
+4. Composer / Replay таймаут и кнопка Cancel (`src-tauri/src/models.rs`, `src-tauri/src/proxy/server/composer_exec.rs`, `src-tauri/src/commands.rs`, `src-tauri/src/lib.rs`, `src/components/ComposerPanel.tsx`):
+   - Добавить опциональные `request_id` и `timeout_sec` в `ComposedRequest`; в `composer_exec.rs` использовать `request.timeout_sec` или `composer_timeout_sec` (`0` = `None`) и отслеживать активный запрос через канал отмены (`cancel_composed_request`), завершая отменённый запрос со статусом `499`.
+   - В `ComposerPanel.tsx` добавить кнопку `Cancel` во время выполнения запроса и опцию выбора таймаута.
+
+5. IPC, настройки, инспектор и профиль (`src-tauri/src/commands.rs`, `src-tauri/src/lib.rs`, `src/types/proxy.ts`, `src/types/settings.ts`, `src/lib/tauriBridge.ts`, `src/lib/settingsManager.ts`, `src/components/settings/GeneralSettingsTab.tsx`, `src/components/SessionInspector.tsx`, `src/App.tsx`):
+   - Зарегистрировать `get_upstream_timeouts` и `set_upstream_timeouts` в Tauri и в fallback `tauriBridge.ts`.
+   - Добавить опциональное поле `upstreamTimeouts?: UpstreamTimeoutConfig` в `FluxUserProxySettings` (во все 7 точек регистрации `settingsManager.ts` + `App.tsx`) с безопасными дефолтами для старых профилей `schemaVersion: 1`.
+   - В `GeneralSettingsTab.tsx` добавить секцию «Upstream Timeouts» (пресеты `Unlimited (Recommended)`, `30 s`, `60 s`, `120 s`, `300 s`, `Custom`, поля Connect / Response Headers / Composer timeouts и предупреждение при TTFB `< 30` с).
+   - В `SessionInspector.tsx` для ответов с `X-FluxProxy-Error: upstream-response-timeout` показывать понятный баннер с кнопкой перехода к настройкам таймаутов.
+
+6. Тесты (`src-tauri/src/proxy/server/mod.rs`, `src-tauri/src/proxy/upstream_client.rs`, `src/lib/settingsManager.test.ts`):
+   - Rust: проверка сквозного получения реального ответа `500` от медленного сервера при `responseHeaderTimeoutSec = 0`, возврат `504` + `X-FluxProxy-Error` при конечном таймауте, финализация `499` через `InFlightSessionGuard` при обрыве клиента и срабатывание `connectTimeoutSec`.
+   - Vitest: проверка дефолтов, валидации границ и миграции `upstreamTimeouts` в `settingsManager.test.ts`.
 
 Проверка: `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings`, `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run typecheck`, `npm run test`, `npm run build`.
 ```
@@ -362,7 +454,7 @@
 ---
 
 ## Этап 38: Единый полноэкранный центр настроек (Unified Fullscreen Settings Hub), реорганизация вкладок, дедупликация панелей и система подсказок
-**Приоритет: P1 / P2 (UI Architecture & Discoverability) | Спринт 6 | Зависимости: Этапы 4 ✅, 10 ✅, 11 ✅, 13 ✅, 18 ✅, 22 ✅, 37 | Замечания: №3, №4**
+**Приоритет: P1 / P2 (UI Architecture & Discoverability) | Спринт 6 | Зависимости: Этапы 4 ✅, 10 ✅, 11 ✅, 13 ✅, 18 ✅, 22 ✅, 37, 39 | Замечания: №3, №4**
 
 ### Цель и контекст
 По мере роста функциональности FluxProxy (Этапы 1–34) элементы управления и окна настроек оказались фрагментированы и многократно продублированы по интерфейсу:
@@ -387,7 +479,7 @@
   - `SettingsModal.tsx` (`Ctrl+,`) переведён в **полноэкранный режим** (`fixed inset-0 h-screen w-screen max-h-none max-w-none m-0 rounded-none border-0`) с удобным боковым меню разделов, строкой быстрого фильтра по настройкам и счётчиками активных правил.
   - Все настройки приложения собраны в **единой точке входа** за счёт прямого встраивания полнофункциональных компонентов вместо урезанных копий и отдельных модалок:
     1. **`general` (Прокси, Интерфейсы и Буфер):** TCP-порт, `Act as System Proxy on startup`, привязка к сетевым адаптерам `BindConfigSection` (**строго в одном месте**, дубликат из `RulesProxySettingsTab` удалён; устаревший блок `Theme` из `GeneralSettingsTab` удалён), `Follow Tail`, лимит `Ring Buffer (Keep)`, `Drop Non-Matching` и управление базой `SQLite (VACUUM / Clear on Exit)`.
-    2. **`networkRouting` (Троттлинг, HOSTS и Upstream Proxy):** полноценная панель управления **Bandwidth Throttling & Latency** (пресеты + кастомный профиль `↓/↑ Kbps, RTT ms`), встроенный полный редактор **HOSTS Remapping (Virtual DNS)** и встроенная настройка **Upstream Proxy Chaining (`HTTP/HTTPS/SOCKS5`)**.
+    2. **`networkRouting` (Троттлинг, HOSTS, Upstream Proxy и Таймауты):** полноценная панель управления **Bandwidth Throttling & Latency** (пресеты + кастомный профиль `↓/↑ Kbps, RTT ms`), встроенный полный редактор **HOSTS Remapping (Virtual DNS)**, встроенная настройка **Upstream Proxy Chaining (`HTTP/HTTPS/SOCKS5`)** и встроенная секция **Upstream Timeouts** из Этапа 39 (`Connect` / `Response Headers` / `Composer`).
     3. **`tlsCertificates` (HTTPS MITM, Сертификаты и Мобильные устройства):** встроенный менеджер **Root CA Certificate** (статус доверия ОС, установка, экспорт форматов), **полный редактор Selective TLS MITM & Bypass 2.0** (`TlsBypassTab` с 11 Quick-Packs, `Hits: N` и `Table View ↔ Bulk Text Editor` вместо прежнего урезанного списка), встроенное хранилище **Client Certificates (mTLS)** и встроенный мастер **Mobile Device Setup (QR / iOS & Android)**.
     4. **`filters` (Матрица фильтров, Списки хостов, Пороги шума и Заголовки):** встроенные полнофункциональные вкладки `FilterMatrixTab` (матрица условий и пресеты), `HostFiltersTab` (массовый Whitelist/Blacklist доменов), `ThresholdsTab` (`Noise & Time Heat`) и `HeaderMutationsTab` (мутации заголовков и `Force No-Cache`) — отдельный дублирующий диалог `FilterDrawer` упразднён, а все вызовы `openFilterDrawerAt(...)` открывают соответствующую подвкладку в едином полноэкранном `Settings Hub`.
     5. **`uiColumns` (Внешний вид, Темы, Панели и Колонки):** единственная точка управления темой (8 пресетов + режим `Dark / Light / System` + детальный редактор палитры), настройка компоновки панелей, групп тулбара и видимости/ширины колонок `TrafficGrid`.
@@ -421,7 +513,7 @@
 1. Единый полноэкранный центр настроек (`src/components/SettingsModal.tsx`, `src/components/settings/`, `src/types/settings.ts`, `src/App.tsx`):
    - Перевести `SettingsModal.tsx` в полноэкранный режим (`fixed inset-0 h-screen w-screen max-h-none max-w-none m-0 rounded-none border-0`) с боковой навигацией по 6 разделам и поиском по настройкам:
      1) `general` (Proxy, Interfaces & Storage): порт, автопривязка SysProxy, единственный экземпляр `BindConfigSection`, `Follow Tail`, `Ring Buffer (Keep)`, `Drop Non-Matching`, `SQLite Archive (VACUUM / Clear on Exit)`. Удалить из `GeneralSettingsTab.tsx` дублирующий блок выбора темы `Dark/Light/System`.
-     2) `networkRouting` (Throttling, HOSTS & Upstream Proxy): встроить полноценное управление `Bandwidth Throttling & Latency` (пресеты + Custom `↓/↑ Kbps, RTT ms`), полный редактор `HOSTS Remapping` и форму `Upstream Proxy Chaining (HTTP/HTTPS/SOCKS5)`.
+     2) `networkRouting` (Throttling, HOSTS, Upstream Proxy & Timeouts): встроить полноценное управление `Bandwidth Throttling & Latency` (пресеты + Custom `↓/↑ Kbps, RTT ms`), полный редактор `HOSTS Remapping`, форму `Upstream Proxy Chaining (HTTP/HTTPS/SOCKS5)` и секцию `Upstream Timeouts` из Этапа 39.
      3) `tlsCertificates` (HTTPS MITM, Certificates & Mobile): встроить полный редактор `TlsBypassTab` (Selective MITM, 11 Quick-Packs, Bulk Editor, Hit Counters), управление `Root CA Certificate`, хранилище `Client Certificates (mTLS)` и `Mobile Device Setup (QR / iOS & Android)`.
      4) `filters` (Filter Matrix, Hosts List, Thresholds & Headers): встроить полные вкладки `FilterMatrixTab`, `HostFiltersTab`, `ThresholdsTab` и `HeaderMutationsTab` напрямую (заменив урезанные списки из старых `FiltersSettingsTab`/`RulesProxySettingsTab` и отдельный диалог `FilterDrawer`).
      5) `uiColumns` (Appearance, Themes, Layout & Columns): галерея из 8 тем-пресетов + базовая схема `Dark/Light/System` + редактор палитры, компоновка панелей, группы тулбара и колонки `TrafficGrid`.
@@ -446,7 +538,7 @@
 ---
 
 ## Этап 12: Аналитика и визуализация: Waterfall Timeline и статистика трафика
-**Приоритет: P2 (Feature) | Спринт 6 | Зависимости: Этапы 34 ✅, 35, 36, 37, 38**
+**Приоритет: P2 (Feature) | Спринт 6 | Зависимости: Этапы 34 ✅, 35, 39, 36, 37, 38**
 
 ### Цель и контекст
 Для поиска узких мест производительности (последовательные «лесенки» запросов, тяжелые эндпоинты, всплески 4xx/5xx и P95-латентность) нужна наглядная временная диаграмма и агрегированная статистика по выборке сессий.
