@@ -109,13 +109,15 @@
 
 ## 📋 Матрица приоритетов и порядок выполнения
 
-> *Номера этапов (`35`, `36`, `12`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз. Завершенные этапы Спринта 1 (Этапы 14, 15, 20, 21, 25–28) выполнены в релизе `v0.2.0`, этапы Спринта 2 (Этапы 5, 16, 17, 23, 24, 29, 30) выполнены в релизе `v0.3.0`, этапы Спринта 3 (Этапы 6, 7, 8, 9, 18, 19, 22) выполнены в релизе `v0.4.0`, стабилизационный Спринт 4 (Этапы 31–33) выполнен в релизе `v0.4.1`, а этапы Спринта 5 (Этапы 10, 11, 13, 34) выполнены в релизе `v0.5.0` и перенесены в раздел реализованных этапов выше.*
+> *Номера этапов (`35`, `36`, `37`, `38`, `12`) используются как стабильные идентификаторы задач (`phase-N`). Все секции документа ниже отсортированы строго в порядке выполнения сверху вниз. Завершенные этапы Спринта 1 (Этапы 14, 15, 20, 21, 25–28) выполнены в релизе `v0.2.0`, этапы Спринта 2 (Этапы 5, 16, 17, 23, 24, 29, 30) выполнены в релизе `v0.3.0`, этапы Спринта 3 (Этапы 6, 7, 8, 9, 18, 19, 22) выполнены в релизе `v0.4.0`, стабилизационный Спринт 4 (Этапы 31–33) выполнен в релизе `v0.4.1`, а этапы Спринта 5 (Этапы 10, 11, 13, 34) выполнены в релизе `v0.5.0` и перенесены в раздел реализованных этапов выше.*
 
 | # | Этап | Приоритет | Спринт | Зависимости | Ключевая ценность |
 | :-: | :--- | :--- | :--- | :--- | :--- |
 | 1 | **[Этап 35](#этап-35-стабилизация-маршрутизации-hosts--ws--upstream-proxy-атомарная-инъекция-ws-фреймов-паритет-composer-и-защита-от-oom)** | **P1 (Core Reliability & Security)** | Спринт 6 | Этапы 7 ✅, 10 ✅, 13 ✅, 34 ✅ | Починка `HOSTS Remapping` для прямых WebSocket (`BUG-01`) и IP / HTTP-прокси (`BUG-02`), предкомпиляция Regex в `hosts.rs` (`PERF-01`), сохранение инъектированных WS-фреймов (`CONC-02`), лимит 64 MiB для буферизации ответов (`SEC-01`), Python-хуки и `OverrideStatus` в Composer (`BUG-03`), синхронизация `clientSendMs` (`BUG-04`), индикация `via <proxy>` в `Server IP` (`BUG-05`) и дедупликация 16-мс батчера (`PERF-02`) |
 | 2 | **[Этап 36](#этап-36-защита-ключей-mtls-dpapi--in-memory-lan-client-allowlist-чистота-zustand-сторов-очистка-техдолга-и-синхронизация-документации)** | **P1 / P2 (Security, State & Hygiene)** | Спринт 6 | Этапы 11 ✅, 18 ✅, 35 | Шифрование ключей mTLS/CA через Windows DPAPI + режим `Session-only (In-Memory)` (`SEC-03`), белый список `LAN Client Allowlist`, фильтрация `SAFE_RASTER_IMAGE_MIMES` в Multipart (`SEC-02`), устранение сброса сессий в `syncFromLocalStorage` (`CONC-01`) и $O(N)$ аллокаций (`PERF-03`), удаление мёртвого кода `reqwest` (`ARCH-01`), вынос `BrowserPreviewEngine` (`ARCH-02`) и синхронизация документации с кодом |
-| 3 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 6 | Этапы 34 ✅, 35, 36 | Виртуализированная многофазная каскадная диаграмма (Waterfall) и сводный Markdown-отчет по всей выборке (P95, TTFB, статусы, MIME) |
+| 3 | **[Этап 37](#этап-37-исправление-ui-багов-инспектора-hexviewer-и-timing-breakdown-и-редизайн-command-palette-20)** | **P1 (UI Bugfixes & UX Ergonomics)** | Спринт 6 | Этапы 22 ✅, 30 ✅, 34 ✅ | Устранение сдвига колонок и наложения байтов на `DECODED ASCII` во вкладке `Hex` (`HexViewer.tsx`), устранение мелькания тултипа при наведении на легенду `TIMING BREAKDOWN` (`SessionStatisticsPanel.tsx`, показ только на таймлайне без layout shift) и крупная понятная `Command Palette 2.0` (`max-w-3xl`, категории, описания, статусы, чипы синтаксиса `bpu`/`jwt`) |
+| 4 | **[Этап 38](#этап-38-единый-полноэкранный-центр-настроек-unified-fullscreen-settings-hub-реорганизация-вкладок-дедупликация-панелей-и-система-подсказок)** | **P1 / P2 (UI Architecture & Discoverability)** | Спринт 6 | Этапы 4 ✅, 10 ✅, 11 ✅, 13 ✅, 18 ✅, 22 ✅, 37 | Консолидация всех разрозненных модалок настроек (`FilterDrawer`, `HOSTS`, `Upstream Proxy`, `Root CA`, `mTLS`, `Mobile`, `Throttling`, `Proxy Doctor`) в единый полноэкранный `Settings Hub` (`Ctrl+,`), перевод конфигурационных модалок в fullscreen, удаление устаревшего свитча темы и дубликатов кнопок между `MenuBar`/`TopToolbar`/`Sidebar`/`Inspector`, наглядный доступ к `Throttling` и контекстные подсказки (`HelpTooltip`) |
+| 5 | **[Этап 12](#этап-12-аналитика-и-визуализация-waterfall-timeline-и-статистика-трафика)** | **P2 (Feature)** | Спринт 6 | Этапы 34 ✅, 35, 36, 37, 38 | Виртуализированная многофазная каскадная диаграмма (Waterfall) и сводный Markdown-отчет по всей выборке (P95, TTFB, статусы, MIME) |
 
 ---
 
@@ -160,7 +162,7 @@
 
 ---
 
-## 🔴 Спринт 6 — P1 / P2 (Audit `v0.5.0` Remediation & Analytics): Стабилизация сетевого ядра, защита ключей и Waterfall Timeline
+## 🔴 Спринт 6 — P1 / P2 (Audit `v0.5.0` Remediation, UX Redesign & Analytics): Стабилизация сетевого ядра, защита ключей, единый полноэкранный Settings Hub, Command Palette 2.0 и Waterfall Timeline
 
 ---
 
@@ -303,8 +305,148 @@
 
 ---
 
+## Этап 37: Исправление UI-багов инспектора (`HexViewer` и `TIMING BREAKDOWN`) и редизайн `Command Palette 2.0`
+**Приоритет: P1 (UI Bugfixes & UX Ergonomics) | Спринт 6 | Зависимости: Этапы 22 ✅, 30 ✅, 34 ✅ | Замечания: №1, №2, №5**
+
+### Цель и контекст
+По итогам пользовательского UX-аудита выявлены два визуальных дефекта в инспекторе сессий и недостаточная эргономика палитры команд (`Ctrl+K`):
+1. **`[UX-01]` Сдвиг байтовых колонок и наложение на `DECODED ASCII` во вкладке `Hex` (`src/components/HexViewer.tsx`):**
+   - В липкой шапке (`HexViewer.tsx:47-53`) индексы колонок `00 01 ... 0F` рендерятся единой текстовой строкой со стилями `text-[10px] tracking-wider` внутри `<span className="w-[360px] shrink-0">`.
+   - В виртуализированных строках данных (`HexViewer.tsx:90-138`) используется `text-xs` (`12px`, без `tracking-wider`), а каждый из 16 байтов оборачивается в `<span className="inline-block rounded px-0.5">{hex}</span>{" "}` (`+4px` горизонтального padding на каждый байт = `+64px` на строку + 16 пробелов + дополнительный пробел перед `colIdx === 8`).
+   - В результате фактическая ширина 16 байтов составляет `~417px`, что: а) прогрессивно смещает байты вправо относительно заголовков `00..0F`, и б) переполняет фиксированный контейнер `w-[360px]` (без `overflow-hidden` при `whitespace-pre`) на `~57px`, из-за чего последние колонки (`0D 0E 0F`) визуально накладываются поверх колонки `Decoded ASCII`.
+2. **`[UX-02]` Мелькание подсказки при наведении на легенду `TIMING BREAKDOWN` в статистике запроса (`src/components/SessionStatisticsPanel.tsx`):**
+   - В `SessionStatisticsPanel.tsx:630-653` блок тултипа `<div id={activeTooltipId} role="tooltip" className="mt-2 flex ...">` рендерится условно (`{hoveredPhase && ...}`) **в обычном потоке документа** непосредственно над блоком легенды (`Phase Legend`, строки `656-686`).
+   - Элементы самой легенды (`строки 657-685`) сделаны кнопками с `onMouseEnter={() => setHoveredPhase(phase)}` и `onMouseLeave`. При наведении курсора на элемент легенды появление тултипа в потоке документа сдвигает легенду вниз на `~36px`; кнопка легенды выскальзывает из-под неподвижного курсора мыши, браузер мгновенно генерирует `onMouseLeave` → `setHoveredPhase(null)` → тултип исчезает, возвращая легенду обратно под курсор, что вызывает бесконечное мелькание.
+   - По требованию пользователя подсказка **не должна мелькать и должна отображаться только при наведении на сам таймлайн** (полосу `Timing Breakdown`), а не на легенду.
+3. **`[UX-05]` Мелкий размер и перегруженность `Command Palette` (`src/components/CommandPalette.tsx`, `src/App.tsx`):**
+   - Текущее окно палитры команд (`max-w-xl` / `576px`, список `max-h-80` / `320px`, мелкий шрифт `text-xs`) выводит 60+ команд единым плоским негруппированным списком без описаний, без индикации текущего состояния переключателей (`ON`/`OFF`, активный пресет троттлинга, порт), без фильтра по категориям и без наглядных подсказок по специальным QuickExec-командам (`bpu`, `bpafter`, `jwt`).
+
+### Критерии приемки (DoD)
+- **`[UX-01]` (`src/components/HexViewer.tsx`):**
+  - Шапка колонок `00..0F` и байтовые ячейки в виртуализированных строках рендерятся через единую детерминированную геометрию ячеек (`COL_INDICES.map`): каждая из 16 колонок и в шапке, и в строках имеет строго одинаковую фиксированную ширину `w-6 text-center font-mono text-xs tabular-nums` (без рассинхронизирующего `tracking-wider` в шапке и без хрупких текстовых пробелов `" "`), с визуальным разделителем октетов `ml-2` перед `colIdx === 8` (`00..07` и `08..0F`).
+  - Контейнер байтового блока в шапке и строках имеет одинаковую детерминированную ширину (`flex w-[392px] shrink-0 items-center`), а символы в колонке `Decoded ASCII` рендерятся фиксированными ячейками `inline-block w-2.5 text-center` (с `ml-1` перед `colIdx === 8`), что полностью исключает смещение колонок и любое наложение на `Decoded ASCII`.
+- **`[UX-02]` (`src/components/SessionStatisticsPanel.tsx`):**
+  - Из элементов `Phase Legend` (`строки 656-686`) полностью удалены обработчики `onMouseEnter`, `onMouseLeave`, `onFocus`, `onBlur` (элементы легенды преобразованы в статические информационные бейджи `<div>`/`<span>`): наведение на легенду больше не вызывает показ или мелькание тултипа.
+  - Тултип `Timing Breakdown` отображается **только** при наведении/фокусе на сегменты самого таймлайна (`role="group"` полосы фаз) и позиционируется как плавающий оверлей (`absolute left-0 right-0 top-full z-20 mt-1.5 pointer-events-none`) без сдвига вёрстки (`layout shift`) легенды и карточек `Actual Performance` под таймлайном.
+- **`[UX-05]` (`src/components/CommandPalette.tsx`, `src/App.tsx`):**
+  - Размер окна `CommandPalette` увеличен до `max-w-3xl` (`w-[min(92vw,820px)]`), высота списка — до `max-h-[62vh]` (`~520px`), поле поиска увеличено до `h-12 text-base px-4`, строки команд получили просторные отступы `px-3.5 py-2.5`.
+  - Интерфейс `PaletteCommand` расширен опциональными полями `description?: string` (понятное однострочное пояснение назначения команды) и `statusBadge?: string` (текущее живое состояние: `Активно`, `ON` / `OFF`, `:8888`, `Fast 3G`, `Targeted (N)`).
+  - Команды визуально сгруппированы по понятным смысловым секциям с липкими заголовками категорий (*Быстрые команды QuickExec*, *Захват и Управление сессиями*, *Сеть, Троттлинг и Маршрутизация*, *Фильтрация и HTTPS MITM*, *Инструменты и Экспорт*, *Настройки и Внешний вид*).
+  - Под строкой поиска добавлены интерактивные пилюли фильтрации по категориям (`Все`, `Захват`, `Сеть и Троттлинг`, `Фильтры и TLS`, `Инструменты`, `Настройки`) и кликабельные чипы-подсказки синтаксиса QuickExec (`bpu /api`, `bpafter /graphql`, `jwt <токен>`, `doctor`, `mtls`), а внизу окна — строка подсказок клавиатурной навигации (`↑↓ Навигация`, `Enter Выполнить`, `Tab Категория`, `Esc Закрыть`, счётчик найденных команд).
+
+### 📝 Промпт для Antigravity (Этап 37)
+
+```markdown
+Роль: Senior Frontend & UI/UX Engineer (React 19 + TypeScript + Tailwind CSS).
+Проект: FluxProxy (Tauri v2 + Rust + React 19).
+
+Задача: Выполнить Этап 37 из ROADMAP.md — исправить сдвиг колонок и наложение на Decoded ASCII в `HexViewer.tsx`, устранить мелькание тултипа легенды `TIMING BREAKDOWN` в `SessionStatisticsPanel.tsx` и провести редизайн `CommandPalette.tsx` (Command Palette 2.0).
+
+1. Точная сетка колонок во вкладке Hex (`[UX-01]`, `src/components/HexViewer.tsx`):
+   - В липкой шапке (`HexViewer.tsx:47-53`) и в виртуализированных строках (`HexViewer.tsx:90-138`) заменить `w-[360px]` и текстовую строку `"00 01 ... 0F"` на единый flex-контейнер `flex w-[392px] shrink-0 items-center tabular-nums`.
+   - Рендерить заголовки `00`..`0F` в шапке через `COL_INDICES.map((colIdx) => ...)` с теми же размерами ячейки `inline-flex h-5 w-6 shrink-0 items-center justify-center font-mono text-xs` и разделителем октетов `colIdx === 8 ? "ml-2" : ""`, что и байтовые ячейки в строках данных.
+   - В колонке `Decoded ASCII` рендерить каждый из 16 символов в фиксированной ячейке `inline-block w-2.5 text-center` (с `ml-1` при `colIdx === 8`), чтобы исключить любое переполнение и наложение байтов на ASCII.
+
+2. Тултип TIMING BREAKDOWN только на таймлайне без мелькания и layout shift (`[UX-02]`, `src/components/SessionStatisticsPanel.tsx`):
+   - В блоке `Phase Legend` (`SessionStatisticsPanel.tsx:656-686`) заменить `<button>` с `onMouseEnter`/`onMouseLeave`/`onFocus`/`onBlur` на статические элементы `<div>`/`<span>` (с подсветкой `hoveredPhase?.key === phase.key` при наведении на сам таймлайн), чтобы наведение курсора на легенду никогда не открывало тултип.
+   - Позиционировать блок `{hoveredPhase && (<div id={activeTooltipId} role="tooltip" ...>)}` (`строки 630-653`) абсолютно относительно контейнера полосы таймлайна (`pointer-events-none absolute left-0 right-0 top-full z-20 mt-1.5 ...`), чтобы при наведении на сегменты таймлайна тултип всплывал поверх без сдвига легенды и таблиц под ним.
+
+3. Редизайн Command Palette 2.0 (`[UX-05]`, `src/components/CommandPalette.tsx`, `src/App.tsx`):
+   - Увеличить размеры диалога до `w-[min(92vw,820px)] max-w-3xl`, поле ввода поиска — до `h-12 text-base`, область результатов — до `max-h-[62vh]`.
+   - Расширить `PaletteCommand` полями `description?: string` и `statusBadge?: string`; заполнить описания и живые бейджи состояния для команд в `src/App.tsx` (статус прокси, порт, активный пресет Throttling, режим TLS MITM, число правил HOSTS / AutoResponder / Breakpoints, активная тема).
+   - Добавить под строкой поиска переключатель категорий (`Все`, `Захват`, `Сеть и Троттлинг`, `Фильтры и TLS`, `Инструменты`, `Настройки`) и интерактивные чипы быстрых команд (`bpu `, `bpafter `, `jwt `, `doctor`), группировку результатов по категориям с заголовками секций и нижний футер с подсказками клавиш (`↑↓`, `Enter`, `Tab`, `Esc`).
+
+Проверка: `npm run typecheck`, `npm run test`, `npm run build`.
+```
+
+---
+
+## Этап 38: Единый полноэкранный центр настроек (Unified Fullscreen Settings Hub), реорганизация вкладок, дедупликация панелей и система подсказок
+**Приоритет: P1 / P2 (UI Architecture & Discoverability) | Спринт 6 | Зависимости: Этапы 4 ✅, 10 ✅, 11 ✅, 13 ✅, 18 ✅, 22 ✅, 37 | Замечания: №3, №4**
+
+### Цель и контекст
+По мере роста функциональности FluxProxy (Этапы 1–34) элементы управления и окна настроек оказались фрагментированы и многократно продублированы по интерфейсу:
+1. **Хаотичное распределение функций и низкая обнаружимость (Замечание №3):**
+   - Чтобы найти **Bandwidth Throttling**, нужно знать про компактную кнопку с иконкой спидометра на `TopToolbar.tsx:1202` (которая в режиме `compactToolbar` при `preset === "none"` вообще скрывается из интерфейса!), а в общих настройках `SettingsModal` управление троттлингом отсутствует вовсе.
+   - Настройки **HOSTS Remapping**, **Upstream Proxy**, **Client Certificates (mTLS)**, **Root CA**, **Mobile Device Setup** и **Proxy Doctor** спрятаны в выпадающих меню `Tools` / `Help` или в меню `•••` и открываются в 7 разных маленьких модальных окнах, никак не связанных с центральным окном `SettingsModal` (`Ctrl+,`).
+2. **Фрагментация настроек и «урезанные дубликаты» вместо единой точки входа (Замечания №3.3 и №4):**
+   - В `SettingsModal.tsx` вкладки `FiltersSettingsTab.tsx` и `RulesProxySettingsTab.tsx` дублируют функционал `FilterDrawer.tsx` и `AutoResponderPanel.tsx` в урезанном, менее удобном виде и содержат кнопки-костыли (*«Открыть Filter Matrix»*, *«Полный редактор TLS…»*, *«Редактор мутаций заголовков…»*), которые закрывают окно настроек и открывают другое модальное окно (`FilterDrawer`).
+   - Внутри самого `SettingsModal` секция привязки сетевых интерфейсов `<BindConfigSection />` рендерится **дважды** (в `GeneralSettingsTab.tsx:234` и в `RulesProxySettingsTab.tsx:79`), а переключатель `Theme: Dark / Light / System` также рендерится **дважды** (в `GeneralSettingsTab.tsx:81-138` и в `UiColumnsSettingsTab.tsx:184-209`).
+   - Все модальные окна настроек зажаты в узких рамках (`max-w-xl`..`max-w-4xl`, `h-[84vh] max-h-[760px]`) с внутренними скроллбарами `max-h-36`, хотя в десктопном отладчике их гораздо удобнее открывать **на весь экран**.
+3. **Устаревший свитч темы и массовое дублирование кнопок между барами (Замечания №3.1, №3.2, №3.5):**
+   - Кнопка переключения темы `Sun`/`Moon` в `Sidebar.tsx:273-284` (и радио-пункты `Dark/Light/System` в `MenuBar.tsx:1659-1685` и `GeneralSettingsTab.tsx:81-138`) потеряла актуальность после появления в настройках галереи из 8 тем-пресетов и редактора палитры.
+   - Одни и те же кнопки визуально повторяются в 4–6 местах одновременно:
+     - `Connect Mobile Device`: в `Sidebar`, в правой части `TopToolbar`, внутри поповера `SysProxy` на `TopToolbar`, в меню `•••` на `TopToolbar`, в `MenuBar (Tools)` и в `Footer`.
+     - `Session Diff` и `TextWizard`: в `Sidebar`, в группе утилит `TopToolbar`, в меню `•••` на `TopToolbar`, в шапке `SessionInspector` и в `MenuBar (Tools)`.
+     - `Breakpoints`, `Filters`, `Inspector Dock Position (Bottom/Right)`, `SysProxy`, `Command Palette`, `Drop Non-Matching`, `Customize Toolbar`: дублируются между `Sidebar`, `TopToolbar`, поповерами `Keep`/`Columns`, меню `•••`, `MenuBar`, шапкой `SessionInspector` и `Footer`.
+4. **Нехватка поясняющих подсказок (Замечание №3.4):**
+   - В выпадающих списках тулбара и в секциях настроек отсутствуют встроенные контекстные подсказки (`?` / описания), объясняющие назначение специфичных прокси-функций (`Drop Non-Matching`, `Targeted Only MITM`, `Strip Alt-Svc`, `Preserve Host/SNI`, `Time Heat`, `Dual Listener`).
+
+### Критерии приемки (DoD)
+- **1. Единый полноэкранный центр настроек (`Unified Fullscreen Settings Hub`, `src/components/SettingsModal.tsx` и `src/components/settings/`):**
+  - `SettingsModal.tsx` (`Ctrl+,`) переведён в **полноэкранный режим** (`fixed inset-0 h-screen w-screen max-h-none max-w-none m-0 rounded-none border-0`) с удобным боковым меню разделов, строкой быстрого фильтра по настройкам и счётчиками активных правил.
+  - Все настройки приложения собраны в **единой точке входа** за счёт прямого встраивания полнофункциональных компонентов вместо урезанных копий и отдельных модалок:
+    1. **`general` (Прокси, Интерфейсы и Буфер):** TCP-порт, `Act as System Proxy on startup`, привязка к сетевым адаптерам `BindConfigSection` (**строго в одном месте**, дубликат из `RulesProxySettingsTab` удалён; устаревший блок `Theme` из `GeneralSettingsTab` удалён), `Follow Tail`, лимит `Ring Buffer (Keep)`, `Drop Non-Matching` и управление базой `SQLite (VACUUM / Clear on Exit)`.
+    2. **`networkRouting` (Троттлинг, HOSTS и Upstream Proxy):** полноценная панель управления **Bandwidth Throttling & Latency** (пресеты + кастомный профиль `↓/↑ Kbps, RTT ms`), встроенный полный редактор **HOSTS Remapping (Virtual DNS)** и встроенная настройка **Upstream Proxy Chaining (`HTTP/HTTPS/SOCKS5`)**.
+    3. **`tlsCertificates` (HTTPS MITM, Сертификаты и Мобильные устройства):** встроенный менеджер **Root CA Certificate** (статус доверия ОС, установка, экспорт форматов), **полный редактор Selective TLS MITM & Bypass 2.0** (`TlsBypassTab` с 11 Quick-Packs, `Hits: N` и `Table View ↔ Bulk Text Editor` вместо прежнего урезанного списка), встроенное хранилище **Client Certificates (mTLS)** и встроенный мастер **Mobile Device Setup (QR / iOS & Android)**.
+    4. **`filters` (Матрица фильтров, Списки хостов, Пороги шума и Заголовки):** встроенные полнофункциональные вкладки `FilterMatrixTab` (матрица условий и пресеты), `HostFiltersTab` (массовый Whitelist/Blacklist доменов), `ThresholdsTab` (`Noise & Time Heat`) и `HeaderMutationsTab` (мутации заголовков и `Force No-Cache`) — отдельный дублирующий диалог `FilterDrawer` упразднён, а все вызовы `openFilterDrawerAt(...)` открывают соответствующую подвкладку в едином полноэкранном `Settings Hub`.
+    5. **`uiColumns` (Внешний вид, Темы, Панели и Колонки):** единственная точка управления темой (8 пресетов + режим `Dark / Light / System` + детальный редактор палитры), настройка компоновки панелей, групп тулбара и видимости/ширины колонок `TrafficGrid`.
+    6. **`diagnosticsBackup` (Диагностика Proxy Doctor и Профили настроек):** встроенная панель самодиагностики **Proxy Doctor** (6 проверок + 1-click fix) и управление профилем `FluxUserSettingsProfile` (`schemaVersion: 1`, экспорт/импорт JSON, сброс к дефолтам).
+  - Все триггеры настроек из `TopToolbar`, `MenuBar`, `Sidebar`, `Footer`, контекстного меню и `CommandPalette` (`Ctrl+,`, `Alt+4`, `Ctrl+Shift+H`, `Ctrl+Shift+U`, `Ctrl+Shift+C`, `Ctrl+Shift+M`, `Ctrl+Shift+D`) открывают **единый полноэкранный Settings Hub** на нужном разделе (`openPreferencesAt(tab, subTab)`), без открытия разрозненных маленьких окон.
+- **2. Полноэкранный режим для всех остальных модальных окон инструментов (Замечание №4):**
+  - Инструментальные модальные окна (`BreakpointModal.tsx`, `TextWizardModal.tsx`, `SessionDiffView.tsx` в модальном режиме, `OpenApiExportModal.tsx`, `SanitizedExportModal.tsx`, `CodeSnippetModal.tsx`, `ShortcutsModal.tsx`) переведены на полноэкранный контейнер (`h-screen w-screen max-h-none max-w-none m-0 rounded-none border-0`). Компактными оставлены только диалоги подтверждения деструктивных действий (`Purge SQLite`, `Reset Settings`) и поповер аннотации сессии (`SessionAnnotationModal`).
+- **3. Переработка системы вкладок, удаление свитча темы и устранение дублирования кнопок (Замечания №3.1, №3.2, №3.5):**
+  - **`Sidebar.tsx` (Левая панель рабочих вкладок):**
+    - Полностью удалена неактуальная кнопка переключения темы `Sun`/`Moon` (`onToggleTheme`).
+    - Из `Sidebar` удалены дублирующие кнопки вызова модалок (`FilterDrawer`, `Session Diff`, `Mobile Setup`, `Root CA Certificates`, `Command Palette`).
+    - В `Sidebar` оставлены только чётко структурированные **рабочие вкладки и инструменты** с иконками, бейджами активности и понятными тултипами: `Traffic` (`Alt+1`), `Composer` (`Alt+2`), `AutoResponder` (`Alt+3`), `Python Scripts` (`Alt+5`), `Breakpoints` (`F11`) и `TextWizard` (`Ctrl+E`), а внизу — единая кнопка **Settings Hub (`Ctrl+,`)** и кнопка сворачивания панели (`Ctrl+B`).
+  - **`TopToolbar.tsx` (Верхняя панель управления захватом и сетью):**
+    - Селектор **Throttling** (`Gauge` + текстовая метка `Throttle: Off` или имя активного пресета) всегда виден в сетевой группе тулбара рядом с `SysProxy` и `HTTPS MITM`, обеспечивая мгновенную обнаружимость троттлинга.
+    - Рядом добавлена компактная кнопка-индикатор сетевых правил (`Routing / Certs`), отображающая число активных правил `HOSTS Remapping` / `Upstream Proxy` / `mTLS` и открывающая вкладку `Network & Routing` в едином центре настроек.
+    - Из `TopToolbar` удалены дублирующие элементы: кнопка `Mobile Setup` справа (`строки 1586-1605`) и внутри поповера `SysProxy` (`строки 1032-1042`), группа дублирующих иконок `Session Diff / Hex / TextWizard / Save SQLite` (`строки 1607-1660`), переключатели докинга инспектора `PanelBottom / PanelRight` (`строки 1690-1739` — они находятся непосредственно в шапке `SessionInspector`), дублирующий пункт `Drop Non-Matching` внутри меню `Keep` (`строки 902-912`), блок `Customize Toolbar` внутри поповера `Columns` (`строки 1821-1862`) и перегруженное меню переполнения `•••` на 20 дублирующих пунктов (`строки 1867-2104`).
+  - **`MenuBar.tsx` и `SessionInspector.tsx`:**
+    - Из правой части `MenuBar.tsx` удалён дублирующий переключатель `SysProxy: ON/OFF` (`строки 2019-2037`, оставлен счётчик сессий и кнопка `Command Palette Ctrl+K`), а из меню `View` удалены 3 радио-кнопки `Theme: Dark / Light / System` в пользу единого пункта `Theme Presets & Appearance…`.
+    - Из шапки `SessionInspector.tsx` удалена дублирующая кнопка `Wizard` (`строки 948-958`, так как контекстная кнопка декодирования уже есть во вкладке `Auth`).
+- **4. Система контекстных подсказок в настройках и выпадающих списках (Замечание №3.4):**
+  - Добавлен переиспользуемый компонент `src/components/ui/HelpTooltip.tsx` (иконка `?` с доступным поповером по наведению/фокусу и кратким практическим примером) и снабжены пояснениями все пункты в выпадающих списках `TopToolbar` (`Keep`, `SysProxy`, `Selective MITM`, `Bandwidth Throttling`, `Columns`) и все секции единого центра настроек.
+
+### 📝 Промпт для Antigravity (Этап 38)
+
+```markdown
+Роль: Principal UI/UX Architect & Senior React/TypeScript Engineer (React 19 + Zustand 5 + Tailwind CSS).
+Проект: FluxProxy (Tauri v2 + Rust + React 19).
+
+Задача: Выполнить Этап 38 из ROADMAP.md — объединить все разрозненные настройки приложения в единый полноэкранный центр управления (Unified Fullscreen Settings Hub), перевести модальные окна в полноэкранный режим, убрать устаревший свитч темы и дублирование кнопок между панелями, сделать Throttling и сетевые функции наглядными и добавить систему контекстных подсказок.
+
+1. Единый полноэкранный центр настроек (`src/components/SettingsModal.tsx`, `src/components/settings/`, `src/types/settings.ts`, `src/App.tsx`):
+   - Перевести `SettingsModal.tsx` в полноэкранный режим (`fixed inset-0 h-screen w-screen max-h-none max-w-none m-0 rounded-none border-0`) с боковой навигацией по 6 разделам и поиском по настройкам:
+     1) `general` (Proxy, Interfaces & Storage): порт, автопривязка SysProxy, единственный экземпляр `BindConfigSection`, `Follow Tail`, `Ring Buffer (Keep)`, `Drop Non-Matching`, `SQLite Archive (VACUUM / Clear on Exit)`. Удалить из `GeneralSettingsTab.tsx` дублирующий блок выбора темы `Dark/Light/System`.
+     2) `networkRouting` (Throttling, HOSTS & Upstream Proxy): встроить полноценное управление `Bandwidth Throttling & Latency` (пресеты + Custom `↓/↑ Kbps, RTT ms`), полный редактор `HOSTS Remapping` и форму `Upstream Proxy Chaining (HTTP/HTTPS/SOCKS5)`.
+     3) `tlsCertificates` (HTTPS MITM, Certificates & Mobile): встроить полный редактор `TlsBypassTab` (Selective MITM, 11 Quick-Packs, Bulk Editor, Hit Counters), управление `Root CA Certificate`, хранилище `Client Certificates (mTLS)` и `Mobile Device Setup (QR / iOS & Android)`.
+     4) `filters` (Filter Matrix, Hosts List, Thresholds & Headers): встроить полные вкладки `FilterMatrixTab`, `HostFiltersTab`, `ThresholdsTab` и `HeaderMutationsTab` напрямую (заменив урезанные списки из старых `FiltersSettingsTab`/`RulesProxySettingsTab` и отдельный диалог `FilterDrawer`).
+     5) `uiColumns` (Appearance, Themes, Layout & Columns): галерея из 8 тем-пресетов + базовая схема `Dark/Light/System` + редактор палитры, компоновка панелей, группы тулбара и колонки `TrafficGrid`.
+     6) `diagnosticsBackup` (Proxy Doctor & Settings Profile): встроенная панель самопроверки `Proxy Doctor` и экспорт/импорт/сброс `FluxUserSettingsProfile (schemaVersion: 1)`.
+   - Направить все вызовы настроек из `TopToolbar`, `MenuBar`, `Sidebar`, `Footer` и `CommandPalette` в единый `SettingsModal` с переходом на нужную вкладку/подвкладку.
+
+2. Полноэкранный режим для инструментальных модальных окон:
+   - Перевести `BreakpointModal.tsx`, `TextWizardModal.tsx`, `SessionDiffView.tsx` (modal), `OpenApiExportModal.tsx`, `SanitizedExportModal.tsx`, `CodeSnippetModal.tsx` и `ShortcutsModal.tsx` на полноэкранный контейнер (`h-screen w-screen max-h-none max-w-none m-0 rounded-none border-0`).
+
+3. Реорганизация навигации и устранение дублирования кнопок (`src/components/Sidebar.tsx`, `src/components/TopToolbar.tsx`, `src/components/MenuBar.tsx`, `src/components/SessionInspector.tsx`):
+   - В `Sidebar.tsx`: удалить кнопку свитча темы (`Sun`/`Moon`), удалить дублирующие кнопки `FilterDrawer`, `Session Diff`, `Mobile Setup`, `Root CA`, `Command Palette`; оставить рабочие секции `Traffic (Alt+1)`, `Composer (Alt+2)`, `AutoResponder (Alt+3)`, `Python Scripts (Alt+5)`, `Breakpoints (F11)`, `TextWizard (Ctrl+E)` и внизу кнопку `Settings (Ctrl+,)` + `Collapse Sidebar (Ctrl+B)`.
+   - В `TopToolbar.tsx`: сделать селектор `Throttling` (`Throttle: Off / Fast 3G / ...`) всегда видимым и подписанным в сетевой группе; удалить дублирующие кнопки `Mobile Setup`, `Session Diff`, `Hex`, `TextWizard`, `Save SQLite`, переключатели докинга инспектора `PanelBottom`/`PanelRight`, дубликат `Drop Non-Matching` в меню `Keep`, дубликат `Customize Toolbar` в поповере `Columns` и меню переполнения `•••`.
+   - В `MenuBar.tsx`: удалить дублирующий индикатор `SysProxy: ON/OFF` справа и радио-пункты `Theme: Dark/Light/System` из меню `View`.
+   - В `SessionInspector.tsx`: удалить дублирующую кнопку `Wizard` из верхней полосы сводки.
+
+4. Контекстные подсказки (`src/components/ui/HelpTooltip.tsx`):
+   - Создать доступный компонент `HelpTooltip` и добавить понятные описания ко всем настройкам и пунктам в выпадающих поповерах `TopToolbar` (`Keep`, `SysProxy`, `MITM`, `Throttle`, `Columns`) и разделах `SettingsModal`.
+
+Проверка: `npm run typecheck`, `npm run test`, `npm run build`.
+```
+
+---
+
 ## Этап 12: Аналитика и визуализация: Waterfall Timeline и статистика трафика
-**Приоритет: P2 (Feature) | Спринт 6 | Зависимости: Этапы 34 ✅, 35, 36**
+**Приоритет: P2 (Feature) | Спринт 6 | Зависимости: Этапы 34 ✅, 35, 36, 37, 38**
 
 ### Цель и контекст
 Для поиска узких мест производительности (последовательные «лесенки» запросов, тяжелые эндпоинты, всплески 4xx/5xx и P95-латентность) нужна наглядная временная диаграмма и агрегированная статистика по выборке сессий.
