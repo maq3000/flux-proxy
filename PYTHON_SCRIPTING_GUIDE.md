@@ -53,11 +53,11 @@
 
 ## 2. Быстрый старт и интерфейс панели (Alt+5)
 
-### Как открыть панель скриптов
+### Как открыть вкладку скриптов
 - Горячая клавиша **`Alt+5`**
-- Левая боковая панель (**Sidebar**) → иконка **Python Scripting Engine** *(когда скрипт активен, на кнопке отображается зелёный индикатор)*
-- Верхнее меню: **Rules → Python Scripting Engine (on_request / on_response)…** или **View → Python Scripting Engine**
-- Командная палитра **`Ctrl+K`** (`Cmd+K` на macOS) → *Open Python Scripting Engine (on_request / on_response)* или *Enable / Disable Python Scripting Engine*
+- Левая боковая панель (**Sidebar**) → иконка **Scripts** *(когда скрипт активен, на кнопке отображается зелёный индикатор)*
+- Верхнее меню: **Rules → Scripts** или **View → Scripts**
+- Командная палитра **`Ctrl+K`** (`Cmd+K` на macOS) → *Scripts* или *Enable Scripts / Disable Scripts*
 
 ### Как устроена панель ([`ScriptingPanel.tsx`](src/components/ScriptingPanel.tsx))
 
@@ -89,7 +89,7 @@
    - Размер разделителя между редактором и консолью сохраняется автоматически между запусками.
 
 ### Сохранение и перенос между компьютерами
-Код скрипта, состояние `enabled` и идентификатор выбранного пресета сохраняются в `localStorage` и автоматически загружаются при старте FluxProxy. Кроме того, секция `scripting` включена в версионированный профиль настроек `fluxproxy-settings-v1.json` (экспорт/импорт через **Preferences → `Ctrl+,`**). При импорте внешнего профиля, содержащего Python-скрипт, в окне предпросмотра показывается предупреждение безопасности с числом строк, а сам скрипт по умолчанию загружается в выключенном состоянии (`enabled = false`), если пользователь явно не подтвердил доверие чекбоксом в окне импорта.
+Код скрипта, состояние `enabled` и идентификатор выбранного пресета сохраняются в `localStorage` и автоматически загружаются при старте FluxProxy. Кроме того, секция `scripting` включена в версионированный профиль настроек `fluxproxy-settings-v1.json` (экспорт/импорт через **Settings (`Ctrl+,`) → Diagnostics & Backup → Profile Backup** или **File → Export / Import Settings Profile**). При импорте внешнего профиля, содержащего Python-скрипт, в окне предпросмотра показывается предупреждение безопасности с числом строк, а сам скрипт по умолчанию загружается в выключенном состоянии (`enabled = false`), если пользователь явно не подтвердил доверие чекбоксом в окне импорта.
 
 ---
 
@@ -105,7 +105,7 @@
   ├─▶ [TLS Bypass / Passthrough]       ──▶ (не расшифровывается, скрипты не вызываются)
   │
   ▼
-1. Header Mutations (Request) из Filter Matrix
+1. Header Mutations (Request) из Settings → Filters → Headers
   ▼
 2. Live Breakpoint: Before Request (F11 / bpu)
   ▼
@@ -140,7 +140,7 @@
 ### Отображение в таблице трафика и работа в Composer / Replay
 - **`MOCK`** — запрос перехвачен скриптом через `request["mock_response"]` (в деталях сессии правило обозначается как `python-script`, а для HTTPS указывается `TLS 1.3 (MITM Python Mock)`).
 - **`HDR`** — `on_request` или `on_response` изменил метод, URL, заголовки, статус или тело.
-- **Паритет Request Composer (`Alt+2`) и Replay (`R` / `Ctrl+R`):** запросы, отправляемые вручную через Composer (`composer_exec.rs`) или повторно через `Replay`, **по умолчанию проходят через тот же конвейер `on_request` / `on_response`** (для автоматического пересчёта динамических HMAC-подписей и токенов). Чтобы отправить «сырой» запрос в обход Python-скриптов, снимите чекбокс **`Run Python Scripts`** в панели **Composer** (`skipPythonScripts: true`).
+- **Паритет Composer (`Alt+2`) и Replay (`R` / `Ctrl+R`):** запросы, отправляемые вручную через Composer (`composer_exec.rs`) или повторно через `Replay`, **по умолчанию проходят через тот же конвейер `on_request` / `on_response`** (для автоматического пересчёта динамических HMAC-подписей и токенов). Чтобы отправить «сырой» запрос в обход Python-скриптов, снимите чекбокс **`Run Python Scripts`** во вкладке **Composer** (`skipPythonScripts: true`).
 
 ---
 

@@ -80,6 +80,16 @@ const QUICK_EXEC_CHIPS: readonly {
     value: "mtls",
     hint: "Открыть клиентские сертификаты (mTLS)",
   },
+  {
+    label: "waterfall",
+    value: "waterfall",
+    hint: "Переключить Traffic в режим Waterfall Timeline",
+  },
+  {
+    label: "stats",
+    value: "stats",
+    hint: "Открыть сводную статистику трафика и Markdown-отчёт",
+  },
 ] as const;
 
 export function resolveCommandGroup(
