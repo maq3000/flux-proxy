@@ -10,6 +10,7 @@ import { AutoResponderPanel } from "./components/AutoResponderPanel";
 import { BreakpointBanner } from "./components/BreakpointBanner";
 import { CertificateModal } from "./components/CertificateModal";
 import { CodeSnippetModal } from "./components/CodeSnippetModal";
+import { CollapsedInspectorBar } from "./components/CollapsedInspectorBar";
 import {
   CommandPalette,
   type PaletteCommand,
@@ -269,7 +270,6 @@ export const App: React.FC = () => {
   const trafficGridRef = useRef<HTMLDivElement>(null);
   const inspectorContainerRef = useRef<HTMLDivElement>(null);
   const sortedSessionsRef = useRef<SessionSummary[]>(filteredSessions);
-  const bottomOuterGroupRef = useRef<ImperativePanelGroupHandle>(null);
   const bottomInnerGroupRef = useRef<ImperativePanelGroupHandle>(null);
   const rightGroupRef = useRef<ImperativePanelGroupHandle>(null);
 
@@ -289,8 +289,6 @@ export const App: React.FC = () => {
 
   const activeSection = useUiStore((s) => s.activeSection);
   const setActiveSection = useUiStore((s) => s.setActiveSection);
-  const dockedComposer = useUiStore((s) => s.dockedComposer);
-  const setDockedComposer = useUiStore((s) => s.setDockedComposer);
   const [composerDraft, setComposerDraft] = useState<ComposedRequest | null>(
     null
   );
@@ -678,10 +676,6 @@ export const App: React.FC = () => {
     [showToast]
   );
 
-  const handleResetBottomOuterGroup = useCallback(() => {
-    bottomOuterGroupRef.current?.setLayout(dockedComposer ? [74, 26] : [100]);
-  }, [dockedComposer]);
-
   const handleResetBottomInnerGroup = useCallback(() => {
     bottomInnerGroupRef.current?.setLayout(
       inspectorCollapsed ? [100] : [54, 46]
@@ -689,16 +683,8 @@ export const App: React.FC = () => {
   }, [inspectorCollapsed]);
 
   const handleResetRightGroup = useCallback(() => {
-    rightGroupRef.current?.setLayout(
-      !inspectorCollapsed
-        ? dockedComposer
-          ? [44, 32, 24]
-          : [56, 44]
-        : dockedComposer
-          ? [74, 26]
-          : [100]
-    );
-  }, [dockedComposer, inspectorCollapsed]);
+    rightGroupRef.current?.setLayout(inspectorCollapsed ? [100] : [56, 44]);
+  }, [inspectorCollapsed]);
 
   const handleResetPanelLayout = useCallback(() => {
     resetPanelLayouts();
@@ -707,7 +693,6 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     const onResetPanels = () => {
-      handleResetBottomOuterGroup();
       handleResetBottomInnerGroup();
       handleResetRightGroup();
     };
@@ -715,11 +700,7 @@ export const App: React.FC = () => {
     return () => {
       window.removeEventListener(FLUX_PANEL_LAYOUT_RESET_EVENT, onResetPanels);
     };
-  }, [
-    handleResetBottomInnerGroup,
-    handleResetBottomOuterGroup,
-    handleResetRightGroup,
-  ]);
+  }, [handleResetBottomInnerGroup, handleResetRightGroup]);
 
   useEffect(() => {
     let mounted = true;
@@ -1671,45 +1652,8 @@ export const App: React.FC = () => {
     ]
   );
 
-  useGlobalShortcuts({
-    activeSection,
-    setActiveSection,
-    diffModalOpen,
-    setDiffModalOpen,
-    sanitizedExportModalOpen,
-    setSanitizedExportModalOpen,
-    settingsModalOpen,
-    onToggleSettingsMain: togglePreferencesMain,
-    onToggleSettingsAt: togglePreferencesAt,
-    onToggleBreakpointsModal: () => setBpModalOpen((prev) => !prev),
-    setPaletteOpen,
-    setShortcutsModalOpen,
-    setTextWizardOpen,
-    effectiveSelectedIds,
-    filteredSessions,
-    sortedSessionsRef,
-    clearAllSessions,
-    copyUrlsForIds,
-    deleteSessions,
-    disableAllBreakpoints,
-    exportAllSessionsAs,
-    handleFocusSearch,
-    importArchiveDialog,
-    openAnnotationFor,
-    openDiffWithPairSmart,
-    openSanitizedExportModal,
-    replaySessions,
-    selectSessions,
-    toggleBreakAfterResponse,
-    toggleBreakBeforeRequest,
-    toggleCompactToolbar,
-    toggleProxy,
-    toggleSidebar,
-    unmarkSessions,
-  });
-
   const loadSessionIntoComposer = useCallback(
-    async (sessionId: number, openStandalone = false) => {
+    async (sessionId: number) => {
       const detail = await proxyBridge.getSessionDetail(sessionId);
       if (!detail) return;
       let requestBody = detail.requestBodyText ?? "";
@@ -1729,16 +1673,62 @@ export const App: React.FC = () => {
         ),
         body: requestBody,
         followRedirects: true,
+        sourceSessionId: sessionId,
       });
-      if (openStandalone) {
-        setActiveSection("composer");
-      } else if (!dockedComposer && activeSection === "traffic") {
-        setDockedComposer(true);
-      }
+      setActiveSection("composer");
       showToast(`Loaded Session #${sessionId} into Composer`);
     },
-    [activeSection, dockedComposer, showToast]
+    [setActiveSection, showToast]
   );
+
+  const handleInspectSessionFromComposer = useCallback(
+    (sessionId: number) => {
+      setSelectedId(sessionId);
+      setInlineDiffDismissed(true);
+      setInspectorCollapsed(false);
+      setActiveSection("traffic");
+    },
+    [setActiveSection, setInspectorCollapsed, setSelectedId]
+  );
+
+  useGlobalShortcuts({
+    activeSection,
+    setActiveSection,
+    diffModalOpen,
+    setDiffModalOpen,
+    sanitizedExportModalOpen,
+    setSanitizedExportModalOpen,
+    settingsModalOpen,
+    onToggleSettingsMain: togglePreferencesMain,
+    onToggleSettingsAt: togglePreferencesAt,
+    onToggleBreakpointsModal: () => setBpModalOpen((prev) => !prev),
+    setPaletteOpen,
+    setShortcutsModalOpen,
+    setTextWizardOpen,
+    selectedId,
+    effectiveSelectedIds,
+    filteredSessions,
+    sortedSessionsRef,
+    clearAllSessions,
+    copyUrlsForIds,
+    deleteSessions,
+    disableAllBreakpoints,
+    exportAllSessionsAs,
+    handleFocusSearch,
+    importArchiveDialog,
+    openAnnotationFor,
+    openDiffWithPairSmart,
+    openInComposer: (id) => void loadSessionIntoComposer(id),
+    openSanitizedExportModal,
+    replaySessions,
+    selectSessions,
+    toggleBreakAfterResponse,
+    toggleBreakBeforeRequest,
+    toggleCompactToolbar,
+    toggleProxy,
+    toggleSidebar,
+    unmarkSessions,
+  });
 
   const handleCreateRuleFromSession = useCallback(
     async (session: SessionSummary) => {
@@ -1841,6 +1831,23 @@ export const App: React.FC = () => {
         perform: () => {
           if (effectiveSelectedIds.length > 0) {
             void replaySessions(effectiveSelectedIds);
+          } else {
+            showToast("Сначала выберите сессию в таблице");
+          }
+        },
+      },
+      {
+        id: "edit-in-composer",
+        category: "Traffic",
+        group: "tools",
+        label: "Edit Selected Session in Request Composer",
+        description: "Загрузить выбранный запрос во вкладку Composer для редактирования и отправки",
+        shortcut: "E",
+        keywords: ["composer", "edit", "modify", "replay", "resend", "редактировать"],
+        perform: () => {
+          const targetId = selectedId ?? effectiveSelectedIds[0] ?? null;
+          if (targetId !== null) {
+            void loadSessionIntoComposer(targetId);
           } else {
             showToast("Сначала выберите сессию в таблице");
           }
@@ -2340,20 +2347,6 @@ export const App: React.FC = () => {
         perform: () => setActiveSection("composer"),
       },
       {
-        id: "toggle-docked-composer",
-        category: "View",
-        group: "settings",
-        label: dockedComposer
-          ? "Hide Docked Split Composer"
-          : "Dock Composer Split Beside Traffic Viewer (Drag & Drop)",
-        description: "Показать или скрыть боковую панель Composer рядом с таблицей трафика",
-        statusBadge: dockedComposer ? "Открыт" : "OFF",
-        perform: () => {
-          setActiveSection("traffic");
-          setDockedComposer((v) => !v);
-        },
-      },
-      {
         id: "view-rules",
         category: "AutoResponder",
         group: "tools",
@@ -2751,7 +2744,6 @@ export const App: React.FC = () => {
       copySessionAsCurl,
       deleteSessions,
       disableAllBreakpoints,
-      dockedComposer,
       dropNonMatching,
       effectiveSelectedIds,
       enabledBreakpointRulesCount,
@@ -2776,6 +2768,7 @@ export const App: React.FC = () => {
       inspectorPosition,
       isForceNoCacheActive,
       loadFromSqlite,
+      loadSessionIntoComposer,
       markedSessionsCount,
       openAnnotationFor,
       openBreakpointsAt,
@@ -2845,6 +2838,15 @@ export const App: React.FC = () => {
       .filter((s): s is SessionSummary => Boolean(s));
   }, [sessions, selectedIds]);
 
+  const selectedSummary = useMemo(
+    () =>
+      selectedDetail?.summary ??
+      (selectedId !== null
+        ? sessions.find((s) => s.id === selectedId) ?? null
+        : null),
+    [selectedDetail, selectedId, sessions]
+  );
+
   const renderTrafficGrid = () => (
     <TrafficGrid
       gridRef={trafficGridRef}
@@ -2884,7 +2886,7 @@ export const App: React.FC = () => {
       onSwapCompare={swapCompareSessions}
       onOpenDiffModal={() => openDiffWithPairSmart()}
       onAnnotateSessions={openAnnotationFor}
-      onSendToComposer={(id) => void loadSessionIntoComposer(id, false)}
+      onSendToComposer={(id) => void loadSessionIntoComposer(id)}
       onCreateRuleFromSession={(s) => void handleCreateRuleFromSession(s)}
       onExportSelectedSessions={(ids, fmt) =>
         void exportSelectedSessionsAs(ids, fmt)
@@ -2955,7 +2957,7 @@ export const App: React.FC = () => {
         }}
         externalHexTrigger={hexTriggerSeq}
         onReplaySession={(id) => void replaySessions([id])}
-        onSendToComposer={(id) => void loadSessionIntoComposer(id, false)}
+        onSendToComposer={(id) => void loadSessionIntoComposer(id)}
         onFilterByProcess={(proc) => quickFilterByProcess(proc, "include")}
         onFilterByClientIp={(ip) => quickFilterByClientIp(ip, "include")}
         onAlwaysInspectHost={(host) => void quickAlwaysInspectHost(host)}
@@ -3081,11 +3083,6 @@ export const App: React.FC = () => {
         onToggleInspector={toggleInspector}
         inspectorPosition={inspectorPosition}
         onSetInspectorPosition={setInspectorPosition}
-        dockedComposer={dockedComposer}
-        onToggleDockedComposer={() => {
-          setActiveSection("traffic");
-          setDockedComposer((v) => !v);
-        }}
         followTail={followTail}
         onToggleFollowTail={() => setFollowTail((v) => !v)}
         compactToolbar={compactToolbar}
@@ -3104,7 +3101,8 @@ export const App: React.FC = () => {
           }
         }}
         onSendSelectedToComposer={() => {
-          if (selectedId !== null) void loadSessionIntoComposer(selectedId, false);
+          const targetId = selectedId ?? effectiveSelectedIds[0] ?? null;
+          if (targetId !== null) void loadSessionIntoComposer(targetId);
         }}
         onOpenSessionDiff={() => openDiffWithPairSmart()}
         onOpenTextWizard={() => openTextWizardAt("jwt")}
@@ -3144,9 +3142,7 @@ export const App: React.FC = () => {
           <Sidebar
             activeSection={activeSection}
             onSelectSection={setActiveSection}
-            onDropSessionToComposer={(id) =>
-              void loadSessionIntoComposer(id, true)
-            }
+            onDropSessionToComposer={(id) => void loadSessionIntoComposer(id)}
             onOpenBreakpoints={() =>
               openBreakpointsAt(
                 pausedBreakpoints.length > 0 ? "intercept" : "rules"
@@ -3201,11 +3197,6 @@ export const App: React.FC = () => {
             compactToolbar={compactToolbar}
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={toggleSidebar}
-            dockedComposer={dockedComposer}
-            onToggleDockedComposer={() => {
-              setActiveSection("traffic");
-              setDockedComposer((v) => !v);
-            }}
             toolbarGroups={toolbarGroups}
             visibleColumns={visibleColumns}
             onToggleColumnVisibility={toggleColumnVisibility}
@@ -3264,165 +3255,110 @@ export const App: React.FC = () => {
 
           <main className="flex-1 overflow-hidden">
             {activeSection === "traffic" && inspectorPosition === "bottom" && (
-              <PanelGroup
-                ref={bottomOuterGroupRef}
-                key="traffic-layout-bottom"
-                autoSaveId={FLUX_PANEL_AUTOSAVE_IDS.bottomOuter}
-                storage={SAFE_PANEL_STORAGE}
-                direction="horizontal"
-                className="h-full w-full"
-              >
-                <Panel
-                  id="traffic-bottom-stack"
-                  order={1}
-                  defaultSize={dockedComposer ? 74 : 100}
-                  minSize={35}
+              <div className="flex h-full w-full flex-col overflow-hidden">
+                <PanelGroup
+                  ref={bottomInnerGroupRef}
+                  key="traffic-layout-bottom"
+                  autoSaveId={FLUX_PANEL_AUTOSAVE_IDS.bottomInner}
+                  storage={SAFE_PANEL_STORAGE}
+                  direction="vertical"
+                  className="min-h-0 w-full flex-1"
                 >
-                  <PanelGroup
-                    ref={bottomInnerGroupRef}
-                    autoSaveId={FLUX_PANEL_AUTOSAVE_IDS.bottomInner}
-                    storage={SAFE_PANEL_STORAGE}
-                    direction="vertical"
-                    className="h-full w-full"
+                  <Panel
+                    id="traffic-grid-top"
+                    order={1}
+                    defaultSize={inspectorCollapsed ? 100 : 54}
+                    minSize={22}
                   >
-                    <Panel
-                      id="traffic-grid-top"
-                      order={1}
-                      defaultSize={inspectorCollapsed ? 100 : 54}
-                      minSize={22}
-                    >
-                      {renderTrafficGrid()}
-                    </Panel>
-                    {!inspectorCollapsed && (
-                      <>
-                        <PanelResizeHandle
-                          onDoubleClick={handleResetBottomInnerGroup}
-                          title="Double-click to reset Traffic / Inspector split"
-                          className="h-1 w-full bg-hairline transition-colors hover:bg-accent/60"
-                        />
-                        <Panel
-                          id="session-inspector-bottom"
-                          order={2}
-                          defaultSize={46}
-                          minSize={20}
-                        >
-                          {renderInspectorOrDiff()}
-                        </Panel>
-                      </>
-                    )}
-                  </PanelGroup>
-                </Panel>
-
-                {dockedComposer && (
-                  <>
-                    <PanelResizeHandle
-                      onDoubleClick={handleResetBottomOuterGroup}
-                      title="Double-click to reset Traffic / Composer split"
-                      className="w-1 bg-hairline transition-colors hover:bg-accent/60"
-                    />
-                    <Panel
-                      id="docked-composer-panel"
-                      order={2}
-                      defaultSize={26}
-                      minSize={20}
-                    >
-                      <ComposerPanel
-                        draftRequest={composerDraft}
-                        resolvedTheme={resolvedTheme}
-                        defaultComposerTimeoutSec={
-                          upstreamTimeouts.composerTimeoutSec
-                        }
-                        onLoadSessionIntoComposer={(id) =>
-                          void loadSessionIntoComposer(id, false)
-                        }
-                        onSessionCreated={(detail) =>
-                          setSelectedId(detail.summary.id)
-                        }
-                        onGenerateCode={openCodeGeneratorForComposerDraft}
-                        onNotify={showToast}
+                    {renderTrafficGrid()}
+                  </Panel>
+                  {!inspectorCollapsed && (
+                    <>
+                      <PanelResizeHandle
+                        onDoubleClick={handleResetBottomInnerGroup}
+                        title="Double-click to reset Traffic / Inspector split"
+                        className="h-1 w-full bg-hairline transition-colors hover:bg-accent/60"
                       />
-                    </Panel>
-                  </>
+                      <Panel
+                        id="session-inspector-bottom"
+                        order={2}
+                        defaultSize={46}
+                        minSize={20}
+                        collapsible
+                        collapsedSize={0}
+                        onCollapse={() => setInspectorCollapsed(true)}
+                      >
+                        {renderInspectorOrDiff()}
+                      </Panel>
+                    </>
+                  )}
+                </PanelGroup>
+
+                {inspectorCollapsed && (
+                  <CollapsedInspectorBar
+                    position="bottom"
+                    selectedSession={selectedSummary}
+                    selectedCount={effectiveSelectedIds.length}
+                    onExpand={handleFocusInspector}
+                    onOpenStatistics={handleOpenStatistics}
+                    onChangePosition={setInspectorPosition}
+                  />
                 )}
-              </PanelGroup>
+              </div>
             )}
 
             {activeSection === "traffic" && inspectorPosition === "right" && (
-              <PanelGroup
-                ref={rightGroupRef}
-                key="traffic-layout-right"
-                autoSaveId={FLUX_PANEL_AUTOSAVE_IDS.right}
-                storage={SAFE_PANEL_STORAGE}
-                direction="horizontal"
-                className="h-full w-full"
-              >
-                <Panel
-                  id="traffic-grid-left"
-                  order={1}
-                  defaultSize={
-                    inspectorCollapsed
-                      ? dockedComposer
-                        ? 74
-                        : 100
-                      : dockedComposer
-                        ? 44
-                        : 56
-                  }
-                  minSize={26}
+              <div className="flex h-full w-full flex-row overflow-hidden">
+                <PanelGroup
+                  ref={rightGroupRef}
+                  key="traffic-layout-right"
+                  autoSaveId={FLUX_PANEL_AUTOSAVE_IDS.right}
+                  storage={SAFE_PANEL_STORAGE}
+                  direction="horizontal"
+                  className="h-full min-w-0 flex-1"
                 >
-                  {renderTrafficGrid()}
-                </Panel>
+                  <Panel
+                    id="traffic-grid-left"
+                    order={1}
+                    defaultSize={inspectorCollapsed ? 100 : 56}
+                    minSize={26}
+                  >
+                    {renderTrafficGrid()}
+                  </Panel>
 
-                {!inspectorCollapsed && (
-                  <>
-                    <PanelResizeHandle
-                      onDoubleClick={handleResetRightGroup}
-                      title="Double-click to reset workspace panel split"
-                      className="w-1 bg-hairline transition-colors hover:bg-accent/60"
-                    />
-                    <Panel
-                      id="session-inspector-right"
-                      order={2}
-                      defaultSize={dockedComposer ? 32 : 44}
-                      minSize={22}
-                    >
-                      {renderInspectorOrDiff()}
-                    </Panel>
-                  </>
-                )}
-
-                {dockedComposer && (
-                  <>
-                    <PanelResizeHandle
-                      onDoubleClick={handleResetRightGroup}
-                      title="Double-click to reset workspace panel split"
-                      className="w-1 bg-hairline transition-colors hover:bg-accent/60"
-                    />
-                    <Panel
-                      id="docked-composer-right"
-                      order={3}
-                      defaultSize={24}
-                      minSize={20}
-                    >
-                      <ComposerPanel
-                        draftRequest={composerDraft}
-                        resolvedTheme={resolvedTheme}
-                        defaultComposerTimeoutSec={
-                          upstreamTimeouts.composerTimeoutSec
-                        }
-                        onLoadSessionIntoComposer={(id) =>
-                          void loadSessionIntoComposer(id, false)
-                        }
-                        onSessionCreated={(detail) =>
-                          setSelectedId(detail.summary.id)
-                        }
-                        onGenerateCode={openCodeGeneratorForComposerDraft}
-                        onNotify={showToast}
+                  {!inspectorCollapsed && (
+                    <>
+                      <PanelResizeHandle
+                        onDoubleClick={handleResetRightGroup}
+                        title="Double-click to reset workspace panel split"
+                        className="w-1 bg-hairline transition-colors hover:bg-accent/60"
                       />
-                    </Panel>
-                  </>
+                      <Panel
+                        id="session-inspector-right"
+                        order={2}
+                        defaultSize={44}
+                        minSize={22}
+                        collapsible
+                        collapsedSize={0}
+                        onCollapse={() => setInspectorCollapsed(true)}
+                      >
+                        {renderInspectorOrDiff()}
+                      </Panel>
+                    </>
+                  )}
+                </PanelGroup>
+
+                {inspectorCollapsed && (
+                  <CollapsedInspectorBar
+                    position="right"
+                    selectedSession={selectedSummary}
+                    selectedCount={effectiveSelectedIds.length}
+                    onExpand={handleFocusInspector}
+                    onOpenStatistics={handleOpenStatistics}
+                    onChangePosition={setInspectorPosition}
+                  />
                 )}
-              </PanelGroup>
+              </div>
             )}
 
             {activeSection === "composer" && (
@@ -3431,9 +3367,11 @@ export const App: React.FC = () => {
                 resolvedTheme={resolvedTheme}
                 defaultComposerTimeoutSec={upstreamTimeouts.composerTimeoutSec}
                 onLoadSessionIntoComposer={(id) =>
-                  void loadSessionIntoComposer(id, true)
+                  void loadSessionIntoComposer(id)
                 }
                 onSessionCreated={(detail) => setSelectedId(detail.summary.id)}
+                onBackToTraffic={() => setActiveSection("traffic")}
+                onInspectSessionInTraffic={handleInspectSessionFromComposer}
                 onGenerateCode={openCodeGeneratorForComposerDraft}
                 onNotify={showToast}
               />

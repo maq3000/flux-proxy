@@ -156,8 +156,6 @@ describe("Stage 38 Navigation & Panel Deduplication", () => {
         compactToolbar={true}
         sidebarCollapsed={false}
         onToggleSidebar={vi.fn()}
-        dockedComposer={false}
-        onToggleDockedComposer={vi.fn()}
         toolbarGroups={{ ...DEFAULT_TOOLBAR_GROUPS, proxyMode: true }}
         visibleColumns={{ ...DEFAULT_VISIBLE_COLUMNS }}
         onToggleColumnVisibility={vi.fn()}
@@ -243,6 +241,9 @@ describe("Stage 38 Navigation & Panel Deduplication", () => {
     ).toBeNull();
     expect(screen.queryByText("Drop Non-Matching on Capture")).toBeNull();
     expect(screen.queryByText("Customize Toolbar")).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Toggle split Request Composer" })
+    ).toBeNull();
   });
 
   it("MenuBar removes duplicate SysProxy status button and View Theme radios", () => {
@@ -306,8 +307,6 @@ describe("Stage 38 Navigation & Panel Deduplication", () => {
         onToggleInspector={vi.fn()}
         inspectorPosition="bottom"
         onSetInspectorPosition={vi.fn()}
-        dockedComposer={false}
-        onToggleDockedComposer={vi.fn()}
         followTail={true}
         onToggleFollowTail={vi.fn()}
         toolbarGroups={{ ...DEFAULT_TOOLBAR_GROUPS }}
@@ -346,6 +345,7 @@ describe("Stage 38 Navigation & Panel Deduplication", () => {
     expect(screen.queryByText("Theme: Dark (Zinc)")).toBeNull();
     expect(screen.queryByText("Theme: Light (Zinc)")).toBeNull();
     expect(screen.queryByText("Theme: System")).toBeNull();
+    expect(screen.queryByText("Split Composer Pane")).toBeNull();
     expect(screen.getByText(/Theme Presets & Appearance/i)).toBeTruthy();
   });
 
@@ -362,6 +362,9 @@ describe("Stage 38 Navigation & Panel Deduplication", () => {
 
     expect(screen.queryByRole("button", { name: "Wizard" })).toBeNull();
     expect(screen.getByRole("button", { name: /Replay/i })).toBeTruthy();
+    expect(
+      screen.getByTitle("Edit & Replay session in Composer (E)")
+    ).toBeTruthy();
   });
 
   it("TopToolbar updates Throttle button label dynamically for active preset", () => {
@@ -401,8 +404,6 @@ describe("Stage 38 Navigation & Panel Deduplication", () => {
         compactToolbar={true}
         sidebarCollapsed={false}
         onToggleSidebar={vi.fn()}
-        dockedComposer={false}
-        onToggleDockedComposer={vi.fn()}
         toolbarGroups={{ ...DEFAULT_TOOLBAR_GROUPS, proxyMode: true }}
         visibleColumns={{ ...DEFAULT_VISIBLE_COLUMNS }}
         onToggleColumnVisibility={vi.fn()}

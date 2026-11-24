@@ -79,8 +79,6 @@ interface MenuBarProps {
   onToggleInspector: () => void;
   inspectorPosition: InspectorDockPosition;
   onSetInspectorPosition: (pos: InspectorDockPosition) => void;
-  dockedComposer: boolean;
-  onToggleDockedComposer: () => void;
   followTail: boolean;
   onToggleFollowTail: () => void;
   compactToolbar?: boolean;
@@ -322,8 +320,6 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onToggleInspector,
   inspectorPosition,
   onSetInspectorPosition,
-  dockedComposer,
-  onToggleDockedComposer,
   followTail,
   onToggleFollowTail,
   compactToolbar = false,
@@ -1404,15 +1400,6 @@ export const MenuBar: React.FC<MenuBarProps> = ({
               <button
                 type="button"
                 role="menuitemcheckbox"
-                aria-checked={dockedComposer}
-                onKeyDown={checkboxKeyDown}
-                onClick={(e) => activateCheckbox(e, onToggleDockedComposer)}
-              >
-                <span>Split Composer Pane</span>
-              </button>
-              <button
-                type="button"
-                role="menuitemcheckbox"
                 aria-checked={followTail}
                 onKeyDown={checkboxKeyDown}
                 onClick={(e) => activateCheckbox(e, onToggleFollowTail)}
@@ -1694,6 +1681,9 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 onClick={(e) => activateCommand(e, onSendSelectedToComposer)}
               >
                 <span>Edit in Request Composer</span>
+                <span className="hint" aria-hidden="true">
+                  E
+                </span>
               </button>
               <hr />
               <button

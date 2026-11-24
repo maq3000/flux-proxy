@@ -1805,6 +1805,9 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
             >
               <Send className="h-3.5 w-3.5 shrink-0 text-muted" />
               <span className="truncate">Открыть в Composer</span>
+              <span className="hint font-mono text-[10px] text-subtle" aria-hidden="true">
+                E
+              </span>
             </button>
           )}
 

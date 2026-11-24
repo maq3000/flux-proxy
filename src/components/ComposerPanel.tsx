@@ -1,9 +1,18 @@
-import React, { useEffect, useId, useMemo, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import Editor from "@monaco-editor/react";
 import {
   AlertTriangle,
+  ArrowLeft,
   CheckCircle2,
   Code2,
+  ExternalLink,
   Loader2,
   Plus,
   Send,
@@ -12,6 +21,17 @@ import {
   UploadCloud,
   X,
 } from "lucide-react";
+import {
+  Panel,
+  PanelGroup,
+  PanelResizeHandle,
+  type ImperativePanelGroupHandle,
+} from "react-resizable-panels";
+import {
+  FLUX_PANEL_AUTOSAVE_IDS,
+  FLUX_PANEL_LAYOUT_RESET_EVENT,
+  SAFE_PANEL_STORAGE,
+} from "../hooks/useUiPreferences";
 import {
   isCurlCommand,
   parseCurlCommand,
@@ -32,6 +52,8 @@ interface ComposerPanelProps {
   defaultComposerTimeoutSec?: number;
   onLoadSessionIntoComposer: (sessionId: number) => void;
   onSessionCreated: (detail: SessionDetail) => void;
+  onBackToTraffic?: () => void;
+  onInspectSessionInTraffic?: (sessionId: number) => void;
   onGenerateCode?: (request: ComposedRequest) => void;
   onNotify?: (msg: string) => void;
 }
@@ -52,15 +74,22 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
   defaultComposerTimeoutSec = 120,
   onLoadSessionIntoComposer,
   onSessionCreated,
+  onBackToTraffic,
+  onInspectSessionInTraffic,
   onGenerateCode,
   onNotify,
 }) => {
   const curlDialogRef = useRef<HTMLDialogElement>(null);
   const curlTextareaRef = useRef<HTMLTextAreaElement>(null);
   const activeRequestIdRef = useRef<string | null>(null);
+  const composerSplitGroupRef = useRef<ImperativePanelGroupHandle>(null);
   const curlTitleId = useId();
   const runScriptsId = useId();
   const timeoutSelectId = useId();
+
+  const [sourceSessionId, setSourceSessionId] = useState<number | null>(
+    () => draftRequest?.sourceSessionId ?? null
+  );
 
   const [method, setMethod] = useState("POST");
   const [url, setUrl] = useState("https://auth.internal.corp/oauth2/token");
@@ -156,6 +185,7 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
 
   useEffect(() => {
     if (!draftRequest) return;
+    setSourceSessionId(draftRequest.sourceSessionId ?? null);
     setMethod(draftRequest.method);
     setUrl(draftRequest.url);
     setHeaders(
@@ -168,6 +198,20 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
     setRunPythonScripts(!draftRequest.skipPythonScripts);
     setErrorMessage(null);
   }, [draftRequest]);
+
+  const handleResetComposerSplit = useCallback(() => {
+    composerSplitGroupRef.current?.setLayout(lastResponse ? [62, 38] : [100]);
+  }, [lastResponse]);
+
+  useEffect(() => {
+    const onReset = () => {
+      handleResetComposerSplit();
+    };
+    window.addEventListener(FLUX_PANEL_LAYOUT_RESET_EVENT, onReset);
+    return () => {
+      window.removeEventListener(FLUX_PANEL_LAYOUT_RESET_EVENT, onReset);
+    };
+  }, [handleResetComposerSplit]);
 
   const handleDragOver = (e: React.DragEvent) => {
     if (e.dataTransfer.types.includes("application/x-fluxproxy-session-id")) {
@@ -191,6 +235,7 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
     parsed: ParsedCurlResult,
     sourceHint?: string
   ) => {
+    setSourceSessionId(null);
     setMethod(parsed.request.method);
     setUrl(parsed.request.url);
     setHeaders(parsed.request.headers);
@@ -339,10 +384,32 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
 
       {/* Composer Header */}
       <div className="flex min-h-9 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-hairline bg-elevated/60 px-3 py-1">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {onBackToTraffic && (
+            <button
+              type="button"
+              onClick={onBackToTraffic}
+              title="Return to Traffic Viewer (Alt+1)"
+              className="inline-flex h-6 items-center gap-1 rounded border border-hairline bg-surface px-2 text-[11px] font-medium text-fg transition-colors hover:border-strong hover:bg-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+            >
+              <ArrowLeft className="h-3 w-3 text-accent" aria-hidden="true" />
+              <span>Traffic</span>
+              <kbd
+                aria-hidden="true"
+                className="ml-0.5 rounded border border-hairline bg-elevated px-1 font-mono text-[9px] text-subtle"
+              >
+                Alt+1
+              </kbd>
+            </button>
+          )}
           <span className="font-mono text-xs font-semibold text-fg">
             Request Composer
           </span>
+          {sourceSessionId !== null && (
+            <span className="rounded border border-accent/35 bg-accent/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-accent tabular-nums">
+              From #{sourceSessionId}
+            </span>
+          )}
           <span className="hidden rounded bg-sky-500/10 px-1.5 py-0.5 text-[10px] text-sky-400 sm:inline">
             Drag & Drop enabled
           </span>
@@ -526,165 +593,216 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
         </div>
       )}
 
-      {/* Request Builder Tabs */}
-      <div className="flex h-8 shrink-0 items-center justify-between border-b border-hairline px-3">
-        <div className="flex items-center gap-1">
-          <button
-            type="button"
-            onClick={() => setActiveTab("headers")}
-            className={`rounded px-2.5 py-0.5 text-xs font-medium ${
-              activeTab === "headers"
-                ? "bg-elevated text-fg ring-1 ring-hairline"
-                : "text-muted hover:text-fg"
-            }`}
+      {/* Resizable Split: Request Builder & Latest Response */}
+      <div className="min-h-0 flex-1 overflow-hidden">
+        <PanelGroup
+          ref={composerSplitGroupRef}
+          autoSaveId={FLUX_PANEL_AUTOSAVE_IDS.composerSplit}
+          storage={SAFE_PANEL_STORAGE}
+          direction="vertical"
+          className="h-full w-full"
+        >
+          <Panel
+            id="composer-request-pane"
+            order={1}
+            defaultSize={lastResponse ? 62 : 100}
+            minSize={25}
+            className="flex flex-col overflow-hidden"
           >
-            Headers ({headers.length})
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab("body")}
-            className={`rounded px-2.5 py-0.5 text-xs font-medium ${
-              activeTab === "body"
-                ? "bg-elevated text-fg ring-1 ring-hairline"
-                : "text-muted hover:text-fg"
-            }`}
-          >
-            Payload Body
-          </button>
-        </div>
+            {/* Request Builder Tabs */}
+            <div className="flex h-8 shrink-0 items-center justify-between border-b border-hairline px-3">
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => setActiveTab("headers")}
+                  className={`rounded px-2.5 py-0.5 text-xs font-medium ${
+                    activeTab === "headers"
+                      ? "bg-elevated text-fg ring-1 ring-hairline"
+                      : "text-muted hover:text-fg"
+                  }`}
+                >
+                  Headers ({headers.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveTab("body")}
+                  className={`rounded px-2.5 py-0.5 text-xs font-medium ${
+                    activeTab === "body"
+                      ? "bg-elevated text-fg ring-1 ring-hairline"
+                      : "text-muted hover:text-fg"
+                  }`}
+                >
+                  Payload Body
+                </button>
+              </div>
 
-        {activeTab === "body" && (
-          <button
-            type="button"
-            onClick={() => {
-              const res = tryFormatJson(body);
-              if (res.valid) setBody(res.formatted);
-            }}
-            className="text-[11px] text-sky-400 hover:underline"
-          >
-            Prettify JSON
-          </button>
-        )}
-      </div>
+              {activeTab === "body" && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const res = tryFormatJson(body);
+                    if (res.valid) setBody(res.formatted);
+                  }}
+                  className="text-[11px] text-sky-400 hover:underline"
+                >
+                  Prettify JSON
+                </button>
+              )}
+            </div>
 
-      {/* Editable Request Content */}
-      <div className="flex-1 overflow-hidden bg-canvas">
-        {activeTab === "headers" ? (
-          <div className="h-full overflow-auto p-3">
-            <div className="space-y-1.5">
-              {headers.map((h, i) => (
-                <div key={i} className="flex items-center gap-1.5">
-                  <input
-                    type="text"
-                    value={h.name}
-                    placeholder="Header-Name"
-                    onChange={(e) => {
-                      const next = headers.slice();
-                      next[i] = { ...next[i], name: e.target.value };
-                      setHeaders(next);
-                    }}
-                    className="h-7 w-44 rounded border border-hairline bg-surface px-2 font-mono text-xs text-sky-400 focus:border-sky-500 focus:outline-none"
-                  />
-                  <input
-                    type="text"
-                    value={h.value}
-                    placeholder="Value"
-                    onChange={(e) => {
-                      const next = headers.slice();
-                      next[i] = { ...next[i], value: e.target.value };
-                      setHeaders(next);
-                    }}
-                    className="h-7 flex-1 rounded border border-hairline bg-surface px-2 font-mono text-xs text-fg focus:border-sky-500 focus:outline-none"
-                  />
+            {/* Editable Request Content */}
+            <div className="min-h-0 flex-1 overflow-hidden bg-canvas">
+              {activeTab === "headers" ? (
+                <div className="h-full overflow-auto p-3">
+                  <div className="space-y-1.5">
+                    {headers.map((h, i) => (
+                      <div
+                        key={i}
+                        className="grid grid-cols-[minmax(180px,28%)_minmax(0,1fr)_auto] items-center gap-1.5"
+                      >
+                        <input
+                          type="text"
+                          value={h.name}
+                          placeholder="Header-Name"
+                          aria-label={`Header name ${i + 1}`}
+                          onChange={(e) => {
+                            const next = headers.slice();
+                            next[i] = { ...next[i], name: e.target.value };
+                            setHeaders(next);
+                          }}
+                          className="h-7 min-w-0 rounded border border-hairline bg-surface px-2 font-mono text-xs text-sky-400 focus:border-sky-500 focus:outline-none"
+                        />
+                        <input
+                          type="text"
+                          value={h.value}
+                          placeholder="Value"
+                          aria-label={`Header value ${i + 1}`}
+                          onChange={(e) => {
+                            const next = headers.slice();
+                            next[i] = { ...next[i], value: e.target.value };
+                            setHeaders(next);
+                          }}
+                          className="h-7 min-w-0 rounded border border-hairline bg-surface px-2 font-mono text-xs text-fg focus:border-sky-500 focus:outline-none"
+                        />
+                        <button
+                          type="button"
+                          aria-label={`Remove header ${h.name || i + 1}`}
+                          onClick={() =>
+                            setHeaders(headers.filter((_, idx) => idx !== i))
+                          }
+                          className="rounded p-1 text-subtle hover:text-rose-400"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                   <button
                     type="button"
                     onClick={() =>
-                      setHeaders(headers.filter((_, idx) => idx !== i))
+                      setHeaders([...headers, { name: "", value: "" }])
                     }
-                    className="rounded p-1 text-subtle hover:text-rose-400"
+                    className="mt-2.5 inline-flex items-center gap-1 rounded border border-hairline bg-surface px-2.5 py-1 text-xs text-muted hover:text-fg"
                   >
-                    <Trash2 className="h-3.5 w-3.5" />
+                    <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Add Header</span>
                   </button>
                 </div>
-              ))}
-            </div>
-            <button
-              type="button"
-              onClick={() =>
-                setHeaders([...headers, { name: "", value: "" }])
-              }
-              className="mt-2.5 inline-flex items-center gap-1 rounded border border-hairline bg-surface px-2.5 py-1 text-xs text-muted hover:text-fg"
-            >
-              <Plus className="h-3.5 w-3.5" />
-              <span>Add Header</span>
-            </button>
-          </div>
-        ) : (
-          <Editor
-            height="100%"
-            language="json"
-            theme={monacoTheme}
-            value={body}
-            onChange={(v) => setBody(v ?? "")}
-            options={{
-              minimap: { enabled: false },
-              fontSize: 12,
-              wordWrap: "on",
-              scrollBeyondLastLine: false,
-            }}
-          />
-        )}
-      </div>
-
-      {/* Inline Latest Response Snapshot */}
-      {lastResponse && (
-        <div className="flex h-52 shrink-0 flex-col border-t border-strong bg-surface">
-          <div className="flex h-7 items-center justify-between border-b border-hairline px-3 font-mono text-xs">
-            <div className="flex items-center gap-2">
-              <span
-                className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${
-                  lastResponse.summary.status >= 400
-                    ? "bg-rose-500/20 text-rose-400"
-                    : "bg-emerald-500/20 text-emerald-400"
-                }`}
-              >
-                {lastResponse.summary.status}
-              </span>
-              {lastResponse.summary.isMocked && (
-                <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-bold text-amber-300">
-                  AUTORESPONDER MOCK
-                </span>
+              ) : (
+                <Editor
+                  height="100%"
+                  language="json"
+                  theme={monacoTheme}
+                  value={body}
+                  onChange={(v) => setBody(v ?? "")}
+                  options={{
+                    minimap: { enabled: false },
+                    fontSize: 12,
+                    wordWrap: "on",
+                    scrollBeyondLastLine: false,
+                  }}
+                />
               )}
-              <span className="text-muted">
-                Session #{lastResponse.summary.id}
-              </span>
             </div>
-            <span className="text-[11px] text-muted tabular-nums">
-              {formatBytes(lastResponse.summary.bodySize)} •{" "}
-              {formatDuration(lastResponse.summary.durationMs)}
-            </span>
-          </div>
-          <div className="flex-1 overflow-hidden">
-            <Editor
-              height="100%"
-              language="json"
-              theme={monacoTheme}
-              value={
-                tryFormatJson(lastResponse.responseBodyText).formatted ||
-                lastResponse.responseBodyText ||
-                ""
-              }
-              options={{
-                readOnly: true,
-                minimap: { enabled: false },
-                fontSize: 11,
-                wordWrap: "on",
-                scrollBeyondLastLine: false,
-              }}
-            />
-          </div>
-        </div>
-      )}
+          </Panel>
+
+          {/* Inline Latest Response Snapshot */}
+          {lastResponse && (
+            <>
+              <PanelResizeHandle
+                onDoubleClick={handleResetComposerSplit}
+                title="Double-click to reset Request / Response split"
+                className="h-1 w-full bg-hairline transition-colors hover:bg-accent/60"
+              />
+              <Panel
+                id="composer-response-pane"
+                order={2}
+                defaultSize={38}
+                minSize={18}
+                className="flex flex-col overflow-hidden bg-surface"
+              >
+                <div className="flex h-7 shrink-0 items-center justify-between gap-2 border-b border-hairline px-3 font-mono text-xs">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span
+                      className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${
+                        lastResponse.summary.status >= 400
+                          ? "bg-rose-500/20 text-rose-400"
+                          : "bg-emerald-500/20 text-emerald-400"
+                      }`}
+                    >
+                      {lastResponse.summary.status}
+                    </span>
+                    {lastResponse.summary.isMocked && (
+                      <span className="rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-bold text-amber-300">
+                        AUTORESPONDER MOCK
+                      </span>
+                    )}
+                    <span className="text-muted">
+                      Session #{lastResponse.summary.id}
+                    </span>
+                    {onInspectSessionInTraffic && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onInspectSessionInTraffic(lastResponse.summary.id)
+                        }
+                        title={`Select Session #${lastResponse.summary.id} and open in Traffic Inspector`}
+                        className="inline-flex h-5 items-center gap-1 rounded border border-accent/40 bg-accent/10 px-1.5 font-sans text-[11px] font-medium text-accent transition-colors hover:bg-accent/20 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+                      >
+                        <ExternalLink className="h-3 w-3" aria-hidden="true" />
+                        <span>Inspect #{lastResponse.summary.id} in Traffic</span>
+                      </button>
+                    )}
+                  </div>
+                  <span className="shrink-0 text-[11px] text-muted tabular-nums">
+                    {formatBytes(lastResponse.summary.bodySize)} •{" "}
+                    {formatDuration(lastResponse.summary.durationMs)}
+                  </span>
+                </div>
+                <div className="min-h-0 flex-1 overflow-hidden">
+                  <Editor
+                    height="100%"
+                    language="json"
+                    theme={monacoTheme}
+                    value={
+                      tryFormatJson(lastResponse.responseBodyText).formatted ||
+                      lastResponse.responseBodyText ||
+                      ""
+                    }
+                    options={{
+                      readOnly: true,
+                      minimap: { enabled: false },
+                      fontSize: 11,
+                      wordWrap: "on",
+                      scrollBeyondLastLine: false,
+                    }}
+                  />
+                </div>
+              </Panel>
+            </>
+          )}
+        </PanelGroup>
+      </div>
 
       {/* Import cURL Dialog */}
       <dialog

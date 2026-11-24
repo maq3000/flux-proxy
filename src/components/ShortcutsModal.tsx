@@ -40,6 +40,10 @@ const SHORTCUT_GROUPS: {
     title: "Действия с сессиями",
     items: [
       { keys: "R / Ctrl+R", description: "Replay — повторить запрос в upstream" },
+      {
+        keys: "E",
+        description: "Открыть и отредактировать выбранную сессию в Request Composer",
+      },
       { keys: "Ctrl+S / Cmd+S", description: "Сохранить все сессии в архив (.har, .saz, .json)" },
       {
         keys: "Ctrl+Shift+S",

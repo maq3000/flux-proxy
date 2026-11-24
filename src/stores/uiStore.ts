@@ -42,10 +42,10 @@ export const CUSTOM_COLOR_OVERRIDES_STORAGE_KEY =
   "fluxproxy.customColorOverrides.v1";
 
 export const FLUX_PANEL_AUTOSAVE_IDS = {
-  bottomOuter: "flux-layout-bottom-outer-v1",
   bottomInner: "flux-layout-bottom-inner-v1",
   right: "flux-layout-right-v1",
   inspectorSplit: "flux-inspector-split-v1",
+  composerSplit: "flux-composer-split-v1",
 } as const;
 
 export const FLUX_PANEL_STORAGE_PREFIX = "react-resizable-panels:flux-";
@@ -56,11 +56,82 @@ export const LS_TOOLBAR_GROUPS_KEY = "fluxproxy.toolbarGroups.v1";
 export const LS_VISIBLE_COLUMNS_KEY = "fluxproxy.visibleColumns.v1";
 export const LS_COLUMN_WIDTHS_KEY = "fluxproxy.columnWidths.v1";
 
+/**
+ * Prevents a collapsed `[100, 0]` inspector layout saved during drag-to-collapse
+ * from immediately re-collapsing the inspector panel when it is re-mounted on Expand.
+ */
+export function sanitizeInspectorPanelStorageJson(
+  storageKey: string,
+  rawJson: string
+): string {
+  const isInspectorGroup =
+    storageKey.endsWith(FLUX_PANEL_AUTOSAVE_IDS.bottomInner) ||
+    storageKey.endsWith(FLUX_PANEL_AUTOSAVE_IDS.right);
+  if (!isInspectorGroup) return rawJson;
+
+  try {
+    const parsed = JSON.parse(rawJson) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return rawJson;
+    }
+
+    const record = parsed as Record<
+      string,
+      {
+        expandToSizes?: Record<string, unknown>;
+        layout?: unknown;
+      }
+    >;
+    let mutated = false;
+
+    for (const [panelKey, entry] of Object.entries(record)) {
+      if (!entry || typeof entry !== "object") continue;
+      const parts = panelKey.split(",");
+      const matchedId = parts.includes("session-inspector-bottom")
+        ? "session-inspector-bottom"
+        : parts.includes("session-inspector-right")
+          ? "session-inspector-right"
+          : null;
+      if (!matchedId) continue;
+
+      if (
+        Array.isArray(entry.layout) &&
+        entry.layout.length === 2 &&
+        typeof entry.layout[1] === "number" &&
+        entry.layout[1] <= 0.5
+      ) {
+        const fallbackSize =
+          matchedId === "session-inspector-bottom" ? 46 : 44;
+        const savedExpand = entry.expandToSizes?.[matchedId];
+        const restored =
+          typeof savedExpand === "number" &&
+          Number.isFinite(savedExpand) &&
+          savedExpand >= 20 &&
+          savedExpand <= 78
+            ? savedExpand
+            : fallbackSize;
+
+        entry.layout = [
+          Number((100 - restored).toFixed(2)),
+          Number(restored.toFixed(2)),
+        ];
+        mutated = true;
+      }
+    }
+
+    return mutated ? JSON.stringify(record) : rawJson;
+  } catch {
+    return rawJson;
+  }
+}
+
 export const SAFE_PANEL_STORAGE: PanelGroupStorage = {
   getItem(name: string): string | null {
     if (typeof window === "undefined") return null;
     try {
-      return window.localStorage.getItem(name);
+      const raw = window.localStorage.getItem(name);
+      if (raw === null) return null;
+      return sanitizeInspectorPanelStorageJson(name, raw);
     } catch {
       return null;
     }
@@ -68,7 +139,8 @@ export const SAFE_PANEL_STORAGE: PanelGroupStorage = {
   setItem(name: string, value: string): void {
     if (typeof window === "undefined") return;
     try {
-      window.localStorage.setItem(name, value);
+      const sanitized = sanitizeInspectorPanelStorageJson(name, value);
+      window.localStorage.setItem(name, sanitized);
     } catch {
       // ignore storage quota / privacy mode errors
     }
@@ -289,7 +361,7 @@ export const TOOLBAR_GROUP_DEFINITIONS: ToolbarGroupDefinition[] = [
   {
     id: "layout",
     label: "Layout & Columns",
-    description: "Sidebar, Split Composer, Column Picker",
+    description: "Sidebar, Column Picker",
   },
   {
     id: "proxyMode",
@@ -557,7 +629,6 @@ export interface UiStoreState {
 
   // App shell view state
   activeSection: ActiveNavSection;
-  dockedComposer: boolean;
 
   // Theme actions
   syncThemeFromLocalStorage: () => void;
@@ -598,7 +669,6 @@ export interface UiStoreState {
 
   // Shell actions
   setActiveSection: (updater: Updater<ActiveNavSection>) => void;
-  setDockedComposer: (updater: Updater<boolean>) => void;
 }
 
 const initialSystemDark = getSystemIsDark();
@@ -616,7 +686,6 @@ export const useUiStore = create<UiStoreState>((set, get) => ({
   columnWidths: readInitialColumnWidths(),
 
   activeSection: "traffic",
-  dockedComposer: false,
 
   syncThemeFromLocalStorage: () => {
     const sysDark = getSystemIsDark();
@@ -963,12 +1032,6 @@ export const useUiStore = create<UiStoreState>((set, get) => ({
   setActiveSection: (updater) => {
     set((state) => ({
       activeSection: resolveUpdater(updater, state.activeSection),
-    }));
-  },
-
-  setDockedComposer: (updater) => {
-    set((state) => ({
-      dockedComposer: resolveUpdater(updater, state.dockedComposer),
     }));
   },
 }));

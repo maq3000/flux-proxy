@@ -1018,11 +1018,17 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
           <button
             type="button"
             onClick={() => onSendToComposer(summary.id)}
-            title="Edit & Replay session in Composer"
+            title="Edit & Replay session in Composer (E)"
             className="inline-flex items-center gap-1 rounded border border-hairline bg-surface px-1.5 py-0.5 text-[11px] text-muted hover:border-strong hover:text-fg"
           >
-            <Send className="h-3 w-3" />
+            <Send className="h-3 w-3" aria-hidden="true" />
             <span className="hidden xl:inline">Composer</span>
+            <kbd
+              aria-hidden="true"
+              className="hidden rounded border border-hairline bg-elevated px-1 font-mono text-[9px] text-subtle xl:inline"
+            >
+              E
+            </kbd>
           </button>
           <button
             type="button"

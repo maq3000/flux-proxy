@@ -26,6 +26,7 @@ export interface UseGlobalShortcutsOptions {
   setPaletteOpen: Dispatch<SetStateAction<boolean>>;
   setShortcutsModalOpen: Dispatch<SetStateAction<boolean>>;
   setTextWizardOpen: Dispatch<SetStateAction<boolean>>;
+  selectedId: number | null;
   effectiveSelectedIds: number[];
   filteredSessions: SessionSummary[];
   sortedSessionsRef: MutableRefObject<SessionSummary[]>;
@@ -38,6 +39,7 @@ export interface UseGlobalShortcutsOptions {
   importArchiveDialog: () => Promise<void> | void;
   openAnnotationFor: (ids: number[]) => void;
   openDiffWithPairSmart: () => void;
+  openInComposer: (sessionId: number) => Promise<void> | void;
   openSanitizedExportModal: () => void;
   replaySessions: (ids: number[]) => Promise<void> | void;
   selectSessions: (ids: number[]) => void;
@@ -68,6 +70,7 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
     setPaletteOpen,
     setShortcutsModalOpen,
     setTextWizardOpen,
+    selectedId,
     effectiveSelectedIds,
     filteredSessions,
     sortedSessionsRef,
@@ -80,6 +83,7 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
     importArchiveDialog,
     openAnnotationFor,
     openDiffWithPairSmart,
+    openInComposer,
     openSanitizedExportModal,
     replaySessions,
     selectSessions,
@@ -230,7 +234,12 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
       }
 
       // Ctrl+E / Cmd+E -> TextWizard
-      if (ctrlOrMeta && !e.altKey && !e.shiftKey && keyLower === "e") {
+      if (
+        ctrlOrMeta &&
+        !e.altKey &&
+        !e.shiftKey &&
+        (keyLower === "e" || e.code === "KeyE")
+      ) {
         e.preventDefault();
         setTextWizardOpen((prev) => !prev);
         return;
@@ -485,6 +494,15 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
 
         if (activeSection !== "traffic") return;
 
+        if (!e.shiftKey && (keyLower === "e" || e.code === "KeyE")) {
+          const targetId = selectedId ?? effectiveSelectedIds[0] ?? null;
+          if (targetId !== null) {
+            e.preventDefault();
+            void openInComposer(targetId);
+          }
+          return;
+        }
+
         if (keyLower === "m" || e.code === "KeyM") {
           e.preventDefault();
           openAnnotationFor(effectiveSelectedIds);
@@ -540,10 +558,12 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
     onToggleSettingsMain,
     openAnnotationFor,
     openDiffWithPairSmart,
+    openInComposer,
     openSanitizedExportModal,
     replaySessions,
     sanitizedExportModalOpen,
     selectSessions,
+    selectedId,
     setActiveSection,
     setDiffModalOpen,
     setPaletteOpen,

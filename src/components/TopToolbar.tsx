@@ -4,7 +4,6 @@ import {
   ArrowDownToLine,
   Check,
   ChevronDown,
-  Columns,
   Columns3,
   Copy,
   Gauge,
@@ -79,8 +78,6 @@ interface TopToolbarProps {
   compactToolbar?: boolean;
   sidebarCollapsed: boolean;
   onToggleSidebar: () => void;
-  dockedComposer: boolean;
-  onToggleDockedComposer: () => void;
   toolbarGroups: Record<ToolbarGroupId, boolean>;
   visibleColumns: Record<ColumnId, boolean>;
   onToggleColumnVisibility: (colId: ColumnId) => void;
@@ -215,8 +212,6 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   compactToolbar = false,
   sidebarCollapsed,
   onToggleSidebar,
-  dockedComposer,
-  onToggleDockedComposer,
   toolbarGroups,
   visibleColumns,
   onToggleColumnVisibility,
@@ -1558,7 +1553,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
 
         {toolbarGroups.layout && (
           <div className="flex items-center gap-1">
-            {/* Layout Segmented Control: Sidebar & Split Composer */}
+            {/* Layout Control: Sidebar */}
             {!compactToolbar && (
               <div
                 role="group"
@@ -1582,21 +1577,6 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                   }`}
                 >
                   <PanelLeft className="h-3.5 w-3.5" />
-                </button>
-
-                <button
-                  type="button"
-                  onClick={onToggleDockedComposer}
-                  aria-pressed={dockedComposer}
-                  aria-label="Toggle split Request Composer"
-                  title="Открыть / скрыть Split Composer рядом с таблицей"
-                  className={`inline-flex h-6 w-6 items-center justify-center rounded transition-colors ${
-                    dockedComposer
-                      ? "bg-selected text-accent"
-                      : "text-muted hover:bg-hover hover:text-fg"
-                  }`}
-                >
-                  <Columns className="h-3.5 w-3.5" />
                 </button>
               </div>
             )}

@@ -346,6 +346,8 @@ export interface ComposedRequest {
   skipPythonScripts?: boolean;
   requestId?: string;
   timeoutSec?: number;
+  /** Optional frontend-only metadata indicating the source Traffic session ID */
+  sourceSessionId?: number;
 }
 
 export interface CaCertificateInfo {
