@@ -2,22 +2,17 @@ import React, { useEffect, useId, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowDownToLine,
-  Binary,
   Check,
   ChevronDown,
   Columns,
   Columns3,
   Copy,
-  Database,
   Gauge,
-  GitCompareArrows,
   Globe,
   ListFilter,
-  MoreHorizontal,
+  Network,
   OctagonPause,
-  PanelBottom,
   PanelLeft,
-  PanelRight,
   Pause,
   Play,
   Plus,
@@ -26,18 +21,13 @@ import {
   RotateCcw,
   Search,
   Shield,
-  Smartphone,
   Target,
   Terminal,
   Trash2,
-  Wand2,
   WifiOff,
   X,
 } from "lucide-react";
-import {
-  TOOLBAR_GROUP_DEFINITIONS,
-  TRAFFIC_COLUMNS,
-} from "../hooks/useUiPreferences";
+import { TRAFFIC_COLUMNS } from "../hooks/useUiPreferences";
 import {
   SESSION_RETENTION_PRESETS,
   THROTTLE_PRESET_DEFINITIONS,
@@ -45,7 +35,6 @@ import {
 import type {
   BreakpointConfig,
   ColumnId,
-  InspectorDockPosition,
   ProxyStatus,
   QuickFilterCategory,
   ThrottleConfig,
@@ -53,6 +42,8 @@ import type {
   TlsInterceptMode,
   ToolbarGroupId,
 } from "../types/proxy";
+import type { SettingsNetworkSubTab } from "../types/settings";
+import { HelpTooltip } from "./ui/HelpTooltip";
 
 function formatRetentionOptionLabel(limit: number | null): string {
   if (limit === null) return "All Sessions";
@@ -81,28 +72,16 @@ interface TopToolbarProps {
   onToggleBreakBeforeRequest: () => void;
   onToggleBreakAfterResponse: () => void;
   onOpenBreakpointsModal: () => void;
-  onOpenTextWizard: () => void;
-  onOpenHexConverter: () => void;
-  onInspectInHex: () => void;
-  hasSelection: boolean;
   markedCount: number;
-  onOpenSessionDiff: () => void;
   followTail: boolean;
   onToggleFollowTail: () => void;
   // Layout & View Customization
   compactToolbar?: boolean;
-  onToggleCompactToolbar?: () => void;
   sidebarCollapsed: boolean;
   onToggleSidebar: () => void;
-  inspectorCollapsed: boolean;
-  onToggleInspector: () => void;
-  inspectorPosition: InspectorDockPosition;
-  onSetInspectorPosition: (pos: InspectorDockPosition) => void;
   dockedComposer: boolean;
   onToggleDockedComposer: () => void;
   toolbarGroups: Record<ToolbarGroupId, boolean>;
-  onToggleToolbarGroup: (groupId: ToolbarGroupId) => void;
-  onResetToolbarGroups: () => void;
   visibleColumns: Record<ColumnId, boolean>;
   onToggleColumnVisibility: (colId: ColumnId) => void;
   onResetColumns: () => void;
@@ -127,14 +106,13 @@ interface TopToolbarProps {
   onToggleHideConnectTunnels: () => void;
   onOpenTlsModeDrawer: () => void;
   onClearSessions: () => void;
-  onSaveSqlite: () => void;
-  onLoadSqlite: () => void;
-  onOpenCertificates: () => void;
-  onOpenMobileSetup: () => void;
   throttleConfig: ThrottleConfig;
   onChangeThrottleConfig: (cfg: ThrottleConfig) => void;
-  onOpenHostRemap: () => void;
   activeHostRemapCount: number;
+  upstreamProxyEnabled?: boolean;
+  activeClientCertsCount?: number;
+  onOpenNetworkRouting: (subTab?: SettingsNetworkSubTab) => void;
+  onOpenAppearanceSettings: () => void;
   onNotify?: (msg: string) => void;
 }
 
@@ -231,27 +209,15 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   onToggleBreakBeforeRequest,
   onToggleBreakAfterResponse,
   onOpenBreakpointsModal,
-  onOpenTextWizard,
-  onOpenHexConverter,
-  onInspectInHex,
-  hasSelection,
   markedCount,
-  onOpenSessionDiff,
   followTail,
   onToggleFollowTail,
   compactToolbar = false,
-  onToggleCompactToolbar,
   sidebarCollapsed,
   onToggleSidebar,
-  inspectorCollapsed,
-  onToggleInspector,
-  inspectorPosition,
-  onSetInspectorPosition,
   dockedComposer,
   onToggleDockedComposer,
   toolbarGroups,
-  onToggleToolbarGroup,
-  onResetToolbarGroups,
   visibleColumns,
   onToggleColumnVisibility,
   onResetColumns,
@@ -274,14 +240,13 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   onToggleHideConnectTunnels,
   onOpenTlsModeDrawer,
   onClearSessions,
-  onSaveSqlite,
-  onLoadSqlite,
-  onOpenCertificates,
-  onOpenMobileSetup,
   throttleConfig,
   onChangeThrottleConfig,
-  onOpenHostRemap,
   activeHostRemapCount,
+  upstreamProxyEnabled = false,
+  activeClientCertsCount = 0,
+  onOpenNetworkRouting,
+  onOpenAppearanceSettings,
   onNotify,
 }) => {
   const sysProxyPopoverId = useId();
@@ -291,8 +256,6 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   const throttleUpInputId = useId();
   const throttleLatencyInputId = useId();
   const columnsPopoverId = useId();
-  const overflowTriggerId = useId();
-  const overflowMenuId = useId();
   const keepTriggerId = useId();
   const keepMenuId = useId();
   const customLimitInputId = useId();
@@ -308,8 +271,6 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   const throttlePopoverRef = useRef<HTMLDivElement>(null);
   const columnsBtnRef = useRef<HTMLButtonElement>(null);
   const columnsPopoverRef = useRef<HTMLDivElement>(null);
-  const overflowBtnRef = useRef<HTMLButtonElement>(null);
-  const overflowMenuRef = useRef<HTMLDivElement>(null);
   const keepBtnRef = useRef<HTMLButtonElement>(null);
   const keepMenuRef = useRef<HTMLDivElement>(null);
   const customLimitFormRef = useRef<HTMLFormElement>(null);
@@ -317,7 +278,6 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
 
   const [copiedEnv, setCopiedEnv] = useState(false);
   const [quickTargetDraft, setQuickTargetDraft] = useState("");
-  const [overflowExpanded, setOverflowExpanded] = useState(false);
   const [keepExpanded, setKeepExpanded] = useState(false);
   const [throttleExpanded, setThrottleExpanded] = useState(false);
   const [customDownDraft, setCustomDownDraft] = useState(() =>
@@ -365,81 +325,10 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   const cliProxyUrl = `http://127.0.0.1:${status.port}`;
   const cliEnvSnippet = `HTTP_PROXY=${cliProxyUrl} HTTPS_PROXY=${cliProxyUrl}`;
   const isTargetedOnly = tlsInterceptMode === "targetedOnly";
-
-  // Progressive enhancement fallback for overflow focusgroup="menu nomemory"
-  useEffect(() => {
-    const menu = overflowMenuRef.current;
-    const trigger = overflowBtnRef.current;
-    if (!menu || !trigger) return;
-
-    const cleanups: (() => void)[] = [];
-
-    const onToggle = () => {
-      const open =
-        ("popover" in HTMLElement.prototype && menu.matches(":popover-open")) ||
-        menu.classList.contains(":popover-open");
-      setOverflowExpanded(open);
-      if (open) {
-        positionToolbarPopoverFallback(trigger, menu, true);
-      }
-    };
-    menu.addEventListener("toggle", onToggle);
-    cleanups.push(() => menu.removeEventListener("toggle", onToggle));
-
-    const group = menu.querySelector<HTMLElement>('[focusgroup~="menu"]');
-    if (
-      group &&
-      typeof HTMLElement !== "undefined" &&
-      !("focusGroup" in HTMLElement.prototype)
-    ) {
-      group.setAttribute("role", "menu");
-      group
-        .querySelectorAll<HTMLButtonElement>("button:not([role])")
-        .forEach((btn) => btn.setAttribute("role", "menuitem"));
-
-      const onKeyDown = (event: KeyboardEvent) => {
-        if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
-          return;
-        }
-        const items = Array.from(
-          group.querySelectorAll<HTMLButtonElement>("button")
-        ).filter((b) => !b.disabled);
-        if (items.length === 0) return;
-        const current = items.indexOf(
-          document.activeElement as HTMLButtonElement
-        );
-        const next =
-          event.key === "Home"
-            ? 0
-            : event.key === "End"
-              ? items.length - 1
-              : current < 0
-                ? 0
-                : (current +
-                    (event.key === "ArrowUp" ? -1 : 1) +
-                    items.length) %
-                  items.length;
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        items[next]?.focus({ preventScroll: true });
-      };
-      group.addEventListener("keydown", onKeyDown, true);
-      cleanups.push(() => group.removeEventListener("keydown", onKeyDown, true));
-    }
-
-    return () => cleanups.forEach((fn) => fn());
-  }, []);
-
-  const closeOverflow = () => {
-    const menu = overflowMenuRef.current;
-    if (!menu) return;
-    if ("popover" in HTMLElement.prototype) {
-      if (menu.matches(":popover-open")) menu.hidePopover();
-    } else {
-      menu.classList.remove(":popover-open");
-    }
-    setOverflowExpanded(false);
-  };
+  const activeRoutingCount =
+    activeHostRemapCount +
+    (upstreamProxyEnabled ? 1 : 0) +
+    activeClientCertsCount;
 
   const closeThrottlePopover = () => {
     const panel = throttlePopoverRef.current;
@@ -842,12 +731,23 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                 {...({ popover: "auto" } as Record<string, string>)}
                 onPointerMove={(e) => {
                   const btn = (e.target as HTMLElement).closest("button");
-                  if (btn && !btn.disabled) {
+                  if (
+                    btn &&
+                    !btn.disabled &&
+                    Boolean(btn.closest('[focusgroup~="menu"]'))
+                  ) {
                     btn.focus({ preventScroll: true });
                   }
                 }}
-                className="desktop-menu z-50 hidden min-w-48 rounded-lg border border-strong bg-surface text-fg shadow-popover"
+                className="desktop-menu z-50 hidden min-w-52 rounded-lg border border-strong bg-surface text-fg shadow-popover"
               >
+                <div className="flex items-center justify-between border-b border-hairline px-2.5 py-1.5 text-[11px] font-semibold text-fg">
+                  <span>Ring Buffer (Keep)</span>
+                  <HelpTooltip
+                    label="Ring Buffer (Keep)"
+                    content="Ограничивает число сессий в памяти. При превышении самые старые удаляются по кольцевому буферу, а настройка Drop Non-Matching сбрасывает отфильтрованный шум на этапе захвата."
+                  />
+                </div>
                 <div
                   {...({ focusgroup: "menu nomemory" } as Record<string, string>)}
                   aria-labelledby={keepTriggerId}
@@ -897,18 +797,6 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                         {formatRetentionOptionLabel(sessionRetentionLimit)}
                       </span>
                     )}
-                  </button>
-                  <hr />
-                  <button
-                    type="button"
-                    role="menuitemcheckbox"
-                    aria-checked={dropNonMatching}
-                    onClick={() => {
-                      closeKeepMenu();
-                      onToggleDropNonMatching();
-                    }}
-                  >
-                    <span>Drop Non-Matching on Capture</span>
                   </button>
                 </div>
               </div>
@@ -991,58 +879,71 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                 ref={sysPopoverRef}
                 id={sysProxyPopoverId}
                 {...({ popover: "auto" } as Record<string, string>)}
-                className="toolbar-popover z-50 hidden w-76 rounded-lg border border-strong bg-surface p-3 text-xs text-fg shadow-popover"
+                className="toolbar-popover z-50 hidden w-80 rounded-lg border border-strong bg-surface p-3 text-xs text-fg shadow-popover"
               >
                 <div className="flex items-center justify-between border-b border-hairline pb-2 font-semibold">
-                  <span>OS System Proxy</span>
+                  <div className="flex items-center gap-1.5">
+                    <span>OS System Proxy</span>
+                    <HelpTooltip
+                      label="Подробнее об OS System Proxy"
+                      content="Прописывает 127.0.0.1 и порт прокси в системных настройках ОС, чтобы браузеры и настольные приложения направляли трафик через FluxProxy без ручной настройки."
+                    />
+                  </div>
                   <span className="font-mono text-[10px] text-muted">
                     {status.systemProxyEnabled
                       ? `127.0.0.1:${status.port}`
                       : "Port Only"}
                   </span>
                 </div>
-                <label className="mt-2.5 flex cursor-pointer items-start gap-2 rounded-md border border-hairline bg-canvas p-2 hover:border-strong">
-                  <input
-                    type="checkbox"
-                    checked={status.autoSystemProxy}
-                    onChange={onToggleAutoSystemProxy}
-                    className="checkbox-native mt-0.5"
+                <div className="mt-2.5 flex items-start justify-between gap-2 rounded-md border border-hairline bg-canvas p-2 hover:border-strong">
+                  <label className="flex flex-1 cursor-pointer items-start gap-2">
+                    <input
+                      type="checkbox"
+                      checked={status.autoSystemProxy}
+                      onChange={onToggleAutoSystemProxy}
+                      className="checkbox-native mt-0.5"
+                    />
+                    <span className="text-[11px] leading-snug text-muted">
+                      <strong className="block text-fg">
+                        Act as System Proxy on startup
+                      </strong>
+                      Автоматически привязывать при старте и откатывать при паузе.
+                    </span>
+                  </label>
+                  <HelpTooltip
+                    label="Act as System Proxy on startup"
+                    content="Автоматически включает системный прокси при запуске захвата и аккуратно возвращает исходные настройки ОС при паузе или выходе."
                   />
-                  <span className="text-[11px] leading-snug text-muted">
-                    <strong className="block text-fg">
-                      Act as System Proxy on startup
-                    </strong>
-                    Автоматически привязывать при старте и откатывать при паузе.
-                  </span>
-                </label>
-                <label className="mt-2 flex cursor-pointer items-start gap-2 rounded-md border border-hairline bg-canvas p-2 hover:border-strong">
-                  <input
-                    type="checkbox"
-                    checked={isRemoteAllowed}
-                    onChange={onToggleAllowRemote}
-                    className="checkbox-native mt-0.5"
+                </div>
+                <div className="mt-2 flex items-start justify-between gap-2 rounded-md border border-hairline bg-canvas p-2 hover:border-strong">
+                  <label className="flex flex-1 cursor-pointer items-start gap-2">
+                    <input
+                      type="checkbox"
+                      checked={isRemoteAllowed}
+                      onChange={onToggleAllowRemote}
+                      className="checkbox-native mt-0.5"
+                    />
+                    <span className="text-[11px] leading-snug text-muted">
+                      <strong className="block text-fg">
+                        Разрешить подключения с удаленных устройств (0.0.0.0)
+                      </strong>
+                      Принимать трафик смартфонов iOS / Android в локальной сети Wi-Fi/LAN.
+                    </span>
+                  </label>
+                  <HelpTooltip
+                    label="Разрешить подключения с удалённых устройств"
+                    content="Переключает прослушивание с loopback 127.0.0.1 на все интерфейсы 0.0.0.0, чтобы принимать запросы от смартфонов в Wi-Fi/LAN и виртуальных машин."
                   />
-                  <span className="text-[11px] leading-snug text-muted">
-                    <strong className="block text-fg">
-                      Разрешить подключения с удаленных устройств (0.0.0.0)
-                    </strong>
-                    Принимать трафик смартфонов iOS / Android в локальной сети Wi-Fi/LAN.
-                  </span>
-                </label>
-                <button
-                  type="button"
-                  onClick={() => {
-                    sysPopoverRef.current?.hidePopover?.();
-                    onOpenMobileSetup();
-                  }}
-                  className="mt-2 flex h-7 w-full items-center justify-center gap-1.5 rounded-md border border-hairline bg-elevated px-2 text-[11px] font-medium text-fg hover:border-strong hover:bg-hover"
-                >
-                  <Smartphone className="h-3.5 w-3.5 text-accent" aria-hidden="true" />
-                  <span>Connect Mobile Device (QR / iOS &amp; Android)…</span>
-                </button>
+                </div>
                 <div className="mt-2 rounded-md border border-hairline bg-canvas p-2">
                   <div className="mb-1 flex items-center justify-between text-[10px] text-subtle">
-                    <span>CLI Env:</span>
+                    <div className="flex items-center gap-1">
+                      <span>CLI Env:</span>
+                      <HelpTooltip
+                        label="CLI Env"
+                        content="Переменные окружения для curl, Python, Node.js и утилит терминала — удобно для перехвата только одной консольной сессии без SysProxy."
+                      />
+                    </div>
                     <button
                       type="button"
                       onClick={() => void handleCopyCliEnv()}
@@ -1112,8 +1013,12 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                 {...({ popover: "auto" } as Record<string, string>)}
                 className="toolbar-popover z-50 hidden w-80 rounded-lg border border-strong bg-surface p-3 text-xs text-fg shadow-popover"
               >
-                <div className="border-b border-hairline pb-2 font-semibold">
-                  Selective TLS MITM
+                <div className="flex items-center justify-between border-b border-hairline pb-2 font-semibold">
+                  <span>Selective TLS MITM</span>
+                  <HelpTooltip
+                    label="Selective TLS MITM"
+                    content="Управляет глубиной HTTPS-перехвата: Intercept All расшифровывает всё (кроме Bypass-исключений), а Targeted Only расшифровывает только хосты из Target Allowlist."
+                  />
                 </div>
                 <div className="mt-2 space-y-1.5">
                   <button
@@ -1173,15 +1078,21 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                       <span>Add</span>
                     </button>
                   </form>
-                  <label className="flex cursor-pointer items-center gap-2 pt-1 text-[11px] text-muted">
-                    <input
-                      type="checkbox"
-                      checked={hideConnectTunnels}
-                      onChange={onToggleHideConnectTunnels}
-                      className="checkbox-native"
+                  <div className="flex items-center justify-between gap-2 pt-1">
+                    <label className="flex flex-1 cursor-pointer items-center gap-2 text-[11px] text-muted">
+                      <input
+                        type="checkbox"
+                        checked={hideConnectTunnels}
+                        onChange={onToggleHideConnectTunnels}
+                        className="checkbox-native"
+                      />
+                      <span>Скрывать туннели CONNECT / PASSTHROUGH</span>
+                    </label>
+                    <HelpTooltip
+                      label="Скрывать CONNECT-туннели"
+                      content="Скрывает непрозрачные TCP-туннели (Bypass / Passthrough) из таблицы сессий, чтобы в списке оставались только расшифрованные HTTP/HTTPS-запросы."
                     />
-                    <span>Скрывать туннели CONNECT / PASSTHROUGH</span>
-                  </label>
+                  </div>
                   <button
                     type="button"
                     onClick={() => {
@@ -1198,190 +1109,233 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
           </div>
         )}
 
-        {/* Network Bandwidth Throttling Selector */}
-        {(!compactToolbar || throttleConfig.preset !== "none") && (
-          <div className="flex items-center border-l border-hairline pl-1.5">
-            <button
-              ref={throttleBtnRef}
-              type="button"
-              aria-label={`Network Throttling: ${activeThrottleDef.label}`}
-              aria-expanded={throttleExpanded}
-              aria-controls={throttlePopoverId}
-              title={
-                throttleConfig.preset === "offline"
-                  ? "Bandwidth Throttling: Offline (все запросы отклоняются с HTTP 503)"
-                  : throttleConfig.preset === "none"
-                    ? "Bandwidth Throttling: No Throttling (полная скорость)"
-                    : `Bandwidth Throttling: ${activeThrottleDef.label} (↓${throttleConfig.downloadKbps} Kbps / ↑${throttleConfig.uploadKbps} Kbps / ${throttleConfig.latencyMs} ms)`
-              }
-              onClick={(e) =>
-                toggleInvokerFallback(
-                  e,
-                  throttleBtnRef.current,
-                  throttlePopoverRef.current
-                )
-              }
-              {...({
-                commandfor: throttlePopoverId,
-                command: "toggle-popover",
-              } as Record<string, string>)}
-              className={`inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs transition-colors ${
-                throttleConfig.preset === "offline"
-                  ? "border-status5xx-fg/50 bg-status5xx-bg text-status5xx-fg hover:brightness-110"
-                  : throttleConfig.preset !== "none"
-                    ? "border-status4xx-fg/45 bg-status4xx-bg text-status4xx-fg hover:brightness-110"
-                    : "border-hairline bg-elevated text-muted hover:border-strong hover:text-fg"
-              }`}
-            >
-              {throttleConfig.preset === "offline" ? (
-                <WifiOff className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-              ) : (
-                <Gauge className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-              )}
-              {(!compactToolbar || throttleConfig.preset !== "none") && (
-                <span className="whitespace-nowrap font-mono text-[11px] font-medium">
-                  {throttleConfig.preset === "custom"
-                    ? `Custom (${throttleConfig.latencyMs}ms)`
-                    : activeThrottleDef.shortLabel}
-                </span>
-              )}
-              <ChevronDown className="h-3 w-3 opacity-75" aria-hidden="true" />
-            </button>
+        {/* Network Bandwidth Throttling Selector & Routing Indicator (always visible & labeled) */}
+        <div className="flex items-center gap-1 border-l border-hairline pl-1.5">
+          <button
+            ref={throttleBtnRef}
+            type="button"
+            aria-label={`Network Throttling: ${activeThrottleDef.label}`}
+            aria-expanded={throttleExpanded}
+            aria-controls={throttlePopoverId}
+            title={
+              throttleConfig.preset === "offline"
+                ? "Bandwidth Throttling: Offline (все запросы отклоняются с HTTP 503)"
+                : throttleConfig.preset === "none"
+                  ? "Bandwidth Throttling: No Throttling (полная скорость)"
+                  : `Bandwidth Throttling: ${activeThrottleDef.label} (↓${throttleConfig.downloadKbps} Kbps / ↑${throttleConfig.uploadKbps} Kbps / ${throttleConfig.latencyMs} ms)`
+            }
+            onClick={(e) =>
+              toggleInvokerFallback(
+                e,
+                throttleBtnRef.current,
+                throttlePopoverRef.current
+              )
+            }
+            {...({
+              commandfor: throttlePopoverId,
+              command: "toggle-popover",
+            } as Record<string, string>)}
+            className={`inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs transition-colors ${
+              throttleConfig.preset === "offline"
+                ? "border-status5xx-fg/50 bg-status5xx-bg text-status5xx-fg hover:brightness-110"
+                : throttleConfig.preset !== "none"
+                  ? "border-status4xx-fg/45 bg-status4xx-bg text-status4xx-fg hover:brightness-110"
+                  : "border-hairline bg-elevated text-muted hover:border-strong hover:text-fg"
+            }`}
+          >
+            {throttleConfig.preset === "offline" ? (
+              <WifiOff className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            ) : (
+              <Gauge className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            )}
+            <span className="whitespace-nowrap font-mono text-[11px] font-medium">
+              {throttleConfig.preset === "none"
+                ? "Throttle: Off"
+                : throttleConfig.preset === "custom"
+                  ? `Throttle: Custom (${throttleConfig.latencyMs}ms)`
+                  : `Throttle: ${activeThrottleDef.shortLabel}`}
+            </span>
+            <ChevronDown className="h-3 w-3 opacity-75" aria-hidden="true" />
+          </button>
 
-            <div
-              ref={throttlePopoverRef}
-              id={throttlePopoverId}
-              {...({ popover: "auto" } as Record<string, string>)}
-              className="toolbar-popover z-50 hidden w-80 rounded-lg border border-strong bg-surface p-3 text-xs text-fg shadow-popover"
-            >
-              <div className="flex items-center justify-between border-b border-hairline pb-2">
+          <button
+            type="button"
+            onClick={() => onOpenNetworkRouting()}
+            aria-label={`Network & Routing (${activeRoutingCount} active)`}
+            title={`Network & Routing: HOSTS (${activeHostRemapCount}), Upstream (${upstreamProxyEnabled ? "On" : "Off"}), mTLS (${activeClientCertsCount}) — открыть в Settings`}
+            className={`inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs transition-colors ${
+              activeRoutingCount > 0
+                ? "border-accent/45 bg-selected text-accent hover:brightness-110"
+                : "border-hairline bg-elevated text-muted hover:border-strong hover:text-fg"
+            }`}
+          >
+            <Network className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            <span className="whitespace-nowrap text-[11px] font-medium">
+              Routing
+            </span>
+            {activeRoutingCount > 0 && (
+              <span className="rounded-full bg-accent/15 px-1.5 font-mono text-[10px] font-semibold tabular-nums text-accent">
+                {activeRoutingCount}
+              </span>
+            )}
+          </button>
+
+          <div
+            ref={throttlePopoverRef}
+            id={throttlePopoverId}
+            {...({ popover: "auto" } as Record<string, string>)}
+            className="toolbar-popover z-50 hidden w-80 rounded-lg border border-strong bg-surface p-3 text-xs text-fg shadow-popover"
+          >
+            <div className="flex items-center justify-between border-b border-hairline pb-2">
+              <div className="flex items-center gap-1.5">
                 <span className="font-semibold">
                   Bandwidth Throttling &amp; Latency
                 </span>
-                {throttleConfig.preset !== "none" && (
-                  <button
-                    type="button"
-                    onClick={() => handleSelectThrottlePreset("none")}
-                    className="text-[11px] text-accent hover:underline"
-                  >
-                    Reset to Full
-                  </button>
-                )}
+                <HelpTooltip
+                  label="Bandwidth Throttling & Latency"
+                  content="Искусственно ограничивает пропускную способность и добавляет сетевую задержку (RTT) или режим Offline для тестирования поведения клиента в плохих сетях."
+                />
               </div>
+              {throttleConfig.preset !== "none" && (
+                <button
+                  type="button"
+                  onClick={() => handleSelectThrottlePreset("none")}
+                  className="text-[11px] text-accent hover:underline"
+                >
+                  Reset to Full
+                </button>
+              )}
+            </div>
 
-              <div className="mt-2 space-y-1">
-                {THROTTLE_PRESET_DEFINITIONS.filter((d) => d.id !== "custom").map(
-                  (presetDef) => {
-                    const isSelected = throttleConfig.preset === presetDef.id;
-                    return (
-                      <button
-                        key={presetDef.id}
-                        type="button"
-                        onClick={() => handleSelectThrottlePreset(presetDef.id)}
-                        className={`flex w-full items-center justify-between rounded-md border px-2.5 py-1.5 text-left transition-colors ${
-                          isSelected
-                            ? presetDef.id === "offline"
-                              ? "border-status5xx-fg/50 bg-status5xx-bg text-status5xx-fg"
-                              : "border-accent/50 bg-selected text-fg"
-                            : "border-hairline bg-canvas text-muted hover:border-strong hover:text-fg"
-                        }`}
-                      >
-                        <div className="flex items-center gap-2">
-                          {isSelected ? (
-                            <Check className="h-3.5 w-3.5 shrink-0 text-accent" />
-                          ) : (
-                            <span className="inline-block h-3.5 w-3.5 shrink-0" />
-                          )}
-                          <span className="font-medium text-fg">
-                            {presetDef.label}
-                          </span>
-                        </div>
-                        <span className="font-mono text-[10px] text-subtle">
-                          {presetDef.summary}
+            <div className="mt-2 space-y-1">
+              {THROTTLE_PRESET_DEFINITIONS.filter((d) => d.id !== "custom").map(
+                (presetDef) => {
+                  const isSelected = throttleConfig.preset === presetDef.id;
+                  return (
+                    <button
+                      key={presetDef.id}
+                      type="button"
+                      onClick={() => handleSelectThrottlePreset(presetDef.id)}
+                      className={`flex w-full items-center justify-between rounded-md border px-2.5 py-1.5 text-left transition-colors ${
+                        isSelected
+                          ? presetDef.id === "offline"
+                            ? "border-status5xx-fg/50 bg-status5xx-bg text-status5xx-fg"
+                            : "border-accent/50 bg-selected text-fg"
+                          : "border-hairline bg-canvas text-muted hover:border-strong hover:text-fg"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        {isSelected ? (
+                          <Check className="h-3.5 w-3.5 shrink-0 text-accent" />
+                        ) : (
+                          <span className="inline-block h-3.5 w-3.5 shrink-0" />
+                        )}
+                        <span className="font-medium text-fg">
+                          {presetDef.label}
                         </span>
-                      </button>
-                    );
-                  }
-                )}
-              </div>
+                      </div>
+                      <span className="font-mono text-[10px] text-subtle">
+                        {presetDef.summary}
+                      </span>
+                    </button>
+                  );
+                }
+              )}
+            </div>
 
-              <form
-                onSubmit={handleApplyCustomThrottle}
-                className="mt-3 space-y-2 border-t border-hairline pt-2.5"
-              >
-                <div className="flex items-center justify-between">
+            <form
+              onSubmit={handleApplyCustomThrottle}
+              className="mt-3 space-y-2 border-t border-hairline pt-2.5"
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5">
                   <span className="text-[11px] font-semibold text-fg">
                     Custom Profile
                   </span>
-                  {throttleConfig.preset === "custom" && (
-                    <span className="rounded bg-status4xx-bg px-1.5 py-0.5 font-mono text-[10px] font-semibold text-status4xx-fg">
-                      Active
-                    </span>
-                  )}
+                  <HelpTooltip
+                    label="Custom Throttling Profile"
+                    content="Ручная настройка ↓ скачивания и ↑ отдачи (Kbps, 0 = без ограничения) и круговой сетевой задержки RTT (ms)."
+                  />
                 </div>
-                <div className="grid grid-cols-3 gap-1.5">
-                  <div className="flex flex-col gap-0.5">
-                    <label
-                      htmlFor={throttleDownInputId}
-                      className="text-[10px] text-subtle"
-                    >
-                      ↓ Kbps
-                    </label>
-                    <input
-                      id={throttleDownInputId}
-                      type="number"
-                      min={0}
-                      inputMode="numeric"
-                      value={customDownDraft}
-                      onChange={(e) => setCustomDownDraft(e.target.value)}
-                      className="h-7 w-full rounded border border-strong bg-canvas px-2 font-mono text-[11px] text-fg focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-                    />
-                  </div>
-                  <div className="flex flex-col gap-0.5">
-                    <label
-                      htmlFor={throttleUpInputId}
-                      className="text-[10px] text-subtle"
-                    >
-                      ↑ Kbps
-                    </label>
-                    <input
-                      id={throttleUpInputId}
-                      type="number"
-                      min={0}
-                      inputMode="numeric"
-                      value={customUpDraft}
-                      onChange={(e) => setCustomUpDraft(e.target.value)}
-                      className="h-7 w-full rounded border border-strong bg-canvas px-2 font-mono text-[11px] text-fg focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-                    />
-                  </div>
-                  <div className="flex flex-col gap-0.5">
-                    <label
-                      htmlFor={throttleLatencyInputId}
-                      className="text-[10px] text-subtle"
-                    >
-                      RTT ms
-                    </label>
-                    <input
-                      id={throttleLatencyInputId}
-                      type="number"
-                      min={0}
-                      inputMode="numeric"
-                      value={customLatencyDraft}
-                      onChange={(e) => setCustomLatencyDraft(e.target.value)}
-                      className="h-7 w-full rounded border border-strong bg-canvas px-2 font-mono text-[11px] text-fg focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-                    />
-                  </div>
+                {throttleConfig.preset === "custom" && (
+                  <span className="rounded bg-status4xx-bg px-1.5 py-0.5 font-mono text-[10px] font-semibold text-status4xx-fg">
+                    Active
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-3 gap-1.5">
+                <div className="flex flex-col gap-0.5">
+                  <label
+                    htmlFor={throttleDownInputId}
+                    className="text-[10px] text-subtle"
+                  >
+                    ↓ Kbps
+                  </label>
+                  <input
+                    id={throttleDownInputId}
+                    type="number"
+                    min={0}
+                    inputMode="numeric"
+                    value={customDownDraft}
+                    onChange={(e) => setCustomDownDraft(e.target.value)}
+                    className="h-7 w-full rounded border border-strong bg-canvas px-2 font-mono text-[11px] text-fg focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                  />
                 </div>
-                <button
-                  type="submit"
-                  className="flex h-7 w-full items-center justify-center rounded border border-strong bg-elevated text-[11px] font-medium text-fg hover:bg-hover"
-                >
-                  Apply Custom Limits
-                </button>
-              </form>
-            </div>
+                <div className="flex flex-col gap-0.5">
+                  <label
+                    htmlFor={throttleUpInputId}
+                    className="text-[10px] text-subtle"
+                  >
+                    ↑ Kbps
+                  </label>
+                  <input
+                    id={throttleUpInputId}
+                    type="number"
+                    min={0}
+                    inputMode="numeric"
+                    value={customUpDraft}
+                    onChange={(e) => setCustomUpDraft(e.target.value)}
+                    className="h-7 w-full rounded border border-strong bg-canvas px-2 font-mono text-[11px] text-fg focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                  />
+                </div>
+                <div className="flex flex-col gap-0.5">
+                  <label
+                    htmlFor={throttleLatencyInputId}
+                    className="text-[10px] text-subtle"
+                  >
+                    RTT ms
+                  </label>
+                  <input
+                    id={throttleLatencyInputId}
+                    type="number"
+                    min={0}
+                    inputMode="numeric"
+                    value={customLatencyDraft}
+                    onChange={(e) => setCustomLatencyDraft(e.target.value)}
+                    className="h-7 w-full rounded border border-strong bg-canvas px-2 font-mono text-[11px] text-fg focus:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                  />
+                </div>
+              </div>
+              <button
+                type="submit"
+                className="flex h-7 w-full items-center justify-center rounded border border-strong bg-elevated text-[11px] font-medium text-fg hover:bg-hover"
+              >
+                Apply Custom Limits
+              </button>
+            </form>
+
+            <button
+              type="button"
+              onClick={() => {
+                closeThrottlePopover();
+                onOpenNetworkRouting("throttling");
+              }}
+              className="mt-2 flex h-7 w-full items-center justify-center rounded border border-hairline bg-elevated text-[11px] text-muted hover:text-fg"
+            >
+              Открыть Network &amp; Routing в Settings…
+            </button>
           </div>
-        )}
+        </div>
 
         {/* Optional Group: Breakpoints (or alert pill when paused packets exist) */}
         {(toolbarGroups.breakpoints || pausedBreakpointCount > 0) &&
@@ -1581,58 +1535,10 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
         </div>
       )}
 
-      {/* Right: Optional Quick Utilities + Mobile Setup + Layout Switches + Column Picker + Overflow ••• */}
+      {/* Right: Optional No-Cache Utility + Layout Switches + Column Picker */}
       <div className="flex shrink-0 items-center gap-1">
-        {!compactToolbar && (
-          <button
-            type="button"
-            onClick={onOpenMobileSetup}
-            title="Connect Mobile Device — iOS & Android Wi-Fi Proxy + QR Code (Ctrl+Shift+M)"
-            aria-label="Connect Mobile Device"
-            className={`inline-flex h-7 items-center gap-1 rounded-md border px-2 text-xs transition-colors ${
-              isRemoteAllowed
-                ? "border-status2xx-fg/40 bg-status2xx-bg text-status2xx-fg hover:brightness-110"
-                : "border-hairline bg-elevated text-muted hover:border-strong hover:text-fg"
-            }`}
-          >
-            <Smartphone className="h-3.5 w-3.5" aria-hidden="true" />
-            {isRemoteAllowed && (
-              <span className="hidden font-mono text-[10px] font-semibold xl:inline">
-                LAN
-              </span>
-            )}
-          </button>
-        )}
-
         {!compactToolbar && toolbarGroups.utilities && (
           <div className="flex items-center gap-1 border-r border-hairline pr-1.5">
-            <button
-              type="button"
-              onClick={onOpenSessionDiff}
-              title="Session Diff (Ctrl+D)"
-              aria-label="Session Diff"
-              className="inline-flex h-7 items-center gap-1 rounded-md border border-hairline bg-elevated px-2 text-xs text-muted hover:border-strong hover:text-fg"
-            >
-              <GitCompareArrows className="h-3.5 w-3.5" />
-            </button>
-            <button
-              type="button"
-              onClick={onOpenHexConverter}
-              title="Hex ↔ Text Converter"
-              aria-label="Hex Converter"
-              className="inline-flex h-7 items-center gap-1 rounded-md border border-hairline bg-elevated px-2 text-xs text-muted hover:border-strong hover:text-fg"
-            >
-              <Binary className="h-3.5 w-3.5" />
-            </button>
-            <button
-              type="button"
-              onClick={onOpenTextWizard}
-              title="Text Wizard & JWT Decoder (Ctrl+E)"
-              aria-label="Text Wizard"
-              className="inline-flex h-7 items-center gap-1 rounded-md border border-hairline bg-elevated px-2 text-xs text-muted hover:border-strong hover:text-fg"
-            >
-              <Wand2 className="h-3.5 w-3.5" />
-            </button>
             <button
               type="button"
               onClick={onToggleForceNoCache}
@@ -1645,23 +1551,14 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                   : "border-hairline bg-elevated text-muted hover:text-fg"
               }`}
             >
-              <RefreshCwOff className="h-3.5 w-3.5" />
-            </button>
-            <button
-              type="button"
-              onClick={onSaveSqlite}
-              title="Save Sessions to SQLite"
-              aria-label="Save to SQLite"
-              className="inline-flex h-7 items-center rounded-md border border-hairline bg-elevated px-2 text-xs text-muted hover:text-fg"
-            >
-              <Database className="h-3.5 w-3.5" />
+              <RefreshCwOff className="h-3.5 w-3.5" aria-hidden="true" />
             </button>
           </div>
         )}
 
         {toolbarGroups.layout && (
           <div className="flex items-center gap-1">
-            {/* Layout Segmented Control: Sidebar, Bottom Inspector, Right Inspector, Split Composer */}
+            {/* Layout Segmented Control: Sidebar & Split Composer */}
             {!compactToolbar && (
               <div
                 role="group"
@@ -1689,56 +1586,6 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
 
                 <button
                   type="button"
-                  onClick={() => {
-                    if (!inspectorCollapsed && inspectorPosition === "bottom") {
-                      onToggleInspector();
-                    } else {
-                      onSetInspectorPosition("bottom");
-                    }
-                  }}
-                  aria-pressed={!inspectorCollapsed && inspectorPosition === "bottom"}
-                  aria-label="Dock Session Inspector at bottom or collapse"
-                  title={
-                    !inspectorCollapsed && inspectorPosition === "bottom"
-                      ? "Свернуть нижнюю панель Session Inspector"
-                      : "Расположить Session Inspector снизу"
-                  }
-                  className={`inline-flex h-6 w-6 items-center justify-center rounded transition-colors ${
-                    !inspectorCollapsed && inspectorPosition === "bottom"
-                      ? "bg-selected text-accent"
-                      : "text-muted hover:bg-hover hover:text-fg"
-                  }`}
-                >
-                  <PanelBottom className="h-3.5 w-3.5" />
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (!inspectorCollapsed && inspectorPosition === "right") {
-                      onToggleInspector();
-                    } else {
-                      onSetInspectorPosition("right");
-                    }
-                  }}
-                  aria-pressed={!inspectorCollapsed && inspectorPosition === "right"}
-                  aria-label="Dock Session Inspector on right or collapse"
-                  title={
-                    !inspectorCollapsed && inspectorPosition === "right"
-                      ? "Свернуть правую панель Session Inspector"
-                      : "Расположить Session Inspector справа"
-                  }
-                  className={`inline-flex h-6 w-6 items-center justify-center rounded transition-colors ${
-                    !inspectorCollapsed && inspectorPosition === "right"
-                      ? "bg-selected text-accent"
-                      : "text-muted hover:bg-hover hover:text-fg"
-                  }`}
-                >
-                  <PanelRight className="h-3.5 w-3.5" />
-                </button>
-
-                <button
-                  type="button"
                   onClick={onToggleDockedComposer}
                   aria-pressed={dockedComposer}
                   aria-label="Toggle split Request Composer"
@@ -1754,7 +1601,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
               </div>
             )}
 
-            {/* Column Picker & Customize Toolbar Popover Button */}
+            {/* Column Picker Popover Button */}
             <button
               ref={columnsBtnRef}
               type="button"
@@ -1766,8 +1613,8 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                   true
                 )
               }
-              aria-label="Customize columns and toolbar"
-              title="Настроить видимость колонок таблицы и групп тулбара"
+              aria-label="Customize columns"
+              title="Настроить видимость колонок таблицы TrafficGrid"
               {...({
                 commandfor: columnsPopoverId,
                 command: "toggle-popover",
@@ -1790,7 +1637,13 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
               className="toolbar-popover z-50 hidden w-72 rounded-lg border border-strong bg-surface p-3 text-xs text-fg shadow-popover"
             >
               <div className="flex items-center justify-between border-b border-hairline pb-2">
-                <span className="font-semibold">Session Columns</span>
+                <div className="flex items-center gap-1.5">
+                  <span className="font-semibold">Session Columns</span>
+                  <HelpTooltip
+                    label="Session Columns"
+                    content="Включает или скрывает столбцы таблицы TrafficGrid. Настройка тем, групп тулбара и компоновки панелей вынесена в Settings → UI & Columns."
+                  />
+                </div>
                 <button
                   type="button"
                   onClick={onResetColumns}
@@ -1817,291 +1670,19 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                   </label>
                 ))}
               </div>
-
-              <div className="mt-3 flex items-center justify-between border-b border-hairline pb-1.5">
-                <span className="font-semibold">Customize Toolbar</span>
-                <button
-                  type="button"
-                  onClick={onResetToolbarGroups}
-                  className="text-[11px] text-muted hover:text-fg"
-                >
-                  Defaults
-                </button>
-              </div>
-              <div className="mt-2 space-y-1">
-                {onToggleCompactToolbar && (
-                  <label className="flex cursor-pointer items-center justify-between gap-2 rounded border-b border-hairline px-1.5 pb-1.5 pt-1 text-[11px] font-medium text-fg hover:bg-hover">
-                    <span className="truncate">
-                      Slim / Compact Toolbar{" "}
-                      <span className="font-mono text-[10px] text-subtle">
-                        (Ctrl+Shift+T)
-                      </span>
-                    </span>
-                    <input
-                      type="checkbox"
-                      checked={compactToolbar}
-                      onChange={onToggleCompactToolbar}
-                      className="checkbox-native"
-                    />
-                  </label>
-                )}
-                {TOOLBAR_GROUP_DEFINITIONS.map((grp) => (
-                  <label
-                    key={grp.id}
-                    className="flex cursor-pointer items-center justify-between gap-2 rounded px-1.5 py-1 text-[11px] text-muted hover:bg-hover hover:text-fg"
-                  >
-                    <span className="truncate">{grp.label}</span>
-                    <input
-                      type="checkbox"
-                      checked={toolbarGroups[grp.id]}
-                      onChange={() => onToggleToolbarGroup(grp.id)}
-                      className="checkbox-native"
-                    />
-                  </label>
-                ))}
-              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  columnsPopoverRef.current?.hidePopover?.();
+                  onOpenAppearanceSettings();
+                }}
+                className="mt-3 flex h-7 w-full items-center justify-center rounded border border-hairline bg-elevated text-[11px] text-muted hover:text-fg"
+              >
+                Настроить тулбар и темы в Settings…
+              </button>
             </div>
           </div>
         )}
-
-        {/* Secondary Utilities Overflow Menu (•••) */}
-        <button
-          ref={overflowBtnRef}
-          id={overflowTriggerId}
-          type="button"
-          aria-label="More tools and utilities"
-          aria-haspopup="menu"
-          aria-expanded={overflowExpanded}
-          title="Утилиты: Session Diff, Hex, Text Wizard, SQLite…"
-          onClick={(e) =>
-            toggleInvokerFallback(
-              e,
-              overflowBtnRef.current,
-              overflowMenuRef.current,
-              true
-            )
-          }
-          {...({
-            commandfor: overflowMenuId,
-            command: "toggle-popover",
-          } as Record<string, string>)}
-          className={`inline-flex h-7 w-7 items-center justify-center rounded-md border transition-colors ${
-            overflowExpanded
-              ? "border-strong bg-hover text-fg"
-              : "border-hairline bg-elevated text-muted hover:border-strong hover:text-fg"
-          }`}
-        >
-          <MoreHorizontal className="h-4 w-4" />
-        </button>
-
-        <div
-          ref={overflowMenuRef}
-          id={overflowMenuId}
-          {...({ popover: "auto" } as Record<string, string>)}
-          onPointerMove={(e) => {
-            const btn = (e.target as HTMLElement).closest("button");
-            if (btn && !btn.disabled) {
-              btn.focus({ preventScroll: true });
-            }
-          }}
-          className="desktop-menu z-50 hidden min-w-60 rounded-lg border border-strong bg-surface text-fg shadow-popover"
-        >
-          <div
-            {...({ focusgroup: "menu nomemory" } as Record<string, string>)}
-            aria-labelledby={overflowTriggerId}
-          >
-            <button
-              type="button"
-              onClick={() => {
-                closeOverflow();
-                onOpenSessionDiff();
-              }}
-            >
-              <span>Session Diff…</span>
-              <span className="hint" aria-hidden="true">
-                Ctrl+D
-              </span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                closeOverflow();
-                onOpenTextWizard();
-              }}
-            >
-              <span>Text Wizard &amp; JWT…</span>
-              <span className="hint" aria-hidden="true">
-                Ctrl+E
-              </span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                closeOverflow();
-                onOpenHexConverter();
-              }}
-            >
-              <span>Hex ↔ Text Converter…</span>
-            </button>
-            <button
-              type="button"
-              disabled={!hasSelection}
-              onClick={() => {
-                closeOverflow();
-                onInspectInHex();
-              }}
-            >
-              <span>Inspect Session in Hex View</span>
-            </button>
-            <hr />
-            <button
-              type="button"
-              role="menuitemcheckbox"
-              aria-checked={isForceNoCacheActive}
-              onClick={() => {
-                onToggleForceNoCache();
-                closeOverflow();
-              }}
-            >
-              <span>Disable Caching (No-Cache)</span>
-            </button>
-            <button
-              type="button"
-              role="menuitemcheckbox"
-              aria-checked={dropNonMatching}
-              onClick={() => {
-                onToggleDropNonMatching();
-                closeOverflow();
-              }}
-            >
-              <span>Drop Non-Matching on Capture</span>
-            </button>
-            <hr />
-            <button
-              type="button"
-              role="menuitemcheckbox"
-              aria-checked={breakpointConfig.breakBeforeRequest}
-              onClick={() => {
-                onToggleBreakBeforeRequest();
-                closeOverflow();
-              }}
-            >
-              <span>Break Before Request</span>
-              <span className="hint" aria-hidden="true">
-                F11
-              </span>
-            </button>
-            <button
-              type="button"
-              role="menuitemcheckbox"
-              aria-checked={breakpointConfig.breakAfterResponse}
-              onClick={() => {
-                onToggleBreakAfterResponse();
-                closeOverflow();
-              }}
-            >
-              <span>Break After Response</span>
-              <span className="hint" aria-hidden="true">
-                Alt+F11
-              </span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                closeOverflow();
-                onOpenBreakpointsModal();
-              }}
-            >
-              <span>Breakpoint Rules (bpu / bpafter)…</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                closeOverflow();
-                onOpenHostRemap();
-              }}
-            >
-              <span>
-                HOSTS Remapping…
-                {activeHostRemapCount > 0 ? ` (${activeHostRemapCount})` : ""}
-              </span>
-              <span className="hint" aria-hidden="true">
-                Ctrl+Shift+H
-              </span>
-            </button>
-            <hr />
-            <button
-              type="button"
-              onClick={() => {
-                closeOverflow();
-                onSaveSqlite();
-              }}
-            >
-              <span>Save Sessions to SQLite</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                closeOverflow();
-                onLoadSqlite();
-              }}
-            >
-              <span>Restore Sessions from SQLite</span>
-            </button>
-            <hr />
-            {onToggleCompactToolbar && (
-              <>
-                <button
-                  type="button"
-                  role="menuitemcheckbox"
-                  aria-checked={compactToolbar}
-                  onClick={() => {
-                    onToggleCompactToolbar();
-                    closeOverflow();
-                  }}
-                >
-                  <span>Slim / Compact Toolbar</span>
-                  <span className="hint" aria-hidden="true">
-                    Ctrl+Shift+T
-                  </span>
-                </button>
-                <hr />
-              </>
-            )}
-            <button
-              type="button"
-              role="menuitemcheckbox"
-              aria-checked={isRemoteAllowed}
-              onClick={() => {
-                onToggleAllowRemote();
-                closeOverflow();
-              }}
-            >
-              <span>Разрешить подключения с удаленных устройств (0.0.0.0)</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                closeOverflow();
-                onOpenMobileSetup();
-              }}
-            >
-              <span>Connect Mobile Device (iOS / Android)…</span>
-              <span className="hint" aria-hidden="true">
-                Ctrl+Shift+M
-              </span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                closeOverflow();
-                onOpenCertificates();
-              }}
-            >
-              <span>HTTPS Root CA Certificate…</span>
-            </button>
-          </div>
-        </div>
       </div>
     </header>
   );

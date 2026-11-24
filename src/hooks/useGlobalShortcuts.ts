@@ -5,27 +5,25 @@ import {
   type SetStateAction,
 } from "react";
 import type { ActiveNavSection, SessionSummary } from "../types/proxy";
+import type { SettingsModalSubTab, SettingsModalTab } from "../types/settings";
 
 export interface UseGlobalShortcutsOptions {
   activeSection: ActiveNavSection;
   setActiveSection: (
     updater: ActiveNavSection | ((prev: ActiveNavSection) => ActiveNavSection)
   ) => void;
-  clientCertsModalOpen: boolean;
-  setClientCertsModalOpen: Dispatch<SetStateAction<boolean>>;
   diffModalOpen: boolean;
   setDiffModalOpen: Dispatch<SetStateAction<boolean>>;
-  hostRemapModalOpen: boolean;
-  setHostRemapModalOpen: Dispatch<SetStateAction<boolean>>;
   sanitizedExportModalOpen: boolean;
   setSanitizedExportModalOpen: Dispatch<SetStateAction<boolean>>;
-  upstreamProxyModalOpen: boolean;
-  setUpstreamProxyModalOpen: Dispatch<SetStateAction<boolean>>;
-  setFilterDrawerOpen: Dispatch<SetStateAction<boolean>>;
-  setMobileModalOpen: Dispatch<SetStateAction<boolean>>;
+  settingsModalOpen: boolean;
+  onToggleSettingsMain: () => void;
+  onToggleSettingsAt: (
+    tab: SettingsModalTab,
+    subTab?: SettingsModalSubTab
+  ) => void;
+  onToggleBreakpointsModal: () => void;
   setPaletteOpen: Dispatch<SetStateAction<boolean>>;
-  setProxyDoctorModalOpen: Dispatch<SetStateAction<boolean>>;
-  setSettingsModalOpen: Dispatch<SetStateAction<boolean>>;
   setShortcutsModalOpen: Dispatch<SetStateAction<boolean>>;
   setTextWizardOpen: Dispatch<SetStateAction<boolean>>;
   effectiveSelectedIds: number[];
@@ -59,21 +57,15 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
   const {
     activeSection,
     setActiveSection,
-    clientCertsModalOpen,
-    setClientCertsModalOpen,
     diffModalOpen,
     setDiffModalOpen,
-    hostRemapModalOpen,
-    setHostRemapModalOpen,
     sanitizedExportModalOpen,
     setSanitizedExportModalOpen,
-    upstreamProxyModalOpen,
-    setUpstreamProxyModalOpen,
-    setFilterDrawerOpen,
-    setMobileModalOpen,
+    settingsModalOpen,
+    onToggleSettingsMain,
+    onToggleSettingsAt,
+    onToggleBreakpointsModal,
     setPaletteOpen,
-    setProxyDoctorModalOpen,
-    setSettingsModalOpen,
     setShortcutsModalOpen,
     setTextWizardOpen,
     effectiveSelectedIds,
@@ -114,6 +106,13 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
 
     const hasOpenModal = (): boolean =>
       Boolean(document.querySelector("dialog[open]"));
+
+    const hasBlockingModal = (): boolean =>
+      Boolean(
+        document.querySelector(
+          'dialog[open]:not([data-settings-hub-dialog="true"])'
+        )
+      );
 
     const isInsidePopover = (target: EventTarget | null): boolean =>
       target instanceof HTMLElement && Boolean(target.closest("[popover]"));
@@ -156,7 +155,7 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
         return;
       }
 
-      // Ctrl+, / Cmd+, -> Preferences & Settings Profile Modal
+      // Ctrl+, / Cmd+, -> Unified Settings Hub
       if (
         ctrlOrMeta &&
         !e.altKey &&
@@ -164,7 +163,9 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
         (e.key === "," || e.code === "Comma")
       ) {
         e.preventDefault();
-        setSettingsModalOpen((prev) => !prev);
+        if (!hasBlockingModal() || settingsModalOpen) {
+          onToggleSettingsMain();
+        }
         return;
       }
 
@@ -235,7 +236,7 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
         return;
       }
 
-      // Ctrl+Shift+M / Cmd+Shift+M -> Connect Mobile Device (iOS & Android Wi-Fi Proxy + QR Code)
+      // Ctrl+Shift+M / Cmd+Shift+M -> Settings Hub -> Mobile Setup
       if (
         ctrlOrMeta &&
         !e.altKey &&
@@ -243,11 +244,13 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
         (keyLower === "m" || e.code === "KeyM")
       ) {
         e.preventDefault();
-        setMobileModalOpen((prev) => !prev);
+        if (!hasBlockingModal()) {
+          onToggleSettingsAt("tlsCertificates", "mobileSetup");
+        }
         return;
       }
 
-      // Ctrl+Shift+C / Cmd+Shift+C -> Client Certificates (mTLS)
+      // Ctrl+Shift+C / Cmd+Shift+C -> Settings Hub -> Client Certificates (mTLS)
       if (
         ctrlOrMeta &&
         !e.altKey &&
@@ -255,15 +258,13 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
         (keyLower === "c" || e.code === "KeyC")
       ) {
         e.preventDefault();
-        if (clientCertsModalOpen) {
-          setClientCertsModalOpen(false);
-        } else if (!hasOpenModal()) {
-          setClientCertsModalOpen(true);
+        if (!hasBlockingModal()) {
+          onToggleSettingsAt("tlsCertificates", "clientCerts");
         }
         return;
       }
 
-      // Ctrl+Shift+H / Cmd+Shift+H -> Virtual DNS (HOSTS Remapping…)
+      // Ctrl+Shift+H / Cmd+Shift+H -> Settings Hub -> HOSTS Remapping
       if (
         ctrlOrMeta &&
         !e.altKey &&
@@ -271,15 +272,13 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
         (keyLower === "h" || e.code === "KeyH")
       ) {
         e.preventDefault();
-        if (hostRemapModalOpen) {
-          setHostRemapModalOpen(false);
-        } else if (!hasOpenModal()) {
-          setHostRemapModalOpen(true);
+        if (!hasBlockingModal()) {
+          onToggleSettingsAt("networkRouting", "hostsRemap");
         }
         return;
       }
 
-      // Ctrl+Shift+U / Cmd+Shift+U -> Upstream Proxy Chaining…
+      // Ctrl+Shift+U / Cmd+Shift+U -> Settings Hub -> Upstream Proxy Chaining
       if (
         ctrlOrMeta &&
         !e.altKey &&
@@ -287,15 +286,13 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
         (keyLower === "u" || e.code === "KeyU")
       ) {
         e.preventDefault();
-        if (upstreamProxyModalOpen) {
-          setUpstreamProxyModalOpen(false);
-        } else if (!hasOpenModal()) {
-          setUpstreamProxyModalOpen(true);
+        if (!hasBlockingModal()) {
+          onToggleSettingsAt("networkRouting", "upstreamProxy");
         }
         return;
       }
 
-      // Ctrl+Shift+D / Cmd+Shift+D -> Run Proxy Doctor
+      // Ctrl+Shift+D / Cmd+Shift+D -> Settings Hub -> Proxy Doctor
       if (
         ctrlOrMeta &&
         !e.altKey &&
@@ -303,7 +300,9 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
         (keyLower === "d" || e.code === "KeyD")
       ) {
         e.preventDefault();
-        setProxyDoctorModalOpen((prev) => !prev);
+        if (!hasBlockingModal()) {
+          onToggleSettingsAt("diagnosticsBackup", "proxyDoctor");
+        }
         return;
       }
 
@@ -451,12 +450,21 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
         }
         if (e.key === "4") {
           e.preventDefault();
-          setFilterDrawerOpen((prev) => !prev);
+          if (!hasBlockingModal()) {
+            onToggleSettingsAt("filters", "matrix");
+          }
           return;
         }
         if (e.key === "5") {
           e.preventDefault();
           setActiveSection("scripts");
+          return;
+        }
+        if (e.key === "6") {
+          e.preventDefault();
+          if (!hasBlockingModal()) {
+            onToggleBreakpointsModal();
+          }
           return;
         }
       }
@@ -518,7 +526,6 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
   }, [
     activeSection,
     clearAllSessions,
-    clientCertsModalOpen,
     copyUrlsForIds,
     deleteSessions,
     diffModalOpen,
@@ -527,8 +534,10 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
     exportAllSessionsAs,
     filteredSessions,
     handleFocusSearch,
-    hostRemapModalOpen,
     importArchiveDialog,
+    onToggleBreakpointsModal,
+    onToggleSettingsAt,
+    onToggleSettingsMain,
     openAnnotationFor,
     openDiffWithPairSmart,
     openSanitizedExportModal,
@@ -536,17 +545,11 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
     sanitizedExportModalOpen,
     selectSessions,
     setActiveSection,
-    setClientCertsModalOpen,
     setDiffModalOpen,
-    setFilterDrawerOpen,
-    setHostRemapModalOpen,
-    setMobileModalOpen,
     setPaletteOpen,
-    setProxyDoctorModalOpen,
-    setSettingsModalOpen,
     setShortcutsModalOpen,
     setTextWizardOpen,
-    setUpstreamProxyModalOpen,
+    settingsModalOpen,
     sortedSessionsRef,
     toggleBreakAfterResponse,
     toggleBreakBeforeRequest,
@@ -554,6 +557,5 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
     toggleProxy,
     toggleSidebar,
     unmarkSessions,
-    upstreamProxyModalOpen,
   ]);
 }

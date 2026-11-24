@@ -735,3 +735,32 @@ dialog.drawer-dialog::backdrop {
   color: var(--accent-primary);
   border-radius: 0.25rem;
 }
+
+/* ============================================================================
+   Contextual Help Toggletip / Popover (HelpTooltip.tsx)
+   ============================================================================ */
+@supports (position-area: block-start) {
+  .help-tooltip-popover {
+    inset: auto;
+    margin: 0 0 0.375rem 0;
+    position-area: block-start;
+    position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+  }
+
+  .help-tooltip-popover[data-placement="bottom"] {
+    margin: 0.375rem 0 0 0;
+    position-area: block-end;
+  }
+}
+
+@supports not (position-area: block-start) {
+  .help-tooltip-popover {
+    position: fixed;
+    inset: auto;
+    margin: 0;
+  }
+}
+
+[popover].help-tooltip-popover:is(:popover-open, .\:popover-open, [data-open="true"]) {
+  display: block;
+}

@@ -289,7 +289,7 @@ export const TOOLBAR_GROUP_DEFINITIONS: ToolbarGroupDefinition[] = [
   {
     id: "layout",
     label: "Layout & Columns",
-    description: "Sidebar, Inspector position/collapse, Composer, Column Picker",
+    description: "Sidebar, Split Composer, Column Picker",
   },
   {
     id: "proxyMode",
@@ -309,7 +309,7 @@ export const TOOLBAR_GROUP_DEFINITIONS: ToolbarGroupDefinition[] = [
   {
     id: "utilities",
     label: "Quick Utilities",
-    description: "Session Diff, Hex, TextWizard, No-Cache, SQLite Save",
+    description: "Disable Caching (No-Cache)",
   },
 ];
 

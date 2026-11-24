@@ -29,7 +29,6 @@ import {
   ShieldOff,
   Smartphone,
   Target,
-  Wand2,
 } from "lucide-react";
 import {
   buildRawHttpRequest,
@@ -811,22 +810,6 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
             ? "text-status3xx-fg"
             : "text-status2xx-fg";
 
-  const handleSendSessionToWizard = () => {
-    if (!onOpenTextWizard) return;
-    const authHdr = effectiveDetail.requestHeaders.find(
-      (h) => h.name.toLowerCase() === "authorization"
-    );
-    if (authHdr && authHdr.value.toLowerCase().startsWith("bearer ")) {
-      onOpenTextWizard(authHdr.value.slice(7).trim(), "jwt");
-      return;
-    }
-    if (effectiveDetail.responseBodyText) {
-      onOpenTextWizard(effectiveDetail.responseBodyText, "base64");
-      return;
-    }
-    onOpenTextWizard(summary.url, "url");
-  };
-
   return (
     <div
       ref={resolvedContainerRef}
@@ -947,17 +930,6 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
             >
               <OctagonPause className="h-3 w-3" />
               <span>bpu</span>
-            </button>
-          )}
-          {onOpenTextWizard && (
-            <button
-              type="button"
-              onClick={handleSendSessionToWizard}
-              title="Открыть токен или тело сессии в TextWizard / JWT Decoder (Ctrl+E)"
-              className="hidden items-center gap-1 rounded border border-hairline bg-surface px-1.5 py-0.5 text-[10px] text-muted hover:border-strong hover:text-fg 2xl:inline-flex"
-            >
-              <Wand2 className="h-3 w-3" />
-              <span>Wizard</span>
             </button>
           )}
           {onAlwaysInspectHost && summary.tlsBypassed && (

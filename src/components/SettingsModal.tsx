@@ -6,49 +6,64 @@ import {
   Download,
   FileJson,
   ListFilter,
+  Network,
   RotateCcw,
+  Search,
   Settings,
-  Shield,
+  ShieldCheck,
+  Stethoscope,
   Trash2,
   Upload,
   X,
 } from "lucide-react";
 import type { ThemePreference } from "../hooks/useTheme";
+import { TRAFFIC_COLUMNS } from "../hooks/useUiPreferences";
+import { compileHostListFilter } from "../lib/filterEngine";
+import { proxyBridge } from "../lib/tauriBridge";
 import {
+  THEME_PRESETS_BY_ID,
   type CustomColorOverrides,
   type ThemePresetId,
   type ThemeTokenKey,
 } from "../lib/themePresets";
-import { compileHostListFilter } from "../lib/filterEngine";
-import { proxyBridge } from "../lib/tauriBridge";
-import type {
-  AutoResponderRule,
-  BindHostMode,
-  ColumnId,
-  FilterConditionRule,
-  FilterPreset,
-  HostListFilterConfig,
-  InspectorDockPosition,
-  InspectorSplitDirection,
-  NetworkInterfaceInfo,
-  NoiseThresholdsConfig,
-  ProxyFilterBackendConfig,
-  ProxyStatus,
-  StorageStats,
-  TlsInterceptMode,
-  ToolbarGroupId,
-  UpstreamTimeoutConfig,
+import {
+  THROTTLE_PRESET_DEFINITIONS,
+  type AutoResponderRule,
+  type BindHostMode,
+  type ColumnId,
+  type DetectedProcessItem,
+  type FilterConditionRule,
+  type FilterPreset,
+  type HostListFilterConfig,
+  type InspectorDockPosition,
+  type InspectorSplitDirection,
+  type NetworkInterfaceInfo,
+  type NoiseThresholdsConfig,
+  type ProxyFilterBackendConfig,
+  type ProxyStatus,
+  type SessionSummary,
+  type StorageStats,
+  type ThrottleConfig,
+  type ToolbarGroupId,
+  type UpstreamProxyConfig,
+  type UpstreamTimeoutConfig,
 } from "../types/proxy";
 import {
   CURRENT_SETTINGS_SCHEMA_VERSION,
+  type SettingsDiagnosticsSubTab,
+  type SettingsFiltersSubTab,
   type SettingsImportPreviewSummary,
+  type SettingsModalSubTab,
   type SettingsModalTab,
+  type SettingsNetworkSubTab,
+  type SettingsTlsSubTab,
 } from "../types/settings";
-import { BackupExportSettingsTab } from "./settings/BackupExportSettingsTab";
 import type { BindConfigSectionProps } from "./settings/BindConfigSection";
+import { DiagnosticsBackupSettingsTab } from "./settings/DiagnosticsBackupSettingsTab";
 import { FiltersSettingsTab } from "./settings/FiltersSettingsTab";
 import { GeneralSettingsTab } from "./settings/GeneralSettingsTab";
-import { RulesProxySettingsTab } from "./settings/RulesProxySettingsTab";
+import { NetworkRoutingSettingsTab } from "./settings/NetworkRoutingSettingsTab";
+import { TlsCertificatesSettingsTab } from "./settings/TlsCertificatesSettingsTab";
 import { UiColumnsSettingsTab } from "./settings/UiColumnsSettingsTab";
 
 function attachDialogLightDismissFallback(
@@ -79,9 +94,206 @@ function attachDialogLightDismissFallback(
   };
 }
 
+interface SettingsSearchEntry {
+  id: string;
+  title: string;
+  description: string;
+  keywords: string[];
+  tab: SettingsModalTab;
+  subTab?: SettingsModalSubTab;
+  sectionId?: string;
+}
+
+const SETTINGS_SEARCH_INDEX: readonly SettingsSearchEntry[] = [
+  {
+    id: "proxy-port",
+    title: "Порт прокси-сервера и SysProxy",
+    description: "TCP-порт слушателя (8888) и автопривязка системного прокси ОС",
+    keywords: ["port", "порт", "8888", "sysproxy", "system proxy", "прокси"],
+    tab: "general",
+    sectionId: "general-proxy-section",
+  },
+  {
+    id: "bind-interfaces",
+    title: "Привязка к сетевым интерфейсам (Bind Host / Dual Listener)",
+    description: "Loopback 127.0.0.1, All Interfaces 0.0.0.0, Specific Adapter (Wi-Fi/VPN/WSL)",
+    keywords: ["bind", "interface", "интерфейс", "0.0.0.0", "127.0.0.1", "dual", "wifi", "wsl"],
+    tab: "general",
+    sectionId: "bind-config-section",
+  },
+  {
+    id: "ring-buffer",
+    title: "Follow Tail, Ring Buffer (Keep) и Drop Non-Matching",
+    description: "Лимит сессий в ОЗУ (FIFO), автопрокрутка и отсев при захвате",
+    keywords: ["tail", "ring", "buffer", "keep", "drop", "буфер", "озу", "память"],
+    tab: "general",
+    sectionId: "general-storage-section",
+  },
+  {
+    id: "sqlite-archive",
+    title: "Архив SQLite (VACUUM / Clear DB on Exit)",
+    description: "Размер sessions.sqlite, сжатие базы и автоочистка при выходе",
+    keywords: ["sqlite", "vacuum", "wal", "database", "архив", "очистка", "диск"],
+    tab: "general",
+    sectionId: "general-storage-section",
+  },
+  {
+    id: "throttling",
+    title: "Bandwidth Throttling & Latency",
+    description: "Пресеты GPRS / Slow 3G / Fast 3G / LTE / Offline 503 и Custom Kbps/RTT",
+    keywords: ["throttle", "throttling", "3g", "4g", "lte", "gprs", "offline", "rtt", "kbps", "скорость", "троттлинг"],
+    tab: "networkRouting",
+    subTab: "throttling",
+    sectionId: "throttling-section",
+  },
+  {
+    id: "hosts-remap",
+    title: "Virtual DNS & HOSTS Remapping",
+    description: "Перенаправление доменов на локальный IP/порт с сохранением TLS SNI",
+    keywords: ["hosts", "dns", "remap", "sni", "preserve host", "перенаправление", "домен"],
+    tab: "networkRouting",
+    subTab: "hostsRemap",
+    sectionId: "hosts-remap-section",
+  },
+  {
+    id: "upstream-proxy",
+    title: "Upstream Proxy Chaining (HTTP / HTTPS / SOCKS5)",
+    description: "Каскадирование трафика через внешний прокси, аутентификация и Bypass List",
+    keywords: ["upstream", "socks5", "chain", "bypass", "rfc1918", "каскад", "корпоративный"],
+    tab: "networkRouting",
+    subTab: "upstreamProxy",
+    sectionId: "upstream-proxy-section",
+  },
+  {
+    id: "upstream-timeouts",
+    title: "Upstream Timeouts (Connect / TTFB / Composer)",
+    description: "Раздельные таймауты DNS/TCP/TLS, ожидания ответа (Unlimited) и Composer",
+    keywords: ["timeout", "ttfb", "connect", "composer", "504", "499", "таймаут", "unlimited"],
+    tab: "networkRouting",
+    subTab: "timeouts",
+    sectionId: "upstream-timeouts-section",
+  },
+  {
+    id: "root-ca",
+    title: "HTTPS MITM Root CA Certificate",
+    description: "Статус доверия ОС, отпечаток SHA-256 и управление корневым сертификатом",
+    keywords: ["root ca", "ca", "certificate", "trust", "sha-256", "сертификат", "доверие"],
+    tab: "tlsCertificates",
+    subTab: "mitmBypass",
+    sectionId: "root-ca-status-card",
+  },
+  {
+    id: "tls-bypass",
+    title: "Selective TLS MITM & Bypass 2.0 (11 Quick-Packs, Bulk Editor)",
+    description: "Intercept All vs Targeted Only, удаление Alt-Svc (HTTP/3/QUIC), счётчики попаданий",
+    keywords: ["tls", "mitm", "bypass", "targeted", "allowlist", "quic", "alt-svc", "http3", "pinning"],
+    tab: "tlsCertificates",
+    subTab: "mitmBypass",
+    sectionId: "tls-bypass-section",
+  },
+  {
+    id: "client-certs",
+    title: "Client Certificates (mTLS — PKCS#12 / PEM / DPAPI / In-Memory)",
+    description: "Хранилище клиентских сертификатов с защитой DPAPI и режимом RAM ONLY",
+    keywords: ["mtls", "client cert", "p12", "pfx", "pem", "dpapi", "ephemeral", "ram only"],
+    tab: "tlsCertificates",
+    subTab: "clientCerts",
+    sectionId: "client-certs-section",
+  },
+  {
+    id: "mobile-setup",
+    title: "Mobile Device Setup (iOS & Android Wi-Fi Proxy, QR, LAN Allowlist)",
+    description: "QR-коды, портал http://flux.proxy, .mobileconfig, network_security_config.xml",
+    keywords: ["mobile", "ios", "android", "qr", "wifi", "allowlist", "flux.proxy", "смартфон", "телефон"],
+    tab: "tlsCertificates",
+    subTab: "mobileSetup",
+    sectionId: "mobile-setup-section",
+  },
+  {
+    id: "filter-matrix",
+    title: "Filter Matrix & Filter Presets",
+    description: "Табличные правила Include / Exclude, процессы (PID) и пресеты фильтров",
+    keywords: ["filter", "matrix", "preset", "include", "exclude", "pid", "фильтры", "матрица"],
+    tab: "filters",
+    subTab: "matrix",
+    sectionId: "filters-subtab-content",
+  },
+  {
+    id: "hosts-list",
+    title: "Hosts List (Bulk Whitelist / Blacklist)",
+    description: "Массовая фильтрация доменов, масок * и regex: по списку",
+    keywords: ["hosts list", "whitelist", "blacklist", "regex", "домены", "список хостов"],
+    tab: "filters",
+    subTab: "hostsList",
+    sectionId: "filters-subtab-content",
+  },
+  {
+    id: "noise-thresholds",
+    title: "Noise & Thresholds (304, OPTIONS, Static, Time Heat)",
+    description: "Скрытие шума, фильтры по размеру тела и пороги подсветки медленных запросов",
+    keywords: ["noise", "threshold", "304", "options", "static", "time heat", "warning", "critical", "шум"],
+    tab: "filters",
+    subTab: "thresholds",
+    sectionId: "filters-subtab-content",
+  },
+  {
+    id: "header-mutations",
+    title: "Header Mutations & Force No-Cache",
+    description: "Правила модификации HTTP-заголовков, подмена User-Agent и отключение кэша",
+    keywords: ["header", "mutation", "user-agent", "no-cache", "etag", "заголовки", "мутации"],
+    tab: "filters",
+    subTab: "headers",
+    sectionId: "filters-subtab-content",
+  },
+  {
+    id: "themes-palette",
+    title: "Theme Presets & Custom Palette Editor",
+    description: "8 тем (Dracula, Tokyo Night, Nord, Fiddler Classic, GitHub Dark, Monokai), Dark/Light/System",
+    keywords: ["theme", "preset", "palette", "color", "dracula", "tokyo", "nord", "fiddler", "тема", "палитра", "цвета"],
+    tab: "uiColumns",
+    sectionId: "ui-theme-gallery-section",
+  },
+  {
+    id: "layout-panels",
+    title: "Workspace Layout & Inspector Split",
+    description: "Compact Toolbar, позиция Session Inspector (Bottom/Right) и направление сплита",
+    keywords: ["layout", "compact", "sidebar", "inspector", "split", "компоновка", "панели"],
+    tab: "uiColumns",
+    sectionId: "ui-layout-section",
+  },
+  {
+    id: "toolbar-columns",
+    title: "Toolbar Groups & TrafficGrid Columns",
+    description: "Видимость групп тулбара и настройка колонок таблицы (TTFB, Server IP и ширина)",
+    keywords: ["toolbar", "columns", "ttfb", "server ip", "width", "колонки", "тулбар"],
+    tab: "uiColumns",
+    sectionId: "ui-columns-section",
+  },
+  {
+    id: "proxy-doctor",
+    title: "Proxy Doctor (Самодиагностика среды)",
+    description: "6 проверок (порт, Root CA, SysProxy, VPN/TUN, Firewall, loopback) и Fix All",
+    keywords: ["doctor", "health", "firewall", "vpn", "diag", "диагностика", "проверка", "исправить"],
+    tab: "diagnosticsBackup",
+    subTab: "proxyDoctor",
+    sectionId: "proxy-doctor-section",
+  },
+  {
+    id: "settings-profile",
+    title: "Settings Profile (JSON v1) & Reset to Defaults",
+    description: "Экспорт, импорт с превью, копирование JSON и сброс настроек к заводским",
+    keywords: ["backup", "export", "import", "json", "profile", "reset", "профиль", "сброс"],
+    tab: "diagnosticsBackup",
+    subTab: "profileBackup",
+    sectionId: "settings-profile-section",
+  },
+];
+
 export interface SettingsModalProps {
   open: boolean;
   initialTab?: SettingsModalTab;
+  initialSubTab?: SettingsModalSubTab;
+  navigationSeq?: number;
   onClose: () => void;
   // UI & Theme
   themePreference: ThemePreference;
@@ -115,14 +327,29 @@ export interface SettingsModalProps {
   onSetColumnWidth: (colId: ColumnId, width: number) => void;
   onResetColumns: () => void;
   // Filters & Presets
+  sessions: SessionSummary[];
+  totalCount: number;
+  filteredCount: number;
   activePresetId: string | null;
   userPresets: FilterPreset[];
-  onApplyPreset: (presetId: string | null) => void;
-  onSaveCustomPreset: (name: string, description: string) => void;
+  allPresets: FilterPreset[];
+  onApplyPreset: (presetId: string) => void;
+  onSaveCustomPreset: (name: string, description?: string) => void;
   onDeleteCustomPreset: (presetId: string) => void;
   matrixEnabled: boolean;
   onSetMatrixEnabled: (enabled: boolean) => void;
   filterRules: FilterConditionRule[];
+  onSetFilterRules: (
+    updater:
+      | FilterConditionRule[]
+      | ((prev: FilterConditionRule[]) => FilterConditionRule[])
+  ) => void;
+  ruleErrors: Record<string, string>;
+  detectedProcesses: DetectedProcessItem[];
+  onQuickProcessFilter: (
+    processName: string,
+    action: "include" | "exclude"
+  ) => void;
   noiseThresholds: NoiseThresholdsConfig;
   onSetNoiseThresholds: (
     updater:
@@ -136,17 +363,24 @@ export interface SettingsModalProps {
       | ((prev: HostListFilterConfig) => HostListFilterConfig)
   ) => void;
   onResetAdvancedFilters: () => void;
-  onOpenFilterDrawer: () => void;
-  // Proxy, TLS, Header Mutations & Buffer
+  isForceNoCacheActive: boolean;
+  onToggleForceNoCache: () => Promise<void>;
+  // Proxy, Network, Routing, TLS, Certificates & Storage
   status: ProxyStatus;
+  onToggleProxy: () => Promise<void>;
   onSetProxyPort: (port: number) => Promise<void>;
   onSetAutoSystemProxy: (auto: boolean) => Promise<void>;
-  onSetAllowRemote?: (allow: boolean) => Promise<void>;
+  onSetAllowRemote: (allow: boolean) => Promise<void>;
   onSetBindConfiguration: (
     bindMode: BindHostMode,
     specificBindIp?: string | null,
     alsoBindLoopback?: boolean
   ) => Promise<void>;
+  throttleConfig: ThrottleConfig;
+  onChangeThrottleConfig: (cfg: ThrottleConfig) => Promise<void>;
+  activeHostRemapCount: number;
+  upstreamProxyConfig: UpstreamProxyConfig;
+  onSaveUpstreamProxyConfig: (next: UpstreamProxyConfig) => Promise<void>;
   upstreamTimeouts: UpstreamTimeoutConfig;
   onSetUpstreamTimeouts: (config: UpstreamTimeoutConfig) => Promise<void>;
   sessionRetentionLimit: number | null;
@@ -159,16 +393,14 @@ export interface SettingsModalProps {
   onClearSqliteDatabase: () => Promise<StorageStats | void> | void;
   backendFilterConfig: ProxyFilterBackendConfig;
   onUpdateBackendFilterConfig: (next: ProxyFilterBackendConfig) => Promise<void>;
-  onSetTlsInterceptMode: (mode: TlsInterceptMode) => Promise<void> | void;
-  onOpenTlsDrawer: () => void;
-  onOpenHeadersDrawer: () => void;
-  // AutoResponder
+  onUpdateLanClientAllowlist: (next: string[]) => Promise<void>;
+  onOpenCertificateModal: () => void;
+  caRefreshKey?: number;
+  activeClientCertsCount: number;
+  onClientCertsCountChange: (count: number) => void;
+  // AutoResponder summary for profile backup tab
   autoResponderEnabled: boolean;
-  onSetAutoResponderEnabled: (enabled: boolean) => Promise<void>;
   autoResponderRules: AutoResponderRule[];
-  onUpsertAutoResponderRule: (rule: AutoResponderRule) => Promise<void>;
-  onDeleteAutoResponderRule: (id: string) => Promise<void>;
-  onOpenAutoResponderStudio: () => void;
   // Profile Backup, Export, Import & Reset
   onExportProfile: () => Promise<void>;
   onImportProfileDialog: () => Promise<void>;
@@ -186,38 +418,74 @@ const TAB_DEFINITIONS: {
   {
     id: "general",
     label: "General",
-    subtitle: "Тема, порт, буфер",
+    subtitle: "Порт, интерфейсы, буфер",
     icon: Settings,
   },
   {
-    id: "uiColumns",
-    label: "UI, Theme & Columns",
-    subtitle: "Темы, тулбар, колонки",
-    icon: Columns,
+    id: "networkRouting",
+    label: "Network & Routing",
+    subtitle: "Throttling, HOSTS, Upstream",
+    icon: Network,
+  },
+  {
+    id: "tlsCertificates",
+    label: "TLS & Mobile",
+    subtitle: "MITM, Root CA, mTLS, QR",
+    icon: ShieldCheck,
   },
   {
     id: "filters",
     label: "Filters",
-    subtitle: "Пресеты и пороги",
+    subtitle: "Matrix, Hosts, Thresholds",
     icon: ListFilter,
   },
   {
-    id: "rulesProxy",
-    label: "Rules & Proxy",
-    subtitle: "TLS, Headers, Mocks",
-    icon: Shield,
+    id: "uiColumns",
+    label: "Appearance & Layout",
+    subtitle: "Темы, тулбар, колонки",
+    icon: Columns,
   },
   {
-    id: "backupExport",
-    label: "Backup & Export",
-    subtitle: "JSON v1 и сброс",
-    icon: FileJson,
+    id: "diagnosticsBackup",
+    label: "Diagnostics & Backup",
+    subtitle: "Proxy Doctor и JSON v1",
+    icon: Stethoscope,
   },
 ];
+
+function isNetworkSubTab(val: unknown): val is SettingsNetworkSubTab {
+  return (
+    val === "throttling" ||
+    val === "hostsRemap" ||
+    val === "upstreamProxy" ||
+    val === "timeouts"
+  );
+}
+
+function isTlsSubTab(val: unknown): val is SettingsTlsSubTab {
+  return (
+    val === "mitmBypass" || val === "clientCerts" || val === "mobileSetup"
+  );
+}
+
+function isFiltersSubTab(val: unknown): val is SettingsFiltersSubTab {
+  return (
+    val === "matrix" ||
+    val === "hostsList" ||
+    val === "thresholds" ||
+    val === "headers"
+  );
+}
+
+function isDiagnosticsSubTab(val: unknown): val is SettingsDiagnosticsSubTab {
+  return val === "proxyDoctor" || val === "profileBackup";
+}
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   open,
   initialTab = "general",
+  initialSubTab,
+  navigationSeq = 0,
   onClose,
   themePreference,
   onSetTheme,
@@ -249,25 +517,40 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   columnWidths,
   onSetColumnWidth,
   onResetColumns,
+  sessions,
+  totalCount,
+  filteredCount,
   activePresetId,
   userPresets,
+  allPresets,
   onApplyPreset,
   onSaveCustomPreset,
   onDeleteCustomPreset,
   matrixEnabled,
   onSetMatrixEnabled,
   filterRules,
+  onSetFilterRules,
+  ruleErrors,
+  detectedProcesses,
+  onQuickProcessFilter,
   noiseThresholds,
   onSetNoiseThresholds,
   hostFilters,
   onSetHostFilters,
   onResetAdvancedFilters,
-  onOpenFilterDrawer,
+  isForceNoCacheActive,
+  onToggleForceNoCache,
   status,
+  onToggleProxy,
   onSetProxyPort,
   onSetAutoSystemProxy,
-  onSetAllowRemote: _onSetAllowRemote,
+  onSetAllowRemote,
   onSetBindConfiguration,
+  throttleConfig,
+  onChangeThrottleConfig,
+  activeHostRemapCount,
+  upstreamProxyConfig,
+  onSaveUpstreamProxyConfig,
   upstreamTimeouts,
   onSetUpstreamTimeouts,
   sessionRetentionLimit,
@@ -280,15 +563,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onClearSqliteDatabase,
   backendFilterConfig,
   onUpdateBackendFilterConfig,
-  onSetTlsInterceptMode,
-  onOpenTlsDrawer,
-  onOpenHeadersDrawer,
+  onUpdateLanClientAllowlist,
+  onOpenCertificateModal,
+  caRefreshKey = 0,
+  activeClientCertsCount,
+  onClientCertsCountChange,
   autoResponderEnabled,
-  onSetAutoResponderEnabled,
   autoResponderRules,
-  onUpsertAutoResponderRule,
-  onDeleteAutoResponderRule,
-  onOpenAutoResponderStudio,
   onExportProfile,
   onImportProfileDialog,
   onImportFromRawJsonText,
@@ -298,22 +579,42 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const dialogRef = useRef<HTMLDialogElement>(null);
   const resetConfirmDialogRef = useRef<HTMLDialogElement>(null);
   const purgeConfirmDialogRef = useRef<HTMLDialogElement>(null);
+  const flushPendingBulkRef = useRef<(() => void) | null>(null);
+  const panelScrollRef = useRef<HTMLDivElement>(null);
+
   const tabButtonRefs = useRef<Record<SettingsModalTab, HTMLButtonElement | null>>(
     {
       general: null,
-      uiColumns: null,
+      networkRouting: null,
+      tlsCertificates: null,
       filters: null,
-      rulesProxy: null,
-      backupExport: null,
+      uiColumns: null,
+      diagnosticsBackup: null,
     }
   );
 
   const baseId = useId();
   const titleId = `${baseId}-title`;
+  const searchInputId = `${baseId}-search`;
   const resetTitleId = `${baseId}-reset-title`;
   const purgeTitleId = `${baseId}-purge-title`;
 
   const [activeTab, setActiveTab] = useState<SettingsModalTab>(initialTab);
+  const [networkSubTab, setNetworkSubTab] = useState<SettingsNetworkSubTab>(
+    isNetworkSubTab(initialSubTab) ? initialSubTab : "throttling"
+  );
+  const [tlsSubTab, setTlsSubTab] = useState<SettingsTlsSubTab>(
+    isTlsSubTab(initialSubTab) ? initialSubTab : "mitmBypass"
+  );
+  const [filtersSubTab, setFiltersSubTab] = useState<SettingsFiltersSubTab>(
+    isFiltersSubTab(initialSubTab) ? initialSubTab : "matrix"
+  );
+  const [diagnosticsSubTab, setDiagnosticsSubTab] =
+    useState<SettingsDiagnosticsSubTab>(
+      isDiagnosticsSubTab(initialSubTab) ? initialSubTab : "proxyDoctor"
+    );
+  const [searchQuery, setSearchQuery] = useState("");
+
   const [confirmResetOpen, setConfirmResetOpen] = useState(false);
   const [confirmPurgeSqliteOpen, setConfirmPurgeSqliteOpen] = useState(false);
   const [isPurgingSqlite, setIsPurgingSqlite] = useState(false);
@@ -350,12 +651,27 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   useEffect(() => {
     if (open) {
       setActiveTab(initialTab);
+      if (initialTab === "networkRouting" && isNetworkSubTab(initialSubTab)) {
+        setNetworkSubTab(initialSubTab);
+      } else if (
+        initialTab === "tlsCertificates" &&
+        isTlsSubTab(initialSubTab)
+      ) {
+        setTlsSubTab(initialSubTab);
+      } else if (initialTab === "filters" && isFiltersSubTab(initialSubTab)) {
+        setFiltersSubTab(initialSubTab);
+      } else if (
+        initialTab === "diagnosticsBackup" &&
+        isDiagnosticsSubTab(initialSubTab)
+      ) {
+        setDiagnosticsSubTab(initialSubTab);
+      }
       setBindError(null);
       setPendingSpecificSelect(false);
       void loadNetworkInterfaces();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, initialTab]);
+  }, [open, initialTab, initialSubTab, navigationSeq]);
 
   useEffect(() => {
     if (status.specificBindIp) {
@@ -562,6 +878,35 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     onReloadInterfaces: loadNetworkInterfaces,
   };
 
+  const navigateToTab = (
+    tab: SettingsModalTab,
+    subTab?: SettingsModalSubTab,
+    sectionId?: string
+  ) => {
+    if (activeTab === "tlsCertificates" && tab !== "tlsCertificates") {
+      flushPendingBulkRef.current?.();
+    }
+    setActiveTab(tab);
+    if (tab === "networkRouting" && isNetworkSubTab(subTab)) {
+      setNetworkSubTab(subTab);
+    } else if (tab === "tlsCertificates" && isTlsSubTab(subTab)) {
+      setTlsSubTab(subTab);
+    } else if (tab === "filters" && isFiltersSubTab(subTab)) {
+      setFiltersSubTab(subTab);
+    } else if (tab === "diagnosticsBackup" && isDiagnosticsSubTab(subTab)) {
+      setDiagnosticsSubTab(subTab);
+    }
+    if (sectionId) {
+      window.requestAnimationFrame(() => {
+        document
+          .getElementById(sectionId)
+          ?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    } else {
+      panelScrollRef.current?.scrollTo({ top: 0 });
+    }
+  };
+
   const handleTabKeyDown = (
     e: React.KeyboardEvent<HTMLButtonElement>,
     idx: number
@@ -587,7 +932,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       nextIdx = (idx - 1 + TAB_DEFINITIONS.length) % TAB_DEFINITIONS.length;
     }
     const targetTab = TAB_DEFINITIONS[nextIdx];
-    setActiveTab(targetTab.id);
+    navigateToTab(targetTab.id);
     tabButtonRefs.current[targetTab.id]?.focus();
   };
 
@@ -596,54 +941,197 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     await onResetAllToDefaults();
   };
 
+  const searchResults = useMemo(() => {
+    const trimmed = searchQuery.trim().toLowerCase();
+    if (!trimmed) return [];
+    const tokens = trimmed.split(/\s+/).filter(Boolean);
+    return SETTINGS_SEARCH_INDEX.filter((entry) => {
+      const haystack = `${entry.title} ${entry.description} ${entry.keywords.join(" ")}`.toLowerCase();
+      return tokens.every((tok) => haystack.includes(tok));
+    });
+  }, [searchQuery]);
+
+  const searchMatchesByTab = useMemo(() => {
+    const counts: Partial<Record<SettingsModalTab, number>> = {};
+    for (const r of searchResults) {
+      counts[r.tab] = (counts[r.tab] ?? 0) + 1;
+    }
+    return counts;
+  }, [searchResults]);
+
+  const tabStatusBadges = useMemo(() => {
+    const activeThrottleDef =
+      THROTTLE_PRESET_DEFINITIONS.find((d) => d.id === throttleConfig.preset) ??
+      THROTTLE_PRESET_DEFINITIONS[0];
+    const networkCount =
+      activeHostRemapCount +
+      (upstreamProxyConfig.enabled ? 1 : 0) +
+      (throttleConfig.preset !== "none" ? 1 : 0);
+
+    const tlsRuleCount =
+      backendFilterConfig.tlsInterceptMode === "targetedOnly"
+        ? (backendFilterConfig.tlsTargetRules ?? []).filter((r) => r.enabled)
+            .length
+        : backendFilterConfig.tlsBypassEnabled
+          ? backendFilterConfig.tlsBypassRules.filter((r) => r.enabled).length
+          : 0;
+
+    let filterActiveCount = 0;
+    if (matrixEnabled) {
+      filterActiveCount += filterRules.filter(
+        (r) => r.enabled && r.value.trim()
+      ).length;
+    }
+    if (hostFilters.enabled) {
+      filterActiveCount += compiledHosts.activeCount;
+    }
+    if (noiseThresholds.hide304NotModified) filterActiveCount++;
+    if (noiseThresholds.hideOptionsPreflight) filterActiveCount++;
+    if (noiseThresholds.hideConnectTunnels) filterActiveCount++;
+    if (noiseThresholds.hideStaticAssets) filterActiveCount++;
+    if (noiseThresholds.onlySlowRequests) filterActiveCount++;
+    if (backendFilterConfig.headerMutationsEnabled) {
+      filterActiveCount += backendFilterConfig.headerMutations.filter(
+        (m) => m.enabled
+      ).length;
+    }
+
+    const visibleColsCount = TRAFFIC_COLUMNS.filter(
+      (c) => visibleColumns[c.id]
+    ).length;
+
+    const activePresetName = themePresetProp
+      ? THEME_PRESETS_BY_ID[themePresetProp]?.name
+      : undefined;
+
+    return {
+      general: `:${status.port}`,
+      networkRouting:
+        throttleConfig.preset !== "none"
+          ? activeThrottleDef.shortLabel
+          : networkCount > 0
+            ? String(networkCount)
+            : undefined,
+      tlsCertificates:
+        activeClientCertsCount > 0
+          ? `${tlsRuleCount} · mTLS ${activeClientCertsCount}`
+          : String(tlsRuleCount),
+      filters: filterActiveCount > 0 ? String(filterActiveCount) : undefined,
+      uiColumns:
+        activePresetName ?? `${visibleColsCount}/${TRAFFIC_COLUMNS.length}`,
+      diagnosticsBackup: `v${CURRENT_SETTINGS_SCHEMA_VERSION}`,
+    } satisfies Record<SettingsModalTab, string | undefined>;
+  }, [
+    status.port,
+    throttleConfig.preset,
+    activeHostRemapCount,
+    upstreamProxyConfig.enabled,
+    backendFilterConfig,
+    activeClientCertsCount,
+    matrixEnabled,
+    filterRules,
+    hostFilters.enabled,
+    compiledHosts.activeCount,
+    noiseThresholds,
+    visibleColumns,
+    themePresetProp,
+  ]);
+
   return (
     <>
       <dialog
         ref={dialogRef}
+        data-settings-hub-dialog="true"
         aria-labelledby={titleId}
-        onClose={onClose}
+        onClose={(e) => {
+          if (e.target !== dialogRef.current) return;
+          flushPendingBulkRef.current?.();
+          if (dialogRef.current) dialogRef.current.returnValue = "";
+          onClose();
+        }}
         {...({ closedby: "any" } as Record<string, string>)}
-        className="m-auto h-[84vh] max-h-[760px] w-full max-w-4xl rounded-xl border border-strong bg-surface p-0 text-fg shadow-popover open:flex open:flex-col"
+        className="fixed inset-0 m-0 h-screen w-screen max-h-none max-w-none rounded-none border-0 bg-surface p-0 text-fg open:flex open:flex-col"
       >
-        {/* Header */}
-        <div className="flex shrink-0 items-center justify-between border-b border-hairline px-4 py-3">
+        {/* Fullscreen Hub Header with Search */}
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-hairline bg-surface px-5 py-3">
           <div className="flex items-center gap-2.5">
-            <Settings className="h-4 w-4 text-accent" />
+            <Settings className="h-4 w-4 text-accent" aria-hidden="true" />
             <div>
-              <h2 id={titleId} className="text-sm font-semibold text-fg">
-                Preferences &amp; Settings Profile
-              </h2>
+              <h1 id={titleId} className="text-sm font-semibold text-fg">
+                Settings Hub
+              </h1>
               <p className="text-[11px] text-muted">
-                Централизованное управление интерфейсом, фильтрами, TLS/прокси и профилем{" "}
+                Единый центр настроек прокси, маршрутизации, TLS/mTLS, фильтров,
+                темы и диагностики{" "}
                 <code className="rounded bg-elevated px-1 py-0.5 font-mono text-[10px]">
                   schemaVersion: {CURRENT_SETTINGS_SCHEMA_VERSION}
                 </code>
               </p>
             </div>
           </div>
-          <button
-            type="button"
-            onClick={() => dialogRef.current?.close()}
-            aria-label="Закрыть окно настроек"
-            className="rounded p-1 text-muted hover:bg-hover hover:text-fg"
-          >
-            <X className="h-4 w-4" />
-          </button>
+
+          <div className="flex flex-1 items-center justify-end gap-3">
+            {/* Settings Search */}
+            <div className="relative w-full max-w-md">
+              <Search
+                aria-hidden="true"
+                className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-subtle"
+              />
+              <input
+                id={searchInputId}
+                type="search"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape" && searchQuery) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setSearchQuery("");
+                  }
+                }}
+                placeholder="Поиск по настройкам (port, throttling, hosts, mtls, theme, doctor…)"
+                aria-label="Поиск по настройкам"
+                className="h-8 w-full rounded-md border border-strong bg-canvas pl-8 pr-7 text-xs text-fg placeholder:text-subtle focus:border-accent focus:outline-none"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery("")}
+                  aria-label="Очистить поиск по настройкам"
+                  className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-subtle hover:bg-hover hover:text-fg"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => dialogRef.current?.close()}
+              aria-label="Закрыть центр настроек"
+              className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-hairline bg-canvas text-muted hover:border-strong hover:bg-hover hover:text-fg"
+            >
+              <X className="h-4 w-4" aria-hidden="true" />
+            </button>
+          </div>
         </div>
 
-        {/* Body: Left Tablist + Right Tabpanel */}
+        {/* Body: Left Tablist + Right Fullscreen Workspace */}
         <div className="flex min-h-0 flex-1 flex-col md:flex-row">
           <div
             role="tablist"
             aria-label="Разделы настроек FluxProxy"
             aria-orientation="vertical"
-            className="flex shrink-0 gap-1 overflow-x-auto border-b border-hairline bg-canvas p-2 md:w-52 md:flex-col md:overflow-y-auto md:border-b-0 md:border-r"
+            className="flex shrink-0 gap-1 overflow-x-auto border-b border-hairline bg-canvas p-2.5 md:w-64 md:flex-col md:overflow-y-auto md:border-b-0 md:border-r"
           >
             {TAB_DEFINITIONS.map((tab, idx) => {
               const Icon = tab.icon;
               const selected = activeTab === tab.id;
               const tabId = `${baseId}-tab-${tab.id}`;
               const panelId = `${baseId}-panel-${tab.id}`;
+              const matchCount = searchMatchesByTab[tab.id];
+              const statusBadge = tabStatusBadges[tab.id];
+
               return (
                 <button
                   key={tab.id}
@@ -656,165 +1144,277 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   aria-selected={selected}
                   aria-controls={panelId}
                   tabIndex={selected ? 0 : -1}
-                  onClick={() => setActiveTab(tab.id)}
+                  onClick={() => navigateToTab(tab.id)}
                   onKeyDown={(e) => handleTabKeyDown(e, idx)}
-                  className={`flex shrink-0 items-center gap-2.5 rounded-lg border px-2.5 py-2 text-left transition-colors ${
+                  className={`flex shrink-0 items-center justify-between gap-2 rounded-lg border px-3 py-2 text-left transition-colors ${
                     selected
-                      ? "border-accent/40 bg-selected text-fg"
+                      ? "border-accent/45 bg-selected text-fg"
                       : "border-transparent text-muted hover:bg-hover hover:text-fg"
                   }`}
                 >
-                  <Icon
-                    className={`h-4 w-4 shrink-0 ${
-                      selected ? "text-accent" : "text-subtle"
-                    }`}
-                  />
-                  <div className="min-w-0">
-                    <div className="truncate text-xs font-semibold">
-                      {tab.label}
-                    </div>
-                    <div className="hidden truncate text-[10px] text-muted md:block">
-                      {tab.subtitle}
+                  <div className="flex min-w-0 items-center gap-2.5">
+                    <Icon
+                      className={`h-4 w-4 shrink-0 ${
+                        selected ? "text-accent" : "text-subtle"
+                      }`}
+                    />
+                    <div className="min-w-0">
+                      <div className="truncate text-xs font-semibold">
+                        {tab.label}
+                      </div>
+                      <div className="hidden truncate text-[10px] text-muted md:block">
+                        {tab.subtitle}
+                      </div>
                     </div>
                   </div>
+                  {matchCount ? (
+                    <span className="shrink-0 rounded-full bg-accent/20 px-1.5 py-0.5 font-mono text-[10px] font-bold text-accent tabular-nums">
+                      {matchCount}
+                    </span>
+                  ) : statusBadge ? (
+                    <span className="hidden shrink-0 rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-muted md:inline">
+                      {statusBadge}
+                    </span>
+                  ) : null}
                 </button>
               );
             })}
           </div>
 
           <div
+            ref={panelScrollRef}
             id={`${baseId}-panel-${activeTab}`}
             role="tabpanel"
             aria-labelledby={`${baseId}-tab-${activeTab}`}
             tabIndex={0}
-            className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4 text-xs focus:outline-none"
+            className="min-h-0 flex-1 overflow-y-auto p-5 text-xs focus:outline-none"
           >
-            {/* ==============================================================
-                TAB 1: GENERAL
-               ============================================================== */}
-            {activeTab === "general" && (
-              <GeneralSettingsTab
-                baseId={baseId}
-                themePreference={themePreference}
-                onSetTheme={onSetTheme}
-                followTail={followTail}
-                onSetFollowTail={onSetFollowTail}
-                status={status}
-                activeEndpointsSummary={activeEndpointsSummary}
-                sysProxyTargetHost={sysProxyTargetHost}
-                onSetProxyPort={onSetProxyPort}
-                onSetAutoSystemProxy={onSetAutoSystemProxy}
-                upstreamTimeouts={upstreamTimeouts}
-                onSetUpstreamTimeouts={onSetUpstreamTimeouts}
-                sessionRetentionLimit={sessionRetentionLimit}
-                onSetSessionRetentionLimit={onSetSessionRetentionLimit}
-                dropNonMatching={dropNonMatching}
-                onSetDropNonMatching={onSetDropNonMatching}
-                clearDbOnExit={clearDbOnExit}
-                onSetClearDbOnExit={onSetClearDbOnExit}
-                storageStats={storageStats}
-                isPurgingSqlite={isPurgingSqlite}
-                setConfirmPurgeSqliteOpen={setConfirmPurgeSqliteOpen}
-                bindConfigProps={bindConfigProps}
-              />
-            )}
+            <div className="mx-auto max-w-6xl space-y-4">
+              {/* Settings Search Results */}
+              {searchQuery.trim() && (
+                <section
+                  aria-label="Результаты поиска по настройкам"
+                  className="space-y-2 rounded-lg border border-accent/40 bg-canvas p-3.5"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-fg">
+                      Результаты поиска ({searchResults.length})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setSearchQuery("")}
+                      className="text-[11px] text-accent hover:underline"
+                    >
+                      Скрыть результаты
+                    </button>
+                  </div>
+                  {searchResults.length === 0 ? (
+                    <p className="text-[11px] text-muted">
+                      По запросу «{searchQuery.trim()}» настройки не найдены.
+                      Попробуйте другие ключевые слова (например: port,
+                      throttling, hosts, mtls, theme, doctor).
+                    </p>
+                  ) : (
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                      {searchResults.map((item) => {
+                        const tabLabel =
+                          TAB_DEFINITIONS.find((t) => t.id === item.tab)
+                            ?.label ?? item.tab;
+                        return (
+                          <button
+                            key={item.id}
+                            type="button"
+                            onClick={() => {
+                              setSearchQuery("");
+                              navigateToTab(
+                                item.tab,
+                                item.subTab,
+                                item.sectionId
+                              );
+                            }}
+                            className="flex flex-col items-start gap-1 rounded-md border border-hairline bg-surface p-2.5 text-left transition-colors hover:border-accent/60 hover:bg-hover"
+                          >
+                            <span className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-accent">
+                              {tabLabel}
+                            </span>
+                            <span className="font-semibold text-fg">
+                              {item.title}
+                            </span>
+                            <span className="text-[11px] leading-snug text-muted">
+                              {item.description}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </section>
+              )}
 
-            {activeTab === "uiColumns" && (
-              <UiColumnsSettingsTab
-                baseId={baseId}
-                themePreference={themePreference}
-                onSetTheme={onSetTheme}
-                themePreset={themePresetProp}
-                customColorOverrides={customColorOverridesProp}
-                effectiveThemeTokens={effectiveThemeTokensProp}
-                onSetThemePreset={onSetThemePreset}
-                onSetCustomColorOverride={onSetCustomColorOverride}
-                onResetCustomColorOverride={onResetCustomColorOverride}
-                onResetCustomColorOverrides={onResetCustomColorOverrides}
-                compactToolbar={compactToolbar}
-                onSetCompactToolbar={onSetCompactToolbar}
-                sidebarCollapsed={sidebarCollapsed}
-                onSetSidebarCollapsed={onSetSidebarCollapsed}
-                inspectorCollapsed={inspectorCollapsed}
-                onSetInspectorCollapsed={onSetInspectorCollapsed}
-                inspectorPosition={inspectorPosition}
-                onSetInspectorPosition={onSetInspectorPosition}
-                inspectorSplitDirection={inspectorSplitDirection}
-                onSetInspectorSplitDirection={onSetInspectorSplitDirection}
-                onResetPanelLayout={onResetPanelLayout}
-                toolbarGroups={toolbarGroups}
-                onToggleToolbarGroup={onToggleToolbarGroup}
-                onResetToolbarGroups={onResetToolbarGroups}
-                visibleColumns={visibleColumns}
-                onToggleColumnVisibility={onToggleColumnVisibility}
-                columnWidths={columnWidths}
-                onSetColumnWidth={onSetColumnWidth}
-                onResetColumns={onResetColumns}
-              />
-            )}
+              {/* TAB 1: GENERAL */}
+              {activeTab === "general" && (
+                <GeneralSettingsTab
+                  baseId={baseId}
+                  followTail={followTail}
+                  onSetFollowTail={onSetFollowTail}
+                  status={status}
+                  activeEndpointsSummary={activeEndpointsSummary}
+                  sysProxyTargetHost={sysProxyTargetHost}
+                  onSetProxyPort={onSetProxyPort}
+                  onSetAutoSystemProxy={onSetAutoSystemProxy}
+                  sessionRetentionLimit={sessionRetentionLimit}
+                  onSetSessionRetentionLimit={onSetSessionRetentionLimit}
+                  dropNonMatching={dropNonMatching}
+                  onSetDropNonMatching={onSetDropNonMatching}
+                  clearDbOnExit={clearDbOnExit}
+                  onSetClearDbOnExit={onSetClearDbOnExit}
+                  storageStats={storageStats}
+                  isPurgingSqlite={isPurgingSqlite}
+                  setConfirmPurgeSqliteOpen={setConfirmPurgeSqliteOpen}
+                  bindConfigProps={bindConfigProps}
+                />
+              )}
 
-            {activeTab === "filters" && (
-              <FiltersSettingsTab
-                baseId={baseId}
-                activePresetId={activePresetId}
-                userPresets={userPresets}
-                onApplyPreset={onApplyPreset}
-                onSaveCustomPreset={onSaveCustomPreset}
-                onDeleteCustomPreset={onDeleteCustomPreset}
-                matrixEnabled={matrixEnabled}
-                onSetMatrixEnabled={onSetMatrixEnabled}
-                filterRules={filterRules}
-                noiseThresholds={noiseThresholds}
-                onSetNoiseThresholds={onSetNoiseThresholds}
-                hostFilters={hostFilters}
-                compiledHosts={compiledHosts}
-                onSetHostFilters={onSetHostFilters}
-                onResetAdvancedFilters={onResetAdvancedFilters}
-                onOpenFilterDrawer={onOpenFilterDrawer}
-                onCloseDialog={() => dialogRef.current?.close()}
-              />
-            )}
+              {/* TAB 2: NETWORK & ROUTING */}
+              {activeTab === "networkRouting" && (
+                <NetworkRoutingSettingsTab
+                  baseId={baseId}
+                  activeSubTab={networkSubTab}
+                  onSubTabChange={setNetworkSubTab}
+                  status={status}
+                  throttleConfig={throttleConfig}
+                  onChangeThrottleConfig={onChangeThrottleConfig}
+                  activeHostRemapCount={activeHostRemapCount}
+                  upstreamProxyConfig={upstreamProxyConfig}
+                  onSaveUpstreamProxyConfig={onSaveUpstreamProxyConfig}
+                  upstreamTimeouts={upstreamTimeouts}
+                  onSetUpstreamTimeouts={onSetUpstreamTimeouts}
+                  onNotify={onNotify}
+                />
+              )}
 
-            {activeTab === "rulesProxy" && (
-              <RulesProxySettingsTab
-                bindConfigProps={bindConfigProps}
-                backendFilterConfig={backendFilterConfig}
-                onUpdateBackendFilterConfig={onUpdateBackendFilterConfig}
-                onSetTlsInterceptMode={onSetTlsInterceptMode}
-                onOpenTlsDrawer={onOpenTlsDrawer}
-                onOpenHeadersDrawer={onOpenHeadersDrawer}
-                autoResponderEnabled={autoResponderEnabled}
-                onSetAutoResponderEnabled={onSetAutoResponderEnabled}
-                autoResponderRules={autoResponderRules}
-                onUpsertAutoResponderRule={onUpsertAutoResponderRule}
-                onDeleteAutoResponderRule={onDeleteAutoResponderRule}
-                onOpenAutoResponderStudio={onOpenAutoResponderStudio}
-                onCloseDialog={() => dialogRef.current?.close()}
-              />
-            )}
+              {/* TAB 3: TLS, CERTIFICATES & MOBILE */}
+              {activeTab === "tlsCertificates" && (
+                <TlsCertificatesSettingsTab
+                  isActive={open && activeTab === "tlsCertificates"}
+                  activeSubTab={tlsSubTab}
+                  onSubTabChange={setTlsSubTab}
+                  sessions={sessions}
+                  thresholds={noiseThresholds}
+                  onThresholdsChange={onSetNoiseThresholds}
+                  backendFilterConfig={backendFilterConfig}
+                  onUpdateBackendFilterConfig={onUpdateBackendFilterConfig}
+                  flushPendingBulkRef={flushPendingBulkRef}
+                  onOpenCertificateModal={onOpenCertificateModal}
+                  caRefreshKey={caRefreshKey}
+                  activeClientCertsCount={activeClientCertsCount}
+                  onClientCertsCountChange={onClientCertsCountChange}
+                  status={status}
+                  lanClientAllowlist={
+                    backendFilterConfig.lanClientAllowlist ?? []
+                  }
+                  onUpdateLanClientAllowlist={onUpdateLanClientAllowlist}
+                  onSetAllowRemote={onSetAllowRemote}
+                  onToggleProxy={onToggleProxy}
+                  onNotify={onNotify}
+                />
+              )}
 
-            {activeTab === "backupExport" && (
-              <BackupExportSettingsTab
-                baseId={baseId}
-                visibleColumns={visibleColumns}
-                toolbarGroups={toolbarGroups}
-                userPresets={userPresets}
-                filterRules={filterRules}
-                autoResponderEnabled={autoResponderEnabled}
-                autoResponderRules={autoResponderRules}
-                backendFilterConfig={backendFilterConfig}
-                onExportProfile={onExportProfile}
-                onImportProfileDialog={onImportProfileDialog}
-                onImportFromRawJsonText={onImportFromRawJsonText}
-                onRequestResetAll={() => setConfirmResetOpen(true)}
-                onNotify={onNotify}
-              />
-            )}
+              {/* TAB 4: FILTERS */}
+              {activeTab === "filters" && (
+                <FiltersSettingsTab
+                  activeSubTab={filtersSubTab}
+                  onSubTabChange={setFiltersSubTab}
+                  totalCount={totalCount}
+                  filteredCount={filteredCount}
+                  sessions={sessions}
+                  matrixEnabled={matrixEnabled}
+                  onSetMatrixEnabled={onSetMatrixEnabled}
+                  filterRules={filterRules}
+                  onSetFilterRules={onSetFilterRules}
+                  ruleErrors={ruleErrors}
+                  allPresets={allPresets}
+                  activePresetId={activePresetId}
+                  onApplyPreset={onApplyPreset}
+                  onSaveCustomPreset={onSaveCustomPreset}
+                  onDeleteCustomPreset={onDeleteCustomPreset}
+                  detectedProcesses={detectedProcesses}
+                  onQuickProcessFilter={onQuickProcessFilter}
+                  hostFilters={hostFilters}
+                  compiledHosts={compiledHosts}
+                  onSetHostFilters={onSetHostFilters}
+                  noiseThresholds={noiseThresholds}
+                  onSetNoiseThresholds={onSetNoiseThresholds}
+                  backendFilterConfig={backendFilterConfig}
+                  onUpdateBackendFilterConfig={onUpdateBackendFilterConfig}
+                  isForceNoCacheActive={isForceNoCacheActive}
+                  onToggleForceNoCache={onToggleForceNoCache}
+                  onResetAdvancedFilters={onResetAdvancedFilters}
+                  onNotify={onNotify}
+                />
+              )}
+
+              {/* TAB 5: APPEARANCE & LAYOUT */}
+              {activeTab === "uiColumns" && (
+                <UiColumnsSettingsTab
+                  baseId={baseId}
+                  themePreference={themePreference}
+                  onSetTheme={onSetTheme}
+                  themePreset={themePresetProp}
+                  customColorOverrides={customColorOverridesProp}
+                  effectiveThemeTokens={effectiveThemeTokensProp}
+                  onSetThemePreset={onSetThemePreset}
+                  onSetCustomColorOverride={onSetCustomColorOverride}
+                  onResetCustomColorOverride={onResetCustomColorOverride}
+                  onResetCustomColorOverrides={onResetCustomColorOverrides}
+                  compactToolbar={compactToolbar}
+                  onSetCompactToolbar={onSetCompactToolbar}
+                  sidebarCollapsed={sidebarCollapsed}
+                  onSetSidebarCollapsed={onSetSidebarCollapsed}
+                  inspectorCollapsed={inspectorCollapsed}
+                  onSetInspectorCollapsed={onSetInspectorCollapsed}
+                  inspectorPosition={inspectorPosition}
+                  onSetInspectorPosition={onSetInspectorPosition}
+                  inspectorSplitDirection={inspectorSplitDirection}
+                  onSetInspectorSplitDirection={onSetInspectorSplitDirection}
+                  onResetPanelLayout={onResetPanelLayout}
+                  toolbarGroups={toolbarGroups}
+                  onToggleToolbarGroup={onToggleToolbarGroup}
+                  onResetToolbarGroups={onResetToolbarGroups}
+                  visibleColumns={visibleColumns}
+                  onToggleColumnVisibility={onToggleColumnVisibility}
+                  columnWidths={columnWidths}
+                  onSetColumnWidth={onSetColumnWidth}
+                  onResetColumns={onResetColumns}
+                />
+              )}
+
+              {/* TAB 6: DIAGNOSTICS & BACKUP */}
+              {activeTab === "diagnosticsBackup" && (
+                <DiagnosticsBackupSettingsTab
+                  baseId={baseId}
+                  activeSubTab={diagnosticsSubTab}
+                  onSubTabChange={setDiagnosticsSubTab}
+                  visibleColumns={visibleColumns}
+                  toolbarGroups={toolbarGroups}
+                  userPresets={userPresets}
+                  filterRules={filterRules}
+                  autoResponderEnabled={autoResponderEnabled}
+                  autoResponderRules={autoResponderRules}
+                  backendFilterConfig={backendFilterConfig}
+                  onExportProfile={onExportProfile}
+                  onImportProfileDialog={onImportProfileDialog}
+                  onImportFromRawJsonText={onImportFromRawJsonText}
+                  onRequestResetAll={() => setConfirmResetOpen(true)}
+                  onNotify={onNotify}
+                />
+              )}
+            </div>
           </div>
         </div>
 
         {/* Footer */}
-        <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-hairline bg-canvas px-4 py-2.5">
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-hairline bg-canvas px-5 py-2.5">
           <button
             type="button"
             onClick={() => setConfirmResetOpen(true)}
@@ -881,7 +1481,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         </div>
         <div className="space-y-2 px-4 py-3 text-xs text-fg">
           <p>
-            Все сохранённые на диске сессии и выгруженные тела запросов/ответов в{" "}
+            Все сохранённые на диске сессии и выгруженные тела запросов/ответов
+            в{" "}
             <code className="rounded bg-canvas px-1 py-0.5 font-mono text-[11px]">
               sessions.sqlite
             </code>{" "}
@@ -896,9 +1497,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <strong className="font-semibold text-fg">
               {(storageStats.sqliteSizeBytes / (1024 * 1024)).toFixed(2)} MB
             </strong>{" "}
-            ({storageStats.sqliteSizeBytes.toLocaleString("en-US")} байт). Сессии в
-            текущей таблице ОЗУ ({storageStats.ramSessions.toLocaleString("en-US")}{" "}
-            шт.) затронуты не будут.
+            ({storageStats.sqliteSizeBytes.toLocaleString("en-US")} байт). Сессии
+            в текущей таблице ОЗУ (
+            {storageStats.ramSessions.toLocaleString("en-US")} шт.) затронуты не
+            будут.
           </p>
         </div>
         <div className="flex items-center justify-end gap-2 border-t border-hairline bg-canvas/50 px-4 py-2.5">
@@ -919,7 +1521,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           >
             <Trash2 className="h-3.5 w-3.5" />
             <span>
-              {isPurgingSqlite ? "Очистка и VACUUM..." : "Очистить и сжать (VACUUM)"}
+              {isPurgingSqlite
+                ? "Очистка и VACUUM..."
+                : "Очистить и сжать (VACUUM)"}
             </span>
           </button>
         </div>
@@ -941,11 +1545,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         </div>
         <div className="space-y-2 p-4 text-xs text-muted">
           <p className="text-fg">
-            Вы действительно хотите сбросить все настройки FluxProxy к значениям по умолчанию?
+            Вы действительно хотите сбросить все настройки FluxProxy к значениям
+            по умолчанию?
           </p>
           <p>
-            Пользовательские пресеты фильтров ({userPresets.length}), настроенные ширины колонок,
-            конфигурация групп тулбара, правила TLS/заголовков, AutoResponder ({autoResponderRules.length}), HOSTS Remapping, Bandwidth Throttling и Upstream Proxy будут перезаписаны заводским профилем.
+            Пользовательские пресеты фильтров ({userPresets.length}),
+            настроенные ширины колонок, конфигурация групп тулбара, правила
+            TLS/заголовков, AutoResponder ({autoResponderRules.length}), HOSTS
+            Remapping, Bandwidth Throttling и Upstream Proxy будут перезаписаны
+            заводским профилем.
           </p>
         </div>
         <div className="flex items-center justify-end gap-2 border-t border-hairline bg-canvas px-4 py-2.5">
@@ -1043,7 +1651,8 @@ export const SettingsImportPreviewModal: React.FC<
 
           <div className="max-h-[70vh] space-y-3 overflow-y-auto p-4 text-xs">
             <p className="text-muted">
-              Проверьте сводку перед применением: следующие пресеты, правила фильтрации/перехвата и параметры колонок будут перезаписаны:
+              Проверьте сводку перед применением: следующие пресеты, правила
+              фильтрации/перехвата и параметры колонок будут перезаписаны:
             </p>
 
             {/* Primary Overwrite Counters: Presets, Rules, Columns */}
@@ -1056,7 +1665,8 @@ export const SettingsImportPreviewModal: React.FC<
                   {preview.userPresetsCount} пресетов
                 </div>
                 <div className="mt-0.5 text-[11px] text-subtle">
-                  Перезапишет текущие ({preview.currentUserPresetsCount}) • Активный:{" "}
+                  Перезапишет текущие ({preview.currentUserPresetsCount}) •
+                  Активный:{" "}
                   <code className="font-mono">
                     {preview.activePresetId ?? "нет"}
                   </code>
@@ -1083,7 +1693,8 @@ export const SettingsImportPreviewModal: React.FC<
                   {preview.totalColumnsCount} колонок
                 </div>
                 <div className="mt-0.5 text-[11px] text-subtle">
-                  Видимых: {preview.visibleColumnsCount}/{preview.totalColumnsCount} • Кастом. ширин:{" "}
+                  Видимых: {preview.visibleColumnsCount}/
+                  {preview.totalColumnsCount} • Кастом. ширин:{" "}
                   {preview.customizedColumnWidthsCount}
                 </div>
               </div>
@@ -1111,8 +1722,8 @@ export const SettingsImportPreviewModal: React.FC<
                 <div>
                   • TLS Bypass / Target:{" "}
                   <span className="font-mono text-fg">
-                    {preview.tlsBypassRulesCount} / {preview.tlsTargetRulesCount}{" "}
-                    ({preview.tlsInterceptMode})
+                    {preview.tlsBypassRulesCount} /{" "}
+                    {preview.tlsTargetRulesCount} ({preview.tlsInterceptMode})
                   </span>
                 </div>
                 <div>

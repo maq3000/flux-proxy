@@ -22,6 +22,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import { HelpTooltip } from "../ui/HelpTooltip";
 import {
   parseBulkTextToTlsRules,
   TLS_BYPASS_QUICK_PACKS,
@@ -914,6 +915,12 @@ export const TlsBypassTab: React.FC<TlsBypassTabProps> = ({
                   <span>
                     Режим работы TLS MITM («Чистый проброс» vs Полная инспекция)
                   </span>
+                  <HelpTooltip
+                    label="Подробнее о режимах TLS MITM"
+                    title="Intercept All vs Targeted Only MITM"
+                    content="Intercept All расшифровывает весь HTTPS/WSS-трафик кроме списка Bypass (банки, антивирусы, мессенджеры). Targeted Only (Selective MITM) пропускает весь трафик напрямую сквозным TCP-туннелем и расшифровывает только явно заданные домены."
+                    example="Targeted Only: *.myapp.dev"
+                  />
                 </div>
 
                 <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border border-hairline bg-canvas px-2.5 py-1 text-[11px] text-muted hover:border-strong hover:text-fg">

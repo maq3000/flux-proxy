@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { AlertTriangle, Check, Copy, Download, FileJson, RotateCcw, Upload } from "lucide-react";
+import { HelpTooltip } from "../ui/HelpTooltip";
 import { TOOLBAR_GROUP_DEFINITIONS, TRAFFIC_COLUMNS } from "../../hooks/useUiPreferences";
 import { collectCurrentSettingsProfile } from "../../lib/settingsManager";
 import type {
@@ -69,9 +70,16 @@ export const BackupExportSettingsTab: React.FC<BackupExportSettingsTabProps> = (
                 <div className="space-y-3 rounded-lg border border-hairline bg-canvas p-3.5">
                   <div className="flex flex-wrap items-start justify-between gap-2">
                     <div>
-                      <h3 className="text-xs font-semibold text-fg">
-                        Экспорт и импорт единого JSON-профиля настроек
-                      </h3>
+                      <div className="flex items-center gap-1.5">
+                        <h3 className="text-xs font-semibold text-fg">
+                          Экспорт и импорт единого JSON-профиля настроек
+                        </h3>
+                        <HelpTooltip
+                          label="Подробнее о профиле FluxUserSettingsProfile"
+                          title="Переносимый JSON-профиль настроек"
+                          content="Сохраняет тему, ширину колонок, тулбар, фильтры, TLS Bypass, HOSTS Remapping, Bandwidth Throttling, таймауты, AutoResponder и Python-скрипты. В целях безопасности пароли Upstream Proxy не включаются, а импортируемые Python-скрипты загружаются выключенными до вашего подтверждения."
+                        />
+                      </div>
                       <p className="text-[11px] text-muted">
                         Файл по умолчанию:{" "}
                         <code className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[11px] text-fg">

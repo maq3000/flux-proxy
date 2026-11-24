@@ -9,8 +9,6 @@ import {
 import { AutoResponderPanel } from "./components/AutoResponderPanel";
 import { BreakpointBanner } from "./components/BreakpointBanner";
 import { CertificateModal } from "./components/CertificateModal";
-import { ClientCertificatesModal } from "./components/ClientCertificatesModal";
-import { HostRemapModal } from "./components/HostRemapModal";
 import { CodeSnippetModal } from "./components/CodeSnippetModal";
 import {
   CommandPalette,
@@ -31,24 +29,9 @@ const BreakpointInterceptorModal = React.lazy(() =>
     default: m.BreakpointInterceptorModal,
   }))
 );
-const FilterDrawer = React.lazy(() =>
-  import("./components/FilterDrawer").then((m) => ({
-    default: m.FilterDrawer,
-  }))
-);
-const MobileSetupModal = React.lazy(() =>
-  import("./components/MobileSetupModal").then((m) => ({
-    default: m.MobileSetupModal,
-  }))
-);
 const OpenApiExportModal = React.lazy(() =>
   import("./components/OpenApiExportModal").then((m) => ({
     default: m.OpenApiExportModal,
-  }))
-);
-const ProxyDoctorModal = React.lazy(() =>
-  import("./components/ProxyDoctorModal").then((m) => ({
-    default: m.ProxyDoctorModal,
   }))
 );
 const SanitizedExportModal = React.lazy(() =>
@@ -84,11 +67,6 @@ const SettingsModal = React.lazy(() =>
 const TextWizardModal = React.lazy(() =>
   import("./components/TextWizardModal").then((m) => ({
     default: m.TextWizardModal,
-  }))
-);
-const UpstreamProxyModal = React.lazy(() =>
-  import("./components/UpstreamProxyModal").then((m) => ({
-    default: m.UpstreamProxyModal,
   }))
 );
 import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
@@ -128,7 +106,6 @@ import { THROTTLE_PRESET_DEFINITIONS } from "./types/proxy";
 import type {
   AutoResponderRule,
   ComposedRequest,
-  FilterDrawerTab,
   PythonScriptPreset,
   SessionSummary,
   ThrottleConfig,
@@ -138,6 +115,7 @@ import type {
 import type {
   FluxUserSettingsProfile,
   SettingsImportPreviewSummary,
+  SettingsModalSubTab,
   SettingsModalTab,
 } from "./types/settings";
 
@@ -153,7 +131,6 @@ export const App: React.FC = () => {
     setCustomColorOverride,
     resetCustomColorOverride,
     resetCustomColorOverrides,
-    toggleLightDark,
   } = useTheme();
   const {
     compactToolbar,
@@ -361,14 +338,33 @@ export const App: React.FC = () => {
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] =
     useState<SettingsModalTab>("general");
+  const [settingsInitialSubTab, setSettingsInitialSubTab] =
+    useState<SettingsModalSubTab | undefined>(undefined);
+  const [settingsNavSeq, setSettingsNavSeq] = useState(0);
+  const [caRefreshKey, setCaRefreshKey] = useState(0);
+  const [activeClientCertsCount, setActiveClientCertsCount] = useState(0);
   const [pendingImportState, setPendingImportState] = useState<{
     profile: FluxUserSettingsProfile;
     preview: SettingsImportPreviewSummary;
   } | null>(null);
   const [certModalOpen, setCertModalOpen] = useState(false);
-  const [clientCertsModalOpen, setClientCertsModalOpen] = useState(false);
-  const [hostRemapModalOpen, setHostRemapModalOpen] = useState(false);
-  const [upstreamProxyModalOpen, setUpstreamProxyModalOpen] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void proxyBridge
+      .listClientCertificates()
+      .then((list) => {
+        if (active) {
+          setActiveClientCertsCount(list.filter((c) => c.enabled).length);
+        }
+      })
+      .catch(() => {
+        // ignore if runtime does not provide client certificate store
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const handleSaveUpstreamProxyConfig = useCallback(
     async (nextCfg: UpstreamProxyConfig) => {
@@ -502,8 +498,6 @@ export const App: React.FC = () => {
     setUpstreamProxyConfig,
     setUpstreamTimeouts,
   ]);
-  const [mobileModalOpen, setMobileModalOpen] = useState(false);
-  const [proxyDoctorModalOpen, setProxyDoctorModalOpen] = useState(false);
   const [sanitizedExportModalOpen, setSanitizedExportModalOpen] =
     useState(false);
   const [openApiModalOpen, setOpenApiModalOpen] = useState(false);
@@ -514,9 +508,6 @@ export const App: React.FC = () => {
   const [hexTriggerSeq, setHexTriggerSeq] = useState(0);
   const [statisticsTriggerSeq, setStatisticsTriggerSeq] = useState(0);
   const [customRetentionTriggerSeq, setCustomRetentionTriggerSeq] = useState(0);
-  const [filterDrawerOpen, setFilterDrawerOpen] = useState(false);
-  const [filterDrawerTab, setFilterDrawerTab] =
-    useState<FilterDrawerTab>("matrix");
 
   // Session Diff & User Annotations (Comment / Mark) Modal State
   const [annotationModalOpen, setAnnotationModalOpen] = useState(false);
@@ -532,20 +523,47 @@ export const App: React.FC = () => {
   const [fileDropLabel, setFileDropLabel] = useState<string | null>(null);
   const htmlDragDepthRef = useRef(0);
 
-  const openPreferencesAt = useCallback((tab: SettingsModalTab = "general") => {
-    setSettingsInitialTab(tab);
-    setSettingsModalOpen(true);
-  }, []);
+  const openPreferencesAt = useCallback(
+    (tab: SettingsModalTab = "general", subTab?: SettingsModalSubTab) => {
+      setSettingsInitialTab(tab);
+      setSettingsInitialSubTab(subTab);
+      setSettingsNavSeq((n) => n + 1);
+      setSettingsModalOpen(true);
+    },
+    []
+  );
+
+  const togglePreferencesMain = useCallback(() => {
+    if (settingsModalOpen) {
+      setSettingsModalOpen(false);
+      return;
+    }
+    openPreferencesAt("general");
+  }, [openPreferencesAt, settingsModalOpen]);
+
+  const togglePreferencesAt = useCallback(
+    (tab: SettingsModalTab, subTab?: SettingsModalSubTab) => {
+      if (
+        settingsModalOpen &&
+        settingsInitialTab === tab &&
+        (subTab === undefined || settingsInitialSubTab === subTab)
+      ) {
+        setSettingsModalOpen(false);
+        return;
+      }
+      openPreferencesAt(tab, subTab);
+    },
+    [
+      openPreferencesAt,
+      settingsInitialSubTab,
+      settingsInitialTab,
+      settingsModalOpen,
+    ]
+  );
 
   const handleOpenTimeoutSettings = useCallback(() => {
-    setSettingsInitialTab("general");
-    setSettingsModalOpen(true);
-    window.requestAnimationFrame(() => {
-      document
-        .getElementById("upstream-timeouts-section")
-        ?.scrollIntoView({ behavior: "smooth", block: "center" });
-    });
-  }, []);
+    openPreferencesAt("networkRouting", "timeouts");
+  }, [openPreferencesAt]);
 
   const openImportPreviewFromJsonText = useCallback(
     (jsonText: string, fileName: string) => {
@@ -1314,11 +1332,6 @@ export const App: React.FC = () => {
     }
   }, [pausedBreakpoints]);
 
-  const openFilterDrawerAt = useCallback((tab: FilterDrawerTab = "matrix") => {
-    setFilterDrawerTab(tab);
-    setFilterDrawerOpen(true);
-  }, []);
-
   const openSanitizedExportModal = useCallback(() => {
     if (sessions.length === 0) {
       showToast("⚠️ Нет захваченных сессий для экспорта");
@@ -1661,21 +1674,15 @@ export const App: React.FC = () => {
   useGlobalShortcuts({
     activeSection,
     setActiveSection,
-    clientCertsModalOpen,
-    setClientCertsModalOpen,
     diffModalOpen,
     setDiffModalOpen,
-    hostRemapModalOpen,
-    setHostRemapModalOpen,
     sanitizedExportModalOpen,
     setSanitizedExportModalOpen,
-    upstreamProxyModalOpen,
-    setUpstreamProxyModalOpen,
-    setFilterDrawerOpen,
-    setMobileModalOpen,
+    settingsModalOpen,
+    onToggleSettingsMain: togglePreferencesMain,
+    onToggleSettingsAt: togglePreferencesAt,
+    onToggleBreakpointsModal: () => setBpModalOpen((prev) => !prev),
     setPaletteOpen,
-    setProxyDoctorModalOpen,
-    setSettingsModalOpen,
     setShortcutsModalOpen,
     setTextWizardOpen,
     effectiveSelectedIds,
@@ -2082,7 +2089,7 @@ export const App: React.FC = () => {
           "диагностика",
           "проблемы",
         ],
-        perform: () => setProxyDoctorModalOpen(true),
+        perform: () => openPreferencesAt("diagnosticsBackup", "proxyDoctor"),
       },
       {
         id: "open-text-wizard",
@@ -2178,7 +2185,7 @@ export const App: React.FC = () => {
             ? `Активно: ${activeFilterBadgeCount}`
             : "Выкл",
         shortcut: "Alt+4",
-        perform: () => openFilterDrawerAt("matrix"),
+        perform: () => openPreferencesAt("filters", "matrix"),
       },
       {
         id: "open-hosts-list-filter",
@@ -2190,7 +2197,7 @@ export const App: React.FC = () => {
         statusBadge: hostListFilter.enabled
           ? `${hostListFilter.mode === "whitelist" ? "Allow" : "Block"} (${compiledHostList.activeCount})`
           : "OFF",
-        perform: () => openFilterDrawerAt("hostsList"),
+        perform: () => openPreferencesAt("filters", "hostsList"),
       },
       {
         id: "open-tls-bypass",
@@ -2203,7 +2210,7 @@ export const App: React.FC = () => {
           backendFilterConfig.tlsInterceptMode === "targetedOnly"
             ? `Targeted (${activeTargetHostsCount})`
             : `Bypass (${enabledTlsBypassCount})`,
-        perform: () => openFilterDrawerAt("tlsBypass"),
+        perform: () => openPreferencesAt("tlsCertificates", "mitmBypass"),
       },
       {
         id: "toggle-tls-mitm-mode",
@@ -2271,7 +2278,7 @@ export const App: React.FC = () => {
             ? `LAN :${status.port}`
             : `Local :${status.port}`,
         shortcut: "Ctrl+Shift+M",
-        perform: () => setMobileModalOpen(true),
+        perform: () => openPreferencesAt("tlsCertificates", "mobileSetup"),
       },
       {
         id: "toggle-allow-remote",
@@ -2407,7 +2414,7 @@ export const App: React.FC = () => {
           "сертификат",
           "клиентский",
         ],
-        perform: () => setClientCertsModalOpen(true),
+        perform: () => openPreferencesAt("tlsCertificates", "clientCerts"),
       },
       {
         id: "host-remap",
@@ -2430,7 +2437,7 @@ export const App: React.FC = () => {
           "перенаправление",
           "хост",
         ],
-        perform: () => setHostRemapModalOpen(true),
+        perform: () => openPreferencesAt("networkRouting", "hostsRemap"),
       },
       {
         id: "upstream-proxy-chaining",
@@ -2450,7 +2457,7 @@ export const App: React.FC = () => {
           "каскад",
           "прокси",
         ],
-        perform: () => setUpstreamProxyModalOpen(true),
+        perform: () => openPreferencesAt("networkRouting", "upstreamProxy"),
       },
       ...THROTTLE_PRESET_DEFINITIONS.filter((d) => d.id !== "custom").map(
         (presetDef) => ({
@@ -2774,7 +2781,6 @@ export const App: React.FC = () => {
       openBreakpointsAt,
       openCodeGeneratorForSession,
       openDiffWithPairSmart,
-      openFilterDrawerAt,
       openOpenApiExportModal,
       openPreferencesAt,
       openSanitizedExportModal,
@@ -3066,9 +3072,9 @@ export const App: React.FC = () => {
         tlsInterceptMode={backendFilterConfig.tlsInterceptMode}
         targetHostsCount={activeTargetHostsCount}
         onToggleTlsInterceptMode={() => void toggleTlsInterceptMode()}
-        onOpenFilterDrawer={() => openFilterDrawerAt("matrix")}
-        onOpenHostsListDrawer={() => openFilterDrawerAt("hostsList")}
-        onOpenTlsModeDrawer={() => openFilterDrawerAt("tlsBypass")}
+        onOpenFilterDrawer={() => openPreferencesAt("filters", "matrix")}
+        onOpenHostsListDrawer={() => openPreferencesAt("filters", "hostsList")}
+        onOpenTlsModeDrawer={() => openPreferencesAt("tlsCertificates", "mitmBypass")}
         sidebarCollapsed={sidebarCollapsed}
         onToggleSidebar={toggleSidebar}
         inspectorCollapsed={inspectorCollapsed}
@@ -3091,8 +3097,6 @@ export const App: React.FC = () => {
         onToggleColumnVisibility={toggleColumnVisibility}
         onResetColumns={resetColumns}
         onResetPanelLayout={handleResetPanelLayout}
-        themePreference={preference}
-        onSetTheme={setTheme}
         onOpenThemeGallery={() => openPreferencesAt("uiColumns")}
         onReplaySelected={() => {
           if (effectiveSelectedIds.length > 0) {
@@ -3107,12 +3111,16 @@ export const App: React.FC = () => {
         onOpenHexConverter={() => openTextWizardAt("hex")}
         onInspectInHex={handleInspectInHex}
         onOpenCompressionCodec={() => openTextWizardAt("compression")}
-        onOpenMobileSetup={() => setMobileModalOpen(true)}
+        onOpenMobileSetup={() => openPreferencesAt("tlsCertificates", "mobileSetup")}
         onOpenCertificates={() => setCertModalOpen(true)}
-        onOpenClientCertificates={() => setClientCertsModalOpen(true)}
-        onOpenHostRemap={() => setHostRemapModalOpen(true)}
+        onOpenClientCertificates={() =>
+          openPreferencesAt("tlsCertificates", "clientCerts")
+        }
+        onOpenHostRemap={() => openPreferencesAt("networkRouting", "hostsRemap")}
         activeHostRemapCount={activeHostRemapCount}
-        onOpenUpstreamProxy={() => setUpstreamProxyModalOpen(true)}
+        onOpenUpstreamProxy={() =>
+          openPreferencesAt("networkRouting", "upstreamProxy")
+        }
         upstreamProxyActiveLabel={upstreamProxyActiveLabel}
         sessionRetentionLimit={sessionRetentionLimit}
         onSetSessionRetentionLimit={(limit) =>
@@ -3124,7 +3132,9 @@ export const App: React.FC = () => {
         onGenerateStress10k={generateStress10k}
         onOpenCommandPalette={() => setPaletteOpen(true)}
         onOpenShortcutsModal={() => setShortcutsModalOpen(true)}
-        onOpenProxyDoctor={() => setProxyDoctorModalOpen(true)}
+        onOpenProxyDoctor={() =>
+          openPreferencesAt("diagnosticsBackup", "proxyDoctor")
+        }
         onCopyCliEnv={copyCliProxyEnv}
         onResetAllUiPreferences={resetAllUiPreferences}
       />
@@ -3137,9 +3147,6 @@ export const App: React.FC = () => {
             onDropSessionToComposer={(id) =>
               void loadSessionIntoComposer(id, true)
             }
-            onOpenFilterDrawer={() => setFilterDrawerOpen((v) => !v)}
-            filterDrawerOpen={filterDrawerOpen}
-            activeFilterCount={activeFilterBadgeCount}
             onOpenBreakpoints={() =>
               openBreakpointsAt(
                 pausedBreakpoints.length > 0 ? "intercept" : "rules"
@@ -3150,19 +3157,13 @@ export const App: React.FC = () => {
             onOpenSessionDiff={() => openDiffWithPairSmart()}
             diffActive={diffModalOpen || showInlineSessionDiff}
             onOpenTextWizard={() => openTextWizardAt("jwt")}
-            onOpenMobileSetup={() => setMobileModalOpen(true)}
-            allowRemote={Boolean(
-              status.allowRemote || status.bindAddr === "0.0.0.0"
-            )}
-            onOpenCertificates={() => setCertModalOpen(true)}
-            onOpenCommandPalette={() => setPaletteOpen(true)}
-            resolvedTheme={resolvedTheme}
-            onToggleTheme={toggleLightDark}
             activeRulesCount={activeRulesCount}
             pythonScriptEnabled={Boolean(
               scriptEnabled &&
                 (pythonRunnerStatus?.running || pythonRunnerStatus?.isSimulator)
             )}
+            onOpenSettings={() => openPreferencesAt("general")}
+            settingsOpen={settingsModalOpen}
             onCollapseSidebar={toggleSidebar}
           />
         )}
@@ -3181,7 +3182,7 @@ export const App: React.FC = () => {
             onSelectCategory={setQuickCategory}
             activeFilterCount={activeFilterBadgeCount}
             activePresetName={activePreset?.name ?? null}
-            onOpenFilterDrawer={() => openFilterDrawerAt("matrix")}
+            onOpenFilterDrawer={() => openPreferencesAt("filters", "matrix")}
             onResetAdvancedFilters={resetAdvancedFilters}
             isForceNoCacheActive={isForceNoCacheActive}
             onToggleForceNoCache={() => void toggleForceNoCache()}
@@ -3194,30 +3195,18 @@ export const App: React.FC = () => {
                 pausedBreakpoints.length > 0 ? "intercept" : "rules"
               )
             }
-            onOpenTextWizard={() => openTextWizardAt("jwt")}
-            onOpenHexConverter={() => openTextWizardAt("hex")}
-            onInspectInHex={handleInspectInHex}
-            hasSelection={effectiveSelectedIds.length > 0}
             markedCount={markedSessionsCount}
-            onOpenSessionDiff={() => openDiffWithPairSmart()}
             followTail={followTail}
             onToggleFollowTail={() => setFollowTail((v) => !v)}
             compactToolbar={compactToolbar}
-            onToggleCompactToolbar={toggleCompactToolbar}
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={toggleSidebar}
-            inspectorCollapsed={inspectorCollapsed}
-            onToggleInspector={toggleInspector}
-            inspectorPosition={inspectorPosition}
-            onSetInspectorPosition={setInspectorPosition}
             dockedComposer={dockedComposer}
             onToggleDockedComposer={() => {
               setActiveSection("traffic");
               setDockedComposer((v) => !v);
             }}
             toolbarGroups={toolbarGroups}
-            onToggleToolbarGroup={toggleToolbarGroup}
-            onResetToolbarGroups={resetToolbarGroups}
             visibleColumns={visibleColumns}
             onToggleColumnVisibility={toggleColumnVisibility}
             onResetColumns={resetColumns}
@@ -3239,7 +3228,9 @@ export const App: React.FC = () => {
                 hideConnectTunnels: !prev.hideConnectTunnels,
               }))
             }
-            onOpenTlsModeDrawer={() => openFilterDrawerAt("tlsBypass")}
+            onOpenTlsModeDrawer={() =>
+              openPreferencesAt("tlsCertificates", "mitmBypass")
+            }
             sessionRetentionLimit={sessionRetentionLimit}
             onSetSessionRetentionLimit={(limit) =>
               void setSessionRetentionLimit(limit)
@@ -3249,14 +3240,15 @@ export const App: React.FC = () => {
             droppedSessionsCount={storageStats.droppedSessionsCount}
             customRetentionTriggerSeq={customRetentionTriggerSeq}
             onClearSessions={() => void clearAllSessions()}
-            onSaveSqlite={() => void saveToSqlite()}
-            onLoadSqlite={() => void loadFromSqlite()}
-            onOpenCertificates={() => setCertModalOpen(true)}
-            onOpenMobileSetup={() => setMobileModalOpen(true)}
             throttleConfig={throttleConfig}
             onChangeThrottleConfig={(cfg) => void handleChangeThrottleConfig(cfg)}
-            onOpenHostRemap={() => setHostRemapModalOpen(true)}
             activeHostRemapCount={activeHostRemapCount}
+            upstreamProxyEnabled={Boolean(upstreamProxyActiveLabel)}
+            activeClientCertsCount={activeClientCertsCount}
+            onOpenNetworkRouting={(subTab) =>
+              openPreferencesAt("networkRouting", subTab ?? "throttling")
+            }
+            onOpenAppearanceSettings={() => openPreferencesAt("uiColumns")}
             onNotify={showToast}
           />
 
@@ -3545,7 +3537,9 @@ export const App: React.FC = () => {
               <span className="text-subtle">•</span>
               <button
                 type="button"
-                onClick={() => setProxyDoctorModalOpen(true)}
+                onClick={() =>
+                  openPreferencesAt("diagnosticsBackup", "proxyDoctor")
+                }
                 title={
                   status.systemProxyError
                     ? `Ошибка системного прокси: ${status.systemProxyError} — нажмите для диагностики Proxy Doctor (Ctrl+Shift+D)`
@@ -3588,7 +3582,9 @@ export const App: React.FC = () => {
             return (
               <button
                 type="button"
-                onClick={() => setMobileModalOpen(true)}
+                onClick={() =>
+                  openPreferencesAt("tlsCertificates", "mobileSetup")
+                }
                 title={`Активные интерфейсы: ${boundEndpoints}. Нажмите для настройки мобильного подключения (Ctrl+Shift+M)`}
                 className={`hidden shrink-0 font-mono hover:underline md:inline ${
                   isRemoteActive ? "text-status2xx-fg" : "text-muted"
@@ -3601,7 +3597,7 @@ export const App: React.FC = () => {
           <span className="hidden text-subtle md:inline">•</span>
           <button
             type="button"
-            onClick={() => openFilterDrawerAt("tlsBypass")}
+            onClick={() => openPreferencesAt("tlsCertificates", "mitmBypass")}
             title="Настроить режим перехвата TLS MITM (Intercept All / Targeted Only Allowlist)"
             className={`hidden shrink-0 hover:underline md:inline ${
               backendFilterConfig.tlsInterceptMode === "targetedOnly"
@@ -3618,7 +3614,9 @@ export const App: React.FC = () => {
               <span className="hidden text-subtle md:inline">•</span>
               <button
                 type="button"
-                onClick={() => setHostRemapModalOpen(true)}
+                onClick={() =>
+                  openPreferencesAt("networkRouting", "hostsRemap")
+                }
                 title={`Активных правил HOSTS Remapping: ${activeHostRemapCount}. Нажмите для управления (Ctrl+Shift+H)`}
                 className="inline-flex shrink-0 items-center gap-1 text-accent hover:underline"
               >
@@ -3632,7 +3630,9 @@ export const App: React.FC = () => {
               <span className="hidden text-subtle md:inline">•</span>
               <button
                 type="button"
-                onClick={() => setUpstreamProxyModalOpen(true)}
+                onClick={() =>
+                  openPreferencesAt("networkRouting", "upstreamProxy")
+                }
                 title={`Каскадирование через Upstream Proxy (${upstreamProxyActiveLabel}). Нажмите для настройки (Ctrl+Shift+U)`}
                 className="inline-flex shrink-0 items-center gap-1 text-accent hover:underline"
               >
@@ -3686,7 +3686,7 @@ export const App: React.FC = () => {
               <span className="text-subtle">•</span>
               <button
                 type="button"
-                onClick={() => openFilterDrawerAt("matrix")}
+                onClick={() => openPreferencesAt("filters", "matrix")}
                 className="shrink-0 text-accent hover:underline"
               >
                 Filters: {activeFilterBadgeCount} (
@@ -3787,6 +3787,8 @@ export const App: React.FC = () => {
           <SettingsModal
             open={settingsModalOpen}
             initialTab={settingsInitialTab}
+            initialSubTab={settingsInitialSubTab}
+            navigationSeq={settingsNavSeq}
             onClose={() => setSettingsModalOpen(false)}
             themePreference={preference}
             onSetTheme={setTheme}
@@ -3818,8 +3820,12 @@ export const App: React.FC = () => {
             columnWidths={columnWidths}
             onSetColumnWidth={setColumnWidth}
             onResetColumns={resetColumns}
+            sessions={sessions}
+            totalCount={sessions.length}
+            filteredCount={filteredSessions.length}
             activePresetId={activePresetId}
             userPresets={customPresets}
+            allPresets={allPresets}
             onApplyPreset={(presetId) => {
               if (presetId) {
                 applyPreset(presetId);
@@ -3832,17 +3838,28 @@ export const App: React.FC = () => {
             matrixEnabled={matrixEnabled}
             onSetMatrixEnabled={setMatrixEnabled}
             filterRules={filterRules}
+            onSetFilterRules={setFilterRules}
+            ruleErrors={ruleErrors}
+            detectedProcesses={detectedProcesses}
+            onQuickProcessFilter={quickFilterByProcess}
             noiseThresholds={thresholds}
             onSetNoiseThresholds={setThresholds}
             hostFilters={hostListFilter}
             onSetHostFilters={setHostListFilter}
             onResetAdvancedFilters={resetAdvancedFilters}
-            onOpenFilterDrawer={() => openFilterDrawerAt("matrix")}
+            isForceNoCacheActive={isForceNoCacheActive}
+            onToggleForceNoCache={toggleForceNoCache}
             status={status}
+            onToggleProxy={toggleProxy}
             onSetProxyPort={setProxyPort}
             onSetAutoSystemProxy={setAutoSystemProxy}
             onSetAllowRemote={setAllowRemote}
             onSetBindConfiguration={setBindConfiguration}
+            throttleConfig={throttleConfig}
+            onChangeThrottleConfig={handleChangeThrottleConfig}
+            activeHostRemapCount={activeHostRemapCount}
+            upstreamProxyConfig={upstreamProxyConfig}
+            onSaveUpstreamProxyConfig={handleSaveUpstreamProxyConfig}
             upstreamTimeouts={upstreamTimeouts}
             onSetUpstreamTimeouts={handleSaveUpstreamTimeouts}
             sessionRetentionLimit={sessionRetentionLimit}
@@ -3855,25 +3872,13 @@ export const App: React.FC = () => {
             onClearSqliteDatabase={clearSqliteDatabase}
             backendFilterConfig={backendFilterConfig}
             onUpdateBackendFilterConfig={updateBackendFilterConfig}
-            onSetTlsInterceptMode={setTlsInterceptMode}
-            onOpenTlsDrawer={() => openFilterDrawerAt("tlsBypass")}
-            onOpenHeadersDrawer={() => openFilterDrawerAt("headers")}
+            onUpdateLanClientAllowlist={updateLanClientAllowlist}
+            onOpenCertificateModal={() => setCertModalOpen(true)}
+            caRefreshKey={caRefreshKey}
+            activeClientCertsCount={activeClientCertsCount}
+            onClientCertsCountChange={setActiveClientCertsCount}
             autoResponderEnabled={autoResponderEnabled}
-            onSetAutoResponderEnabled={handleSetAutoResponderEnabled}
             autoResponderRules={rules}
-            onUpsertAutoResponderRule={async (rule) => {
-              const next = await proxyBridge.upsertRule(rule);
-              setRules(next);
-              persistAutoResponderStorage(autoResponderEnabled, next);
-              showToast(`Saved rule "${rule.name}"`);
-            }}
-            onDeleteAutoResponderRule={async (id) => {
-              const next = await proxyBridge.deleteRule(id);
-              setRules(next);
-              persistAutoResponderStorage(autoResponderEnabled, next);
-              showToast("Deleted AutoResponder rule");
-            }}
-            onOpenAutoResponderStudio={() => setActiveSection("rules")}
             onExportProfile={handleExportSettingsProfile}
             onImportProfileDialog={handleImportSettingsProfileDialog}
             onImportFromRawJsonText={(jsonText, label) =>
@@ -3923,42 +3928,6 @@ export const App: React.FC = () => {
         </React.Suspense>
       )}
 
-      {filterDrawerOpen && (
-        <React.Suspense fallback={null}>
-          <FilterDrawer
-            open={filterDrawerOpen}
-            initialTab={filterDrawerTab}
-            onClose={() => setFilterDrawerOpen(false)}
-            totalCount={sessions.length}
-            filteredCount={filteredSessions.length}
-            sessions={sessions}
-            hostListFilter={hostListFilter}
-            compiledHostList={compiledHostList}
-            onHostListFilterChange={setHostListFilter}
-            onNotify={showToast}
-            matrixEnabled={matrixEnabled}
-            onMatrixEnabledChange={setMatrixEnabled}
-            rules={filterRules}
-            onRulesChange={setFilterRules}
-            ruleErrors={ruleErrors}
-            presets={allPresets}
-            activePresetId={activePresetId}
-            onApplyPreset={applyPreset}
-            onSavePreset={saveCustomPreset}
-            onDeletePreset={deleteCustomPreset}
-            onResetAll={resetAdvancedFilters}
-            detectedProcesses={detectedProcesses}
-            onQuickProcessFilter={quickFilterByProcess}
-            thresholds={thresholds}
-            onThresholdsChange={setThresholds}
-            backendConfig={backendFilterConfig}
-            onBackendConfigChange={updateBackendFilterConfig}
-            isForceNoCacheActive={isForceNoCacheActive}
-            onToggleForceNoCache={toggleForceNoCache}
-          />
-        </React.Suspense>
-      )}
-
       {bpModalOpen && (
         <React.Suspense fallback={null}>
           <BreakpointInterceptorModal
@@ -3990,58 +3959,12 @@ export const App: React.FC = () => {
 
       <CertificateModal
         open={certModalOpen}
-        onClose={() => setCertModalOpen(false)}
+        onClose={() => {
+          setCertModalOpen(false);
+          setCaRefreshKey((n) => n + 1);
+        }}
         onNotify={showToast}
       />
-
-      <ClientCertificatesModal
-        open={clientCertsModalOpen}
-        onClose={() => setClientCertsModalOpen(false)}
-        onNotify={showToast}
-      />
-
-      <HostRemapModal
-        open={hostRemapModalOpen}
-        onClose={() => setHostRemapModalOpen(false)}
-        onNotify={showToast}
-      />
-
-      {upstreamProxyModalOpen && (
-        <React.Suspense fallback={null}>
-          <UpstreamProxyModal
-            open={upstreamProxyModalOpen}
-            config={upstreamProxyConfig}
-            proxyPort={status.port}
-            onClose={() => setUpstreamProxyModalOpen(false)}
-            onSave={handleSaveUpstreamProxyConfig}
-          />
-        </React.Suspense>
-      )}
-
-      {mobileModalOpen && (
-        <React.Suspense fallback={null}>
-          <MobileSetupModal
-            open={mobileModalOpen}
-            status={status}
-            lanClientAllowlist={backendFilterConfig.lanClientAllowlist ?? []}
-            onUpdateLanClientAllowlist={updateLanClientAllowlist}
-            onSetAllowRemote={setAllowRemote}
-            onToggleProxy={toggleProxy}
-            onClose={() => setMobileModalOpen(false)}
-            onNotify={showToast}
-          />
-        </React.Suspense>
-      )}
-
-      {proxyDoctorModalOpen && (
-        <React.Suspense fallback={null}>
-          <ProxyDoctorModal
-            open={proxyDoctorModalOpen}
-            onClose={() => setProxyDoctorModalOpen(false)}
-            onNotify={showToast}
-          />
-        </React.Suspense>
-      )}
 
       {sanitizedExportModalOpen && (
         <React.Suspense fallback={null}>
@@ -4085,8 +4008,12 @@ export const App: React.FC = () => {
         }
         onQuickOpenJwt={(token) => openTextWizardAt("jwt", token)}
         onQuickOpenSanitizedExport={openSanitizedExportModal}
-        onQuickOpenProxyDoctor={() => setProxyDoctorModalOpen(true)}
-        onQuickOpenClientCerts={() => setClientCertsModalOpen(true)}
+        onQuickOpenProxyDoctor={() =>
+          openPreferencesAt("diagnosticsBackup", "proxyDoctor")
+        }
+        onQuickOpenClientCerts={() =>
+          openPreferencesAt("tlsCertificates", "clientCerts")
+        }
       />
 
       <dialog

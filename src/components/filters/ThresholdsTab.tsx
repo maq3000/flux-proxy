@@ -1,5 +1,6 @@
 import React from "react";
 import { Flame, Gauge } from "lucide-react";
+import { HelpTooltip } from "../ui/HelpTooltip";
 import { formatBytes } from "../../lib/formatters";
 import type { NoiseThresholdsConfig } from "../../types/proxy";
 
@@ -174,21 +175,29 @@ export const ThresholdsTab: React.FC<ThresholdsTabProps> = ({
             {/* Time Heat Coloring & Slow Request Filter */}
             <section className="rounded-lg border border-hairline bg-surface p-3.5 space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <label className="inline-flex cursor-pointer items-center gap-2 text-xs font-semibold text-fg">
-                  <input
-                    type="checkbox"
-                    checked={thresholds.timeHeatEnabled}
-                    onChange={(e) =>
-                      onThresholdsChange((prev) => ({
-                        ...prev,
-                        timeHeatEnabled: e.target.checked,
-                      }))
-                    }
-                    className="checkbox-native"
+                <div className="flex items-center gap-1.5">
+                  <label className="inline-flex cursor-pointer items-center gap-2 text-xs font-semibold text-fg">
+                    <input
+                      type="checkbox"
+                      checked={thresholds.timeHeatEnabled}
+                      onChange={(e) =>
+                        onThresholdsChange((prev) => ({
+                          ...prev,
+                          timeHeatEnabled: e.target.checked,
+                        }))
+                      }
+                      className="checkbox-native"
+                    />
+                    <Flame className="h-4 w-4 text-amber-400" />
+                    <span>Time Heat — тепловая индикация медленных запросов</span>
+                  </label>
+                  <HelpTooltip
+                    label="Подробнее о Time Heat"
+                    title="Тепловая подсветка времени ответа"
+                    content="Окрашивает колонку Time в таблице трафика: превышение порога Warning подсвечивается янтарным, превышение Critical — красным цветом для быстрого поиска узких мест."
+                    example="Warning ≥ 500 ms, Critical ≥ 1500 ms"
                   />
-                  <Flame className="h-4 w-4 text-amber-400" />
-                  <span>Time Heat — тепловая индикация медленных запросов</span>
-                </label>
+                </div>
 
                 <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-300">
                   <input

@@ -4,7 +4,6 @@ import {
   TOOLBAR_GROUP_DEFINITIONS,
   TRAFFIC_COLUMNS,
 } from "../hooks/useUiPreferences";
-import type { ThemePreference } from "../hooks/useTheme";
 import { SESSION_RETENTION_PRESETS } from "../types/proxy";
 import type {
   ActiveNavSection,
@@ -93,8 +92,6 @@ interface MenuBarProps {
   onToggleColumnVisibility: (colId: ColumnId) => void;
   onResetColumns: () => void;
   onResetPanelLayout: () => void;
-  themePreference: ThemePreference;
-  onSetTheme: (pref: ThemePreference) => void;
   onOpenThemeGallery?: () => void;
   // Tools
   sessionRetentionLimit: number | null;
@@ -338,8 +335,6 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onToggleColumnVisibility,
   onResetColumns,
   onResetPanelLayout,
-  themePreference,
-  onSetTheme,
   onOpenThemeGallery,
   sessionRetentionLimit,
   onSetSessionRetentionLimit,
@@ -1654,44 +1649,17 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 </button>
               </div>
 
-              <hr />
-
-              <div role="group" aria-label="Color Theme">
-                <button
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked={themePreference === "dark"}
-                  onClick={(e) => activateCommand(e, () => onSetTheme("dark"))}
-                >
-                  <span>Theme: Dark (Zinc)</span>
-                </button>
-                <button
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked={themePreference === "light"}
-                  onClick={(e) => activateCommand(e, () => onSetTheme("light"))}
-                >
-                  <span>Theme: Light (Zinc)</span>
-                </button>
-                <button
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked={themePreference === "system"}
-                  onClick={(e) =>
-                    activateCommand(e, () => onSetTheme("system"))
-                  }
-                >
-                  <span>Theme: System</span>
-                </button>
-                {onOpenThemeGallery && (
+              {onOpenThemeGallery && (
+                <>
+                  <hr />
                   <button
                     type="button"
                     onClick={(e) => activateCommand(e, onOpenThemeGallery)}
                   >
-                    <span>Theme Gallery &amp; Custom Palette…</span>
+                    <span>Theme Presets &amp; Appearance…</span>
                   </button>
-                )}
-              </div>
+                </>
+              )}
             </div>
           </div>
 
@@ -2015,26 +1983,6 @@ export const MenuBar: React.FC<MenuBarProps> = ({
         <span className="hidden tabular-nums sm:inline">
           {filteredCount.toLocaleString()} / {totalCount.toLocaleString()} sessions
         </span>
-        <span className="hidden text-hairline md:inline">|</span>
-        <button
-          type="button"
-          onClick={onToggleSystemProxy}
-          title="Click to toggle OS System Proxy"
-          className={`hidden rounded px-1.5 py-0.5 transition-colors hover:bg-hover md:inline-flex ${
-            status.systemProxyError
-              ? "text-status4xx-fg"
-              : status.systemProxyEnabled
-                ? "text-status2xx-fg"
-                : "text-subtle"
-          }`}
-        >
-          SysProxy:{" "}
-          {status.systemProxyError
-            ? "WARN"
-            : status.systemProxyEnabled
-              ? "ON"
-              : "OFF"}
-        </button>
         <button
           type="button"
           onClick={onOpenCommandPalette}

@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { Check, ChevronDown, ChevronRight, Palette, RotateCcw } from "lucide-react";
+import { HelpTooltip } from "../ui/HelpTooltip";
 import type { ThemePreference } from "../../hooks/useTheme";
 import {
   COLUMN_MIN_WIDTHS,
@@ -166,7 +167,7 @@ export const UiColumnsSettingsTab: React.FC<UiColumnsSettingsTabProps> = ({
 
   return (
               <>
-                <div className="space-y-3 rounded-lg border border-hairline bg-canvas p-3.5">
+                <div id="ui-theme-gallery-section" className="space-y-3 rounded-lg border border-hairline bg-canvas p-3.5">
                   <div className="flex flex-wrap items-start justify-between gap-2">
                     <div>
                       <div className="flex items-center gap-1.5">
@@ -174,6 +175,11 @@ export const UiColumnsSettingsTab: React.FC<UiColumnsSettingsTabProps> = ({
                         <h3 className="text-xs font-semibold text-fg">
                           Галерея цветовых тем-пресетов
                         </h3>
+                        <HelpTooltip
+                          label="Подробнее о темах и редакторе палитры"
+                          title="Единый центр тем и палитры"
+                          content="8 встроенных тем и базовая схема Dark/Light/System синхронизируются с CSS-токенами приложения и темой редактора Monaco Editor. Любой цвет можно переопределить в детальном редакторе ниже."
+                        />
                       </div>
                       <p className="mt-0.5 text-[11px] text-muted">
                         Мгновенно переключает интерфейс, HTTP-статусы и подсветку Monaco Editor.
@@ -561,11 +567,18 @@ export const UiColumnsSettingsTab: React.FC<UiColumnsSettingsTabProps> = ({
                   </div>
                 </div>
 
-                <div className="space-y-3 rounded-lg border border-hairline bg-canvas p-3.5">
+                <div id="ui-layout-section" className="space-y-3 rounded-lg border border-hairline bg-canvas p-3.5">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <h3 className="text-xs font-semibold text-fg">
-                      Компоновка рабочей области
-                    </h3>
+                    <div className="flex items-center gap-1.5">
+                      <h3 className="text-xs font-semibold text-fg">
+                        Компоновка рабочей области
+                      </h3>
+                      <HelpTooltip
+                        label="Подробнее о компоновке панелей"
+                        title="Раскладка и автосохранение сплитов"
+                        content="Пропорции таблиц и панелей сохраняются автоматически при перетягивании разделителей. Двойной клик по разделителю или кнопка Reset сбрасывает их к пропорциям по умолчанию."
+                      />
+                    </div>
                     <button
                       type="button"
                       onClick={onResetPanelLayout}
@@ -742,15 +755,22 @@ export const UiColumnsSettingsTab: React.FC<UiColumnsSettingsTabProps> = ({
                   </fieldset>
                 </div>
 
-                <div className="space-y-2.5 rounded-lg border border-hairline bg-canvas p-3.5">
+                <div id="ui-toolbar-groups-section" className="space-y-2.5 rounded-lg border border-hairline bg-canvas p-3.5">
                   <div className="flex items-center justify-between gap-2">
                     <div>
-                      <h3 className="text-xs font-semibold text-fg">
-                        Группы верхней панели инструментов ({visibleGroupsCount}/
-                        {TOOLBAR_GROUP_DEFINITIONS.length})
-                      </h3>
+                      <div className="flex items-center gap-1.5">
+                        <h3 className="text-xs font-semibold text-fg">
+                          Группы верхней панели инструментов ({visibleGroupsCount}/
+                          {TOOLBAR_GROUP_DEFINITIONS.length})
+                        </h3>
+                        <HelpTooltip
+                          label="Подробнее о группах тулбара"
+                          title="Настройка видимости блоков TopToolbar"
+                          content="Позволяет скрыть редко используемые группы кнопок с верхней панели. Селектор Bandwidth Throttling всегда остаётся на виду для наглядности сетевых ограничений."
+                        />
+                      </div>
                       <p className="text-[11px] text-muted">
-                        Скрытые группы остаются доступны через меню «⋯» и сохраняются в JSON-профиль.
+                        Скрытые действия остаются доступны через верхнее меню, Command Palette (Ctrl+K) и сохраняются в JSON-профиль.
                       </p>
                     </div>
                     <button
@@ -793,13 +813,20 @@ export const UiColumnsSettingsTab: React.FC<UiColumnsSettingsTabProps> = ({
                   </div>
                 </div>
 
-                <div className="space-y-2.5 rounded-lg border border-hairline bg-canvas p-3.5">
+                <div id="ui-columns-section" className="space-y-2.5 rounded-lg border border-hairline bg-canvas p-3.5">
                   <div className="flex items-center justify-between gap-2">
                     <div>
-                      <h3 className="text-xs font-semibold text-fg">
-                        Видимость и ширина колонок таблицы ({visibleColsCount}/
-                        {TRAFFIC_COLUMNS.length})
-                      </h3>
+                      <div className="flex items-center gap-1.5">
+                        <h3 className="text-xs font-semibold text-fg">
+                          Видимость и ширина колонок таблицы ({visibleColsCount}/
+                          {TRAFFIC_COLUMNS.length})
+                        </h3>
+                        <HelpTooltip
+                          label="Подробнее о колонках таблицы"
+                          title="Столбцы TrafficGrid"
+                          content="Включите дополнительные столбцы TTFB и Server IP для диагностики задержек и маршрутизации (включая пометку via proxy). Двойной клик по границе шапки в таблице выполняет Auto-fit ширины."
+                        />
+                      </div>
                       <p className="text-[11px] text-muted">
                         Настройте отображаемые столбцы и их точную ширину в пикселях.
                       </p>

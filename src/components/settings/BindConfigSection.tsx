@@ -1,9 +1,14 @@
 import React from "react";
 import { AlertTriangle, RefreshCw } from "lucide-react";
-import type { BindHostMode, NetworkInterfaceInfo, ProxyStatus } from "../../types/proxy";
+import { HelpTooltip } from "../ui/HelpTooltip";
+import type {
+  BindHostMode,
+  NetworkInterfaceInfo,
+  ProxyStatus,
+} from "../../types/proxy";
 
 export interface BindConfigSectionProps {
-  sectionKey: "general" | "rules";
+  sectionKey?: string;
   baseId: string;
   status: ProxyStatus;
   effectiveBindMode: BindHostMode;
@@ -20,7 +25,7 @@ export interface BindConfigSectionProps {
 }
 
 export const BindConfigSection: React.FC<BindConfigSectionProps> = ({
-  sectionKey,
+  sectionKey = "general",
   baseId,
   status,
   effectiveBindMode,
@@ -35,42 +40,49 @@ export const BindConfigSection: React.FC<BindConfigSectionProps> = ({
   onAlsoBindLoopbackChange,
   onReloadInterfaces,
 }) => {
-    const radioName = `${baseId}-${sectionKey}-bind-mode`;
-    const isSpecific = effectiveBindMode === "specific";
-    const activeSpecificValue = resolvedSpecificIpCandidate;
-    const hasCurrentSpecificInList = Boolean(
-      activeSpecificValue &&
-        networkInterfaces.some((iface) => iface.ip === activeSpecificValue)
-    );
-    const alsoLoopbackChecked = status.alsoBindLoopback ?? true;
+  const radioName = `${baseId}-${sectionKey}-bind-mode`;
+  const isSpecific = effectiveBindMode === "specific";
+  const activeSpecificValue = resolvedSpecificIpCandidate;
+  const hasCurrentSpecificInList = Boolean(
+    activeSpecificValue &&
+      networkInterfaces.some((iface) => iface.ip === activeSpecificValue)
+  );
+  const alsoLoopbackChecked = status.alsoBindLoopback ?? true;
 
-    const options: {
-      value: BindHostMode;
-      title: string;
-      desc: string;
-    }[] = [
-      {
-        value: "loopback",
-        title: "Loopback (127.0.0.1)",
-        desc: "Принимать подключения только локально с этого ПК (изолированный безопасный режим).",
-      },
-      {
-        value: "all",
-        title: "All Interfaces (0.0.0.0)",
-        desc: "Слушать все сетевые интерфейсы: Wi-Fi, LAN, смартфоны iOS / Android, VPN и WSL.",
-      },
-      {
-        value: "specific",
-        title: "Specific Interface",
-        desc: "Выбрать конкретный сетевой адаптер (Wi-Fi, Ethernet, WSL, Docker, Hyper-V, VPN).",
-      },
-    ];
+  const options: {
+    value: BindHostMode;
+    title: string;
+    desc: string;
+  }[] = [
+    {
+      value: "loopback",
+      title: "Loopback (127.0.0.1)",
+      desc: "Принимать подключения только локально с этого ПК (изолированный безопасный режим).",
+    },
+    {
+      value: "all",
+      title: "All Interfaces (0.0.0.0)",
+      desc: "Слушать все сетевые интерфейсы: Wi-Fi, LAN, смартфоны iOS / Android, VPN и WSL.",
+    },
+    {
+      value: "specific",
+      title: "Specific Interface",
+      desc: "Выбрать конкретный сетевой адаптер (Wi-Fi, Ethernet, WSL, Docker, Hyper-V, VPN).",
+    },
+  ];
 
-    const body = (
+  return (
+    <div id="bind-config-section" className="border-t border-hairline pt-2.5">
       <div className="space-y-2.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="font-semibold text-fg">
-            Привязка к сетевому интерфейсу (Bind Host)
+          <div className="flex items-center gap-1.5 font-semibold text-fg">
+            <span>Привязка к сетевому интерфейсу (Bind Host)</span>
+            <HelpTooltip
+              label="Подробнее о Bind Host и Dual Listener"
+              title="Режимы сетевого интерфейса прокси"
+              content="Loopback (127.0.0.1) изолирует прокси внутри этого ПК. All Interfaces (0.0.0.0) открывает приём с iOS/Android в Wi-Fi. Specific Interface позволяет слушать только выбранный адаптер (например, WSL или VPN)."
+              example="Specific + Dual Listener → слушает LAN IP и 127.0.0.1 одновременно"
+            />
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
             {activeBoundIps.map((ip) => (
@@ -169,31 +181,40 @@ export const BindConfigSection: React.FC<BindConfigSectionProps> = ({
               </button>
             </div>
 
-            <label
-              htmlFor={`${baseId}-${sectionKey}-also-loopback`}
-              className="flex cursor-pointer items-start gap-2 pt-0.5"
-            >
-              <input
-                id={`${baseId}-${sectionKey}-also-loopback`}
-                type="checkbox"
-                checked={alsoLoopbackChecked}
-                disabled={isApplyingBind || activeSpecificValue === "127.0.0.1"}
-                onChange={(e) =>
-                  void onAlsoBindLoopbackChange(e.target.checked)
-                }
-                className="checkbox-native mt-0.5"
-              />
-              <div>
-                <div className="text-xs font-medium text-fg">
-                  Также слушать 127.0.0.1 для системного прокси ОС
+            <div className="flex items-start gap-2 pt-0.5">
+              <label
+                htmlFor={`${baseId}-${sectionKey}-also-loopback`}
+                className="flex flex-1 cursor-pointer items-start gap-2"
+              >
+                <input
+                  id={`${baseId}-${sectionKey}-also-loopback`}
+                  type="checkbox"
+                  checked={alsoLoopbackChecked}
+                  disabled={
+                    isApplyingBind || activeSpecificValue === "127.0.0.1"
+                  }
+                  onChange={(e) =>
+                    void onAlsoBindLoopbackChange(e.target.checked)
+                  }
+                  className="checkbox-native mt-0.5"
+                />
+                <div>
+                  <div className="flex items-center gap-1.5 text-xs font-medium text-fg">
+                    <span>Также слушать 127.0.0.1 для системного прокси ОС</span>
+                    <HelpTooltip
+                      label="Подробнее о Dual Listener"
+                      title="Dual Listener (Loopback + LAN IP)"
+                      content="Запускает два независимых сокета одновременно: на выбранном адаптере для внешних устройств/VM и на 127.0.0.1 для браузеров на этом ПК, не открывая порт на 0.0.0.0."
+                    />
+                  </div>
+                  <div className="text-[11px] text-muted">
+                    {alsoLoopbackChecked && activeSpecificValue !== "127.0.0.1"
+                      ? `Dual Listener: прокси принимает подключения и на ${activeSpecificValue}:${status.port}, и на 127.0.0.1:${status.port} (системный прокси ОС указывает на 127.0.0.1).`
+                      : `Один сокет: прокси и системный прокси ОС используют ${activeSpecificValue || "выбранный IP"}:${status.port}.`}
+                  </div>
                 </div>
-                <div className="text-[11px] text-muted">
-                  {alsoLoopbackChecked && activeSpecificValue !== "127.0.0.1"
-                    ? `Dual Listener: прокси принимает подключения и на ${activeSpecificValue}:${status.port}, и на 127.0.0.1:${status.port} (системный прокси ОС указывает на 127.0.0.1).`
-                    : `Один сокет: прокси и системный прокси ОС используют ${activeSpecificValue || "выбранный IP"}:${status.port}.`}
-                </div>
-              </div>
-            </label>
+              </label>
+            </div>
           </div>
         )}
 
@@ -207,22 +228,6 @@ export const BindConfigSection: React.FC<BindConfigSectionProps> = ({
           </div>
         )}
       </div>
-    );
-
-    if (sectionKey === "rules") {
-      return (
-        <fieldset className="space-y-2.5 rounded-lg border border-hairline bg-canvas p-3.5">
-          <legend className="px-1 text-xs font-semibold text-fg">
-            Сетевой интерфейс прокси (Bind Host)
-          </legend>
-          {body}
-        </fieldset>
-      );
-    }
-
-    return (
-      <div className="border-t border-hairline pt-2.5">
-        {body}
-      </div>
-    );
-  };
+    </div>
+  );
+};

@@ -129,10 +129,38 @@ export interface FluxUserSettingsProfile {
 
 export type SettingsModalTab =
   | "general"
-  | "uiColumns"
+  | "networkRouting"
+  | "tlsCertificates"
   | "filters"
-  | "rulesProxy"
-  | "backupExport";
+  | "uiColumns"
+  | "diagnosticsBackup";
+
+export type SettingsNetworkSubTab =
+  | "throttling"
+  | "hostsRemap"
+  | "upstreamProxy"
+  | "timeouts";
+
+export type SettingsTlsSubTab =
+  | "mitmBypass"
+  | "clientCerts"
+  | "mobileSetup";
+
+export type SettingsFiltersSubTab =
+  | "matrix"
+  | "hostsList"
+  | "thresholds"
+  | "headers";
+
+export type SettingsDiagnosticsSubTab =
+  | "proxyDoctor"
+  | "profileBackup";
+
+export type SettingsModalSubTab =
+  | SettingsNetworkSubTab
+  | SettingsTlsSubTab
+  | SettingsFiltersSubTab
+  | SettingsDiagnosticsSubTab;
 
 export interface SettingsProfileValidationReport {
   profile: FluxUserSettingsProfile;
