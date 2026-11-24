@@ -84,7 +84,7 @@ import {
   WebSocketFramesPanel,
 } from "./InspectorProtocolPanels";
 import { SessionStatisticsPanel } from "./SessionStatisticsPanel";
-import type { TextWizardTab } from "./TextWizardModal";
+import type { TextWizardTab } from "./TextWizardPanel";
 
 interface SessionInspectorProps {
   detail: SessionDetail | null;

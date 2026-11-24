@@ -419,7 +419,24 @@ export interface ProxyStatus {
   boundIps?: string[];
 }
 
-export type ActiveNavSection = "traffic" | "composer" | "rules" | "scripts";
+export type ActiveNavSection =
+  | "traffic"
+  | "composer"
+  | "rules"
+  | "breakpoints"
+  | "scripts"
+  | "diff"
+  | "wizard";
+
+export const ALL_NAV_SECTIONS: readonly ActiveNavSection[] = [
+  "traffic",
+  "composer",
+  "rules",
+  "breakpoints",
+  "scripts",
+  "diff",
+  "wizard",
+] as const;
 
 export type ScriptConsoleLogLevel =
   | "stdout"

@@ -7,6 +7,7 @@ import type {
   RuleActionType,
   RuleMatchTarget,
 } from "../types/proxy";
+import { SectionHeader } from "./ui/SectionHeader";
 
 interface AutoResponderPanelProps {
   enabled?: boolean;
@@ -60,16 +61,16 @@ export const AutoResponderPanel: React.FC<AutoResponderPanelProps> = ({
   };
 
   return (
-    <div className="pane-contain flex h-full w-full overflow-hidden bg-canvas">
-      {/* Left List of Rules */}
-      <div className="flex w-80 shrink-0 flex-col border-r border-hairline bg-surface">
-        <div className="flex h-10 items-center justify-between border-b border-hairline px-3">
-          <div className="flex items-center gap-2">
-            <Sliders className="h-4 w-4 text-amber-400" />
-            <span className="text-xs font-semibold text-fg">
-              AutoResponder Rules
-            </span>
-          </div>
+    <div className="pane-contain flex h-full w-full flex-col overflow-hidden bg-canvas">
+      <SectionHeader
+        sectionId="rules"
+        icon={<Sliders className="h-4 w-4 text-amber-400" />}
+        badges={
+          <span className="rounded bg-canvas px-1.5 py-0.5 font-mono text-[10px] text-muted ring-1 ring-hairline tabular-nums">
+            {rules.filter((r) => r.enabled).length}/{rules.length} active
+          </span>
+        }
+        actions={
           <div className="flex items-center gap-2">
             {onToggleEnabled && (
               <label
@@ -89,30 +90,34 @@ export const AutoResponderPanel: React.FC<AutoResponderPanelProps> = ({
             <button
               type="button"
               onClick={() => void handleCreateRule()}
-              className="inline-flex items-center gap-1 rounded bg-sky-600 px-2 py-1 text-xs font-medium text-white hover:bg-sky-500"
+              className="inline-flex items-center gap-1 rounded bg-sky-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-500"
             >
-              <Plus className="h-3.5 w-3.5" />
+              <Plus className="h-3.5 w-3.5" aria-hidden="true" />
               <span>Add Rule</span>
             </button>
           </div>
+        }
+      />
+
+      {!enabled && (
+        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-hairline bg-status4xx-bg px-4 py-1.5 text-[11px] text-status4xx-fg">
+          <span>AutoResponder отключён глобально</span>
+          {onToggleEnabled && (
+            <button
+              type="button"
+              onClick={() => void onToggleEnabled(true)}
+              className="shrink-0 rounded border border-status4xx-fg/40 px-1.5 py-0.5 text-[10px] font-semibold hover:brightness-110"
+            >
+              Включить
+            </button>
+          )}
         </div>
+      )}
 
-        {!enabled && (
-          <div className="flex items-center justify-between gap-2 border-b border-hairline bg-status4xx-bg px-3 py-1.5 text-[11px] text-status4xx-fg">
-            <span>AutoResponder отключён глобально</span>
-            {onToggleEnabled && (
-              <button
-                type="button"
-                onClick={() => void onToggleEnabled(true)}
-                className="shrink-0 rounded border border-status4xx-fg/40 px-1.5 py-0.5 text-[10px] font-semibold hover:brightness-110"
-              >
-                Включить
-              </button>
-            )}
-          </div>
-        )}
-
-        <div className="flex-1 overflow-y-auto p-2 space-y-1">
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+        {/* Left List of Rules */}
+        <div className="flex w-80 shrink-0 flex-col border-r border-hairline bg-surface">
+          <div className="flex-1 space-y-1 overflow-y-auto p-2">
           {rules.length === 0 ? (
             <p className="p-4 text-center text-xs text-subtle">
               No interception rules configured.
@@ -173,6 +178,7 @@ export const AutoResponderPanel: React.FC<AutoResponderPanelProps> = ({
           Select or create an AutoResponder rule to mock responses, override status codes, or inject artificial latency.
         </div>
       )}
+      </div>
     </div>
   );
 };
@@ -363,7 +369,7 @@ const RuleDetailForm: React.FC<{
       {/* Mocked Payload Body Editor */}
       <div className="flex flex-1 flex-col overflow-hidden">
         <div className="flex h-7 items-center justify-between border-b border-hairline px-4 text-[11px] text-muted">
-          <span>Mock Response Payload (Monaco Editor)</span>
+          <span>Mock Response Payload</span>
           <span className="font-mono">Content-Type: application/json</span>
         </div>
         <div className="flex-1 overflow-hidden">

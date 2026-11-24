@@ -19,6 +19,7 @@ import {
 import type { ThemePreference } from "../hooks/useTheme";
 import { TRAFFIC_COLUMNS } from "../hooks/useUiPreferences";
 import { compileHostListFilter } from "../lib/filterEngine";
+import { getSectionMeta } from "../lib/sectionRegistry";
 import { proxyBridge } from "../lib/tauriBridge";
 import {
   THEME_PRESETS_BY_ID,
@@ -65,6 +66,7 @@ import { GeneralSettingsTab } from "./settings/GeneralSettingsTab";
 import { NetworkRoutingSettingsTab } from "./settings/NetworkRoutingSettingsTab";
 import { TlsCertificatesSettingsTab } from "./settings/TlsCertificatesSettingsTab";
 import { UiColumnsSettingsTab } from "./settings/UiColumnsSettingsTab";
+import { SectionHeader } from "./ui/SectionHeader";
 
 function attachDialogLightDismissFallback(
   dialog: HTMLDialogElement | null
@@ -417,37 +419,37 @@ const TAB_DEFINITIONS: {
 }[] = [
   {
     id: "general",
-    label: "General",
+    label: getSectionMeta("settings.general").title,
     subtitle: "Порт, интерфейсы, буфер",
     icon: Settings,
   },
   {
     id: "networkRouting",
-    label: "Network & Routing",
+    label: getSectionMeta("settings.networkRouting").title,
     subtitle: "Throttling, HOSTS, Upstream",
     icon: Network,
   },
   {
     id: "tlsCertificates",
-    label: "TLS & Mobile",
+    label: getSectionMeta("settings.tlsCertificates").title,
     subtitle: "MITM, Root CA, mTLS, QR",
     icon: ShieldCheck,
   },
   {
     id: "filters",
-    label: "Filters",
+    label: getSectionMeta("settings.filters").title,
     subtitle: "Matrix, Hosts, Thresholds",
     icon: ListFilter,
   },
   {
     id: "uiColumns",
-    label: "Appearance & Layout",
+    label: getSectionMeta("settings.uiColumns").title,
     subtitle: "Темы, тулбар, колонки",
     icon: Columns,
   },
   {
     id: "diagnosticsBackup",
-    label: "Diagnostics & Backup",
+    label: getSectionMeta("settings.diagnosticsBackup").title,
     subtitle: "Proxy Doctor и JSON v1",
     icon: Stethoscope,
   },
@@ -1052,69 +1054,64 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         {...({ closedby: "any" } as Record<string, string>)}
         className="fixed inset-0 m-0 h-screen w-screen max-h-none max-w-none rounded-none border-0 bg-surface p-0 text-fg open:flex open:flex-col"
       >
-        {/* Fullscreen Hub Header with Search */}
-        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-hairline bg-surface px-5 py-3">
-          <div className="flex items-center gap-2.5">
-            <Settings className="h-4 w-4 text-accent" aria-hidden="true" />
-            <div>
-              <h1 id={titleId} className="text-sm font-semibold text-fg">
-                Settings Hub
-              </h1>
-              <p className="text-[11px] text-muted">
-                Единый центр настроек прокси, маршрутизации, TLS/mTLS, фильтров,
-                темы и диагностики{" "}
-                <code className="rounded bg-elevated px-1 py-0.5 font-mono text-[10px]">
-                  schemaVersion: {CURRENT_SETTINGS_SCHEMA_VERSION}
-                </code>
-              </p>
-            </div>
-          </div>
+        {/* Fullscreen Settings Header with Search */}
+        <SectionHeader
+          sectionId="settings"
+          titleId={titleId}
+          headingLevel={1}
+          icon={<Settings className="h-4 w-4 text-accent" />}
+          badges={
+            <code className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-muted">
+              schemaVersion: {CURRENT_SETTINGS_SCHEMA_VERSION}
+            </code>
+          }
+          actions={
+            <div className="flex items-center gap-3">
+              {/* Settings Search */}
+              <div className="relative w-64 sm:w-80 md:w-96">
+                <Search
+                  aria-hidden="true"
+                  className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-subtle"
+                />
+                <input
+                  id={searchInputId}
+                  type="search"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape" && searchQuery) {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setSearchQuery("");
+                    }
+                  }}
+                  placeholder="Поиск по настройкам (port, throttling, hosts, mtls, theme, doctor…)"
+                  aria-label="Поиск по настройкам"
+                  className="h-8 w-full rounded-md border border-strong bg-canvas pl-8 pr-7 text-xs text-fg placeholder:text-subtle focus:border-accent focus:outline-none"
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setSearchQuery("")}
+                    aria-label="Очистить поиск по настройкам"
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-subtle hover:bg-hover hover:text-fg"
+                  >
+                    <X className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                )}
+              </div>
 
-          <div className="flex flex-1 items-center justify-end gap-3">
-            {/* Settings Search */}
-            <div className="relative w-full max-w-md">
-              <Search
-                aria-hidden="true"
-                className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-subtle"
-              />
-              <input
-                id={searchInputId}
-                type="search"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape" && searchQuery) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    setSearchQuery("");
-                  }
-                }}
-                placeholder="Поиск по настройкам (port, throttling, hosts, mtls, theme, doctor…)"
-                aria-label="Поиск по настройкам"
-                className="h-8 w-full rounded-md border border-strong bg-canvas pl-8 pr-7 text-xs text-fg placeholder:text-subtle focus:border-accent focus:outline-none"
-              />
-              {searchQuery && (
-                <button
-                  type="button"
-                  onClick={() => setSearchQuery("")}
-                  aria-label="Очистить поиск по настройкам"
-                  className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-subtle hover:bg-hover hover:text-fg"
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={() => dialogRef.current?.close()}
+                aria-label="Закрыть Settings"
+                className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-hairline bg-canvas text-muted hover:border-strong hover:bg-hover hover:text-fg"
+              >
+                <X className="h-4 w-4" aria-hidden="true" />
+              </button>
             </div>
-
-            <button
-              type="button"
-              onClick={() => dialogRef.current?.close()}
-              aria-label="Закрыть центр настроек"
-              className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-hairline bg-canvas text-muted hover:border-strong hover:bg-hover hover:text-fg"
-            >
-              <X className="h-4 w-4" aria-hidden="true" />
-            </button>
-          </div>
-        </div>
+          }
+        />
 
         {/* Body: Left Tablist + Right Fullscreen Workspace */}
         <div className="flex min-h-0 flex-1 flex-col md:flex-row">

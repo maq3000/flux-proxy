@@ -93,15 +93,17 @@ describe("Stage 38 Navigation & Panel Deduplication", () => {
       />
     );
 
-    expect(
-      screen.getByTitle(/Traffic Viewer & Session Inspector \(Alt\+1\)/i)
-    ).toBeTruthy();
-    expect(
-      screen.getByTitle(/API Composer.*\(Alt\+2\)/i)
-    ).toBeTruthy();
-    expect(
-      screen.getByTitle(/AutoResponder & Latency Rules \(Alt\+3\)/i)
-    ).toBeTruthy();
+    expect(screen.getByTitle("Traffic (Alt+1)")).toBeTruthy();
+    expect(screen.getByTitle("Composer (Alt+2)")).toBeTruthy();
+    expect(screen.getByTitle("AutoResponder (Alt+3)")).toBeTruthy();
+    expect(screen.getByTitle("Breakpoints (Alt+6)")).toBeTruthy();
+    expect(screen.getByTitle("Scripts (Alt+5)")).toBeTruthy();
+    expect(screen.getByTitle("Session Diff (Ctrl+D)")).toBeTruthy();
+    expect(screen.getByTitle("TextWizard (Ctrl+E)")).toBeTruthy();
+    expect(screen.getByTitle("Settings (Ctrl+,)")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Traffic" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Composer" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "AutoResponder" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Breakpoints" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Scripts" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Session Diff" })).toBeTruthy();
@@ -346,7 +348,12 @@ describe("Stage 38 Navigation & Panel Deduplication", () => {
     expect(screen.queryByText("Theme: Light (Zinc)")).toBeNull();
     expect(screen.queryByText("Theme: System")).toBeNull();
     expect(screen.queryByText("Split Composer Pane")).toBeNull();
-    expect(screen.getByText(/Theme Presets & Appearance/i)).toBeTruthy();
+    expect(screen.getByText("Appearance & Layout")).toBeTruthy();
+    expect(screen.getByText("OpenAPI Export")).toBeTruthy();
+    expect(screen.getByText("Sanitized Export")).toBeTruthy();
+    expect(screen.getByText("Code Generator")).toBeTruthy();
+    expect(screen.getByText("Root CA")).toBeTruthy();
+    expect(screen.getByText("Shortcuts")).toBeTruthy();
   });
 
   it("SessionInspector removes the duplicate top summary bar Wizard button", () => {

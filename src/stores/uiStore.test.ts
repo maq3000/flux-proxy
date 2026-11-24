@@ -14,6 +14,7 @@ import {
   TOOLBAR_GROUP_DEFINITIONS,
   useUiStore,
 } from "./uiStore";
+import { ALL_NAV_SECTIONS, type ActiveNavSection } from "../types/proxy";
 
 describe("Stage 40 uiStore cleanup and inspector panel storage safety", () => {
   afterEach(() => {
@@ -94,5 +95,35 @@ describe("Stage 40 uiStore cleanup and inspector panel storage safety", () => {
 
     expect(window.localStorage.getItem(legacyBottomOuter)).toBeNull();
     expect(window.localStorage.getItem(composerKey)).toBeNull();
+  });
+
+  it("switches activeSection across all 7 ActiveNavSection tabs via direct value and updater", () => {
+    const store = useUiStore.getState();
+    store.setActiveSection("traffic");
+    expect(useUiStore.getState().activeSection).toBe("traffic");
+
+    expect(ALL_NAV_SECTIONS).toHaveLength(7);
+    for (const section of ALL_NAV_SECTIONS) {
+      useUiStore.getState().setActiveSection(section);
+      expect(useUiStore.getState().activeSection).toBe(section);
+    }
+
+    // Functional toggle updater (used by Ctrl+E TextWizard toggle)
+    useUiStore
+      .getState()
+      .setActiveSection((prev: ActiveNavSection) =>
+        prev === "wizard" ? "traffic" : "wizard"
+      );
+    expect(useUiStore.getState().activeSection).toBe("traffic");
+
+    useUiStore
+      .getState()
+      .setActiveSection((prev: ActiveNavSection) =>
+        prev === "wizard" ? "traffic" : "wizard"
+      );
+    expect(useUiStore.getState().activeSection).toBe("wizard");
+
+    // Reset back to default tab
+    useUiStore.getState().setActiveSection("traffic");
   });
 });

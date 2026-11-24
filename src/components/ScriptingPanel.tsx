@@ -21,6 +21,7 @@ import type {
   PythonScriptPreset,
   ScriptConsoleLogEvent,
 } from "../types/proxy";
+import { SectionHeader } from "./ui/SectionHeader";
 
 interface ScriptingPanelProps {
   code: string;
@@ -177,86 +178,84 @@ export const ScriptingPanel: React.FC<ScriptingPanelProps> = ({
   return (
     <div className="pane-contain flex h-full w-full flex-col overflow-hidden bg-canvas">
       {/* Top Header Bar */}
-      <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-hairline bg-surface px-4 py-2">
-        <div className="flex min-w-0 flex-wrap items-center gap-2.5">
-          <div className="flex items-center gap-2">
-            <FileCode2 className="h-4 w-4 text-accent" />
-            <h1 className="text-xs font-semibold text-fg">
-              Python Scripting Engine
-            </h1>
-          </div>
-
-          <span
-            title={statusBadge.title}
-            className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 font-mono text-[11px] font-medium ${statusBadge.tone}`}
-          >
-            {statusBadge.icon}
-            <span>{statusBadge.label}</span>
-          </span>
-
-          {status?.hasOnRequest && (
-            <span className="rounded bg-status3xx-bg px-1.5 py-0.5 font-mono text-[10px] font-semibold text-status3xx-fg">
-              on_request
+      <SectionHeader
+        sectionId="scripts"
+        icon={<FileCode2 className="h-4 w-4 text-accent" />}
+        badges={
+          <>
+            <span
+              title={statusBadge.title}
+              className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 font-mono text-[11px] font-medium ${statusBadge.tone}`}
+            >
+              {statusBadge.icon}
+              <span>{statusBadge.label}</span>
             </span>
-          )}
-          {status?.hasOnResponse && (
-            <span className="rounded bg-status2xx-bg px-1.5 py-0.5 font-mono text-[10px] font-semibold text-status2xx-fg">
-              on_response
-            </span>
-          )}
-          {hasUnsavedChanges && (
-            <span className="rounded bg-status4xx-bg px-1.5 py-0.5 font-mono text-[10px] font-medium text-status4xx-fg">
-              Modified
-            </span>
-          )}
-        </div>
 
-        <div className="flex items-center gap-2.5">
-          <label
-            htmlFor={toggleId}
-            className="inline-flex cursor-pointer select-none items-center gap-2 rounded-md border border-hairline bg-elevated px-2.5 py-1 text-xs font-medium text-fg"
-          >
-            <input
-              id={toggleId}
-              type="checkbox"
-              {...({ switch: "" } as Record<string, string>)}
-              {...(!supportsNativeSwitch
-                ? {
-                    role: "switch",
-                    "data-switch-fallback": "true",
-                  }
-                : {})}
-              checked={enabled}
+            {status?.hasOnRequest && (
+              <span className="rounded bg-status3xx-bg px-1.5 py-0.5 font-mono text-[10px] font-semibold text-status3xx-fg">
+                on_request
+              </span>
+            )}
+            {status?.hasOnResponse && (
+              <span className="rounded bg-status2xx-bg px-1.5 py-0.5 font-mono text-[10px] font-semibold text-status2xx-fg">
+                on_response
+              </span>
+            )}
+            {hasUnsavedChanges && (
+              <span className="rounded bg-status4xx-bg px-1.5 py-0.5 font-mono text-[10px] font-medium text-status4xx-fg">
+                Modified
+              </span>
+            )}
+          </>
+        }
+        actions={
+          <div className="flex items-center gap-2.5">
+            <label
+              htmlFor={toggleId}
+              className="inline-flex cursor-pointer select-none items-center gap-2 rounded-md border border-hairline bg-elevated px-2.5 py-1 text-xs font-medium text-fg"
+            >
+              <input
+                id={toggleId}
+                type="checkbox"
+                {...({ switch: "" } as Record<string, string>)}
+                {...(!supportsNativeSwitch
+                  ? {
+                      role: "switch",
+                      "data-switch-fallback": "true",
+                    }
+                  : {})}
+                checked={enabled}
+                disabled={isApplying}
+                onChange={(e) => void onToggleEnabled(e.target.checked)}
+                className="cert-switch"
+              />
+              <span>{enabled ? "Enabled" : "Disabled"}</span>
+            </label>
+
+            <button
+              type="button"
+              onClick={() => void onRefreshStatus()}
               disabled={isApplying}
-              onChange={(e) => void onToggleEnabled(e.target.checked)}
-              className="cert-switch"
-            />
-            <span>{enabled ? "Enabled" : "Disabled"}</span>
-          </label>
+              title="Проверить доступность Python и обновить статус воркера"
+              className="inline-flex h-7 items-center gap-1 rounded border border-hairline bg-elevated px-2 text-xs text-muted transition-colors hover:border-strong hover:text-fg disabled:opacity-50"
+            >
+              <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+              <span className="hidden sm:inline">Check Python</span>
+            </button>
 
-          <button
-            type="button"
-            onClick={() => void onRefreshStatus()}
-            disabled={isApplying}
-            title="Проверить доступность Python и обновить статус воркера"
-            className="inline-flex h-7 items-center gap-1 rounded border border-hairline bg-elevated px-2 text-xs text-muted transition-colors hover:border-strong hover:text-fg disabled:opacity-50"
-          >
-            <RefreshCw className="h-3.5 w-3.5" />
-            <span className="hidden sm:inline">Check Python</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => void onApplyScript(code, enabled)}
-            disabled={isApplying}
-            title="Загрузить скрипт в Python-раннер (Ctrl+Enter / Ctrl+S)"
-            className="inline-flex h-7 items-center gap-1.5 rounded bg-emerald-600 px-3 text-xs font-semibold text-white transition-colors hover:bg-emerald-500 disabled:opacity-50"
-          >
-            <Play className="h-3.5 w-3.5" />
-            <span>{isApplying ? "Applying…" : "Apply Script"}</span>
-          </button>
-        </div>
-      </div>
+            <button
+              type="button"
+              onClick={() => void onApplyScript(code, enabled)}
+              disabled={isApplying}
+              title="Загрузить скрипт в Python-раннер (Ctrl+Enter / Ctrl+S)"
+              className="inline-flex h-7 items-center gap-1.5 rounded bg-emerald-600 px-3 text-xs font-semibold text-white transition-colors hover:bg-emerald-500 disabled:opacity-50"
+            >
+              <Play className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>{isApplying ? "Applying…" : "Apply Script"}</span>
+            </button>
+          </div>
+        }
+      />
 
       {/* Contextual Simulator / Missing Interpreter / Error Banners */}
       {status?.isSimulator && (

@@ -36,7 +36,7 @@ import type {
   WebSocketFrameRecord,
   WsInjectDirection,
 } from "../types/proxy";
-import type { TextWizardTab } from "./TextWizardModal";
+import type { TextWizardTab } from "./TextWizardPanel";
 
 // ============================================================================
 // 1. SSE (Server-Sent Events / text/event-stream) Streaming Inspector

@@ -149,7 +149,7 @@ export const FiltersSettingsTab: React.FC<FiltersSettingsTabProps> = ({
     },
     {
       id: "thresholds",
-      label: "Noise & Thresholds",
+      label: "Thresholds",
       badge: activeThresholdCount,
       icon: Flame,
     },

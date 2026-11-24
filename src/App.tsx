@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Database, Gauge, Globe, Network, Stethoscope, Trash2, Upload, WifiOff, X } from "lucide-react";
+import { Activity, Database, Gauge, Globe, Network, Stethoscope, Trash2, Upload, WifiOff, X } from "lucide-react";
 import {
   Panel,
   PanelGroup,
@@ -8,6 +8,7 @@ import {
 } from "react-resizable-panels";
 import { AutoResponderPanel } from "./components/AutoResponderPanel";
 import { BreakpointBanner } from "./components/BreakpointBanner";
+import type { BreakpointsPanelMode } from "./components/BreakpointsPanel";
 import { CertificateModal } from "./components/CertificateModal";
 import { CodeSnippetModal } from "./components/CodeSnippetModal";
 import { CollapsedInspectorBar } from "./components/CollapsedInspectorBar";
@@ -21,13 +22,14 @@ import { SessionAnnotationModal } from "./components/SessionAnnotationModal";
 import { SessionInspector } from "./components/SessionInspector";
 import { ShortcutsModal } from "./components/ShortcutsModal";
 import { Sidebar } from "./components/Sidebar";
-import type { TextWizardTab } from "./components/TextWizardModal";
+import type { TextWizardTab } from "./components/TextWizardPanel";
 import { TopToolbar } from "./components/TopToolbar";
 import { TrafficGrid } from "./components/TrafficGrid";
+import { SectionHeader } from "./components/ui/SectionHeader";
 
-const BreakpointInterceptorModal = React.lazy(() =>
-  import("./components/BreakpointModal").then((m) => ({
-    default: m.BreakpointInterceptorModal,
+const BreakpointsPanel = React.lazy(() =>
+  import("./components/BreakpointsPanel").then((m) => ({
+    default: m.BreakpointsPanel,
   }))
 );
 const OpenApiExportModal = React.lazy(() =>
@@ -45,11 +47,6 @@ const ScriptingPanel = React.lazy(() =>
     default: m.ScriptingPanel,
   }))
 );
-const SessionDiffModal = React.lazy(() =>
-  import("./components/SessionDiffView").then((m) => ({
-    default: m.SessionDiffModal,
-  }))
-);
 const SessionDiffView = React.lazy(() =>
   import("./components/SessionDiffView").then((m) => ({
     default: m.SessionDiffView,
@@ -65,9 +62,9 @@ const SettingsModal = React.lazy(() =>
     default: m.SettingsModal,
   }))
 );
-const TextWizardModal = React.lazy(() =>
-  import("./components/TextWizardModal").then((m) => ({
-    default: m.TextWizardModal,
+const TextWizardPanel = React.lazy(() =>
+  import("./components/TextWizardPanel").then((m) => ({
+    default: m.TextWizardPanel,
   }))
 );
 import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
@@ -99,15 +96,18 @@ import {
   SETTINGS_APPLIED_EVENT,
   SETTINGS_STORAGE_KEYS,
 } from "./lib/settingsManager";
+import { getSectionMeta } from "./lib/sectionRegistry";
 import { isTauriRuntime, proxyBridge } from "./lib/tauriBridge";
 import { useProxyStore } from "./stores/proxyStore";
 import { useUiStore } from "./stores/uiStore";
 import { THEME_PRESETS } from "./lib/themePresets";
 import { THROTTLE_PRESET_DEFINITIONS } from "./types/proxy";
 import type {
+  ActiveNavSection,
   AutoResponderRule,
   ComposedRequest,
   PythonScriptPreset,
+  SessionDetail,
   SessionSummary,
   ThrottleConfig,
   UpstreamProxyConfig,
@@ -289,6 +289,23 @@ export const App: React.FC = () => {
 
   const activeSection = useUiStore((s) => s.activeSection);
   const setActiveSection = useUiStore((s) => s.setActiveSection);
+  const [visitedSections, setVisitedSections] = useState<
+    Record<ActiveNavSection, boolean>
+  >({
+    traffic: true,
+    composer: false,
+    rules: false,
+    breakpoints: false,
+    scripts: false,
+    diff: false,
+    wizard: false,
+  });
+
+  useEffect(() => {
+    setVisitedSections((prev) =>
+      prev[activeSection] ? prev : { ...prev, [activeSection]: true }
+    );
+  }, [activeSection]);
   const [composerDraft, setComposerDraft] = useState<ComposedRequest | null>(
     null
   );
@@ -507,10 +524,16 @@ export const App: React.FC = () => {
   const [statisticsTriggerSeq, setStatisticsTriggerSeq] = useState(0);
   const [customRetentionTriggerSeq, setCustomRetentionTriggerSeq] = useState(0);
 
-  // Session Diff & User Annotations (Comment / Mark) Modal State
+  // Session Diff & User Annotations (Comment / Mark) State
   const [annotationModalOpen, setAnnotationModalOpen] = useState(false);
   const [annotationTargetIds, setAnnotationTargetIds] = useState<number[]>([]);
-  const [diffModalOpen, setDiffModalOpen] = useState(false);
+  const [diffTabPairIds, setDiffTabPairIds] = useState<[number, number] | null>(
+    null
+  );
+  const [diffTabDetails, setDiffTabDetails] = useState<{
+    left: SessionDetail | null;
+    right: SessionDetail | null;
+  }>({ left: null, right: null });
   const [inlineDiffDismissed, setInlineDiffDismissed] = useState(false);
   const [codeSnippetModalOpen, setCodeSnippetModalOpen] = useState(false);
   const [codeSnippetRequest, setCodeSnippetRequest] =
@@ -894,8 +917,79 @@ export const App: React.FC = () => {
   useEffect(() => {
     if (selectedPairKey) {
       setInlineDiffDismissed(false);
+      setDiffTabPairIds([selectedIds[0], selectedIds[1]]);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedPairKey]);
+
+  // Clear saved Session Diff pair only if either session was removed/cleared
+  useEffect(() => {
+    if (!diffTabPairIds) return;
+    const [leftId, rightId] = diffTabPairIds;
+    const hasLeft = sessions.some((s) => s.id === leftId);
+    const hasRight = sessions.some((s) => s.id === rightId);
+    if (!hasLeft || !hasRight) {
+      setDiffTabPairIds(null);
+      setDiffTabDetails({ left: null, right: null });
+    }
+  }, [diffTabPairIds, sessions]);
+
+  // Keep Session Diff tab details loaded even when user clicks a single session in Traffic
+  useEffect(() => {
+    if (!diffTabPairIds) {
+      setDiffTabDetails({ left: null, right: null });
+      return;
+    }
+    const [leftId, rightId] = diffTabPairIds;
+    if (
+      diffLeftDetail?.summary.id === leftId &&
+      diffRightDetail?.summary.id === rightId
+    ) {
+      setDiffTabDetails({ left: diffLeftDetail, right: diffRightDetail });
+      return;
+    }
+    let active = true;
+    void Promise.all([
+      proxyBridge.getSessionDetail(leftId),
+      proxyBridge.getSessionDetail(rightId),
+    ])
+      .then(([left, right]) => {
+        if (!active) return;
+        setDiffTabDetails({ left, right });
+      })
+      .catch(() => {
+        if (!active) return;
+        setDiffTabDetails({ left: null, right: null });
+      });
+    return () => {
+      active = false;
+    };
+  }, [diffLeftDetail, diffRightDetail, diffTabPairIds]);
+
+  const resolvedDiffTabLeftDetail =
+    diffTabPairIds && diffLeftDetail?.summary.id === diffTabPairIds[0]
+      ? diffLeftDetail
+      : diffTabDetails.left;
+  const resolvedDiffTabRightDetail =
+    diffTabPairIds && diffRightDetail?.summary.id === diffTabPairIds[1]
+      ? diffRightDetail
+      : diffTabDetails.right;
+
+  const handleSelectDiffTabPair = useCallback(
+    (leftId: number, rightId: number) => {
+      if (leftId === rightId) return;
+      setDiffTabPairIds([leftId, rightId]);
+      setComparePairIds(leftId, rightId);
+    },
+    [setComparePairIds]
+  );
+
+  const handleSwapDiffTabPair = useCallback(() => {
+    setDiffTabPairIds((prev) => (prev ? [prev[1], prev[0]] : prev));
+    if (selectedIds.length >= 2) {
+      swapCompareSessions();
+    }
+  }, [selectedIds.length, swapCompareSessions]);
 
   const annotationTargetSessions = useMemo(() => {
     if (annotationTargetIds.length === 0) return [];
@@ -903,19 +997,18 @@ export const App: React.FC = () => {
     return sessions.filter((s) => idSet.has(s.id));
   }, [annotationTargetIds, sessions]);
 
-  // TextWizard & JWT Decoder Modal State
-  const [textWizardOpen, setTextWizardOpen] = useState(false);
+  // TextWizard Panel State (tab-scoped, preserved across switches)
   const [textWizardTab, setTextWizardTab] = useState<TextWizardTab>("jwt");
   const [textWizardInput, setTextWizardInput] = useState<string | undefined>(
     undefined
   );
+  const [textWizardRequestSeq, setTextWizardRequestSeq] = useState(0);
 
-  // Live Breakpoint Interceptor Modal State
-  const [bpModalOpen, setBpModalOpen] = useState(false);
-  const [bpModalMode, setBpModalMode] = useState<"intercept" | "rules">(
-    "intercept"
-  );
+  // Live Breakpoints Panel State (tab-scoped, non-blocking)
+  const [bpPanelMode, setBpPanelMode] =
+    useState<BreakpointsPanelMode>("intercept");
   const [selectedBpId, setSelectedBpId] = useState<string | null>(null);
+  const [bpRequestSeq, setBpRequestSeq] = useState(0);
   const lastAutoOpenedBpRef = useRef<string | null>(null);
 
   const persistAutoResponderStorage = useCallback(
@@ -1298,7 +1391,8 @@ export const App: React.FC = () => {
     return registerLiveSettingsSnapshotGetter(() => liveSnapshotRef.current());
   }, []);
 
-  // Automatically surface the Monaco Breakpoint Interceptor when a new live packet is parked
+  // Automatically focus the non-blocking Breakpoints tab once per newly parked packet
+  // so the user stays free to switch back to Traffic or TextWizard while paused
   useEffect(() => {
     if (pausedBreakpoints.length === 0) {
       lastAutoOpenedBpRef.current = null;
@@ -1308,10 +1402,11 @@ export const App: React.FC = () => {
     if (lastAutoOpenedBpRef.current !== firstId) {
       lastAutoOpenedBpRef.current = firstId;
       setSelectedBpId(firstId);
-      setBpModalMode("intercept");
-      setBpModalOpen(true);
+      setBpPanelMode("intercept");
+      setBpRequestSeq((n) => n + 1);
+      setActiveSection("breakpoints");
     }
-  }, [pausedBreakpoints]);
+  }, [pausedBreakpoints, setActiveSection]);
 
   const openSanitizedExportModal = useCallback(() => {
     if (sessions.length === 0) {
@@ -1345,18 +1440,20 @@ export const App: React.FC = () => {
     (tab: TextWizardTab = "jwt", input?: string) => {
       setTextWizardTab(tab);
       setTextWizardInput(input);
-      setTextWizardOpen(true);
+      setTextWizardRequestSeq((n) => n + 1);
+      setActiveSection("wizard");
     },
-    []
+    [setActiveSection]
   );
 
   const openBreakpointsAt = useCallback(
-    (mode: "intercept" | "rules", bpId?: string) => {
-      setBpModalMode(mode);
+    (mode: BreakpointsPanelMode, bpId?: string) => {
+      setBpPanelMode(mode);
       if (bpId) setSelectedBpId(bpId);
-      setBpModalOpen(true);
+      setBpRequestSeq((n) => n + 1);
+      setActiveSection("breakpoints");
     },
-    []
+    [setActiveSection]
   );
 
   const openAnnotationFor = useCallback(
@@ -1593,9 +1690,20 @@ export const App: React.FC = () => {
 
   const openDiffWithPairSmart = useCallback(
     (anchorSessionId?: number) => {
-      if (anchorSessionId === undefined && selectedIds.length >= 2) {
-        setDiffModalOpen(true);
-        return;
+      if (anchorSessionId === undefined) {
+        if (selectedIds.length >= 2) {
+          setDiffTabPairIds([selectedIds[0], selectedIds[1]]);
+          setActiveSection("diff");
+          return;
+        }
+        if (
+          diffTabPairIds &&
+          sessions.some((s) => s.id === diffTabPairIds[0]) &&
+          sessions.some((s) => s.id === diffTabPairIds[1])
+        ) {
+          setActiveSection("diff");
+          return;
+        }
       }
 
       const pool = filteredSessions.length >= 2 ? filteredSessions : sessions;
@@ -1603,6 +1711,7 @@ export const App: React.FC = () => {
         anchorSessionId ?? selectedId ?? pool[0]?.id ?? sessions[0]?.id ?? null;
 
       if (anchorId === null) {
+        setActiveSection("diff");
         showToast("Нет доступных сессий для сравнения в Session Diff");
         return;
       }
@@ -1631,22 +1740,27 @@ export const App: React.FC = () => {
           : undefined) ?? candidates[0];
 
       if (!partner) {
+        setActiveSection("diff");
         showToast("Для сравнения требуется минимум 2 захваченные сессии");
         return;
       }
 
       if (anchor && anchor.status >= 400 && partner.status < 400) {
+        setDiffTabPairIds([partner.id, anchorId]);
         setComparePairIds(partner.id, anchorId);
       } else {
+        setDiffTabPairIds([anchorId, partner.id]);
         setComparePairIds(anchorId, partner.id);
       }
-      setDiffModalOpen(true);
+      setActiveSection("diff");
     },
     [
+      diffTabPairIds,
       filteredSessions,
       selectedId,
-      selectedIds.length,
+      selectedIds,
       sessions,
+      setActiveSection,
       setComparePairIds,
       showToast,
     ]
@@ -1694,17 +1808,13 @@ export const App: React.FC = () => {
   useGlobalShortcuts({
     activeSection,
     setActiveSection,
-    diffModalOpen,
-    setDiffModalOpen,
     sanitizedExportModalOpen,
     setSanitizedExportModalOpen,
     settingsModalOpen,
     onToggleSettingsMain: togglePreferencesMain,
     onToggleSettingsAt: togglePreferencesAt,
-    onToggleBreakpointsModal: () => setBpModalOpen((prev) => !prev),
     setPaletteOpen,
     setShortcutsModalOpen,
-    setTextWizardOpen,
     selectedId,
     effectiveSelectedIds,
     filteredSessions,
@@ -1840,7 +1950,7 @@ export const App: React.FC = () => {
         id: "edit-in-composer",
         category: "Traffic",
         group: "tools",
-        label: "Edit Selected Session in Request Composer",
+        label: `Edit in ${getSectionMeta("composer").title}`,
         description: "Загрузить выбранный запрос во вкладку Composer для редактирования и отправки",
         shortcut: "E",
         keywords: ["composer", "edit", "modify", "replay", "resend", "редактировать"],
@@ -1890,8 +2000,8 @@ export const App: React.FC = () => {
         id: "generate-client-code",
         category: "Traffic",
         group: "tools",
-        label: "Generate Client Code… (JavaScript, Python, Go, Rust, cURL)",
-        description: "Сгенерировать код HTTP-клиента по выбранной сессии в Monaco",
+        label: getSectionMeta("codeGenerator").title,
+        description: getSectionMeta("codeGenerator").summary,
         keywords: [
           "code",
           "snippet",
@@ -1919,20 +2029,20 @@ export const App: React.FC = () => {
         id: "open-session-diff",
         category: "Session Diff",
         group: "tools",
-        label:
-          "Открыть Session Diff — сравнение заголовков, кук и JSON двух сессий (Monaco DiffEditor)",
-        description: "Сравнение двух запросов/ответов с подсветкой различий заголовков и тела",
+        label: getSectionMeta("diff").title,
+        description: getSectionMeta("diff").summary,
         shortcut: "Ctrl+D",
+        keywords: ["diff", "compare", "сравнение", "headers", "json"],
         perform: () => openDiffWithPairSmart(),
       },
       {
         id: "annotate-session",
         category: "Annotations",
         group: "capture",
-        label:
-          "Добавить комментарий и цветовую заливку к выбранной сессии (Comment / Mark)",
-        description: "Установить цветную метку и заметку для выбранных сессий",
+        label: getSectionMeta("commentMark").title,
+        description: getSectionMeta("commentMark").summary,
         shortcut: "M",
+        keywords: ["comment", "mark", "note", "комментарий", "метка"],
         perform: () => openAnnotationFor(effectiveSelectedIds),
       },
       {
@@ -2071,17 +2181,17 @@ export const App: React.FC = () => {
         id: "open-shortcuts-modal",
         category: "Help",
         group: "settings",
-        label: "Показать справку по горячим клавишам (Keyboard Shortcuts)",
-        description: "Полный список клавиатурных комбинаций таблицы, инспектора и фильтров",
+        label: getSectionMeta("shortcuts").title,
+        description: getSectionMeta("shortcuts").summary,
         shortcut: "?",
+        keywords: ["shortcuts", "keys", "hotkeys", "клавиши", "справка"],
         perform: () => setShortcutsModalOpen(true),
       },
       {
         id: "run-proxy-doctor",
         category: "Diagnostics",
         group: "tools",
-        label:
-          "Run Proxy Doctor… (Диагностика порта, Root CA, SysProxy, VPN, Firewall и loopback)",
+        label: "Proxy Doctor",
         description: "Автоматическая проверка 6 компонентов среды и исправление проблем в 1 клик",
         shortcut: "Ctrl+Shift+D",
         keywords: [
@@ -2102,26 +2212,28 @@ export const App: React.FC = () => {
         id: "open-text-wizard",
         category: "TextWizard",
         group: "tools",
-        label:
-          "Открыть TextWizard & JWT Decoder (Base64, URL, Gzip/Brotli/Zstd, Hex, Timestamp)",
-        description: "Инструмент кодирования, декодирования, разбора JWT и сжатия текста",
+        label: getSectionMeta("wizard").title,
+        description: getSectionMeta("wizard").summary,
         shortcut: "Ctrl+E",
-        perform: () => openTextWizardAt("jwt"),
+        keywords: ["wizard", "jwt", "base64", "url", "gzip", "brotli", "zstd", "hex", "timestamp"],
+        perform: () => setActiveSection("wizard"),
       },
       {
         id: "open-jwt-inspector",
         category: "TextWizard",
         group: "tools",
-        label: "JWT Inspector: декодировать Header / Claims и проверить exp",
-        description: "Быстрый разбор структуры JSON Web Token и валидности подписи/срока",
+        label: "TextWizard: JWT",
+        description: "Быстрый разбор структуры JSON Web Token и валидности срока действия",
+        keywords: ["jwt", "token", "claims", "exp"],
         perform: () => openTextWizardAt("jwt"),
       },
       {
         id: "open-compression-codec",
         category: "TextWizard",
         group: "tools",
-        label: "TextWizard: Сжатие и распаковка Gzip / Brotli / Deflate / Zstd",
-        description: "Конвертер сжатых payload и проверка размера до/после компрессии",
+        label: "TextWizard: Compression Codec",
+        description: "Сжатие и распаковка Gzip, Brotli, Deflate и Zstd",
+        keywords: ["gzip", "brotli", "deflate", "zstd", "codec", "сжатие"],
         perform: () => openTextWizardAt("compression"),
       },
       {
@@ -2129,8 +2241,8 @@ export const App: React.FC = () => {
         category: "Breakpoints",
         group: "filters",
         label: breakpointConfig.breakBeforeRequest
-          ? "Отключить Break on Request (перехват до отправки на апстрим)"
-          : "Включить Break on Request — ставить запросы на паузу в Monaco",
+          ? "Отключить Break Before Request"
+          : "Включить Break Before Request",
         description: "Глобальная пауза всех исходящих запросов для ручного редактирования",
         statusBadge: breakpointConfig.breakBeforeRequest ? "ON" : "OFF",
         shortcut: "F11",
@@ -2141,8 +2253,8 @@ export const App: React.FC = () => {
         category: "Breakpoints",
         group: "filters",
         label: breakpointConfig.breakAfterResponse
-          ? "Отключить Break on Response (перехват ответа сервера)"
-          : "Включить Break on Response — править JSON или код 500 на лету",
+          ? "Отключить Break After Response"
+          : "Включить Break After Response",
         description: "Глобальная пауза всех ответов перед возвратом в браузер или приложение",
         statusBadge: breakpointConfig.breakAfterResponse ? "ON" : "OFF",
         shortcut: "Alt+F11",
@@ -2152,15 +2264,16 @@ export const App: React.FC = () => {
         id: "open-bp-rules",
         category: "Breakpoints",
         group: "filters",
-        label:
-          "Открыть Live Breakpoints и правила `bpu` / `bpafter` (или введите `bpu <url>` выше)",
-        description: "Очередь перехваченных пакетов в Monaco и настройка условных правил",
+        label: getSectionMeta("breakpoints").title,
+        description: getSectionMeta("breakpoints").summary,
+        shortcut: "Alt+6",
         statusBadge:
           pausedBreakpoints.length > 0
             ? `Пауза: ${pausedBreakpoints.length} · Правил: ${enabledBreakpointRulesCount}`
             : enabledBreakpointRulesCount > 0
               ? `Правил: ${enabledBreakpointRulesCount}`
               : "0 правил",
+        keywords: ["breakpoints", "bpu", "bpafter", "pause", "intercept", "точки останова"],
         perform: () =>
           openBreakpointsAt(
             pausedBreakpoints.length > 0 ? "intercept" : "rules"
@@ -2185,38 +2298,39 @@ export const App: React.FC = () => {
         id: "open-filters-matrix",
         category: "Filters",
         group: "filters",
-        label: "Открыть Таблицу фильтров и Пресеты (Include / Exclude / PID)",
-        description: "Многострочные правила фильтрации трафика, процессы и пресеты",
+        label: getSectionMeta("settings.filters").title,
+        description: getSectionMeta("settings.filters").summary,
         statusBadge:
           activeFilterBadgeCount > 0
             ? `Активно: ${activeFilterBadgeCount}`
             : "Выкл",
         shortcut: "Alt+4",
+        keywords: ["filters", "matrix", "presets", "pid", "фильтры", "пресеты"],
         perform: () => openPreferencesAt("filters", "matrix"),
       },
       {
         id: "open-hosts-list-filter",
         category: "Filters",
         group: "filters",
-        label:
-          "Открыть Массовый фильтр хостов и URL (Hosts List: Show only Whitelist / Hide Blacklist)",
+        label: "Hosts List",
         description: "Фильтрация трафика по списку доменов, маскам * и регулярным выражениям",
         statusBadge: hostListFilter.enabled
           ? `${hostListFilter.mode === "whitelist" ? "Allow" : "Block"} (${compiledHostList.activeCount})`
           : "OFF",
+        keywords: ["hosts", "whitelist", "blacklist", "домены", "список"],
         perform: () => openPreferencesAt("filters", "hostsList"),
       },
       {
         id: "open-tls-bypass",
         category: "TLS / CA",
         group: "filters",
-        label:
-          "Открыть настройки Selective TLS MITM: Target Allowlist & Bypass",
-        description: "Настройка целевых доменов расшифровки, Quick-Packs и Bulk Editor",
+        label: "TLS Bypass",
+        description: "Настройка целевых доменов расшифровки, Quick-Packs и пакетного редактора",
         statusBadge:
           backendFilterConfig.tlsInterceptMode === "targetedOnly"
             ? `Targeted (${activeTargetHostsCount})`
             : `Bypass (${enabledTlsBypassCount})`,
+        keywords: ["tls", "mitm", "bypass", "allowlist", "passthrough"],
         perform: () => openPreferencesAt("tlsCertificates", "mitmBypass"),
       },
       {
@@ -2277,14 +2391,14 @@ export const App: React.FC = () => {
         id: "connect-mobile-device",
         category: "Proxy",
         group: "network",
-        label:
-          "Connect Mobile Device — iOS & Android Wi-Fi Proxy + QR Code (flux.proxy)",
+        label: "Mobile Setup",
         description: "LAN IP, QR-код установки Root CA и шаблон Android network_security_config",
         statusBadge:
           status.allowRemote || status.bindAddr === "0.0.0.0"
             ? `LAN :${status.port}`
             : `Local :${status.port}`,
         shortcut: "Ctrl+Shift+M",
+        keywords: ["mobile", "ios", "android", "qr", "wifi", "flux.proxy"],
         perform: () => openPreferencesAt("tlsCertificates", "mobileSetup"),
       },
       {
@@ -2331,17 +2445,18 @@ export const App: React.FC = () => {
         id: "view-traffic",
         category: "View",
         group: "settings",
-        label: "Switch to Traffic Viewer & Session Inspector",
-        description: "Переключиться на основную таблицу перехваченного трафика",
+        label: getSectionMeta("traffic").title,
+        description: getSectionMeta("traffic").summary,
         shortcut: "Alt+1",
+        keywords: ["traffic", "stream", "grid", "inspector", "трафик"],
         perform: () => setActiveSection("traffic"),
       },
       {
         id: "view-composer",
         category: "View",
         group: "tools",
-        label: "Switch to Request Composer",
-        description: "Открыть конструктор HTTP-запросов с импортом cURL и генератором кода",
+        label: getSectionMeta("composer").title,
+        description: getSectionMeta("composer").summary,
         shortcut: "Alt+2",
         keywords: ["composer", "curl", "import", "paste", "request", "http"],
         perform: () => setActiveSection("composer"),
@@ -2350,20 +2465,21 @@ export const App: React.FC = () => {
         id: "view-rules",
         category: "AutoResponder",
         group: "tools",
-        label: "Open AutoResponder & Latency Simulation Rules",
-        description: "Правила локальных моков ответов, подмены статусов и искусственной задержки",
+        label: getSectionMeta("rules").title,
+        description: getSectionMeta("rules").summary,
         statusBadge: autoResponderEnabled
           ? `ON (${activeRulesCount}/${rules.length})`
           : `OFF (${rules.length})`,
         shortcut: "Alt+3",
+        keywords: ["autoresponder", "mock", "latency", "rules", "правила"],
         perform: () => setActiveSection("rules"),
       },
       {
         id: "view-scripts",
         category: "Scripting",
         group: "tools",
-        label: "Open Python Scripting Engine (on_request / on_response)",
-        description: "Редактор Python-хуков с живой консолью stdout/stderr и пресетами",
+        label: getSectionMeta("scripts").title,
+        description: getSectionMeta("scripts").summary,
         statusBadge: scriptEnabled ? "ON" : "OFF",
         shortcut: "Alt+5",
         keywords: ["python", "script", "hmac", "mock", "on_request", "on_response"],
@@ -2374,25 +2490,27 @@ export const App: React.FC = () => {
         category: "Scripting",
         group: "tools",
         label: scriptEnabled
-          ? "Disable Python Scripting Engine"
-          : "Enable Python Scripting Engine",
+          ? "Disable Scripts"
+          : "Enable Scripts",
         description: "Включить или выключить выполнение Python-хуков на проходящем трафике",
         statusBadge: scriptEnabled ? "ON" : "OFF",
+        keywords: ["python", "scripts", "toggle"],
         perform: () => void handleTogglePythonScript(!scriptEnabled),
       },
       {
         id: "root-ca",
         category: "TLS / CA",
         group: "filters",
-        label: "Inspect or Install HTTPS MITM Root CA Certificate",
-        description: "Проверить статус доверия ОС, отпечаток SHA-256 и установить Root CA",
+        label: getSectionMeta("rootCa").title,
+        description: getSectionMeta("rootCa").summary,
+        keywords: ["ca", "root", "certificate", "mitm", "trust", "сертификат"],
         perform: () => setCertModalOpen(true),
       },
       {
         id: "client-certificates",
         category: "TLS / mTLS",
         group: "filters",
-        label: "Client Certificates… (mTLS — .p12 / .pfx / .pem)",
+        label: "Client Certificates",
         description: "Хранилище клиентских сертификатов с поддержкой DPAPI и режима In-Memory",
         shortcut: "Ctrl+Shift+C",
         keywords: [
@@ -2413,7 +2531,7 @@ export const App: React.FC = () => {
         id: "host-remap",
         category: "DNS / Routing",
         group: "network",
-        label: "HOSTS Remapping… (Virtual DNS перенаправление доменов)",
+        label: "HOSTS Remapping",
         description: "Виртуальный DNS для маршрутизации доменов на локальные или стендовые IP",
         statusBadge:
           activeHostRemapCount > 0
@@ -2436,7 +2554,7 @@ export const App: React.FC = () => {
         id: "upstream-proxy-chaining",
         category: "Tools",
         group: "network",
-        label: "Upstream Proxy Chaining… (HTTP / HTTPS / SOCKS5)",
+        label: "Upstream Proxy",
         description: "Цепочка вышестоящего прокси с аутентификацией и списком обхода bypass",
         statusBadge: upstreamProxyActiveLabel ?? "OFF",
         shortcut: "Ctrl+Shift+U",
@@ -2508,9 +2626,8 @@ export const App: React.FC = () => {
         id: "export-sanitized-sessions",
         category: "Security",
         group: "tools",
-        label:
-          "Export Sanitized Sessions… (PII & Secrets Redaction for HAR / SAZ / JSON / Raw)",
-        description: "Безопасный экспорт с маскированием токенов, Cookie, PII и секретов",
+        label: getSectionMeta("sanitizedExport").title,
+        description: getSectionMeta("sanitizedExport").summary,
         shortcut: "Ctrl+Shift+S",
         keywords: [
           "sanitize",
@@ -2531,8 +2648,8 @@ export const App: React.FC = () => {
         id: "export-openapi-spec",
         category: "Traffic",
         group: "tools",
-        label: "Export as OpenAPI 3.0 Spec… (YAML / JSON)",
-        description: "Автогенерация схемы OpenAPI 3.0.3 по выбранным API-запросам",
+        label: getSectionMeta("openApiExport").title,
+        description: getSectionMeta("openApiExport").summary,
         keywords: ["openapi", "swagger", "spec", "yaml", "json", "schema", "api"],
         perform: () => openOpenApiExportModal(),
       },
@@ -2653,8 +2770,8 @@ export const App: React.FC = () => {
         id: "open-theme-gallery",
         category: "Theme",
         group: "settings",
-        label: "Theme Gallery & Custom Palette… (8 тем-пресетов и редактор цветов)",
-        description: "Выбор цветовой темы и точная настройка токенов палитры с Monaco",
+        label: getSectionMeta("settings.uiColumns").title,
+        description: getSectionMeta("settings.uiColumns").summary,
         statusBadge: activeThemePresetName,
         keywords: [
           "theme",
@@ -2692,9 +2809,10 @@ export const App: React.FC = () => {
         id: "open-preferences",
         category: "Settings",
         group: "settings",
-        label: "Preferences... — Открыть настройки и управление профилем",
-        description: "Порт прокси, таймауты, интерфейсы, колонки, фильтры и профиль JSON",
+        label: getSectionMeta("settings").title,
+        description: getSectionMeta("settings").summary,
         shortcut: "Ctrl+,",
+        keywords: ["settings", "preferences", "настройки", "профиль"],
         perform: () => openPreferencesAt("general"),
       },
       {
@@ -2923,10 +3041,10 @@ export const App: React.FC = () => {
           sessions={filteredSessions.length >= 2 ? filteredSessions : sessions}
           resolvedTheme={resolvedTheme}
           defaultSideBySide
-          onSelectPair={setComparePairIds}
-          onSwapPair={swapCompareSessions}
+          onSelectPair={handleSelectDiffTabPair}
+          onSwapPair={handleSwapDiffTabPair}
           onAnnotateSession={(id) => openAnnotationFor([id])}
-          onExpandModal={() => setDiffModalOpen(true)}
+          onExpandTab={() => setActiveSection("diff")}
           onOpenStatistics={() => {
             setInlineDiffDismissed(true);
             setStatisticsTriggerSeq((n) => n + 1);
@@ -3105,7 +3223,7 @@ export const App: React.FC = () => {
           if (targetId !== null) void loadSessionIntoComposer(targetId);
         }}
         onOpenSessionDiff={() => openDiffWithPairSmart()}
-        onOpenTextWizard={() => openTextWizardAt("jwt")}
+        onOpenTextWizard={() => setActiveSection("wizard")}
         onOpenHexConverter={() => openTextWizardAt("hex")}
         onInspectInHex={handleInspectInHex}
         onOpenCompressionCodec={() => openTextWizardAt("compression")}
@@ -3151,8 +3269,8 @@ export const App: React.FC = () => {
             breakpointsArmed={breakpointsArmed}
             pausedBreakpointCount={pausedBreakpoints.length}
             onOpenSessionDiff={() => openDiffWithPairSmart()}
-            diffActive={diffModalOpen || showInlineSessionDiff}
-            onOpenTextWizard={() => openTextWizardAt("jwt")}
+            diffActive={activeSection === "diff" || showInlineSessionDiff}
+            onOpenTextWizard={() => setActiveSection("wizard")}
             activeRulesCount={activeRulesCount}
             pythonScriptEnabled={Boolean(
               scriptEnabled &&
@@ -3254,181 +3372,333 @@ export const App: React.FC = () => {
           />
 
           <main className="flex-1 overflow-hidden">
-            {activeSection === "traffic" && inspectorPosition === "bottom" && (
-              <div className="flex h-full w-full flex-col overflow-hidden">
-                <PanelGroup
-                  ref={bottomInnerGroupRef}
-                  key="traffic-layout-bottom"
-                  autoSaveId={FLUX_PANEL_AUTOSAVE_IDS.bottomInner}
-                  storage={SAFE_PANEL_STORAGE}
-                  direction="vertical"
-                  className="min-h-0 w-full flex-1"
-                >
-                  <Panel
-                    id="traffic-grid-top"
-                    order={1}
-                    defaultSize={inspectorCollapsed ? 100 : 54}
-                    minSize={22}
-                  >
-                    {renderTrafficGrid()}
-                  </Panel>
-                  {!inspectorCollapsed && (
-                    <>
-                      <PanelResizeHandle
-                        onDoubleClick={handleResetBottomInnerGroup}
-                        title="Double-click to reset Traffic / Inspector split"
-                        className="h-1 w-full bg-hairline transition-colors hover:bg-accent/60"
-                      />
-                      <Panel
-                        id="session-inspector-bottom"
-                        order={2}
-                        defaultSize={46}
-                        minSize={20}
-                        collapsible
-                        collapsedSize={0}
-                        onCollapse={() => setInspectorCollapsed(true)}
-                      >
-                        {renderInspectorOrDiff()}
-                      </Panel>
-                    </>
-                  )}
-                </PanelGroup>
-
-                {inspectorCollapsed && (
-                  <CollapsedInspectorBar
-                    position="bottom"
-                    selectedSession={selectedSummary}
-                    selectedCount={effectiveSelectedIds.length}
-                    onExpand={handleFocusInspector}
-                    onOpenStatistics={handleOpenStatistics}
-                    onChangePosition={setInspectorPosition}
-                  />
-                )}
-              </div>
-            )}
-
-            {activeSection === "traffic" && inspectorPosition === "right" && (
-              <div className="flex h-full w-full flex-row overflow-hidden">
-                <PanelGroup
-                  ref={rightGroupRef}
-                  key="traffic-layout-right"
-                  autoSaveId={FLUX_PANEL_AUTOSAVE_IDS.right}
-                  storage={SAFE_PANEL_STORAGE}
-                  direction="horizontal"
-                  className="h-full min-w-0 flex-1"
-                >
-                  <Panel
-                    id="traffic-grid-left"
-                    order={1}
-                    defaultSize={inspectorCollapsed ? 100 : 56}
-                    minSize={26}
-                  >
-                    {renderTrafficGrid()}
-                  </Panel>
-
-                  {!inspectorCollapsed && (
-                    <>
-                      <PanelResizeHandle
-                        onDoubleClick={handleResetRightGroup}
-                        title="Double-click to reset workspace panel split"
-                        className="w-1 bg-hairline transition-colors hover:bg-accent/60"
-                      />
-                      <Panel
-                        id="session-inspector-right"
-                        order={2}
-                        defaultSize={44}
-                        minSize={22}
-                        collapsible
-                        collapsedSize={0}
-                        onCollapse={() => setInspectorCollapsed(true)}
-                      >
-                        {renderInspectorOrDiff()}
-                      </Panel>
-                    </>
-                  )}
-                </PanelGroup>
-
-                {inspectorCollapsed && (
-                  <CollapsedInspectorBar
-                    position="right"
-                    selectedSession={selectedSummary}
-                    selectedCount={effectiveSelectedIds.length}
-                    onExpand={handleFocusInspector}
-                    onOpenStatistics={handleOpenStatistics}
-                    onChangePosition={setInspectorPosition}
-                  />
-                )}
-              </div>
-            )}
-
-            {activeSection === "composer" && (
-              <ComposerPanel
-                draftRequest={composerDraft}
-                resolvedTheme={resolvedTheme}
-                defaultComposerTimeoutSec={upstreamTimeouts.composerTimeoutSec}
-                onLoadSessionIntoComposer={(id) =>
-                  void loadSessionIntoComposer(id)
+            {/* Tab 1: Traffic */}
+            <div
+              hidden={activeSection !== "traffic"}
+              className={
+                activeSection === "traffic"
+                  ? "flex h-full w-full flex-col overflow-hidden"
+                  : "hidden"
+              }
+            >
+              <SectionHeader
+                sectionId="traffic"
+                compact
+                icon={<Activity className="h-3.5 w-3.5 text-accent" />}
+                badges={
+                  <span className="rounded bg-canvas px-1.5 py-0.5 font-mono text-[10px] text-muted ring-1 ring-hairline tabular-nums">
+                    {filteredSessions.length.toLocaleString()} /{" "}
+                    {sessions.length.toLocaleString()}
+                  </span>
                 }
-                onSessionCreated={(detail) => setSelectedId(detail.summary.id)}
-                onBackToTraffic={() => setActiveSection("traffic")}
-                onInspectSessionInTraffic={handleInspectSessionFromComposer}
-                onGenerateCode={openCodeGeneratorForComposerDraft}
-                onNotify={showToast}
               />
-            )}
 
-            {activeSection === "rules" && (
-              <AutoResponderPanel
-                enabled={autoResponderEnabled}
-                onToggleEnabled={handleSetAutoResponderEnabled}
-                rules={rules}
-                resolvedTheme={resolvedTheme}
-                onUpsertRule={async (rule) => {
-                  const next = await proxyBridge.upsertRule(rule);
-                  setRules(next);
-                  persistAutoResponderStorage(autoResponderEnabled, next);
-                  showToast(`Saved rule "${rule.name}"`);
-                }}
-                onDeleteRule={async (id) => {
-                  const next = await proxyBridge.deleteRule(id);
-                  setRules(next);
-                  persistAutoResponderStorage(autoResponderEnabled, next);
-                  showToast("Deleted AutoResponder rule");
-                }}
-              />
-            )}
+              <div className="min-h-0 flex-1 overflow-hidden">
+                {inspectorPosition === "bottom" && (
+                  <div className="flex h-full w-full flex-col overflow-hidden">
+                    <PanelGroup
+                      ref={bottomInnerGroupRef}
+                      key="traffic-layout-bottom"
+                      autoSaveId={FLUX_PANEL_AUTOSAVE_IDS.bottomInner}
+                      storage={SAFE_PANEL_STORAGE}
+                      direction="vertical"
+                      className="min-h-0 w-full flex-1"
+                    >
+                      <Panel
+                        id="traffic-grid-top"
+                        order={1}
+                        defaultSize={inspectorCollapsed ? 100 : 54}
+                        minSize={22}
+                      >
+                        {renderTrafficGrid()}
+                      </Panel>
+                      {!inspectorCollapsed && (
+                        <>
+                          <PanelResizeHandle
+                            onDoubleClick={handleResetBottomInnerGroup}
+                            title="Double-click to reset Traffic / Inspector split"
+                            className="h-1 w-full bg-hairline transition-colors hover:bg-accent/60"
+                          />
+                          <Panel
+                            id="session-inspector-bottom"
+                            order={2}
+                            defaultSize={46}
+                            minSize={20}
+                            collapsible
+                            collapsedSize={0}
+                            onCollapse={() => setInspectorCollapsed(true)}
+                          >
+                            {renderInspectorOrDiff()}
+                          </Panel>
+                        </>
+                      )}
+                    </PanelGroup>
 
-            {activeSection === "scripts" && (
-              <React.Suspense
-                fallback={
-                  <div className="flex flex-1 items-center justify-center text-xs text-muted">
-                    Loading Python Scripting IDE...
+                    {inspectorCollapsed && (
+                      <CollapsedInspectorBar
+                        position="bottom"
+                        selectedSession={selectedSummary}
+                        selectedCount={effectiveSelectedIds.length}
+                        onExpand={handleFocusInspector}
+                        onOpenStatistics={handleOpenStatistics}
+                        onChangePosition={setInspectorPosition}
+                      />
+                    )}
                   </div>
+                )}
+
+                {inspectorPosition === "right" && (
+                  <div className="flex h-full w-full flex-row overflow-hidden">
+                    <PanelGroup
+                      ref={rightGroupRef}
+                      key="traffic-layout-right"
+                      autoSaveId={FLUX_PANEL_AUTOSAVE_IDS.right}
+                      storage={SAFE_PANEL_STORAGE}
+                      direction="horizontal"
+                      className="h-full min-w-0 flex-1"
+                    >
+                      <Panel
+                        id="traffic-grid-left"
+                        order={1}
+                        defaultSize={inspectorCollapsed ? 100 : 56}
+                        minSize={26}
+                      >
+                        {renderTrafficGrid()}
+                      </Panel>
+
+                      {!inspectorCollapsed && (
+                        <>
+                          <PanelResizeHandle
+                            onDoubleClick={handleResetRightGroup}
+                            title="Double-click to reset workspace panel split"
+                            className="w-1 bg-hairline transition-colors hover:bg-accent/60"
+                          />
+                          <Panel
+                            id="session-inspector-right"
+                            order={2}
+                            defaultSize={44}
+                            minSize={22}
+                            collapsible
+                            collapsedSize={0}
+                            onCollapse={() => setInspectorCollapsed(true)}
+                          >
+                            {renderInspectorOrDiff()}
+                          </Panel>
+                        </>
+                      )}
+                    </PanelGroup>
+
+                    {inspectorCollapsed && (
+                      <CollapsedInspectorBar
+                        position="right"
+                        selectedSession={selectedSummary}
+                        selectedCount={effectiveSelectedIds.length}
+                        onExpand={handleFocusInspector}
+                        onOpenStatistics={handleOpenStatistics}
+                        onChangePosition={setInspectorPosition}
+                      />
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Tab 2: Composer (kept mounted once visited to preserve unsent request draft) */}
+            {visitedSections.composer && (
+              <div
+                hidden={activeSection !== "composer"}
+                className={
+                  activeSection === "composer"
+                    ? "h-full w-full overflow-hidden"
+                    : "hidden"
                 }
               >
-                <ScriptingPanel
-                  code={scriptCode}
-                  enabled={scriptEnabled}
-                  activePresetId={scriptActivePresetId}
-                  status={pythonRunnerStatus}
-                  logs={scriptConsoleLogs}
+                <ComposerPanel
+                  draftRequest={composerDraft}
                   resolvedTheme={resolvedTheme}
-                  isApplying={isApplyingScript}
-                  onChangeCode={(nextCode) => {
-                    setScriptCode(nextCode);
-                    persistPythonScriptStorage(
-                      scriptEnabled,
-                      nextCode,
-                      scriptActivePresetId
-                    );
-                  }}
-                  onSelectPreset={handleSelectPythonPreset}
-                  onApplyScript={handleApplyPythonScript}
-                  onToggleEnabled={handleTogglePythonScript}
-                  onRefreshStatus={handleRefreshPythonStatus}
-                  onClearLogs={() => setScriptConsoleLogs([])}
+                  defaultComposerTimeoutSec={upstreamTimeouts.composerTimeoutSec}
+                  onLoadSessionIntoComposer={(id) =>
+                    void loadSessionIntoComposer(id)
+                  }
+                  onSessionCreated={(detail) => setSelectedId(detail.summary.id)}
+                  onBackToTraffic={() => setActiveSection("traffic")}
+                  onInspectSessionInTraffic={handleInspectSessionFromComposer}
+                  onGenerateCode={openCodeGeneratorForComposerDraft}
+                  onNotify={showToast}
                 />
-              </React.Suspense>
+              </div>
+            )}
+
+            {/* Tab 3: AutoResponder */}
+            {visitedSections.rules && (
+              <div
+                hidden={activeSection !== "rules"}
+                className={
+                  activeSection === "rules"
+                    ? "h-full w-full overflow-hidden"
+                    : "hidden"
+                }
+              >
+                <AutoResponderPanel
+                  enabled={autoResponderEnabled}
+                  onToggleEnabled={handleSetAutoResponderEnabled}
+                  rules={rules}
+                  resolvedTheme={resolvedTheme}
+                  onUpsertRule={async (rule) => {
+                    const next = await proxyBridge.upsertRule(rule);
+                    setRules(next);
+                    persistAutoResponderStorage(autoResponderEnabled, next);
+                    showToast(`Saved rule "${rule.name}"`);
+                  }}
+                  onDeleteRule={async (id) => {
+                    const next = await proxyBridge.deleteRule(id);
+                    setRules(next);
+                    persistAutoResponderStorage(autoResponderEnabled, next);
+                    showToast("Deleted AutoResponder rule");
+                  }}
+                />
+              </div>
+            )}
+
+            {/* Tab 4: Breakpoints (non-blocking, preserves edits and rules draft) */}
+            {visitedSections.breakpoints && (
+              <div
+                hidden={activeSection !== "breakpoints"}
+                className={
+                  activeSection === "breakpoints"
+                    ? "flex h-full w-full flex-col overflow-hidden"
+                    : "hidden"
+                }
+              >
+                <React.Suspense
+                  fallback={
+                    <div className="flex flex-1 items-center justify-center text-xs text-muted">
+                      Loading Breakpoints...
+                    </div>
+                  }
+                >
+                  <BreakpointsPanel
+                    isActive={activeSection === "breakpoints"}
+                    requestedMode={bpPanelMode}
+                    selectedBreakpointId={selectedBpId}
+                    requestSeq={bpRequestSeq}
+                    pausedItems={pausedBreakpoints}
+                    config={breakpointConfig}
+                    resolvedTheme={resolvedTheme}
+                    onBackToTraffic={() => setActiveSection("traffic")}
+                    onUpdateConfig={updateBreakpointConfig}
+                    onResolve={resolvePausedBreakpoint}
+                    onResumeAll={resumeAllBreakpoints}
+                  />
+                </React.Suspense>
+              </div>
+            )}
+
+            {/* Tab 5: Scripts */}
+            {visitedSections.scripts && (
+              <div
+                hidden={activeSection !== "scripts"}
+                className={
+                  activeSection === "scripts"
+                    ? "flex h-full w-full flex-col overflow-hidden"
+                    : "hidden"
+                }
+              >
+                <React.Suspense
+                  fallback={
+                    <div className="flex flex-1 items-center justify-center text-xs text-muted">
+                      Loading Scripts...
+                    </div>
+                  }
+                >
+                  <ScriptingPanel
+                    code={scriptCode}
+                    enabled={scriptEnabled}
+                    activePresetId={scriptActivePresetId}
+                    status={pythonRunnerStatus}
+                    logs={scriptConsoleLogs}
+                    resolvedTheme={resolvedTheme}
+                    isApplying={isApplyingScript}
+                    onChangeCode={(nextCode) => {
+                      setScriptCode(nextCode);
+                      persistPythonScriptStorage(
+                        scriptEnabled,
+                        nextCode,
+                        scriptActivePresetId
+                      );
+                    }}
+                    onSelectPreset={handleSelectPythonPreset}
+                    onApplyScript={handleApplyPythonScript}
+                    onToggleEnabled={handleTogglePythonScript}
+                    onRefreshStatus={handleRefreshPythonStatus}
+                    onClearLogs={() => setScriptConsoleLogs([])}
+                  />
+                </React.Suspense>
+              </div>
+            )}
+
+            {/* Tab 6: Session Diff (preserves selected A/B pair and diff options) */}
+            {visitedSections.diff && (
+              <div
+                hidden={activeSection !== "diff"}
+                className={
+                  activeSection === "diff"
+                    ? "flex h-full w-full flex-col overflow-hidden"
+                    : "hidden"
+                }
+              >
+                <React.Suspense
+                  fallback={
+                    <div className="flex flex-1 items-center justify-center text-xs text-muted">
+                      Loading Session Diff...
+                    </div>
+                  }
+                >
+                  <SessionDiffView
+                    leftDetail={resolvedDiffTabLeftDetail}
+                    rightDetail={resolvedDiffTabRightDetail}
+                    sessions={
+                      filteredSessions.length >= 2 ? filteredSessions : sessions
+                    }
+                    resolvedTheme={resolvedTheme}
+                    defaultSideBySide
+                    showSectionHeader
+                    onBackToTraffic={() => setActiveSection("traffic")}
+                    onSelectPair={handleSelectDiffTabPair}
+                    onSwapPair={handleSwapDiffTabPair}
+                    onAnnotateSession={(id) => openAnnotationFor([id])}
+                  />
+                </React.Suspense>
+              </div>
+            )}
+
+            {/* Tab 7: TextWizard (preserves input and tool state across switches) */}
+            {visitedSections.wizard && (
+              <div
+                hidden={activeSection !== "wizard"}
+                className={
+                  activeSection === "wizard"
+                    ? "flex h-full w-full flex-col overflow-hidden"
+                    : "hidden"
+                }
+              >
+                <React.Suspense
+                  fallback={
+                    <div className="flex flex-1 items-center justify-center text-xs text-muted">
+                      Loading TextWizard...
+                    </div>
+                  }
+                >
+                  <TextWizardPanel
+                    isActive={activeSection === "wizard"}
+                    requestedTab={textWizardTab}
+                    requestedInput={textWizardInput}
+                    requestSeq={textWizardRequestSeq}
+                    onBackToTraffic={() => setActiveSection("traffic")}
+                    onNotify={showToast}
+                  />
+                </React.Suspense>
+              </div>
             )}
           </main>
         </div>
@@ -3849,51 +4119,6 @@ export const App: React.FC = () => {
           void annotateSessions(ids, comment, markedColor);
         }}
       />
-
-      {diffModalOpen && (
-        <React.Suspense fallback={null}>
-          <SessionDiffModal
-            open={diffModalOpen}
-            leftDetail={diffLeftDetail}
-            rightDetail={diffRightDetail}
-            sessions={filteredSessions.length >= 2 ? filteredSessions : sessions}
-            resolvedTheme={resolvedTheme}
-            onSelectPair={setComparePairIds}
-            onSwapPair={swapCompareSessions}
-            onAnnotateSession={(id) => openAnnotationFor([id])}
-            onClose={() => setDiffModalOpen(false)}
-          />
-        </React.Suspense>
-      )}
-
-      {bpModalOpen && (
-        <React.Suspense fallback={null}>
-          <BreakpointInterceptorModal
-            open={bpModalOpen}
-            initialMode={bpModalMode}
-            selectedBreakpointId={selectedBpId}
-            pausedItems={pausedBreakpoints}
-            config={breakpointConfig}
-            resolvedTheme={resolvedTheme}
-            onClose={() => setBpModalOpen(false)}
-            onUpdateConfig={updateBreakpointConfig}
-            onResolve={resolvePausedBreakpoint}
-            onResumeAll={resumeAllBreakpoints}
-          />
-        </React.Suspense>
-      )}
-
-      {textWizardOpen && (
-        <React.Suspense fallback={null}>
-          <TextWizardModal
-            open={textWizardOpen}
-            initialTab={textWizardTab}
-            initialInput={textWizardInput}
-            onClose={() => setTextWizardOpen(false)}
-            onNotify={showToast}
-          />
-        </React.Suspense>
-      )}
 
       <CertificateModal
         open={certModalOpen}

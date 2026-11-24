@@ -257,9 +257,10 @@ describe("SettingsModal (Unified Fullscreen Settings Hub)", () => {
 
     const heading = screen.getByRole("heading", {
       level: 1,
-      name: /Settings Hub/i,
+      name: "Settings",
     });
     expect(heading).toBeTruthy();
+    expect(screen.getByRole("button", { name: "О разделе" })).toBeTruthy();
 
     const tablist = screen.getByRole("tablist", {
       name: "Разделы настроек FluxProxy",

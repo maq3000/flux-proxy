@@ -12,8 +12,6 @@ export interface UseGlobalShortcutsOptions {
   setActiveSection: (
     updater: ActiveNavSection | ((prev: ActiveNavSection) => ActiveNavSection)
   ) => void;
-  diffModalOpen: boolean;
-  setDiffModalOpen: Dispatch<SetStateAction<boolean>>;
   sanitizedExportModalOpen: boolean;
   setSanitizedExportModalOpen: Dispatch<SetStateAction<boolean>>;
   settingsModalOpen: boolean;
@@ -22,10 +20,8 @@ export interface UseGlobalShortcutsOptions {
     tab: SettingsModalTab,
     subTab?: SettingsModalSubTab
   ) => void;
-  onToggleBreakpointsModal: () => void;
   setPaletteOpen: Dispatch<SetStateAction<boolean>>;
   setShortcutsModalOpen: Dispatch<SetStateAction<boolean>>;
-  setTextWizardOpen: Dispatch<SetStateAction<boolean>>;
   selectedId: number | null;
   effectiveSelectedIds: number[];
   filteredSessions: SessionSummary[];
@@ -59,17 +55,13 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
   const {
     activeSection,
     setActiveSection,
-    diffModalOpen,
-    setDiffModalOpen,
     sanitizedExportModalOpen,
     setSanitizedExportModalOpen,
     settingsModalOpen,
     onToggleSettingsMain,
     onToggleSettingsAt,
-    onToggleBreakpointsModal,
     setPaletteOpen,
     setShortcutsModalOpen,
-    setTextWizardOpen,
     selectedId,
     effectiveSelectedIds,
     filteredSessions,
@@ -233,15 +225,16 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
         return;
       }
 
-      // Ctrl+E / Cmd+E -> TextWizard
+      // Ctrl+E / Cmd+E -> TextWizard tab (toggles back to Traffic if already active)
       if (
         ctrlOrMeta &&
         !e.altKey &&
         !e.shiftKey &&
-        (keyLower === "e" || e.code === "KeyE")
+        (keyLower === "e" || e.code === "KeyE") &&
+        !hasOpenModal()
       ) {
         e.preventDefault();
-        setTextWizardOpen((prev) => !prev);
+        setActiveSection((prev) => (prev === "wizard" ? "traffic" : "wizard"));
         return;
       }
 
@@ -363,21 +356,22 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
         return;
       }
 
-      // Ctrl+D / Cmd+D -> Session Diff
+      // Ctrl+D / Cmd+D -> Session Diff tab (toggles back to Traffic if already active)
       if (
         ctrlOrMeta &&
         !e.altKey &&
         !e.shiftKey &&
         (keyLower === "d" || e.code === "KeyD") &&
+        !hasOpenModal() &&
         !(
           e.target instanceof HTMLElement &&
           e.target.closest(".monaco-editor") &&
-          !diffModalOpen
+          activeSection !== "diff"
         )
       ) {
         e.preventDefault();
-        if (diffModalOpen) {
-          setDiffModalOpen(false);
+        if (activeSection === "diff") {
+          setActiveSection("traffic");
         } else {
           openDiffWithPairSmart();
         }
@@ -440,21 +434,21 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
         return;
       }
 
-      // Alt+1..5 -> Primary views
+      // Alt+1..6 -> Primary workspace views & Settings -> Filters
       if (e.altKey && !ctrlOrMeta && !e.shiftKey) {
         if (e.key === "1") {
           e.preventDefault();
-          setActiveSection("traffic");
+          if (!hasOpenModal()) setActiveSection("traffic");
           return;
         }
         if (e.key === "2") {
           e.preventDefault();
-          setActiveSection("composer");
+          if (!hasOpenModal()) setActiveSection("composer");
           return;
         }
         if (e.key === "3") {
           e.preventDefault();
-          setActiveSection("rules");
+          if (!hasOpenModal()) setActiveSection("rules");
           return;
         }
         if (e.key === "4") {
@@ -466,14 +460,12 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
         }
         if (e.key === "5") {
           e.preventDefault();
-          setActiveSection("scripts");
+          if (!hasOpenModal()) setActiveSection("scripts");
           return;
         }
         if (e.key === "6") {
           e.preventDefault();
-          if (!hasBlockingModal()) {
-            onToggleBreakpointsModal();
-          }
+          if (!hasOpenModal()) setActiveSection("breakpoints");
           return;
         }
       }
@@ -546,14 +538,12 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
     clearAllSessions,
     copyUrlsForIds,
     deleteSessions,
-    diffModalOpen,
     disableAllBreakpoints,
     effectiveSelectedIds,
     exportAllSessionsAs,
     filteredSessions,
     handleFocusSearch,
     importArchiveDialog,
-    onToggleBreakpointsModal,
     onToggleSettingsAt,
     onToggleSettingsMain,
     openAnnotationFor,
@@ -565,10 +555,8 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
     selectSessions,
     selectedId,
     setActiveSection,
-    setDiffModalOpen,
     setPaletteOpen,
     setShortcutsModalOpen,
-    setTextWizardOpen,
     settingsModalOpen,
     sortedSessionsRef,
     toggleBreakAfterResponse,

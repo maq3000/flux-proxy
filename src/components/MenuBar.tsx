@@ -4,6 +4,7 @@ import {
   TOOLBAR_GROUP_DEFINITIONS,
   TRAFFIC_COLUMNS,
 } from "../hooks/useUiPreferences";
+import { getSectionMeta } from "../lib/sectionRegistry";
 import { SESSION_RETENTION_PRESETS } from "../types/proxy";
 import type {
   ActiveNavSection,
@@ -1010,7 +1011,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 disabled={totalCount === 0}
                 onClick={(e) => activateCommand(e, onOpenSanitizedExport)}
               >
-                <span>Export Sanitized Sessions…</span>
+                <span>{getSectionMeta("sanitizedExport").title}</span>
                 <span className="hint" aria-hidden="true">
                   Ctrl+Shift+S
                 </span>
@@ -1020,7 +1021,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 disabled={totalCount === 0}
                 onClick={(e) => activateCommand(e, onOpenOpenApiExport)}
               >
-                <span>Export as OpenAPI 3.0 Spec…</span>
+                <span>{getSectionMeta("openApiExport").title}</span>
               </button>
               <button
                 type="button"
@@ -1077,7 +1078,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenPreferences)}
               >
-                <span>Preferences...</span>
+                <span>{getSectionMeta("settings").title}</span>
                 <span className="hint" aria-hidden="true">
                   Ctrl+,
                 </span>
@@ -1137,7 +1138,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 disabled={!hasSelection}
                 onClick={(e) => activateCommand(e, onGenerateClientCode)}
               >
-                <span>Generate Client Code…</span>
+                <span>{getSectionMeta("codeGenerator").title}</span>
               </button>
               <button
                 type="button"
@@ -1159,7 +1160,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 disabled={!hasSelection}
                 onClick={(e) => activateCommand(e, onAnnotateSelected)}
               >
-                <span>Comment / Mark Session…</span>
+                <span>{getSectionMeta("commentMark").title}</span>
                 <span className="hint" aria-hidden="true">
                   M
                 </span>
@@ -1251,7 +1252,10 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenBreakpointsModal)}
               >
-                <span>Breakpoint Rules (bpu / bpafter)…</span>
+                <span>{getSectionMeta("breakpoints").title}</span>
+                <span className="hint" aria-hidden="true">
+                  Alt+6
+                </span>
               </button>
               <hr />
               <button
@@ -1290,7 +1294,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                   activateCommand(e, () => onSelectSection("rules"))
                 }
               >
-                <span>AutoResponder &amp; Latency Rules…</span>
+                <span>{getSectionMeta("rules").title}</span>
                 <span className="hint" aria-hidden="true">
                   Alt+3
                 </span>
@@ -1299,7 +1303,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenFilterDrawer)}
               >
-                <span>Filter Matrix &amp; Header Mutations…</span>
+                <span>{getSectionMeta("settings.filters").title}</span>
                 <span className="hint" aria-hidden="true">
                   Alt+4
                 </span>
@@ -1310,7 +1314,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                   activateCommand(e, () => onSelectSection("scripts"))
                 }
               >
-                <span>Python Scripting Engine (on_request / on_response)…</span>
+                <span>{getSectionMeta("scripts").title}</span>
                 <span className="hint" aria-hidden="true">
                   Alt+5
                 </span>
@@ -1319,13 +1323,13 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenHostsListDrawer)}
               >
-                <span>Hosts List (Whitelist / Blacklist)…</span>
+                <span>Hosts List</span>
               </button>
               <button
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenTlsModeDrawer)}
               >
-                <span>TLS Allowlist &amp; Bypass Domains…</span>
+                <span>TLS Bypass</span>
               </button>
             </div>
           </div>
@@ -1590,7 +1594,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                     activateCommand(e, () => onSelectSection("traffic"))
                   }
                 >
-                  <span>Traffic Viewer</span>
+                  <span>{getSectionMeta("traffic").title}</span>
                   <span className="hint" aria-hidden="true">
                     Alt+1
                   </span>
@@ -1603,7 +1607,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                     activateCommand(e, () => onSelectSection("composer"))
                   }
                 >
-                  <span>Request Composer</span>
+                  <span>{getSectionMeta("composer").title}</span>
                   <span className="hint" aria-hidden="true">
                     Alt+2
                   </span>
@@ -1616,9 +1620,22 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                     activateCommand(e, () => onSelectSection("rules"))
                   }
                 >
-                  <span>AutoResponder</span>
+                  <span>{getSectionMeta("rules").title}</span>
                   <span className="hint" aria-hidden="true">
                     Alt+3
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={activeSection === "breakpoints"}
+                  onClick={(e) =>
+                    activateCommand(e, () => onSelectSection("breakpoints"))
+                  }
+                >
+                  <span>{getSectionMeta("breakpoints").title}</span>
+                  <span className="hint" aria-hidden="true">
+                    Alt+6
                   </span>
                 </button>
                 <button
@@ -1629,9 +1646,31 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                     activateCommand(e, () => onSelectSection("scripts"))
                   }
                 >
-                  <span>Python Scripting Engine</span>
+                  <span>{getSectionMeta("scripts").title}</span>
                   <span className="hint" aria-hidden="true">
                     Alt+5
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={activeSection === "diff"}
+                  onClick={(e) => activateCommand(e, onOpenSessionDiff)}
+                >
+                  <span>{getSectionMeta("diff").title}</span>
+                  <span className="hint" aria-hidden="true">
+                    Ctrl+D
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={activeSection === "wizard"}
+                  onClick={(e) => activateCommand(e, onOpenTextWizard)}
+                >
+                  <span>{getSectionMeta("wizard").title}</span>
+                  <span className="hint" aria-hidden="true">
+                    Ctrl+E
                   </span>
                 </button>
               </div>
@@ -1643,7 +1682,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                     type="button"
                     onClick={(e) => activateCommand(e, onOpenThemeGallery)}
                   >
-                    <span>Theme Presets &amp; Appearance…</span>
+                    <span>{getSectionMeta("settings.uiColumns").title}</span>
                   </button>
                 </>
               )}
@@ -1680,7 +1719,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 disabled={!hasSelection}
                 onClick={(e) => activateCommand(e, onSendSelectedToComposer)}
               >
-                <span>Edit in Request Composer</span>
+                <span>Edit in Composer</span>
                 <span className="hint" aria-hidden="true">
                   E
                 </span>
@@ -1690,7 +1729,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenSessionDiff)}
               >
-                <span>Session Diff (Compare)…</span>
+                <span>{getSectionMeta("diff").title}</span>
                 <span className="hint" aria-hidden="true">
                   Ctrl+D
                 </span>
@@ -1699,7 +1738,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenTextWizard)}
               >
-                <span>Text Wizard &amp; JWT Decoder…</span>
+                <span>{getSectionMeta("wizard").title}</span>
                 <span className="hint" aria-hidden="true">
                   Ctrl+E
                 </span>
@@ -1708,7 +1747,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenHexConverter)}
               >
-                <span>Hex ↔ Text Converter…</span>
+                <span>Hex ↔ Text</span>
               </button>
               <button
                 type="button"
@@ -1721,7 +1760,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenCompressionCodec)}
               >
-                <span>Gzip / Brotli / Deflate / Zstd Codec…</span>
+                <span>Compression Codec</span>
               </button>
               <hr />
               <button
@@ -1845,7 +1884,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenMobileSetup)}
               >
-                <span>Connect Mobile Device (iOS / Android)…</span>
+                <span>Mobile Setup</span>
                 <span className="hint" aria-hidden="true">
                   Ctrl+Shift+M
                 </span>
@@ -1854,13 +1893,13 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenCertificates)}
               >
-                <span>HTTPS Root CA Certificate…</span>
+                <span>{getSectionMeta("rootCa").title}</span>
               </button>
               <button
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenClientCertificates)}
               >
-                <span>Client Certificates…</span>
+                <span>Client Certificates</span>
                 <span className="hint" aria-hidden="true">
                   Ctrl+Shift+C
                 </span>
@@ -1871,7 +1910,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                   onClick={(e) => activateCommand(e, onOpenHostRemap)}
                 >
                   <span>
-                    HOSTS Remapping…
+                    HOSTS Remapping
                     {activeHostRemapCount > 0
                       ? ` (${activeHostRemapCount})`
                       : ""}
@@ -1887,7 +1926,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                   onClick={(e) => activateCommand(e, onOpenUpstreamProxy)}
                 >
                   <span>
-                    Upstream Proxy…
+                    Upstream Proxy
                     {upstreamProxyActiveLabel
                       ? ` (${upstreamProxyActiveLabel})`
                       : ""}
@@ -1926,7 +1965,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenCommandPalette)}
               >
-                <span>Command Palette…</span>
+                <span>Command Palette</span>
                 <span className="hint" aria-hidden="true">
                   Ctrl+K
                 </span>
@@ -1935,7 +1974,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenShortcutsModal)}
               >
-                <span>Keyboard Shortcuts…</span>
+                <span>{getSectionMeta("shortcuts").title}</span>
                 <span className="hint" aria-hidden="true">
                   ?
                 </span>
@@ -1945,7 +1984,7 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenProxyDoctor)}
               >
-                <span>Run Proxy Doctor…</span>
+                <span>Proxy Doctor</span>
                 <span className="hint" aria-hidden="true">
                   Ctrl+Shift+D
                 </span>

@@ -764,3 +764,27 @@ dialog.drawer-dialog::backdrop {
 [popover].help-tooltip-popover:is(:popover-open, .\:popover-open, [data-open="true"]) {
   display: block;
 }
+
+/* ============================================================================
+   SectionHeader "О разделе" Disclosure Popover (SectionHeader.tsx)
+   ============================================================================ */
+@supports (position-area: block-end) {
+  .section-about-popover {
+    inset: auto;
+    margin: 0.375rem 0 0 0;
+    position-area: block-end span-inline-end;
+    position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+  }
+}
+
+@supports not (position-area: block-end) {
+  .section-about-popover {
+    position: fixed;
+    inset: auto;
+    margin: 0;
+  }
+}
+
+[popover].section-about-popover:is(:popover-open, .\:popover-open, [data-open="true"]) {
+  display: block;
+}

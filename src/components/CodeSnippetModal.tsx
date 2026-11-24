@@ -11,6 +11,7 @@ import {
   type CodeLanguageGroupId,
 } from "../lib/codeGenerators";
 import { getMonacoThemeName } from "../lib/monaco";
+import { SectionHeader } from "./ui/SectionHeader";
 
 interface CodeSnippetModalProps {
   open: boolean;
@@ -198,41 +199,43 @@ export const CodeSnippetModal: React.FC<CodeSnippetModalProps> = ({
         onClose();
       }}
       {...({ closedby: "any" } as Record<string, string>)}
-      className="m-auto h-[80vh] max-h-[760px] w-[92vw] max-w-4xl overflow-hidden rounded-xl border border-strong bg-surface p-0 text-fg shadow-2xl open:flex open:flex-col"
+      className="fixed inset-0 m-0 h-screen w-screen max-h-none max-w-none overflow-hidden rounded-none border-0 bg-surface p-0 text-fg open:flex open:flex-col"
     >
-      {/* Header */}
-      <div className="flex shrink-0 items-center justify-between gap-3 border-b border-hairline bg-elevated/70 px-4 py-3">
-        <div className="flex min-w-0 items-center gap-2.5">
-          <Code2 className="h-4 w-4 shrink-0 text-accent" aria-hidden="true" />
-          <h2 id={titleId} className="shrink-0 text-sm font-semibold text-fg">
-            Generate Client Code
-          </h2>
-          {request?.sourceLabel && (
-            <span className="shrink-0 rounded bg-canvas px-2 py-0.5 font-mono text-[10px] font-medium text-muted ring-1 ring-hairline">
-              {request.sourceLabel}
-            </span>
-          )}
-          {request && (
-            <div className="hidden min-w-0 items-center gap-1.5 rounded bg-canvas/80 px-2 py-0.5 font-mono text-[11px] ring-1 ring-hairline sm:flex">
-              <span className="shrink-0 font-bold text-sky-400">
-                {request.method}
+      <SectionHeader
+        sectionId="codeGenerator"
+        titleId={titleId}
+        headingLevel={1}
+        icon={<Code2 className="h-4 w-4 text-accent" />}
+        badges={
+          <>
+            {request?.sourceLabel && (
+              <span className="shrink-0 rounded bg-canvas px-2 py-0.5 font-mono text-[10px] font-medium text-muted ring-1 ring-hairline">
+                {request.sourceLabel}
               </span>
-              <span className="truncate text-muted" title={request.url}>
-                {request.url}
-              </span>
-            </div>
-          )}
-        </div>
-
-        <button
-          type="button"
-          onClick={() => dialogRef.current?.close()}
-          aria-label="Закрыть генератор кода"
-          className="shrink-0 rounded p-1 text-muted hover:bg-hover hover:text-fg"
-        >
-          <X className="h-4 w-4" aria-hidden="true" />
-        </button>
-      </div>
+            )}
+            {request && (
+              <div className="hidden min-w-0 max-w-xl items-center gap-1.5 rounded bg-canvas/80 px-2 py-0.5 font-mono text-[11px] ring-1 ring-hairline sm:flex">
+                <span className="shrink-0 font-bold text-sky-400">
+                  {request.method}
+                </span>
+                <span className="truncate text-muted" title={request.url}>
+                  {request.url}
+                </span>
+              </div>
+            )}
+          </>
+        }
+        actions={
+          <button
+            type="button"
+            onClick={() => dialogRef.current?.close()}
+            aria-label="Закрыть Code Generator"
+            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-hairline bg-canvas text-muted hover:border-strong hover:bg-hover hover:text-fg"
+          >
+            <X className="h-4 w-4" aria-hidden="true" />
+          </button>
+        }
+      />
 
       {/* Language & Library Switcher Bar */}
       <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-hairline bg-surface px-4 py-2">

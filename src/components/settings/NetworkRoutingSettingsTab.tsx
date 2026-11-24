@@ -113,7 +113,7 @@ export const NetworkRoutingSettingsTab: React.FC<
   }[] = [
     {
       id: "throttling",
-      label: "Bandwidth Throttling",
+      label: "Throttling",
       badge:
         throttleConfig.preset === "none"
           ? "Off"
@@ -138,7 +138,7 @@ export const NetworkRoutingSettingsTab: React.FC<
     },
     {
       id: "timeouts",
-      label: "Upstream Timeouts",
+      label: "Timeouts",
       badge:
         upstreamTimeouts.responseHeaderTimeoutSec === 0
           ? "Unlimited"

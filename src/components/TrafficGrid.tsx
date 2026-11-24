@@ -40,6 +40,7 @@ import {
   formatMsPrecise,
   formatTimeCellTooltip,
 } from "../lib/requestStatistics";
+import { getSectionMeta } from "../lib/sectionRegistry";
 import { hexToRgba } from "../lib/sessionDiff";
 import type {
   ColumnId,
@@ -1873,7 +1874,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
               }}
             >
               <Code2 className="h-3.5 w-3.5 shrink-0 text-accent" />
-              <span className="truncate">Generate Client Code…</span>
+              <span className="truncate">{getSectionMeta("codeGenerator").title}</span>
             </button>
           )}
 
@@ -1949,7 +1950,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
                 >
                   <FileJson className="h-3.5 w-3.5 shrink-0 text-accent" />
                   <span className="truncate">
-                    Export as OpenAPI 3.0 Spec…
+                    {getSectionMeta("openApiExport").title}
                     {ctxTargetIds.length > 1 ? ` (${ctxTargetIds.length})` : ""}
                   </span>
                 </button>
@@ -2009,7 +2010,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
               }}
             >
               <MessageSquarePlus className="h-3.5 w-3.5 shrink-0 text-status4xx-fg" />
-              <span className="truncate">Комментарий / Маркер</span>
+              <span className="truncate">{getSectionMeta("commentMark").title}</span>
               <span className="hint font-mono text-[10px] text-subtle" aria-hidden="true">
                 M
               </span>

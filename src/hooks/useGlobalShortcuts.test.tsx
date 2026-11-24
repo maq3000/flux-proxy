@@ -31,17 +31,13 @@ function createOptions(
   return {
     activeSection: "traffic" as ActiveNavSection,
     setActiveSection: vi.fn(),
-    diffModalOpen: false,
-    setDiffModalOpen: vi.fn(),
     sanitizedExportModalOpen: false,
     setSanitizedExportModalOpen: vi.fn(),
     settingsModalOpen: false,
     onToggleSettingsMain: vi.fn(),
     onToggleSettingsAt: vi.fn(),
-    onToggleBreakpointsModal: vi.fn(),
     setPaletteOpen: vi.fn(),
     setShortcutsModalOpen: vi.fn(),
-    setTextWizardOpen: vi.fn(),
     selectedId: 101,
     effectiveSelectedIds: [101],
     filteredSessions: SAMPLE_SESSIONS,
@@ -89,7 +85,7 @@ const ShortcutHarness: React.FC<{ options: UseGlobalShortcutsOptions }> = ({
   );
 };
 
-describe("useGlobalShortcuts — Fiddler E vs Ctrl+E", () => {
+describe("useGlobalShortcuts — Fiddler E, 7-tab workspace navigation & Breakpoints", () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
@@ -97,10 +93,10 @@ describe("useGlobalShortcuts — Fiddler E vs Ctrl+E", () => {
 
   it("opens selected session in Composer on single key E (including non-Latin KeyE)", () => {
     const openInComposer = vi.fn();
-    const setTextWizardOpen = vi.fn();
+    const setActiveSection = vi.fn();
     const { getByTestId } = render(
       <ShortcutHarness
-        options={createOptions({ openInComposer, setTextWizardOpen })}
+        options={createOptions({ openInComposer, setActiveSection })}
       />
     );
 
@@ -108,7 +104,7 @@ describe("useGlobalShortcuts — Fiddler E vs Ctrl+E", () => {
     fireEvent.keyDown(target, { key: "e", code: "KeyE" });
     expect(openInComposer).toHaveBeenCalledTimes(1);
     expect(openInComposer).toHaveBeenCalledWith(101);
-    expect(setTextWizardOpen).not.toHaveBeenCalled();
+    expect(setActiveSection).not.toHaveBeenCalled();
 
     // Non-Latin keyboard layout (e.g. Russian 'у' on KeyE)
     fireEvent.keyDown(target, { key: "у", code: "KeyE" });
@@ -151,23 +147,109 @@ describe("useGlobalShortcuts — Fiddler E vs Ctrl+E", () => {
     expect(openInComposer).not.toHaveBeenCalled();
   });
 
-  it("keeps Ctrl+E / Cmd+E bound to TextWizard without triggering openInComposer", () => {
+  it("switches to TextWizard tab (and back to Traffic) on Ctrl+E / Cmd+E without triggering openInComposer", () => {
     const openInComposer = vi.fn();
-    const setTextWizardOpen = vi.fn();
+    let currentSection: ActiveNavSection = "traffic";
+    const setActiveSection = vi.fn(
+      (
+        updater:
+          | ActiveNavSection
+          | ((prev: ActiveNavSection) => ActiveNavSection)
+      ) => {
+        currentSection =
+          typeof updater === "function" ? updater(currentSection) : updater;
+      }
+    );
+
     const { getByTestId } = render(
       <ShortcutHarness
-        options={createOptions({ openInComposer, setTextWizardOpen })}
+        options={createOptions({ openInComposer, setActiveSection })}
       />
     );
 
     const target = getByTestId("grid-focus-target");
     fireEvent.keyDown(target, { key: "e", code: "KeyE", ctrlKey: true });
-    expect(setTextWizardOpen).toHaveBeenCalledTimes(1);
+    expect(setActiveSection).toHaveBeenCalledTimes(1);
+    expect(currentSection).toBe("wizard");
     expect(openInComposer).not.toHaveBeenCalled();
 
     fireEvent.keyDown(target, { key: "e", code: "KeyE", metaKey: true });
-    expect(setTextWizardOpen).toHaveBeenCalledTimes(2);
+    expect(setActiveSection).toHaveBeenCalledTimes(2);
+    expect(currentSection).toBe("traffic");
     expect(openInComposer).not.toHaveBeenCalled();
+  });
+
+  it("navigates all Alt+1..6 targets, Ctrl+D Session Diff tab toggle, and F11 breakpoint arm/disarm shortcuts", () => {
+    const setActiveSection = vi.fn();
+    const onToggleSettingsAt = vi.fn();
+    const openDiffWithPairSmart = vi.fn();
+    const toggleBreakBeforeRequest = vi.fn();
+    const toggleBreakAfterResponse = vi.fn();
+    const disableAllBreakpoints = vi.fn();
+
+    const { rerender, getByTestId } = render(
+      <ShortcutHarness
+        options={createOptions({
+          activeSection: "traffic",
+          setActiveSection,
+          onToggleSettingsAt,
+          openDiffWithPairSmart,
+          toggleBreakBeforeRequest,
+          toggleBreakAfterResponse,
+          disableAllBreakpoints,
+        })}
+      />
+    );
+
+    const target = getByTestId("grid-focus-target");
+    fireEvent.keyDown(target, { key: "1", altKey: true });
+    expect(setActiveSection).toHaveBeenLastCalledWith("traffic");
+
+    fireEvent.keyDown(target, { key: "2", altKey: true });
+    expect(setActiveSection).toHaveBeenLastCalledWith("composer");
+
+    fireEvent.keyDown(target, { key: "3", altKey: true });
+    expect(setActiveSection).toHaveBeenLastCalledWith("rules");
+
+    fireEvent.keyDown(target, { key: "4", altKey: true });
+    expect(onToggleSettingsAt).toHaveBeenCalledWith("filters", "matrix");
+
+    fireEvent.keyDown(target, { key: "5", altKey: true });
+    expect(setActiveSection).toHaveBeenLastCalledWith("scripts");
+
+    fireEvent.keyDown(target, { key: "6", altKey: true });
+    expect(setActiveSection).toHaveBeenLastCalledWith("breakpoints");
+
+    // Ctrl+D opens Session Diff tab via smart pair helper
+    fireEvent.keyDown(target, { key: "d", code: "KeyD", ctrlKey: true });
+    expect(openDiffWithPairSmart).toHaveBeenCalledTimes(1);
+
+    // Ctrl+D while already on Session Diff returns to Traffic tab
+    rerender(
+      <ShortcutHarness
+        options={createOptions({
+          activeSection: "diff",
+          setActiveSection,
+          onToggleSettingsAt,
+          openDiffWithPairSmart,
+          toggleBreakBeforeRequest,
+          toggleBreakAfterResponse,
+          disableAllBreakpoints,
+        })}
+      />
+    );
+    fireEvent.keyDown(target, { key: "d", code: "KeyD", ctrlKey: true });
+    expect(setActiveSection).toHaveBeenLastCalledWith("traffic");
+
+    // F11 / Alt+F11 / Shift+F11 arm/disarm
+    fireEvent.keyDown(target, { key: "F11" });
+    expect(toggleBreakBeforeRequest).toHaveBeenCalledTimes(1);
+
+    fireEvent.keyDown(target, { key: "F11", altKey: true });
+    expect(toggleBreakAfterResponse).toHaveBeenCalledTimes(1);
+
+    fireEvent.keyDown(target, { key: "F11", shiftKey: true });
+    expect(disableAllBreakpoints).toHaveBeenCalledTimes(1);
   });
 
   it("ignores Shift+E, Alt+E, and E outside the traffic section", () => {

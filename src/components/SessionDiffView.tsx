@@ -2,6 +2,7 @@ import React, { useEffect, useId, useMemo, useRef, useState } from "react";
 import { DiffEditor, type MonacoDiffEditor } from "@monaco-editor/react";
 import {
   ArrowDownAz,
+  ArrowLeft,
   ArrowLeftRight,
   BarChart2,
   Check,
@@ -28,6 +29,7 @@ import type {
   SessionDetail,
   SessionSummary,
 } from "../types/proxy";
+import { SectionHeader } from "./ui/SectionHeader";
 
 const DIFF_TABS: { id: DiffTabId; label: string; hint: string }[] = [
   {
@@ -63,10 +65,12 @@ interface SessionDiffViewProps {
   sessions?: SessionSummary[];
   resolvedTheme: "dark" | "light";
   defaultSideBySide?: boolean;
+  showSectionHeader?: boolean;
+  onBackToTraffic?: () => void;
   onSelectPair?: (leftId: number, rightId: number) => void;
   onSwapPair: () => void;
   onAnnotateSession?: (id: number) => void;
-  onExpandModal?: () => void;
+  onExpandTab?: () => void;
   onOpenStatistics?: () => void;
   onCloseDiff?: () => void;
   closeLabel?: string;
@@ -78,10 +82,12 @@ export const SessionDiffView: React.FC<SessionDiffViewProps> = ({
   sessions,
   resolvedTheme,
   defaultSideBySide = true,
+  showSectionHeader = false,
+  onBackToTraffic,
   onSelectPair,
   onSwapPair,
   onAnnotateSession,
-  onExpandModal,
+  onExpandTab,
   onOpenStatistics,
   onCloseDiff,
   closeLabel = "К инспектору",
@@ -136,22 +142,61 @@ export const SessionDiffView: React.FC<SessionDiffViewProps> = ({
     }
   };
 
+  const renderTabHeader = () =>
+    showSectionHeader ? (
+      <SectionHeader
+        sectionId="diff"
+        icon={<GitCompareArrows className="h-4 w-4 text-sky-400" />}
+        leading={
+          onBackToTraffic ? (
+            <button
+              type="button"
+              onClick={onBackToTraffic}
+              title="Traffic (Alt+1)"
+              className="inline-flex h-6 items-center gap-1 rounded border border-hairline bg-canvas px-2 text-[11px] font-medium text-fg transition-colors hover:border-strong hover:bg-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+            >
+              <ArrowLeft className="h-3 w-3 text-accent" aria-hidden="true" />
+              <span>Traffic</span>
+            </button>
+          ) : undefined
+        }
+      />
+    ) : null;
+
   if (!leftDetail || !rightDetail || !bundle || !activeSection) {
+    const canQuickPick = Boolean(sessions && sessions.length >= 2 && onSelectPair);
     return (
-      <div className="pane-contain flex h-full flex-col items-center justify-center gap-2 bg-surface p-6 text-center text-xs text-muted">
-        <GitCompareArrows className="h-7 w-7 text-sky-400/80" />
-        <p className="font-semibold text-fg">Session Diff (Monaco DiffEditor)</p>
-        <p className="max-w-sm leading-relaxed text-subtle">
-          Выделите две строки в <code className="text-fg">TrafficGrid</code> с зажатым{" "}
-          <kbd className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-fg">
-            Ctrl+Click
-          </kbd>{" "}
-          или{" "}
-          <kbd className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-fg">
-            Shift+Click
-          </kbd>{" "}
-          (либо нажмите иконку сравнения в строке), чтобы увидеть построчную разницу заголовков, кук и JSON-пейлоада.
-        </p>
+      <div className="pane-contain flex h-full flex-col overflow-hidden bg-surface">
+        {renderTabHeader()}
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center text-xs text-muted">
+          <GitCompareArrows className="h-7 w-7 text-sky-400/80" aria-hidden="true" />
+          <p className="font-semibold text-fg">Session Diff</p>
+          <p className="max-w-md leading-relaxed text-subtle">
+            Выделите две строки в <code className="text-fg">Traffic</code> с
+            зажатым{" "}
+            <kbd className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-fg">
+              Ctrl+Click
+            </kbd>{" "}
+            или{" "}
+            <kbd className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-fg">
+              Shift+Click
+            </kbd>{" "}
+            (либо нажмите иконку сравнения в строке), чтобы увидеть построчную
+            разницу заголовков, кук и тела.
+          </p>
+          {canQuickPick && sessions && onSelectPair && (
+            <button
+              type="button"
+              onClick={() => onSelectPair(sessions[0].id, sessions[1].id)}
+              className="inline-flex items-center gap-1.5 rounded-md border border-sky-500/40 bg-sky-500/15 px-3 py-1.5 text-xs font-medium text-sky-300 transition-colors hover:bg-sky-500/25"
+            >
+              <GitCompareArrows className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>
+                Сравнить #{sessions[0].id} и #{sessions[1].id}
+              </span>
+            </button>
+          )}
+        </div>
       </div>
     );
   }
@@ -163,6 +208,8 @@ export const SessionDiffView: React.FC<SessionDiffViewProps> = ({
 
   return (
     <div className="pane-contain flex h-full flex-col overflow-hidden bg-surface">
+      {renderTabHeader()}
+
       {/* Top Comparison Header: Session A vs Session B */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-elevated/60 px-3 py-2">
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 text-xs">
@@ -239,15 +286,15 @@ export const SessionDiffView: React.FC<SessionDiffViewProps> = ({
               <span className="hidden lg:inline">Statistics (2)</span>
             </button>
           )}
-          {onExpandModal && (
+          {onExpandTab && (
             <button
               type="button"
-              onClick={onExpandModal}
-              title="Развернуть Session Diff в широком модальном окне (Ctrl+D)"
+              onClick={onExpandTab}
+              title="Открыть во вкладке Session Diff (Ctrl+D)"
               className="inline-flex h-7 items-center gap-1 rounded-md border border-hairline bg-surface px-2 text-[11px] font-medium text-fg transition-colors hover:border-sky-500/50 hover:text-sky-300"
             >
-              <Maximize2 className="h-3 w-3" />
-              <span className="hidden xl:inline">На весь экран</span>
+              <Maximize2 className="h-3 w-3" aria-hidden="true" />
+              <span className="hidden xl:inline">Во вкладке</span>
             </button>
           )}
           {onCloseDiff && (
@@ -547,131 +594,5 @@ const SessionEndpointPill: React.FC<{
         </button>
       )}
     </div>
-  );
-};
-
-interface SessionDiffModalProps {
-  open: boolean;
-  leftDetail: SessionDetail | null;
-  rightDetail: SessionDetail | null;
-  sessions: SessionSummary[];
-  resolvedTheme: "dark" | "light";
-  onSelectPair: (leftId: number, rightId: number) => void;
-  onSwapPair: () => void;
-  onAnnotateSession: (id: number) => void;
-  onClose: () => void;
-}
-
-export const SessionDiffModal: React.FC<SessionDiffModalProps> = ({
-  open,
-  leftDetail,
-  rightDetail,
-  sessions,
-  resolvedTheme,
-  onSelectPair,
-  onSwapPair,
-  onAnnotateSession,
-  onClose,
-}) => {
-  const dialogRef = useRef<HTMLDialogElement>(null);
-  const closeBtnRef = useRef<HTMLButtonElement>(null);
-  const titleId = useId();
-
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-
-    if (open) {
-      if (!dialog.open) {
-        dialog.showModal();
-      }
-    } else if (dialog.open) {
-      dialog.close();
-    }
-  }, [open]);
-
-  // Light-dismiss pointer-bounds fallback when `<dialog closedby="any">` is not natively supported
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog || "closedBy" in HTMLDialogElement.prototype) return;
-
-    const isOutside = (e: PointerEvent) => {
-      const r = dialog.getBoundingClientRect();
-      return (
-        e.clientX < r.left ||
-        e.clientX > r.right ||
-        e.clientY < r.top ||
-        e.clientY > r.bottom
-      );
-    };
-
-    let pressedOutside = false;
-    const onDown = (e: PointerEvent) => {
-      pressedOutside = isOutside(e);
-    };
-    const onUp = (e: PointerEvent) => {
-      if (pressedOutside && isOutside(e)) dialog.close();
-    };
-
-    dialog.addEventListener("pointerdown", onDown);
-    dialog.addEventListener("pointerup", onUp);
-    return () => {
-      dialog.removeEventListener("pointerdown", onDown);
-      dialog.removeEventListener("pointerup", onUp);
-    };
-  }, []);
-
-  return (
-    <dialog
-      ref={dialogRef}
-      aria-labelledby={titleId}
-      onClose={() => {
-        if (dialogRef.current) dialogRef.current.returnValue = "";
-        onClose();
-      }}
-      {...({ closedby: "any" } as Record<string, string>)}
-      className="m-auto h-[90vh] w-[95vw] max-w-7xl overflow-hidden rounded-xl border border-strong bg-surface p-0 text-fg shadow-2xl open:flex open:flex-col"
-    >
-      <div className="flex shrink-0 items-center justify-between border-b border-hairline px-4 py-2.5">
-        <div className="flex items-center gap-2">
-          <GitCompareArrows className="h-4 w-4 text-sky-400" />
-          <h2 id={titleId} className="text-sm font-semibold">
-            Session Diff — Сравнение двух HTTP/HTTPS сессий (Monaco DiffEditor)
-          </h2>
-          <kbd className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-subtle">
-            Ctrl+D
-          </kbd>
-        </div>
-
-        <form method="dialog">
-          <button
-            ref={closeBtnRef}
-            value="cancel"
-            autoFocus
-            {...({ autofocus: "" } as Record<string, string>)}
-            aria-label="Закрыть окно Session Diff"
-            className="inline-flex items-center gap-1 rounded-md border border-hairline bg-elevated px-2.5 py-1 text-xs text-muted hover:bg-hover hover:text-fg"
-          >
-            <X className="h-3.5 w-3.5" />
-            <span>Esc</span>
-          </button>
-        </form>
-      </div>
-
-      <div className="min-h-0 flex-1 overflow-hidden">
-        {open && (
-          <SessionDiffView
-            leftDetail={leftDetail}
-            rightDetail={rightDetail}
-            sessions={sessions}
-            resolvedTheme={resolvedTheme}
-            defaultSideBySide
-            onSelectPair={onSelectPair}
-            onSwapPair={onSwapPair}
-            onAnnotateSession={onAnnotateSession}
-          />
-        )}
-      </div>
-    </dialog>
   );
 };

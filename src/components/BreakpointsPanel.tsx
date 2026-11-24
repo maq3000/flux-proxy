@@ -1,6 +1,7 @@
-import React, { useEffect, useId, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import Editor from "@monaco-editor/react";
 import {
+  ArrowLeft,
   Ban,
   FastForward,
   Flame,
@@ -10,7 +11,6 @@ import {
   RotateCcw,
   SlidersHorizontal,
   Trash2,
-  X,
   Zap,
 } from "lucide-react";
 import { statusReasonPhrase, tryFormatJson } from "../lib/formatters";
@@ -25,19 +25,19 @@ import type {
   HeaderPair,
   PausedBreakpointItem,
 } from "../types/proxy";
-export { BreakpointBanner, type BreakpointBannerProps } from "./BreakpointBanner";
+import { SectionHeader } from "./ui/SectionHeader";
 
-// ============================================================================
-// Live Breakpoint Monaco Interceptor & `bpu` Rules Modal
-// ============================================================================
-interface BreakpointInterceptorModalProps {
-  open: boolean;
-  initialMode: "intercept" | "rules";
+export type BreakpointsPanelMode = "intercept" | "rules";
+
+export interface BreakpointsPanelProps {
+  isActive?: boolean;
+  requestedMode?: BreakpointsPanelMode;
   selectedBreakpointId?: string | null;
+  requestSeq?: number;
   pausedItems: PausedBreakpointItem[];
   config: BreakpointConfig;
   resolvedTheme: "dark" | "light";
-  onClose: () => void;
+  onBackToTraffic?: () => void;
   onUpdateConfig: (next: BreakpointConfig) => Promise<BreakpointConfig>;
   onResolve: (resolution: BreakpointResolution) => Promise<boolean>;
   onResumeAll: (action: BreakpointAction) => Promise<void>;
@@ -55,31 +55,32 @@ const HTTP_METHODS = [
 
 const STATUS_PRESETS = [200, 201, 400, 401, 403, 404, 429, 500, 503];
 
-export const BreakpointInterceptorModal: React.FC<
-  BreakpointInterceptorModalProps
-> = ({
-  open,
-  initialMode,
+export const BreakpointsPanel: React.FC<BreakpointsPanelProps> = ({
+  isActive = true,
+  requestedMode = "intercept",
   selectedBreakpointId,
+  requestSeq = 0,
   pausedItems,
   config,
   resolvedTheme,
-  onClose,
+  onBackToTraffic,
   onUpdateConfig,
   onResolve,
   onResumeAll,
 }) => {
-  const dialogRef = useRef<HTMLDialogElement>(null);
-  const titleId = useId();
   const monacoTheme = getMonacoThemeName(resolvedTheme);
 
-  const [tab, setTab] = useState<"intercept" | "rules">(initialMode);
+  const [tab, setTab] = useState<BreakpointsPanelMode>(() =>
+    requestedMode === "intercept" && pausedItems.length === 0
+      ? "rules"
+      : requestedMode
+  );
   const [activeBpId, setActiveBpId] = useState<string | null>(
     selectedBreakpointId ?? null
   );
   const [editorSubTab, setEditorSubTab] = useState<"body" | "headers">("body");
 
-  // Editable draft fields for the currently inspected parked packet
+  // Editable draft fields preserved across tab switches while parked packet stays active
   const [draftMethod, setDraftMethod] = useState("GET");
   const [draftUrl, setDraftUrl] = useState("");
   const [draftStatus, setDraftStatus] = useState<number>(200);
@@ -88,11 +89,15 @@ export const BreakpointInterceptorModal: React.FC<
   const [isBinaryBody, setIsBinaryBody] = useState(false);
   const [bodyModified, setBodyModified] = useState(false);
 
-  // New `bpu` rule form
+  // New `bpu` / `bpafter` rule form
   const [newRulePattern, setNewRulePattern] = useState("");
   const [newRuleStage, setNewRuleStage] = useState<BreakpointStage>("request");
   const [newRuleMethod, setNewRuleMethod] = useState("ANY");
   const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const lastAppliedSeqRef = useRef(0);
+  const pausedCountRef = useRef(pausedItems.length);
+  pausedCountRef.current = pausedItems.length;
 
   const activeItem = useMemo(() => {
     if (pausedItems.length === 0) return null;
@@ -103,42 +108,21 @@ export const BreakpointInterceptorModal: React.FC<
     return pausedItems[0];
   }, [pausedItems, activeBpId]);
 
-  const wasOpenRef = useRef(false);
-  const pausedCountRef = useRef(pausedItems.length);
-  pausedCountRef.current = pausedItems.length;
-
-  // Open / close native modal `<dialog>` (uses default `closerequest` so outside clicks never drop live breakpoints)
+  // Apply explicit navigation requests (e.g., clicking BreakpointBanner or new paused hit)
+  // without discarding in-progress edits on regular tab switching
   useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-
-    if (open) {
-      if (!wasOpenRef.current) {
-        setTab(
-          initialMode === "intercept" && pausedCountRef.current === 0
-            ? "rules"
-            : initialMode
-        );
-      }
-      wasOpenRef.current = true;
-      if (!dialog.open) {
-        dialog.showModal();
-      }
-    } else {
-      wasOpenRef.current = false;
-      if (dialog.open) {
-        dialog.close();
-      }
-    }
-  }, [open, initialMode]);
-
-  useEffect(() => {
-    if (open && selectedBreakpointId) {
+    if (requestSeq <= 0 || requestSeq === lastAppliedSeqRef.current) return;
+    lastAppliedSeqRef.current = requestSeq;
+    setTab(
+      requestedMode === "intercept" && pausedCountRef.current === 0
+        ? "rules"
+        : requestedMode
+    );
+    if (selectedBreakpointId) {
       setActiveBpId(selectedBreakpointId);
     }
-  }, [open, selectedBreakpointId]);
+  }, [requestSeq, requestedMode, selectedBreakpointId]);
 
-  // Populate draft editors whenever the active parked item changes
   const loadItemIntoDraft = (item: PausedBreakpointItem) => {
     setDraftMethod(item.method);
     setDraftUrl(item.url);
@@ -190,10 +174,11 @@ export const BreakpointInterceptorModal: React.FC<
   }, [activeItem?.breakpointId]);
 
   useEffect(() => {
-    if (!open || pausedItems.length === 0) return;
+    if (!isActive || pausedItems.length === 0) return;
+    setNowMs(Date.now());
     const id = window.setInterval(() => setNowMs(Date.now()), 500);
     return () => window.clearInterval(id);
-  }, [open, pausedItems.length]);
+  }, [isActive, pausedItems.length]);
 
   const detectedLanguage = useMemo(() => {
     if (isBinaryBody) return "plaintext";
@@ -255,16 +240,6 @@ export const BreakpointInterceptorModal: React.FC<
             }),
       });
     }
-
-    // Auto-close modal only after verifying the real paused queue is empty
-    const remaining = await proxyBridge
-      .listPausedBreakpoints()
-      .catch(() =>
-        pausedItems.filter((i) => i.breakpointId !== activeItem.breakpointId)
-      );
-    if (remaining.length === 0) {
-      dialogRef.current?.close();
-    }
   };
 
   const handleAbortCurrent = async () => {
@@ -273,14 +248,6 @@ export const BreakpointInterceptorModal: React.FC<
       breakpointId: activeItem.breakpointId,
       action: "abort",
     });
-    const remaining = await proxyBridge
-      .listPausedBreakpoints()
-      .catch(() =>
-        pausedItems.filter((i) => i.breakpointId !== activeItem.breakpointId)
-      );
-    if (remaining.length === 0) {
-      dialogRef.current?.close();
-    }
   };
 
   const handleAddRule = async (e: React.FormEvent) => {
@@ -311,35 +278,40 @@ export const BreakpointInterceptorModal: React.FC<
     : 0;
 
   return (
-    <dialog
-      ref={dialogRef}
-      aria-labelledby={titleId}
-      onClose={() => {
-        if (dialogRef.current) dialogRef.current.returnValue = "";
-        onClose();
-      }}
-      className="m-auto flex h-[84vh] w-full max-w-5xl flex-col overflow-hidden rounded-xl border border-strong bg-surface p-0 text-fg shadow-2xl [&:not([open])]:hidden"
-    >
-      {/* Top Header */}
-      <div className="flex shrink-0 items-center justify-between border-b border-hairline bg-elevated/80 px-4 py-2.5">
-        <div className="flex items-center gap-3">
-          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-amber-500/20 text-amber-400 ring-1 ring-amber-500/40">
-            <OctagonPause className="h-4 w-4" />
-          </div>
-          <div>
-            <h2 id={titleId} className="text-sm font-semibold text-fg">
-              Интерактивные точки останова — Live Breakpoints
-            </h2>
-            <p className="text-[11px] text-muted">
-              F11 (Before Request) • Alt+F11 (After Response) • Shift+F11 (Снять все) • Команды `bpu` и `bpafter` в Ctrl+K
-            </p>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-2">
-          <div className="flex rounded-md border border-hairline bg-canvas p-0.5 text-xs">
+    <div className="pane-contain flex h-full w-full flex-col overflow-hidden bg-surface text-fg">
+      <SectionHeader
+        sectionId="breakpoints"
+        icon={<OctagonPause className="h-4 w-4 text-amber-400" />}
+        leading={
+          onBackToTraffic ? (
             <button
               type="button"
+              onClick={onBackToTraffic}
+              title="Traffic (Alt+1)"
+              className="inline-flex h-6 items-center gap-1 rounded border border-hairline bg-canvas px-2 text-[11px] font-medium text-fg transition-colors hover:border-strong hover:bg-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+            >
+              <ArrowLeft className="h-3 w-3 text-accent" aria-hidden="true" />
+              <span>Traffic</span>
+            </button>
+          ) : undefined
+        }
+        badges={
+          pausedItems.length > 0 ? (
+            <span className="rounded-full bg-rose-500 px-1.5 py-0.5 font-mono text-[10px] font-bold text-white tabular-nums">
+              {pausedItems.length} paused
+            </span>
+          ) : undefined
+        }
+        actions={
+          <div
+            role="tablist"
+            aria-label="Режимы Breakpoints"
+            className="flex rounded-md border border-hairline bg-canvas p-0.5 text-xs"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === "intercept"}
               onClick={() => setTab("intercept")}
               className={`inline-flex items-center gap-1.5 rounded px-2.5 py-1 font-medium transition-colors ${
                 tab === "intercept"
@@ -347,7 +319,7 @@ export const BreakpointInterceptorModal: React.FC<
                   : "text-muted hover:text-fg"
               }`}
             >
-              <span>Перехват в реальном времени</span>
+              <span>Перехват</span>
               {pausedItems.length > 0 && (
                 <span className="rounded-full bg-rose-500 px-1.5 font-mono text-[10px] font-bold text-white">
                   {pausedItems.length}
@@ -356,6 +328,8 @@ export const BreakpointInterceptorModal: React.FC<
             </button>
             <button
               type="button"
+              role="tab"
+              aria-selected={tab === "rules"}
               onClick={() => setTab("rules")}
               className={`inline-flex items-center gap-1.5 rounded px-2.5 py-1 font-medium transition-colors ${
                 tab === "rules"
@@ -363,47 +337,43 @@ export const BreakpointInterceptorModal: React.FC<
                   : "text-muted hover:text-fg"
               }`}
             >
-              <SlidersHorizontal className="h-3.5 w-3.5" />
-              <span>Правила `bpu` ({config.rules.length})</span>
+              <SlidersHorizontal className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Правила ({config.rules.length})</span>
             </button>
           </div>
-
-          <form method="dialog">
-            <button
-              type="submit"
-              value="close"
-              aria-label="Свернуть окно точек останова"
-              title="Свернуть редактор (пакет останется на паузе в верхней панели)"
-              className="rounded-md p-1 text-muted hover:bg-hover hover:text-fg"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          </form>
-        </div>
-      </div>
+        }
+      />
 
       {/* TAB 1: LIVE INTERCEPTOR */}
       {tab === "intercept" && (
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
           {!activeItem ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center text-xs text-muted">
-              <OctagonPause className="h-8 w-8 text-subtle" />
+              <OctagonPause className="h-8 w-8 text-subtle" aria-hidden="true" />
               <div className="max-w-md space-y-1">
                 <p className="text-sm font-semibold text-fg">
                   Сейчас нет пакетов, стоящих на паузе
                 </p>
                 <p className="text-subtle">
-                  Нажмите <kbd className="rounded bg-elevated px-1.5 py-0.5 font-mono">F11</kbd> (Break on Request),{" "}
-                  <kbd className="rounded bg-elevated px-1.5 py-0.5 font-mono">Alt+F11</kbd> (Break on Response) или задайте фильтр <code>bpu /api</code> во вкладке правил.
+                  Нажмите{" "}
+                  <kbd className="rounded bg-elevated px-1.5 py-0.5 font-mono">
+                    F11
+                  </kbd>{" "}
+                  (Before Request),{" "}
+                  <kbd className="rounded bg-elevated px-1.5 py-0.5 font-mono">
+                    Alt+F11
+                  </kbd>{" "}
+                  (After Response) или задайте фильтр <code>bpu /api</code> во
+                  вкладке правил.
                 </p>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center justify-center gap-2">
                 <button
                   type="button"
                   onClick={() => setTab("rules")}
                   className="rounded-md border border-sky-500/40 bg-sky-500/15 px-3 py-1.5 text-xs font-medium text-sky-300 hover:bg-sky-500/25"
                 >
-                  Настроить правила `bpu`
+                  Настроить правила bpu
                 </button>
                 {!isTauriRuntime() && (
                   <button
@@ -423,7 +393,7 @@ export const BreakpointInterceptorModal: React.FC<
                     }}
                     className="inline-flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/15 px-3 py-1.5 text-xs font-medium text-amber-200 hover:bg-amber-500/25"
                   >
-                    <Zap className="h-3.5 w-3.5" />
+                    <Zap className="h-3.5 w-3.5" aria-hidden="true" />
                     <span>Включить F11 и перехватить демо-запрос</span>
                   </button>
                 )}
@@ -475,11 +445,12 @@ export const BreakpointInterceptorModal: React.FC<
                       }`}
                     >
                       {activeItem.stage === "response"
-                        ? "AFTER RESPONSE (До возврата в браузер)"
-                        : "BEFORE REQUEST (До отправки на апстрим)"}
+                        ? "AFTER RESPONSE (До возврата в клиент)"
+                        : "BEFORE REQUEST (До отправки на сервер)"}
                     </span>
                     <span className="text-muted">
-                      Session <strong className="text-fg">#{activeItem.sessionId}</strong>
+                      Session{" "}
+                      <strong className="text-fg">#{activeItem.sessionId}</strong>
                     </span>
                     {activeItem.processName && (
                       <span className="text-violet-300">
@@ -492,7 +463,7 @@ export const BreakpointInterceptorModal: React.FC<
                   </div>
 
                   <span className="font-mono text-[11px] text-amber-300 tabular-nums">
-                    Таймаут безопасности tokio::oneshot: {remainingSec}с
+                    Таймаут паузы: {remainingSec}с
                   </span>
                 </div>
 
@@ -521,7 +492,10 @@ export const BreakpointInterceptorModal: React.FC<
                 ) : (
                   <div className="space-y-2">
                     <div className="truncate font-mono text-xs text-muted">
-                      Запрос: <strong className="text-sky-400">{activeItem.method}</strong>{" "}
+                      Запрос:{" "}
+                      <strong className="text-sky-400">
+                        {activeItem.method}
+                      </strong>{" "}
                       <span className="text-fg">{activeItem.url}</span>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
@@ -585,7 +559,7 @@ export const BreakpointInterceptorModal: React.FC<
                           }}
                           className="ml-1 inline-flex items-center gap-1 rounded border border-rose-500/45 bg-rose-500/15 px-2 py-0.5 text-[11px] font-semibold text-rose-200 hover:bg-rose-500/25"
                         >
-                          <Flame className="h-3 w-3" />
+                          <Flame className="h-3 w-3" aria-hidden="true" />
                           <span>500 + JSON Error</span>
                         </button>
                       </div>
@@ -594,7 +568,7 @@ export const BreakpointInterceptorModal: React.FC<
                 )}
               </div>
 
-              {/* Sub-bar: Monaco Body vs Editable Headers */}
+              {/* Sub-bar: Body vs Editable Headers */}
               <div className="flex h-8 shrink-0 items-center justify-between border-b border-hairline bg-elevated/40 px-4 text-xs">
                 <div className="flex items-center gap-1.5">
                   <button
@@ -606,7 +580,11 @@ export const BreakpointInterceptorModal: React.FC<
                         : "text-muted hover:text-fg"
                     }`}
                   >
-                    Payload Body ({isBinaryBody ? "BASE64 / BINARY" : detectedLanguage.toUpperCase()})
+                    Payload Body (
+                    {isBinaryBody
+                      ? "BASE64 / BINARY"
+                      : detectedLanguage.toUpperCase()}
+                    )
                   </button>
                   <button
                     type="button"
@@ -642,7 +620,7 @@ export const BreakpointInterceptorModal: React.FC<
                     onClick={() => loadItemIntoDraft(activeItem)}
                     className="inline-flex items-center gap-1 rounded border border-hairline bg-surface px-2 py-0.5 text-[11px] text-muted hover:text-fg"
                   >
-                    <RotateCcw className="h-3 w-3" />
+                    <RotateCcw className="h-3 w-3" aria-hidden="true" />
                     <span>Сбросить правки</span>
                   </button>
                 </div>
@@ -703,8 +681,9 @@ export const BreakpointInterceptorModal: React.FC<
                           }
                           className="rounded p-1 text-subtle hover:bg-hover hover:text-rose-400"
                           title="Удалить заголовок"
+                          aria-label="Удалить заголовок"
                         >
-                          <Trash2 className="h-3.5 w-3.5" />
+                          <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
                         </button>
                       </div>
                     ))}
@@ -718,7 +697,7 @@ export const BreakpointInterceptorModal: React.FC<
                       }
                       className="mt-2 inline-flex items-center gap-1 rounded border border-hairline bg-elevated px-2.5 py-1 text-xs text-sky-400 hover:bg-hover"
                     >
-                      <Plus className="h-3.5 w-3.5" />
+                      <Plus className="h-3.5 w-3.5" aria-hidden="true" />
                       <span>Добавить заголовок</span>
                     </button>
                   </div>
@@ -733,7 +712,7 @@ export const BreakpointInterceptorModal: React.FC<
                     onClick={() => void handleAbortCurrent()}
                     className="inline-flex items-center gap-1.5 rounded-md border border-rose-500/50 bg-rose-500/15 px-3 py-1.5 text-xs font-semibold text-rose-300 hover:bg-rose-500/25"
                   >
-                    <Ban className="h-3.5 w-3.5" />
+                    <Ban className="h-3.5 w-3.5" aria-hidden="true" />
                     <span>Abort (Прервать запрос)</span>
                   </button>
                   {pausedItems.length > 1 && (
@@ -742,7 +721,7 @@ export const BreakpointInterceptorModal: React.FC<
                       onClick={() => void onResumeAll("continue")}
                       className="inline-flex items-center gap-1.5 rounded-md border border-hairline bg-elevated px-3 py-1.5 text-xs text-muted hover:text-fg"
                     >
-                      <FastForward className="h-3.5 w-3.5" />
+                      <FastForward className="h-3.5 w-3.5" aria-hidden="true" />
                       <span>Пропустить всю очередь ({pausedItems.length})</span>
                     </button>
                   )}
@@ -753,7 +732,7 @@ export const BreakpointInterceptorModal: React.FC<
                   onClick={() => void handleContinueWithEdits()}
                   className="inline-flex items-center gap-1.5 rounded-md border border-emerald-500/60 bg-emerald-500/25 px-4 py-1.5 text-xs font-semibold text-emerald-200 shadow hover:bg-emerald-500/35"
                 >
-                  <Play className="h-3.5 w-3.5" />
+                  <Play className="h-3.5 w-3.5" aria-hidden="true" />
                   <span>
                     Continue —{" "}
                     {activeItem.stage === "response"
@@ -769,202 +748,213 @@ export const BreakpointInterceptorModal: React.FC<
 
       {/* TAB 2: RULES & QUICKEXEC `bpu` / `bpafter` */}
       {tab === "rules" && (
-        <div className="flex-1 space-y-4 overflow-y-auto p-4 text-xs select-text">
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
-            <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-hairline bg-canvas p-3 hover:border-amber-500/40">
-              <input
-                type="checkbox"
-                checked={config.breakBeforeRequest}
-                onChange={(e) =>
-                  void onUpdateConfig({
-                    ...config,
-                    breakBeforeRequest: e.target.checked,
-                  })
-                }
-                className="checkbox-native mt-0.5"
-              />
-              <div>
+        <div className="min-h-0 flex-1 overflow-y-auto p-4 text-xs select-text">
+          <div className="mx-auto max-w-5xl space-y-4">
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+              <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-hairline bg-canvas p-3 hover:border-amber-500/40">
+                <input
+                  type="checkbox"
+                  checked={config.breakBeforeRequest}
+                  onChange={(e) =>
+                    void onUpdateConfig({
+                      ...config,
+                      breakBeforeRequest: e.target.checked,
+                    })
+                  }
+                  className="checkbox-native mt-0.5"
+                />
+                <div>
+                  <div className="font-semibold text-fg">
+                    Break Before Request (F11)
+                  </div>
+                  <p className="mt-0.5 text-[11px] text-muted">
+                    Глобально перехватывать каждый запрос до отправки на сервер.
+                  </p>
+                </div>
+              </label>
+
+              <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-hairline bg-canvas p-3 hover:border-violet-500/40">
+                <input
+                  type="checkbox"
+                  checked={config.breakAfterResponse}
+                  onChange={(e) =>
+                    void onUpdateConfig({
+                      ...config,
+                      breakAfterResponse: e.target.checked,
+                    })
+                  }
+                  className="checkbox-native mt-0.5"
+                />
+                <div>
+                  <div className="font-semibold text-fg">
+                    Break After Response (Alt+F11)
+                  </div>
+                  <p className="mt-0.5 text-[11px] text-muted">
+                    Перехватывать ответы сервера для подмены JSON или статуса
+                    500.
+                  </p>
+                </div>
+              </label>
+
+              <div className="rounded-lg border border-hairline bg-canvas p-3">
                 <div className="font-semibold text-fg">
-                  Break on All Requests (F11)
+                  Таймаут паузы (сек)
                 </div>
                 <p className="mt-0.5 text-[11px] text-muted">
-                  Глобально перехватывать каждый запрос до отправки на апстрим.
+                  Автоматически продолжать запрос, если пауза не обработана:
                 </p>
+                <input
+                  type="number"
+                  min={5}
+                  max={600}
+                  value={config.timeoutSecs}
+                  onChange={(e) =>
+                    void onUpdateConfig({
+                      ...config,
+                      timeoutSecs: Math.max(
+                        5,
+                        Math.min(600, Number(e.target.value) || 120)
+                      ),
+                    })
+                  }
+                  className="mt-1.5 h-7 w-28 rounded border border-strong bg-surface px-2 font-mono text-xs text-fg"
+                />
               </div>
-            </label>
-
-            <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-hairline bg-canvas p-3 hover:border-violet-500/40">
-              <input
-                type="checkbox"
-                checked={config.breakAfterResponse}
-                onChange={(e) =>
-                  void onUpdateConfig({
-                    ...config,
-                    breakAfterResponse: e.target.checked,
-                  })
-                }
-                className="checkbox-native mt-0.5"
-              />
-              <div>
-                <div className="font-semibold text-fg">
-                  Break on All Responses (Alt+F11)
-                </div>
-                <p className="mt-0.5 text-[11px] text-muted">
-                  Перехватывать ответы реального сервера для подмены JSON или кода 500.
-                </p>
-              </div>
-            </label>
-
-            <div className="rounded-lg border border-hairline bg-canvas p-3">
-              <div className="font-semibold text-fg">
-                Таймаут безопасности (сек)
-              </div>
-              <p className="mt-0.5 text-[11px] text-muted">
-                Авто-продолжение oneshot-канала, если вкладка забыта:
-              </p>
-              <input
-                type="number"
-                min={5}
-                max={600}
-                value={config.timeoutSecs}
-                onChange={(e) =>
-                  void onUpdateConfig({
-                    ...config,
-                    timeoutSecs: Math.max(
-                      5,
-                      Math.min(600, Number(e.target.value) || 120)
-                    ),
-                  })
-                }
-                className="mt-1.5 h-7 w-28 rounded border border-strong bg-surface px-2 font-mono text-xs text-fg"
-              />
             </div>
-          </div>
 
-          {/* Add Conditional bpu / bpafter Rule */}
-          <form
-            onSubmit={(e) => void handleAddRule(e)}
-            className="rounded-lg border border-hairline bg-canvas p-3"
-          >
-            <div className="mb-2 font-mono text-[10px] font-semibold uppercase tracking-wider text-subtle">
-              Условные точки останова (аналог Fiddler `bpu &lt;url&gt;` и `bpafter &lt;url&gt;`)
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <select
-                value={newRuleStage}
-                onChange={(e) =>
-                  setNewRuleStage(e.target.value as BreakpointStage)
-                }
-                className="h-8 rounded-md border border-strong bg-surface px-2.5 text-xs text-fg"
-              >
-                <option value="request">Before Request (`bpu`)</option>
-                <option value="response">After Response (`bpafter`)</option>
-                <option value="both">Обе фазы (Req + Resp)</option>
-              </select>
-
-              <select
-                value={newRuleMethod}
-                onChange={(e) => setNewRuleMethod(e.target.value)}
-                className="h-8 rounded-md border border-strong bg-surface px-2 font-mono text-xs text-fg"
-              >
-                <option value="ANY">ANY Method</option>
-                {HTTP_METHODS.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-              </select>
-
-              <input
-                type="text"
-                value={newRulePattern}
-                onChange={(e) => setNewRulePattern(e.target.value)}
-                placeholder="Подстрока URL, wildcard (*stripe.com*) или regex:^https://api\."
-                className="h-8 min-w-[220px] flex-1 rounded-md border border-strong bg-surface px-3 font-mono text-xs text-fg placeholder:text-subtle"
-              />
-
-              <button
-                type="submit"
-                className="inline-flex h-8 items-center gap-1 rounded-md border border-sky-500/50 bg-sky-500/15 px-3 text-xs font-semibold text-sky-300 hover:bg-sky-500/25"
-              >
-                <Plus className="h-3.5 w-3.5" />
-                <span>Добавить правило</span>
-              </button>
-            </div>
-          </form>
-
-          {/* Existing Rules List */}
-          <div className="space-y-1.5">
-            {config.rules.length === 0 ? (
-              <div className="rounded-lg border border-dashed border-hairline p-6 text-center text-subtle">
-                Условные правила `bpu` не заданы. Вы также можете нажать{" "}
-                <kbd className="rounded bg-elevated px-1.5 py-0.5 font-mono">
-                  Ctrl+K
-                </kbd>{" "}
-                и ввести <code>bpu /v1/payment</code> или <code>bpafter graphql</code>.
+            {/* Add Conditional bpu / bpafter Rule */}
+            <form
+              onSubmit={(e) => void handleAddRule(e)}
+              className="rounded-lg border border-hairline bg-canvas p-3"
+            >
+              <div className="mb-2 font-mono text-[10px] font-semibold uppercase tracking-wider text-subtle">
+                Условные точки останова (bpu &lt;url&gt; и bpafter &lt;url&gt;)
               </div>
-            ) : (
-              config.rules.map((r) => (
-                <div
-                  key={r.id}
-                  className="flex items-center justify-between gap-2 rounded-lg border border-hairline bg-canvas px-3 py-2 font-mono text-xs"
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  value={newRuleStage}
+                  onChange={(e) =>
+                    setNewRuleStage(e.target.value as BreakpointStage)
+                  }
+                  aria-label="Фаза точки останова"
+                  className="h-8 rounded-md border border-strong bg-surface px-2.5 text-xs text-fg"
                 >
-                  <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5">
-                    <input
-                      type="checkbox"
-                      checked={r.enabled}
-                      onChange={(e) =>
+                  <option value="request">Before Request (bpu)</option>
+                  <option value="response">After Response (bpafter)</option>
+                  <option value="both">Обе фазы (Req + Resp)</option>
+                </select>
+
+                <select
+                  value={newRuleMethod}
+                  onChange={(e) => setNewRuleMethod(e.target.value)}
+                  aria-label="Фильтр HTTP метода"
+                  className="h-8 rounded-md border border-strong bg-surface px-2 font-mono text-xs text-fg"
+                >
+                  <option value="ANY">ANY Method</option>
+                  {HTTP_METHODS.map((m) => (
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
+                  ))}
+                </select>
+
+                <input
+                  type="text"
+                  value={newRulePattern}
+                  onChange={(e) => setNewRulePattern(e.target.value)}
+                  placeholder="Подстрока URL, wildcard (*stripe.com*) или regex:^https://api\."
+                  aria-label="Шаблон URL правила точки останова"
+                  className="h-8 min-w-[220px] flex-1 rounded-md border border-strong bg-surface px-3 font-mono text-xs text-fg placeholder:text-subtle"
+                />
+
+                <button
+                  type="submit"
+                  className="inline-flex h-8 items-center gap-1 rounded-md border border-sky-500/50 bg-sky-500/15 px-3 text-xs font-semibold text-sky-300 hover:bg-sky-500/25"
+                >
+                  <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span>Добавить правило</span>
+                </button>
+              </div>
+            </form>
+
+            {/* Existing Rules List */}
+            <div className="space-y-1.5">
+              {config.rules.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-hairline p-6 text-center text-subtle">
+                  Условные правила <code>bpu</code> не заданы. Вы также можете
+                  нажать{" "}
+                  <kbd className="rounded bg-elevated px-1.5 py-0.5 font-mono">
+                    Ctrl+K
+                  </kbd>{" "}
+                  и ввести <code>bpu /v1/payment</code> или{" "}
+                  <code>bpafter graphql</code>.
+                </div>
+              ) : (
+                config.rules.map((r) => (
+                  <div
+                    key={r.id}
+                    className="flex items-center justify-between gap-2 rounded-lg border border-hairline bg-canvas px-3 py-2 font-mono text-xs"
+                  >
+                    <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5">
+                      <input
+                        type="checkbox"
+                        checked={r.enabled}
+                        onChange={(e) =>
+                          void onUpdateConfig({
+                            ...config,
+                            rules: config.rules.map((item) =>
+                              item.id === r.id
+                                ? { ...item, enabled: e.target.checked }
+                                : item
+                            ),
+                          })
+                        }
+                        className="checkbox-native"
+                      />
+                      <span
+                        className={`rounded px-1.5 py-0.5 text-[10px] font-bold uppercase ${
+                          r.stage === "response"
+                            ? "bg-violet-500/20 text-violet-300"
+                            : r.stage === "both"
+                              ? "bg-sky-500/20 text-sky-300"
+                              : "bg-amber-500/20 text-amber-300"
+                        }`}
+                      >
+                        {r.stage}
+                      </span>
+                      {r.methodFilter && (
+                        <span className="rounded bg-elevated px-1.5 py-0.5 text-[10px] text-sky-400">
+                          {r.methodFilter}
+                        </span>
+                      )}
+                      <span className="truncate font-semibold text-fg">
+                        {r.urlPattern}
+                      </span>
+                    </label>
+
+                    <button
+                      type="button"
+                      onClick={() =>
                         void onUpdateConfig({
                           ...config,
-                          rules: config.rules.map((item) =>
-                            item.id === r.id
-                              ? { ...item, enabled: e.target.checked }
-                              : item
+                          rules: config.rules.filter(
+                            (item) => item.id !== r.id
                           ),
                         })
                       }
-                      className="checkbox-native"
-                    />
-                    <span
-                      className={`rounded px-1.5 py-0.5 text-[10px] font-bold uppercase ${
-                        r.stage === "response"
-                          ? "bg-violet-500/20 text-violet-300"
-                          : r.stage === "both"
-                            ? "bg-sky-500/20 text-sky-300"
-                            : "bg-amber-500/20 text-amber-300"
-                      }`}
+                      className="rounded p-1 text-subtle hover:bg-hover hover:text-rose-400"
+                      title="Удалить правило"
+                      aria-label={`Удалить правило ${r.urlPattern}`}
                     >
-                      {r.stage}
-                    </span>
-                    {r.methodFilter && (
-                      <span className="rounded bg-elevated px-1.5 py-0.5 text-[10px] text-sky-400">
-                        {r.methodFilter}
-                      </span>
-                    )}
-                    <span className="truncate font-semibold text-fg">
-                      {r.urlPattern}
-                    </span>
-                  </label>
-
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void onUpdateConfig({
-                        ...config,
-                        rules: config.rules.filter((item) => item.id !== r.id),
-                      })
-                    }
-                    className="rounded p-1 text-subtle hover:bg-hover hover:text-rose-400"
-                    title="Удалить правило"
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              ))
-            )}
+                      <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
           </div>
         </div>
       )}
-    </dialog>
+    </div>
   );
 };

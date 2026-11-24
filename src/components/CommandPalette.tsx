@@ -1,5 +1,6 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Search, X } from "lucide-react";
+import { getSectionMeta } from "../lib/sectionRegistry";
 
 export type PaletteCategoryGroupId =
   | "all"
@@ -301,10 +302,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         id: "quickexec-sanitized-export",
         category: "Security",
         group: "quickexec",
-        label:
-          "Export Sanitized Sessions… (PII & Secrets Redaction for HAR / SAZ / JSON / Raw)",
-        description:
-          "Удаляет токены, Authorization, Cookie и секреты JSON перед публикацией трафика",
+        label: getSectionMeta("sanitizedExport").title,
+        description: getSectionMeta("sanitizedExport").summary,
         statusBadge: "Security",
         shortcut: "Ctrl+Shift+S",
         perform: () => onQuickOpenSanitizedExport(),
@@ -319,8 +318,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         id: "quickexec-proxy-doctor",
         category: "Diagnostics",
         group: "quickexec",
-        label:
-          "Run Proxy Doctor… (Диагностика порта, Root CA, SysProxy, VPN и loopback)",
+        label: "Proxy Doctor",
         description:
           "Проверяет сокет прокси, доверие Root CA, системный прокси, VPN и loopback",
         statusBadge: "Диагностика",
@@ -341,8 +339,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         id: "quickexec-client-certs",
         category: "TLS / mTLS",
         group: "quickexec",
-        label:
-          "Client Certificates… (mTLS хранилище .p12 / .pfx / .pem и маски доменов)",
+        label: "Client Certificates",
         description:
           "Управление клиентскими сертификатами mTLS для защищённых корпоративных API",
         statusBadge: "mTLS",

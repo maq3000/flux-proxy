@@ -2122,7 +2122,7 @@ export const TlsBypassTab: React.FC<TlsBypassTabProps> = ({
             aria-hidden="true"
           />
           <h3 id={quickPasteTitleId} className="text-sm font-semibold text-fg">
-            Quick Paste — пакетное добавление доменов
+            Quick Paste
           </h3>
         </div>
         <form method="dialog">

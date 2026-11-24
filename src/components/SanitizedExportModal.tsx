@@ -29,6 +29,7 @@ import {
   type SanitizationPresetId,
 } from "../types/proxy";
 import { SETTINGS_APPLIED_EVENT } from "../types/settings";
+import { SectionHeader } from "./ui/SectionHeader";
 
 interface SanitizedExportModalProps {
   open: boolean;
@@ -400,38 +401,31 @@ export const SanitizedExportModal: React.FC<SanitizedExportModalProps> = ({
         onClose();
       }}
       {...({ closedby: "any" } as Record<string, string>)}
-      className="m-auto w-full max-w-3xl rounded-xl border border-strong bg-surface p-0 text-fg shadow-popover open:flex open:max-h-[90vh] open:flex-col"
+      className="fixed inset-0 m-0 h-screen w-screen max-h-none max-w-none overflow-hidden rounded-none border-0 bg-surface p-0 text-fg open:flex open:flex-col"
     >
-      <div className="flex items-center justify-between border-b border-hairline px-4 py-3">
-        <div className="flex items-center gap-2.5">
-          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-accent/15 text-accent">
-            <ShieldCheck className="h-4 w-4" />
-          </div>
-          <div>
-            <h2 id={titleId} className="text-sm font-semibold text-fg">
-              Export Sanitized Sessions (PII &amp; Secrets Redaction)
-            </h2>
-            <p className="text-[11px] text-muted">
-              Очистка токенов, заголовков, ключей JSON/Form, query-параметров и
-              метаданных клиента перед передачей архива
-            </p>
-          </div>
-        </div>
-        <button
-          type="button"
-          onClick={() => dialogRef.current?.close()}
-          aria-label="Закрыть окно санитизированного экспорта"
-          className="rounded p-1 text-muted hover:bg-hover hover:text-fg"
-        >
-          <X className="h-4 w-4" />
-        </button>
-      </div>
+      <SectionHeader
+        sectionId="sanitizedExport"
+        titleId={titleId}
+        headingLevel={1}
+        icon={<ShieldCheck className="h-4 w-4 text-accent" />}
+        actions={
+          <button
+            type="button"
+            onClick={() => dialogRef.current?.close()}
+            aria-label="Закрыть Sanitized Export"
+            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-hairline bg-canvas text-muted hover:border-strong hover:bg-hover hover:text-fg"
+          >
+            <X className="h-4 w-4" aria-hidden="true" />
+          </button>
+        }
+      />
 
       <form
         onSubmit={(e) => void handleSubmitExport(e)}
         className="flex min-h-0 flex-1 flex-col overflow-hidden"
       >
-        <div className="flex-1 space-y-4 overflow-y-auto px-4 py-3.5 text-xs">
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4 text-xs">
+          <div className="mx-auto max-w-5xl space-y-4">
           {/* Scope & Format Selection */}
           <div className="grid gap-3 md:grid-cols-2">
             <div className="space-y-1.5 rounded-lg border border-hairline bg-canvas p-3">
@@ -830,6 +824,7 @@ export const SanitizedExportModal: React.FC<SanitizedExportModalProps> = ({
                 Client: {previewSample.clientMeta}
               </div>
             </div>
+          </div>
           </div>
         </div>
 

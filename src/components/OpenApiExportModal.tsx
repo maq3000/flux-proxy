@@ -19,6 +19,7 @@ import {
 } from "../lib/openApiGenerator";
 import { proxyBridge, type FileDialogFilter } from "../lib/tauriBridge";
 import type { SessionDetail } from "../types/proxy";
+import { SectionHeader } from "./ui/SectionHeader";
 
 interface OpenApiExportModalProps {
   open: boolean;
@@ -401,17 +402,15 @@ export const OpenApiExportModal: React.FC<OpenApiExportModalProps> = ({
         onClose();
       }}
       {...({ closedby: "any" } as Record<string, string>)}
-      className="m-auto h-[84vh] max-h-[820px] w-[92vw] max-w-5xl overflow-hidden rounded-xl border border-strong bg-surface p-0 text-fg shadow-popover open:flex open:flex-col"
+      className="fixed inset-0 m-0 h-screen w-screen max-h-none max-w-none overflow-hidden rounded-none border-0 bg-surface p-0 text-fg open:flex open:flex-col"
     >
-      {/* Header */}
-      <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-hairline bg-elevated/70 px-4 py-3">
-        <div className="flex min-w-0 flex-wrap items-center gap-2.5">
-          <FileJson className="h-4 w-4 shrink-0 text-accent" aria-hidden="true" />
-          <h2 id={titleId} className="shrink-0 text-sm font-semibold text-fg">
-            Export OpenAPI 3.0.3 Specification
-          </h2>
-
-          {!isLoading && (
+      <SectionHeader
+        sectionId="openApiExport"
+        titleId={titleId}
+        headingLevel={1}
+        icon={<FileJson className="h-4 w-4 text-accent" />}
+        badges={
+          !isLoading ? (
             <div className="flex flex-wrap items-center gap-1.5 font-mono text-[10px]">
               <span className="rounded bg-canvas px-1.5 py-0.5 text-fg ring-1 ring-hairline">
                 {stats.operationsCount} endpoints
@@ -440,18 +439,19 @@ export const OpenApiExportModal: React.FC<OpenApiExportModalProps> = ({
                 </span>
               )}
             </div>
-          )}
-        </div>
-
-        <button
-          type="button"
-          onClick={() => dialogRef.current?.close()}
-          aria-label="Закрыть окно экспорта OpenAPI"
-          className="shrink-0 rounded p-1 text-muted hover:bg-hover hover:text-fg"
-        >
-          <X className="h-4 w-4" aria-hidden="true" />
-        </button>
-      </div>
+          ) : undefined
+        }
+        actions={
+          <button
+            type="button"
+            onClick={() => dialogRef.current?.close()}
+            aria-label="Закрыть OpenAPI Export"
+            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-hairline bg-canvas text-muted hover:border-strong hover:bg-hover hover:text-fg"
+          >
+            <X className="h-4 w-4" aria-hidden="true" />
+          </button>
+        }
+      />
 
       {/* Config Toolbar */}
       <div className="flex shrink-0 flex-wrap items-end justify-between gap-3 border-b border-hairline bg-surface px-4 py-2.5 text-xs">

@@ -7,6 +7,7 @@ import {
   Tag,
   X,
 } from "lucide-react";
+import { getSectionMeta } from "../lib/sectionRegistry";
 import {
   hexToRgba,
   QUICK_COMMENT_SUGGESTIONS,
@@ -132,9 +133,9 @@ export const SessionAnnotationModal: React.FC<SessionAnnotationModalProps> = ({
       <div className="flex items-center justify-between border-b border-hairline px-4 py-3">
         <div className="flex items-center gap-2">
           <MessageSquarePlus className="h-4 w-4 text-amber-400" />
-          <h2 id={titleId} className="text-sm font-semibold">
-            Комментарий и цветовой маркер сессии (Comment / Mark)
-          </h2>
+          <h1 id={titleId} className="text-sm font-semibold">
+            {getSectionMeta("commentMark").title}
+          </h1>
           <kbd className="rounded bg-elevated px-1.5 py-0.5 font-mono text-[10px] text-subtle">
             M
           </kbd>

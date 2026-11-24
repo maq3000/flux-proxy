@@ -61,7 +61,7 @@ export const DiagnosticsBackupSettingsTab: React.FC<
     },
     {
       id: "profileBackup",
-      label: "Settings Profile (JSON v1) & Reset",
+      label: "Settings Profile",
       icon: FileJson,
     },
   ];

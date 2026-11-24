@@ -8,6 +8,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import { getSectionMeta } from "../lib/sectionRegistry";
 import { proxyBridge } from "../lib/tauriBridge";
 import type { CaCertificateInfo } from "../types/proxy";
 
@@ -145,14 +146,14 @@ export const CertificateModal: React.FC<CertificateModalProps> = ({
             aria-hidden="true"
             className="h-4 w-4 text-emerald-400"
           />
-          <h2 id={titleId} className="text-sm font-semibold">
-            HTTPS MITM Root Certificate Authority
-          </h2>
+          <h1 id={titleId} className="text-sm font-semibold">
+            {getSectionMeta("rootCa").title}
+          </h1>
         </div>
         <button
           type="button"
           onClick={() => dialogRef.current?.close()}
-          aria-label="Close certificate settings"
+          aria-label="Close Root CA"
           className="rounded p-1 text-muted hover:bg-hover hover:text-fg"
         >
           <X aria-hidden="true" className="h-4 w-4" />
@@ -161,12 +162,9 @@ export const CertificateModal: React.FC<CertificateModalProps> = ({
 
       <div className="space-y-3 p-4 text-xs">
         <p className="leading-relaxed text-muted">
-          FluxProxy dynamically generates per-domain ECDSA P-256 leaf certificates on the fly via{" "}
-          <code className="rounded bg-elevated px-1 py-0.5 font-mono text-sky-400">
-            rcgen + rustls
-          </code>
-          . Trusting this local Root CA allows decrypting HTTPS/1.1, HTTPS/2, and WSS traffic on{" "}
-          <code className="font-mono text-fg">127.0.0.1:8888</code>.
+          FluxProxy динамически выпускает локальные ECDSA P-256 сертификаты для
+          доменов на лету. Доверие к этому локальному Root CA позволяет
+          расшифровывать HTTPS/1.1, HTTPS/2 и WSS трафик через локальный прокси.
         </p>
 
         {caInfo && (

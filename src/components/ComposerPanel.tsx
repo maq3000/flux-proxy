@@ -39,12 +39,14 @@ import {
 } from "../lib/curlParser";
 import { formatBytes, formatDuration, tryFormatJson } from "../lib/formatters";
 import { getMonacoThemeName } from "../lib/monaco";
+import { getSectionMeta } from "../lib/sectionRegistry";
 import { proxyBridge } from "../lib/tauriBridge";
 import type {
   ComposedRequest,
   HeaderPair,
   SessionDetail,
 } from "../types/proxy";
+import { SectionHeader } from "./ui/SectionHeader";
 
 interface ComposerPanelProps {
   draftRequest: ComposedRequest | null;
@@ -383,14 +385,17 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
       )}
 
       {/* Composer Header */}
-      <div className="flex min-h-9 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-hairline bg-elevated/60 px-3 py-1">
-        <div className="flex flex-wrap items-center gap-2">
-          {onBackToTraffic && (
+      <SectionHeader
+        sectionId="composer"
+        compact
+        icon={<Send className="h-3.5 w-3.5 text-accent" />}
+        leading={
+          onBackToTraffic ? (
             <button
               type="button"
               onClick={onBackToTraffic}
-              title="Return to Traffic Viewer (Alt+1)"
-              className="inline-flex h-6 items-center gap-1 rounded border border-hairline bg-surface px-2 text-[11px] font-medium text-fg transition-colors hover:border-strong hover:bg-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+              title="Return to Traffic (Alt+1)"
+              className="inline-flex h-6 items-center gap-1 rounded border border-hairline bg-canvas px-2 text-[11px] font-medium text-fg transition-colors hover:border-strong hover:bg-hover focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
             >
               <ArrowLeft className="h-3 w-3 text-accent" aria-hidden="true" />
               <span>Traffic</span>
@@ -401,120 +406,122 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
                 Alt+1
               </kbd>
             </button>
-          )}
-          <span className="font-mono text-xs font-semibold text-fg">
-            Request Composer
-          </span>
-          {sourceSessionId !== null && (
-            <span className="rounded border border-accent/35 bg-accent/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-accent tabular-nums">
-              From #{sourceSessionId}
+          ) : undefined
+        }
+        badges={
+          <>
+            {sourceSessionId !== null && (
+              <span className="rounded border border-accent/35 bg-accent/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-accent tabular-nums">
+                From #{sourceSessionId}
+              </span>
+            )}
+            <span className="hidden rounded bg-sky-500/10 px-1.5 py-0.5 text-[10px] text-sky-400 sm:inline">
+              Drag & Drop enabled
             </span>
-          )}
-          <span className="hidden rounded bg-sky-500/10 px-1.5 py-0.5 text-[10px] text-sky-400 sm:inline">
-            Drag & Drop enabled
-          </span>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setCurlModalOpen(true)}
-            title="Вставить или импортировать команду cURL (Bash / Windows cmd / PowerShell)"
-            className="inline-flex h-6 items-center gap-1 rounded border border-hairline bg-surface px-2 text-[11px] font-medium text-fg transition-colors hover:border-strong hover:bg-hover"
-          >
-            <Terminal className="h-3 w-3 text-sky-400" aria-hidden="true" />
-            <span>Import cURL</span>
-          </button>
-
-          {onGenerateCode && (
+          </>
+        }
+        actions={
+          <>
             <button
               type="button"
-              disabled={!url.trim()}
-              onClick={handleGenerateCodeClick}
-              title="Сгенерировать клиентский код для текущего запроса (JS / Python / Go / Rust / cURL)"
-              className="inline-flex h-6 items-center gap-1 rounded border border-hairline bg-surface px-2 text-[11px] font-medium text-fg transition-colors hover:border-strong hover:bg-hover disabled:cursor-not-allowed disabled:opacity-45"
+              onClick={() => setCurlModalOpen(true)}
+              title="Вставить или импортировать команду cURL (Bash / Windows cmd / PowerShell)"
+              className="inline-flex h-6 items-center gap-1 rounded border border-hairline bg-canvas px-2 text-[11px] font-medium text-fg transition-colors hover:border-strong hover:bg-hover"
             >
-              <Code2 className="h-3 w-3 text-accent" aria-hidden="true" />
-              <span>Generate Client Code…</span>
+              <Terminal className="h-3 w-3 text-sky-400" aria-hidden="true" />
+              <span>{getSectionMeta("importCurl").title}</span>
             </button>
-          )}
 
-          <label className="flex items-center gap-1.5 text-xs text-muted">
-            <input
-              type="checkbox"
-              checked={followRedirects}
-              onChange={(e) => setFollowRedirects(e.target.checked)}
-              className="rounded accent-sky-500"
-            />
-            <span>Follow redirects</span>
-          </label>
-
-          <span className="inline-flex items-center gap-1.5 text-xs text-muted">
-            <input
-              id={runScriptsId}
-              type="checkbox"
-              checked={runPythonScripts}
-              onChange={(e) => setRunPythonScripts(e.target.checked)}
-              className="rounded accent-sky-500"
-            />
-            <label htmlFor={runScriptsId} className="cursor-pointer select-none">
-              Run Python Scripts
-            </label>
-          </span>
-
-          <div className="inline-flex items-center gap-1 text-xs text-muted">
-            <label htmlFor={timeoutSelectId} className="select-none">
-              Timeout:
-            </label>
-            <select
-              id={timeoutSelectId}
-              value={timeoutOption}
-              disabled={sending}
-              onChange={(e) =>
-                setTimeoutOption(
-                  e.target.value as
-                    | "default"
-                    | "0"
-                    | "30"
-                    | "60"
-                    | "120"
-                    | "300"
-                    | "custom"
-                )
-              }
-              aria-label="Composer request timeout"
-              className="h-6 rounded border border-hairline bg-surface px-1.5 font-mono text-[11px] text-fg focus:border-sky-500 focus:outline-none disabled:opacity-50"
-            >
-              <option value="default">
-                {defaultComposerTimeoutSec === 0
-                  ? "Default (Unlimited)"
-                  : `Default (${defaultComposerTimeoutSec}s)`}
-              </option>
-              <option value="0">Unlimited</option>
-              <option value="30">30 s</option>
-              <option value="60">60 s</option>
-              <option value="120">120 s</option>
-              <option value="300">300 s</option>
-              <option value="custom">Custom…</option>
-            </select>
-            {timeoutOption === "custom" && (
-              <input
-                type="text"
-                inputMode="numeric"
-                autoCorrect="off"
-                autoCapitalize="none"
-                spellCheck={false}
-                disabled={sending}
-                value={customTimeoutInput}
-                onChange={(e) => setCustomTimeoutInput(e.target.value)}
-                aria-label="Custom Composer timeout in seconds"
-                placeholder="sec (0=∞)"
-                className="h-6 w-16 rounded border border-strong bg-surface px-1.5 font-mono text-[11px] text-fg tabular-nums focus:border-sky-500 focus:outline-none"
-              />
+            {onGenerateCode && (
+              <button
+                type="button"
+                disabled={!url.trim()}
+                onClick={handleGenerateCodeClick}
+                title="Сгенерировать клиентский код для текущего запроса (JS / Python / Go / Rust / cURL)"
+                className="inline-flex h-6 items-center gap-1 rounded border border-hairline bg-canvas px-2 text-[11px] font-medium text-fg transition-colors hover:border-strong hover:bg-hover disabled:cursor-not-allowed disabled:opacity-45"
+              >
+                <Code2 className="h-3 w-3 text-accent" aria-hidden="true" />
+                <span>{getSectionMeta("codeGenerator").title}</span>
+              </button>
             )}
-          </div>
-        </div>
-      </div>
+
+            <label className="flex items-center gap-1.5 text-xs text-muted">
+              <input
+                type="checkbox"
+                checked={followRedirects}
+                onChange={(e) => setFollowRedirects(e.target.checked)}
+                className="rounded accent-sky-500"
+              />
+              <span>Follow redirects</span>
+            </label>
+
+            <span className="inline-flex items-center gap-1.5 text-xs text-muted">
+              <input
+                id={runScriptsId}
+                type="checkbox"
+                checked={runPythonScripts}
+                onChange={(e) => setRunPythonScripts(e.target.checked)}
+                className="rounded accent-sky-500"
+              />
+              <label htmlFor={runScriptsId} className="cursor-pointer select-none">
+                Run Python Scripts
+              </label>
+            </span>
+
+            <div className="inline-flex items-center gap-1 text-xs text-muted">
+              <label htmlFor={timeoutSelectId} className="select-none">
+                Timeout:
+              </label>
+              <select
+                id={timeoutSelectId}
+                value={timeoutOption}
+                disabled={sending}
+                onChange={(e) =>
+                  setTimeoutOption(
+                    e.target.value as
+                      | "default"
+                      | "0"
+                      | "30"
+                      | "60"
+                      | "120"
+                      | "300"
+                      | "custom"
+                  )
+                }
+                aria-label="Composer request timeout"
+                className="h-6 rounded border border-hairline bg-canvas px-1.5 font-mono text-[11px] text-fg focus:border-sky-500 focus:outline-none disabled:opacity-50"
+              >
+                <option value="default">
+                  {defaultComposerTimeoutSec === 0
+                    ? "Default (Unlimited)"
+                    : `Default (${defaultComposerTimeoutSec}s)`}
+                </option>
+                <option value="0">Unlimited</option>
+                <option value="30">30 s</option>
+                <option value="60">60 s</option>
+                <option value="120">120 s</option>
+                <option value="300">300 s</option>
+                <option value="custom">Custom…</option>
+              </select>
+              {timeoutOption === "custom" && (
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  autoCorrect="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                  disabled={sending}
+                  value={customTimeoutInput}
+                  onChange={(e) => setCustomTimeoutInput(e.target.value)}
+                  aria-label="Custom Composer timeout in seconds"
+                  placeholder="sec (0=∞)"
+                  className="h-6 w-16 rounded border border-strong bg-canvas px-1.5 font-mono text-[11px] text-fg tabular-nums focus:border-sky-500 focus:outline-none"
+                />
+              )}
+            </div>
+          </>
+        }
+      />
 
       {/* URL & Method Bar */}
       <form
@@ -820,9 +827,9 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
         <div className="flex items-center justify-between border-b border-hairline bg-elevated/70 px-4 py-3">
           <div className="flex items-center gap-2">
             <Terminal className="h-4 w-4 text-sky-400" aria-hidden="true" />
-            <h2 id={curlTitleId} className="text-sm font-semibold text-fg">
-              Import cURL Command
-            </h2>
+            <h1 id={curlTitleId} className="text-sm font-semibold text-fg">
+              {getSectionMeta("importCurl").title}
+            </h1>
           </div>
           <button
             type="button"

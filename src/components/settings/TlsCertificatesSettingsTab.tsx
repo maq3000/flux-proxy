@@ -117,7 +117,7 @@ export const TlsCertificatesSettingsTab: React.FC<
   }[] = [
     {
       id: "mitmBypass",
-      label: "HTTPS MITM & Bypass 2.0",
+      label: "TLS Bypass",
       badge:
         backendFilterConfig.tlsInterceptMode === "targetedOnly"
           ? `Targeted (${activeTlsRulesCount})`
@@ -126,14 +126,14 @@ export const TlsCertificatesSettingsTab: React.FC<
     },
     {
       id: "clientCerts",
-      label: "Client Certificates (mTLS)",
+      label: "Client Certificates",
       badge:
         activeClientCertsCount > 0 ? String(activeClientCertsCount) : undefined,
       icon: FileKey2,
     },
     {
       id: "mobileSetup",
-      label: "Mobile Device Setup",
+      label: "Mobile Setup",
       badge: isRemoteAllowed ? "LAN" : "Local",
       icon: Smartphone,
     },
@@ -161,7 +161,7 @@ export const TlsCertificatesSettingsTab: React.FC<
           <div className="min-w-0 flex-1 space-y-1">
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs font-semibold text-fg">
-                HTTPS MITM Root Certificate Authority
+                Root CA
               </span>
               <HelpTooltip
                 label="Подробнее о Root CA сертификате"

@@ -131,9 +131,14 @@ export const BreakpointBanner: React.FC<BreakpointBannerProps> = ({
           : "border-amber-500/45 bg-amber-500/15"
       }`}
     >
-      <div className="flex min-w-0 items-center gap-2 font-mono text-[11px]">
+      <button
+        type="button"
+        onClick={() => onInspectItem(head.breakpointId)}
+        title="Открыть ожидающий пакет во вкладке Breakpoints"
+        className="flex min-w-0 flex-1 items-center gap-2 rounded px-1 py-0.5 text-left font-mono text-[11px] transition-colors hover:bg-canvas/40 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+      >
         <span className="inline-flex animate-pulse items-center gap-1 rounded bg-rose-500 px-1.5 py-0.5 text-[10px] font-bold uppercase text-white">
-          <OctagonPause className="h-3 w-3" />
+          <OctagonPause className="h-3 w-3" aria-hidden="true" />
           <span>
             {isResponseStage ? "PAUSED RESPONSE" : "PAUSED REQUEST"}
           </span>
@@ -160,7 +165,7 @@ export const BreakpointBanner: React.FC<BreakpointBannerProps> = ({
         <span className="text-[10px] text-muted tabular-nums">
           (авто-таймаут: {remainingSec}с)
         </span>
-      </div>
+      </button>
 
       <div className="flex shrink-0 items-center gap-1.5">
         <button
@@ -168,8 +173,8 @@ export const BreakpointBanner: React.FC<BreakpointBannerProps> = ({
           onClick={() => onInspectItem(head.breakpointId)}
           className="inline-flex items-center gap-1 rounded-md border border-sky-400/60 bg-sky-500/25 px-2.5 py-1 text-xs font-semibold text-sky-100 shadow-sm hover:bg-sky-500/35"
         >
-          <Sparkles className="h-3.5 w-3.5" />
-          <span>Править в Monaco</span>
+          <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
+          <span>Открыть в Breakpoints</span>
         </button>
 
         {isResponseStage && (

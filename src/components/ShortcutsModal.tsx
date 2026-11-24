@@ -1,5 +1,6 @@
 import React, { useEffect, useId, useRef } from "react";
 import { Keyboard, X } from "lucide-react";
+import { SectionHeader } from "./ui/SectionHeader";
 
 interface ShortcutsModalProps {
   open: boolean;
@@ -13,7 +14,7 @@ const SHORTCUT_GROUPS: {
   {
     title: "Навигация и выделение сессий",
     items: [
-      { keys: "↑ / ↓", description: "Перемещение по строкам таблицы сессий" },
+      { keys: "↑ / ↓", description: "Перемещение по строкам таблицы Traffic" },
       {
         keys: "Shift + ↑ / ↓",
         description: "Множественное выделение диапазона строк",
@@ -39,54 +40,54 @@ const SHORTCUT_GROUPS: {
   {
     title: "Действия с сессиями",
     items: [
-      { keys: "R / Ctrl+R", description: "Replay — повторить запрос в upstream" },
+      { keys: "R / Ctrl+R", description: "Повторить выбранный запрос в upstream (Replay)" },
       {
         keys: "E",
-        description: "Открыть и отредактировать выбранную сессию в Request Composer",
+        description: "Открыть и отредактировать выбранную сессию в Composer",
       },
       { keys: "Ctrl+S / Cmd+S", description: "Сохранить все сессии в архив (.har, .saz, .json)" },
       {
         keys: "Ctrl+Shift+S",
-        description:
-          "Экспорт сессий с санитизацией секретов и PII (Export Sanitized Sessions…)",
+        description: "Открыть Sanitized Export (очистка токенов и PII)",
       },
       { keys: "Ctrl+O / Cmd+O", description: "Открыть / импортировать архив (.har, .saz, .json)" },
-      { keys: "M", description: "Добавить / изменить комментарий и маркер сессии" },
+      { keys: "M", description: "Открыть Comment & Mark для выбранных сессий" },
       { keys: "U", description: "Снять цветовую метку (Unmark)" },
       { keys: "Ctrl+C / Cmd+C", description: "Скопировать URL выбранной сессии" },
       { keys: "Delete / Backspace", description: "Удалить выбранные сессии из списка" },
-      { keys: "Ctrl+X / Cmd+X", description: "Очистить все захваченные сессии (Clear All)" },
-      { keys: "Ctrl+D", description: "Открыть сравнение двух сессий (Session Diff)" },
+      { keys: "Ctrl+X / Cmd+X", description: "Очистить все захваченные сессии" },
+      { keys: "Ctrl+D", description: "Переключить вкладку Session Diff" },
     ],
   },
   {
-    title: "Прокси, поиск и интерфейс",
+    title: "Вкладки, прокси и инструменты",
     items: [
       { keys: "F12", description: "Включить / приостановить захват трафика (Capture)" },
       { keys: "Ctrl+F", description: "Фокус на строку быстрого поиска и фильтрации" },
-      { keys: "F11 / Alt+F11", description: "Точки останова Break on Request / Response" },
+      { keys: "F11 / Alt+F11", description: "Переключить Break Before Request / After Response" },
       { keys: "Shift+F11", description: "Снять все точки останова" },
       { keys: "Ctrl+B", description: "Свернуть / развернуть боковую панель (Sidebar)" },
       {
         keys: "Ctrl+Shift+T",
-        description: "Компактный режим тулбара (Slim / Compact Toolbar)",
+        description: "Переключить компактный режим тулбара",
       },
-      { keys: "Ctrl+Shift+M", description: "Connect Mobile Device — iOS / Android Wi-Fi Proxy + QR" },
-      { keys: "Ctrl+Shift+C", description: "Хранилище клиентских сертификатов (mTLS — Client Certificates)" },
-      { keys: "Ctrl+Shift+H", description: "HOSTS Remapping — виртуальный DNS и перенаправление доменов" },
-      { keys: "Ctrl+Shift+U", description: "Upstream Proxy — каскадирование через HTTP / HTTPS / SOCKS5" },
-      { keys: "Ctrl+Shift+D", description: "Запустить диагностический мастер Proxy Doctor" },
-      { keys: "Ctrl+E", description: "Открыть Text Wizard & JWT Decoder" },
+      { keys: "Ctrl+Shift+M", description: "Открыть Settings → Mobile Setup" },
+      { keys: "Ctrl+Shift+C", description: "Открыть Settings → Client Certificates" },
+      { keys: "Ctrl+Shift+H", description: "Открыть Settings → HOSTS Remapping" },
+      { keys: "Ctrl+Shift+U", description: "Открыть Settings → Upstream Proxy" },
+      { keys: "Ctrl+Shift+D", description: "Открыть Settings → Proxy Doctor" },
+      { keys: "Ctrl+E", description: "Переключить вкладку TextWizard" },
       {
         keys: "Alt+1 … Alt+6",
         description:
-          "Разделы: 1 Traffic, 2 Composer, 3 AutoResponder, 4 Settings → Filters, 5 Python Scripts, 6 Breakpoints",
+          "Разделы: 1 Traffic, 2 Composer, 3 AutoResponder, 4 Settings → Filters, 5 Scripts, 6 Breakpoints",
       },
       {
         keys: "Ctrl+, / Cmd+,",
-        description: "Открыть настройки и профиль (Preferences)",
+        description: "Открыть Settings",
       },
-      { keys: "Ctrl+K", description: "Открыть палитру команд (Command Palette)" },
+      { keys: "Ctrl+K", description: "Открыть Command Palette" },
+      { keys: "?", description: "Открыть / закрыть Shortcuts" },
     ],
   },
 ];
@@ -108,82 +109,62 @@ export const ShortcutsModal: React.FC<ShortcutsModalProps> = ({
     }
   }, [open]);
 
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (!dialog || "closedBy" in HTMLDialogElement.prototype) return;
-    const isOutside = (e: PointerEvent) => {
-      const r = dialog.getBoundingClientRect();
-      return (
-        e.clientX < r.left ||
-        e.clientX > r.right ||
-        e.clientY < r.top ||
-        e.clientY > r.bottom
-      );
-    };
-    let pressedOutside = false;
-    const onDown = (e: PointerEvent) => {
-      pressedOutside = isOutside(e);
-    };
-    const onUp = (e: PointerEvent) => {
-      if (pressedOutside && isOutside(e)) dialog.close();
-    };
-    dialog.addEventListener("pointerdown", onDown);
-    dialog.addEventListener("pointerup", onUp);
-    return () => {
-      dialog.removeEventListener("pointerdown", onDown);
-      dialog.removeEventListener("pointerup", onUp);
-    };
-  }, []);
-
   return (
     <dialog
       ref={dialogRef}
       aria-labelledby={titleId}
-      onClose={onClose}
+      onClose={() => {
+        if (dialogRef.current) dialogRef.current.returnValue = "";
+        onClose();
+      }}
       {...({ closedby: "any" } as Record<string, string>)}
-      className="m-auto w-full max-w-2xl rounded-xl border border-strong bg-surface p-0 text-fg shadow-popover open:flex open:flex-col"
+      className="fixed inset-0 m-0 h-screen w-screen max-h-none max-w-none overflow-hidden rounded-none border-0 bg-surface p-0 text-fg open:flex open:flex-col"
     >
-      <div className="flex items-center justify-between border-b border-hairline px-4 py-3">
-        <div className="flex items-center gap-2">
-          <Keyboard className="h-4 w-4 text-accent" />
-          <h2 id={titleId} className="text-sm font-semibold">
-            Горячие клавиши FluxProxy
-          </h2>
-        </div>
-        <button
-          type="button"
-          onClick={() => dialogRef.current?.close()}
-          aria-label="Закрыть справку по горячим клавишам"
-          className="rounded p-1 text-muted hover:bg-hover hover:text-fg"
-        >
-          <X className="h-4 w-4" />
-        </button>
-      </div>
-
-      <div className="grid max-h-[75vh] gap-4 overflow-y-auto p-4 text-xs md:grid-cols-2">
-        {SHORTCUT_GROUPS.map((group) => (
-          <div
-            key={group.title}
-            className="space-y-2 rounded-lg border border-hairline bg-canvas p-3 md:last:col-span-2"
+      <SectionHeader
+        sectionId="shortcuts"
+        titleId={titleId}
+        headingLevel={1}
+        icon={<Keyboard className="h-4 w-4 text-accent" />}
+        actions={
+          <button
+            type="button"
+            autoFocus
+            {...({ autofocus: "" } as Record<string, string>)}
+            onClick={() => dialogRef.current?.close()}
+            aria-label="Закрыть Shortcuts"
+            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-hairline bg-canvas text-muted hover:border-strong hover:bg-hover hover:text-fg"
           >
-            <h3 className="text-[11px] font-semibold uppercase tracking-wider text-subtle">
-              {group.title}
-            </h3>
-            <div className="divide-y divide-hairline/70">
-              {group.items.map((item) => (
-                <div
-                  key={item.keys}
-                  className="flex items-center justify-between gap-3 py-1.5"
-                >
-                  <span className="text-muted">{item.description}</span>
-                  <kbd className="shrink-0 rounded border border-hairline bg-surface px-1.5 py-0.5 font-mono text-[10px] font-medium text-fg">
-                    {item.keys}
-                  </kbd>
-                </div>
-              ))}
+            <X className="h-4 w-4" aria-hidden="true" />
+          </button>
+        }
+      />
+
+      <div className="min-h-0 flex-1 overflow-y-auto p-6 text-xs">
+        <div className="mx-auto grid max-w-6xl gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {SHORTCUT_GROUPS.map((group) => (
+            <div
+              key={group.title}
+              className="space-y-2 rounded-lg border border-hairline bg-canvas p-4"
+            >
+              <h2 className="text-[11px] font-semibold uppercase tracking-wider text-subtle">
+                {group.title}
+              </h2>
+              <div className="divide-y divide-hairline/70">
+                {group.items.map((item) => (
+                  <div
+                    key={item.keys}
+                    className="flex items-center justify-between gap-3 py-1.5"
+                  >
+                    <span className="text-muted">{item.description}</span>
+                    <kbd className="shrink-0 rounded border border-hairline bg-surface px-1.5 py-0.5 font-mono text-[10px] font-medium text-fg">
+                      {item.keys}
+                    </kbd>
+                  </div>
+                ))}
+              </div>
             </div>
-          </div>
-        ))}
+          ))}
+        </div>
       </div>
     </dialog>
   );
