@@ -547,6 +547,7 @@ export interface TrafficRowMenuOptions {
   onCompareWithSession: (id: number) => void;
   onOpenDiffModal: () => void;
   onOpenStatistics?: (id: number) => void;
+  onOpenTrafficStatistics?: (scope: "filtered" | "selected") => void;
   onCopyUrl: (ids: number[]) => void;
   onCopyCurl: (id: number) => void;
   onGenerateClientCode?: (id: number) => void;
@@ -633,6 +634,19 @@ export function buildTrafficRowContextMenu(
       label: "Открыть Statistics",
       icon: makeIcon(BarChart2, "h-3.5 w-3.5 text-accent"),
       onSelect: () => opts.onOpenStatistics?.(session.id),
+    });
+  }
+
+  if (opts.onOpenTrafficStatistics) {
+    items.push({
+      id: "row-traffic-statistics-report",
+      label:
+        count > 1
+          ? `Traffic Statistics Report (${count} selected)…`
+          : "Traffic Statistics Report (Sample)…",
+      icon: makeIcon(BarChart2, "h-3.5 w-3.5 text-accent"),
+      onSelect: () =>
+        opts.onOpenTrafficStatistics?.(count > 1 ? "selected" : "filtered"),
     });
   }
 
@@ -1016,7 +1030,10 @@ export interface TrafficEmptyMenuOptions {
   proxyRunning: boolean;
   followTail: boolean;
   hasActiveFilters: boolean;
+  isWaterfallView?: boolean;
   onSelectAllVisible?: () => void;
+  onOpenTrafficStatistics?: () => void;
+  onToggleWaterfallView?: () => void;
   onToggleCapture?: () => void;
   onToggleFollowTail?: () => void;
   onImportArchive?: () => void;
@@ -1046,6 +1063,27 @@ export function buildTrafficEmptyContextMenu(
       shortcut: "Ctrl+A",
       disabled: opts.visibleCount === 0,
       onSelect: opts.onSelectAllVisible,
+    });
+  }
+
+  if (opts.onOpenTrafficStatistics) {
+    items.push({
+      id: "empty-traffic-statistics",
+      label: "Traffic Statistics Report…",
+      icon: makeIcon(BarChart2, "h-3.5 w-3.5 text-accent"),
+      disabled: opts.visibleCount === 0,
+      onSelect: opts.onOpenTrafficStatistics,
+    });
+  }
+
+  if (opts.onToggleWaterfallView) {
+    items.push({
+      id: "empty-toggle-waterfall",
+      label: opts.isWaterfallView
+        ? "Switch to Traffic Table (Grid)"
+        : "Switch to Waterfall Timeline",
+      icon: makeIcon(LayoutGrid),
+      onSelect: opts.onToggleWaterfallView,
     });
   }
 

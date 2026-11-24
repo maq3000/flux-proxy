@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   ArrowLeftRight,
+  BarChart3,
   Flame,
   GitCompareArrows,
   Maximize2,
@@ -58,6 +59,8 @@ interface TrafficGridProps {
   onSortedSessionsChange?: (sessions: SessionSummary[]) => void;
   onFocusInspector: () => void;
   onOpenStatistics?: (id: number) => void;
+  onOpenTrafficStatistics?: (scope: "filtered" | "selected") => void;
+  onToggleWaterfallView?: () => void;
   onDeleteSessions: (ids: number[]) => void;
   onReplaySessions: (ids: number[]) => void;
   onUnmarkSessions: (ids: number[]) => void;
@@ -289,6 +292,8 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
   onSortedSessionsChange,
   onFocusInspector,
   onOpenStatistics,
+  onOpenTrafficStatistics,
+  onToggleWaterfallView,
   onDeleteSessions,
   onReplaySessions,
   onUnmarkSessions,
@@ -416,6 +421,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
         onCompareWithSession,
         onOpenDiffModal,
         onOpenStatistics,
+        onOpenTrafficStatistics,
         onCopyUrl,
         onCopyCurl,
         onGenerateClientCode,
@@ -463,6 +469,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
       onGenerateClientCode,
       onOpenDiffModal,
       onOpenStatistics,
+      onOpenTrafficStatistics,
       onReplaySessions,
       onSaveSessionBody,
       onSelectSession,
@@ -540,9 +547,14 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
         proxyRunning,
         followTail,
         hasActiveFilters,
+        isWaterfallView: false,
         onSelectAllVisible: onSelectAllSessions
           ? () => onSelectAllSessions(sortedSessions.map((s) => s.id))
           : undefined,
+        onOpenTrafficStatistics: onOpenTrafficStatistics
+          ? () => onOpenTrafficStatistics("filtered")
+          : undefined,
+        onToggleWaterfallView,
         onToggleCapture,
         onToggleFollowTail,
         onImportArchive,
@@ -562,12 +574,14 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
       hasActiveFilters,
       onClearAllSessions,
       onImportArchive,
+      onOpenTrafficStatistics,
       onResetColumns,
       onResetFilters,
       onSaveAllSessions,
       onSelectAllSessions,
       onToggleCapture,
       onToggleFollowTail,
+      onToggleWaterfallView,
       openContextMenu,
       proxyRunning,
       sessions.length,
@@ -966,6 +980,17 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
               <ArrowLeftRight className="h-3 w-3" />
               <span className="hidden xl:inline">A↔B</span>
             </button>
+            {onOpenTrafficStatistics && (
+              <button
+                type="button"
+                onClick={() => onOpenTrafficStatistics("selected")}
+                title="Открыть сводную статистику и Markdown-отчёт по выделенным сессиям"
+                className="inline-flex h-6 items-center gap-1 rounded border border-hairline bg-surface px-2 text-[11px] text-accent hover:border-strong"
+              >
+                <BarChart3 className="h-3 w-3" />
+                <span>Stats</span>
+              </button>
+            )}
             <button
               type="button"
               onClick={() => onAnnotateSessions(selectedIds)}

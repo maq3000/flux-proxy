@@ -275,4 +275,56 @@ describe("CommandPalette 2.0", () => {
     expect(onPerform).toHaveBeenCalledWith("throttle-preset-fast3g");
     expect(onClose).toHaveBeenCalled();
   });
+
+  it("supports QuickExec stats and waterfall commands", () => {
+    const onPerform = vi.fn();
+    const onClose = vi.fn();
+    const onQuickOpenTrafficStatistics = vi.fn();
+    const onQuickOpenWaterfall = vi.fn();
+
+    const { rerender } = render(
+      <CommandPalette
+        open
+        onClose={onClose}
+        commands={createTestCommands(onPerform)}
+        onQuickOpenTrafficStatistics={onQuickOpenTrafficStatistics}
+        onQuickOpenWaterfall={onQuickOpenWaterfall}
+      />
+    );
+
+    const input = screen.getByLabelText("Search commands");
+    fireEvent.change(input, { target: { value: "stats" } });
+    expect(
+      screen.getByText("Traffic Statistics — сводная статистика и Markdown-отчёт")
+    ).toBeTruthy();
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onQuickOpenTrafficStatistics).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <CommandPalette
+        open={false}
+        onClose={onClose}
+        commands={createTestCommands(onPerform)}
+        onQuickOpenTrafficStatistics={onQuickOpenTrafficStatistics}
+        onQuickOpenWaterfall={onQuickOpenWaterfall}
+      />
+    );
+    rerender(
+      <CommandPalette
+        open
+        onClose={onClose}
+        commands={createTestCommands(onPerform)}
+        onQuickOpenTrafficStatistics={onQuickOpenTrafficStatistics}
+        onQuickOpenWaterfall={onQuickOpenWaterfall}
+      />
+    );
+
+    const input2 = screen.getByLabelText("Search commands");
+    fireEvent.change(input2, { target: { value: "waterfall" } });
+    expect(
+      screen.getByText("Waterfall Timeline — многофазная каскадная диаграмма")
+    ).toBeTruthy();
+    fireEvent.keyDown(input2, { key: "Enter" });
+    expect(onQuickOpenWaterfall).toHaveBeenCalledTimes(1);
+  });
 });

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, Database, Gauge, Globe, Network, Stethoscope, Trash2, Upload, WifiOff, X } from "lucide-react";
+import { Activity, BarChart3, BarChartHorizontal, Database, Gauge, Globe, Network, Stethoscope, Table2, Trash2, Upload, WifiOff, X } from "lucide-react";
 import {
   Panel,
   PanelGroup,
@@ -25,6 +25,11 @@ import { Sidebar } from "./components/Sidebar";
 import type { TextWizardTab } from "./components/TextWizardPanel";
 import { TopToolbar } from "./components/TopToolbar";
 import { TrafficGrid } from "./components/TrafficGrid";
+import {
+  TrafficStatisticsModal,
+  type TrafficStatisticsScope,
+} from "./components/TrafficStatisticsModal";
+import { WaterfallTimeline } from "./components/WaterfallTimeline";
 import { ContextMenuProvider } from "./components/ui/ContextMenu";
 import { SectionHeader } from "./components/ui/SectionHeader";
 import { useContextMenu, type ContextMenuEventLike } from "./hooks/useContextMenu";
@@ -33,6 +38,8 @@ import {
   buildFooterContextMenu,
   buildInspectorChromeContextMenu,
   buildSelectionContextMenuItems,
+  buildTrafficEmptyContextMenu,
+  buildTrafficRowContextMenu,
   captureEditableSelection,
   copyTextToClipboard,
   findEditableTextTarget,
@@ -537,9 +544,31 @@ const AppContent: React.FC = () => {
   const [openApiAllIds, setOpenApiAllIds] = useState<number[]>([]);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsModalOpen, setShortcutsModalOpen] = useState(false);
+  const [trafficViewMode, setTrafficViewMode] = useState<"grid" | "waterfall">(
+    "grid"
+  );
+  const [trafficStatsModalOpen, setTrafficStatsModalOpen] = useState(false);
+  const [trafficStatsInitialScope, setTrafficStatsInitialScope] =
+    useState<TrafficStatisticsScope>("filtered");
   const [hexTriggerSeq, setHexTriggerSeq] = useState(0);
   const [statisticsTriggerSeq, setStatisticsTriggerSeq] = useState(0);
   const [customRetentionTriggerSeq, setCustomRetentionTriggerSeq] = useState(0);
+
+  const openTrafficStatisticsModal = useCallback(
+    (scope: TrafficStatisticsScope = "filtered") => {
+      setTrafficStatsInitialScope(scope);
+      setTrafficStatsModalOpen(true);
+    },
+    []
+  );
+
+  const handleSetTrafficViewMode = useCallback(
+    (mode: "grid" | "waterfall") => {
+      setActiveSection("traffic");
+      setTrafficViewMode(mode);
+    },
+    [setActiveSection]
+  );
 
   // Session Diff & User Annotations (Comment / Mark) State
   const [annotationModalOpen, setAnnotationModalOpen] = useState(false);
@@ -2117,6 +2146,62 @@ const AppContent: React.FC = () => {
         perform: handleOpenStatistics,
       },
       {
+        id: "open-traffic-statistics",
+        category: "Traffic",
+        group: "tools",
+        label: "Traffic Statistics — сводная статистика и Markdown-отчёт по выборке",
+        description:
+          "Доли 2xx–5xx/Pending, объём wire/decoded, Avg/Median/P95 Latency и TTFB, MIME, хосты и топ-5 URL",
+        statusBadge: `${filteredSessions.length.toLocaleString("en-US")} сессий`,
+        keywords: [
+          "statistics",
+          "stats",
+          "summary",
+          "report",
+          "markdown",
+          "p95",
+          "median",
+          "ttfb",
+          "mime",
+          "hosts",
+          "статистика",
+          "отчёт",
+          "отчет",
+          "выборка",
+        ],
+        perform: () => openTrafficStatisticsModal("filtered"),
+      },
+      {
+        id: "toggle-waterfall-timeline",
+        category: "View",
+        group: "tools",
+        label:
+          trafficViewMode === "waterfall"
+            ? "Переключить Traffic в режим таблицы (Table Grid)"
+            : "Открыть Waterfall Timeline — многофазная каскадная диаграмма",
+        description:
+          "Виртуализированная временная шкала с фазами DNS / TCP / TLS / TTFB / Download и масштабированием",
+        statusBadge: trafficViewMode === "waterfall" ? "Waterfall" : "Grid",
+        keywords: [
+          "waterfall",
+          "timeline",
+          "gantt",
+          "cascade",
+          "dns",
+          "tcp",
+          "tls",
+          "ttfb",
+          "zoom",
+          "таймлайн",
+          "водопад",
+          "каскад",
+        ],
+        perform: () =>
+          handleSetTrafficViewMode(
+            trafficViewMode === "waterfall" ? "grid" : "waterfall"
+          ),
+      },
+      {
         id: "toggle-compact-toolbar",
         category: "View",
         group: "settings",
@@ -2885,6 +2970,7 @@ const AppContent: React.FC = () => {
       enabledTlsBypassCount,
       exportAllSessionsAs,
       exportSelectedSessionsAs,
+      filteredSessions.length,
       generateStress10k,
       handleChangeThrottleConfig,
       handleExportSettingsProfile,
@@ -2895,6 +2981,7 @@ const AppContent: React.FC = () => {
       handleResetAllSettings,
       handleResetPanelLayout,
       handleSelectAllSessions,
+      handleSetTrafficViewMode,
       handleTogglePythonScript,
       hostListFilter.enabled,
       hostListFilter.mode,
@@ -2913,6 +3000,7 @@ const AppContent: React.FC = () => {
       openPreferencesAt,
       openSanitizedExportModal,
       openTextWizardAt,
+      openTrafficStatisticsModal,
       pausedBreakpoints.length,
       preference,
       replaySessions,
@@ -2951,6 +3039,7 @@ const AppContent: React.FC = () => {
       toggleSidebar,
       toggleSystemProxy,
       toggleTlsInterceptMode,
+      trafficViewMode,
       unmarkSessions,
       upstreamProxyActiveLabel,
     ]
@@ -3258,81 +3347,240 @@ const AppContent: React.FC = () => {
     filterQuery.trim() || quickCategory !== "all" || activeFilterBadgeCount > 0
   );
 
-  const renderTrafficGrid = () => (
-    <TrafficGrid
-      gridRef={trafficGridRef}
-      sessions={filteredSessions}
-      totalSessionsCount={sessions.length}
-      proxyRunning={status.running}
-      hasActiveFilters={hasAnyActiveFilter}
-      selectedId={selectedId}
-      selectedIds={selectedIds}
-      visibleColumns={visibleColumns}
-      columnWidths={columnWidths}
-      onColumnWidthChange={setColumnWidth}
-      onToggleColumnVisibility={toggleColumnVisibility}
-      onResetColumns={resetColumns}
-      onSelectSession={(id) => {
-        setSelectedId(id);
-        const paused = pausedBreakpoints.find((p) => p.sessionId === id);
-        if (paused) {
-          openBreakpointsAt("intercept", paused.breakpointId);
-        }
-      }}
-      onToggleSelectSession={toggleSessionSelection}
-      onSelectSessionRange={selectSessionRange}
-      onSelectAllSessions={selectSessions}
-      onSortedSessionsChange={(list) => {
-        sortedSessionsRef.current = list;
-      }}
-      onFocusInspector={handleFocusInspector}
-      onOpenStatistics={handleOpenStatisticsForSession}
-      onDeleteSessions={(ids) => void deleteSessions(ids)}
-      onReplaySessions={(ids) => void replaySessions(ids)}
-      onUnmarkSessions={(ids) => void unmarkSessions(ids)}
-      onCopyUrl={copyUrlsForIds}
-      onCopyCurl={(id) => void copySessionAsCurl(id)}
-      onGenerateClientCode={(id) => void openCodeGeneratorForSession(id)}
-      onCopyHeaders={(id, kind) => void copySessionHeaders(id, kind)}
-      onCompareWithSession={(id) => {
-        setInlineDiffDismissed(false);
-        compareWithSession(id);
-      }}
-      onSwapCompare={swapCompareSessions}
-      onOpenDiffModal={() => openDiffWithPairSmart()}
-      onAnnotateSessions={openAnnotationFor}
-      onSendToComposer={(id) => void loadSessionIntoComposer(id)}
-      onCreateRuleFromSession={(s) => void handleCreateRuleFromSession(s)}
-      onAddBreakpoint={(stage, pattern) =>
-        void applyQuickExecBpu(stage, pattern)
+  const handleWaterfallRowContextMenu = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>, session: SessionSummary) => {
+      const isAlreadySelected = selectedIds.includes(session.id);
+      if (!isAlreadySelected) {
+        setSelectedId(session.id);
       }
-      onExportSelectedSessions={(ids, fmt) =>
-        void exportSelectedSessionsAs(ids, fmt)
-      }
-      onExportOpenApi={(ids) => openOpenApiExportModal(ids)}
-      onSaveSessionBody={(id, isResponse) =>
-        void saveSessionBodyAs(id, isResponse)
-      }
-      onFilterByHost={handleFilterByHost}
-      onFilterByStatus={handleFilterByStatus}
-      onFilterByProcess={(proc) => quickFilterByProcess(proc, "include")}
-      onFilterByClientIp={(ip) => quickFilterByClientIp(ip, "include")}
-      onAddClientIpToAllowlist={(ip) => void addLanClientToAllowlist(ip)}
-      onAlwaysInspectHost={(host) => void quickAlwaysInspectHost(host)}
-      onAlwaysPassthroughHost={(host) => void quickAlwaysPassthroughHost(host)}
-      onAddHostToTlsBypass={(host) => void quickAddTlsBypassHost(host)}
-      onDisableFollowTail={() => setFollowTail(false)}
-      onToggleCapture={() => void toggleProxy()}
-      onToggleFollowTail={() => setFollowTail((v) => !v)}
-      onClearAllSessions={() => void clearAllSessions()}
-      onImportArchive={() => void importArchiveDialog()}
-      onSaveAllSessions={() => void exportAllSessionsAs()}
-      onResetFilters={handleResetAllTrafficFilters}
-      onNotify={showToast}
-      thresholds={thresholds}
-      followTail={followTail}
-    />
+      const targetIds =
+        isAlreadySelected && selectedIds.length > 0 ? selectedIds : [session.id];
+
+      const items = buildTrafficRowContextMenu({
+        session,
+        targetIds,
+        selectedId,
+        onReplaySessions: (ids) => void replaySessions(ids),
+        onSendToComposer: (id) => void loadSessionIntoComposer(id),
+        onCompareWithSession: (id) => {
+          setInlineDiffDismissed(false);
+          compareWithSession(id);
+        },
+        onOpenDiffModal: () => openDiffWithPairSmart(),
+        onOpenStatistics: handleOpenStatisticsForSession,
+        onOpenTrafficStatistics: openTrafficStatisticsModal,
+        onCopyUrl: copyUrlsForIds,
+        onCopyCurl: (id) => void copySessionAsCurl(id),
+        onGenerateClientCode: (id) => void openCodeGeneratorForSession(id),
+        onCopyHeaders: (id, kind) => void copySessionHeaders(id, kind),
+        onExportSelectedSessions: (ids, fmt) =>
+          void exportSelectedSessionsAs(ids, fmt),
+        onExportOpenApi: (ids) => openOpenApiExportModal(ids),
+        onSaveSessionBody: (id, isResponse) =>
+          void saveSessionBodyAs(id, isResponse),
+        onAnnotateSessions: openAnnotationFor,
+        onUnmarkSessions: (ids) => void unmarkSessions(ids),
+        onCreateRuleFromSession: (s) => void handleCreateRuleFromSession(s),
+        onAddBreakpoint: (stage, pattern) =>
+          void applyQuickExecBpu(stage, pattern),
+        onFilterByHost: handleFilterByHost,
+        onFilterByStatus: handleFilterByStatus,
+        onFilterByProcess: (proc) => quickFilterByProcess(proc, "include"),
+        onFilterByClientIp: (ip) => quickFilterByClientIp(ip, "include"),
+        onAddClientIpToAllowlist: (ip) => void addLanClientToAllowlist(ip),
+        onAlwaysInspectHost: (host) => void quickAlwaysInspectHost(host),
+        onAlwaysPassthroughHost: (host) =>
+          void quickAlwaysPassthroughHost(host),
+        onDeleteSessions: (ids) => void deleteSessions(ids),
+      });
+
+      openContextMenu(e, items, {
+        ariaLabel: `Действия для сессии #${session.id}`,
+        minWidth: 240,
+      });
+    },
+    [
+      addLanClientToAllowlist,
+      applyQuickExecBpu,
+      compareWithSession,
+      copySessionAsCurl,
+      copySessionHeaders,
+      copyUrlsForIds,
+      deleteSessions,
+      exportSelectedSessionsAs,
+      handleCreateRuleFromSession,
+      handleFilterByHost,
+      handleFilterByStatus,
+      handleOpenStatisticsForSession,
+      loadSessionIntoComposer,
+      openAnnotationFor,
+      openCodeGeneratorForSession,
+      openContextMenu,
+      openDiffWithPairSmart,
+      openOpenApiExportModal,
+      openTrafficStatisticsModal,
+      quickAlwaysInspectHost,
+      quickAlwaysPassthroughHost,
+      quickFilterByClientIp,
+      quickFilterByProcess,
+      replaySessions,
+      saveSessionBodyAs,
+      selectedId,
+      selectedIds,
+      setSelectedId,
+      unmarkSessions,
+    ]
   );
+
+  const handleWaterfallEmptyContextMenu = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (e.defaultPrevented) return;
+      const items = buildTrafficEmptyContextMenu({
+        visibleCount: filteredSessions.length,
+        totalCount: sessions.length,
+        proxyRunning: status.running,
+        followTail,
+        hasActiveFilters: hasAnyActiveFilter,
+        isWaterfallView: true,
+        onSelectAllVisible: () =>
+          selectSessions(filteredSessions.map((s) => s.id)),
+        onOpenTrafficStatistics: () => openTrafficStatisticsModal("filtered"),
+        onToggleWaterfallView: () => setTrafficViewMode("grid"),
+        onToggleCapture: () => void toggleProxy(),
+        onToggleFollowTail: () => setFollowTail((v) => !v),
+        onImportArchive: () => void importArchiveDialog(),
+        onSaveAllSessions: () => void exportAllSessionsAs(),
+        onResetFilters: handleResetAllTrafficFilters,
+        onResetColumns: resetColumns,
+        onClearAllSessions: () => void clearAllSessions(),
+      });
+
+      openContextMenu(e, items, {
+        ariaLabel: "Действия Waterfall Timeline",
+        minWidth: 232,
+      });
+    },
+    [
+      clearAllSessions,
+      exportAllSessionsAs,
+      filteredSessions,
+      followTail,
+      handleResetAllTrafficFilters,
+      hasAnyActiveFilter,
+      importArchiveDialog,
+      openContextMenu,
+      openTrafficStatisticsModal,
+      resetColumns,
+      selectSessions,
+      sessions.length,
+      setFollowTail,
+      status.running,
+      toggleProxy,
+    ]
+  );
+
+  const renderTrafficGrid = () =>
+    trafficViewMode === "waterfall" ? (
+      <WaterfallTimeline
+        sessions={filteredSessions}
+        totalSessionsCount={sessions.length}
+        selectedId={selectedId}
+        selectedIds={selectedIds}
+        onSelectSession={(id) => {
+          setSelectedId(id);
+          const paused = pausedBreakpoints.find((p) => p.sessionId === id);
+          if (paused) {
+            openBreakpointsAt("intercept", paused.breakpointId);
+          }
+        }}
+        onToggleSelectSession={toggleSessionSelection}
+        onFocusInspector={handleFocusInspector}
+        onOpenTrafficStatistics={() => openTrafficStatisticsModal("filtered")}
+        onSwitchToGrid={() => setTrafficViewMode("grid")}
+        onRowContextMenu={handleWaterfallRowContextMenu}
+        onEmptyAreaContextMenu={handleWaterfallEmptyContextMenu}
+        followTail={followTail}
+        onDisableFollowTail={() => setFollowTail(false)}
+      />
+    ) : (
+      <TrafficGrid
+        gridRef={trafficGridRef}
+        sessions={filteredSessions}
+        totalSessionsCount={sessions.length}
+        proxyRunning={status.running}
+        hasActiveFilters={hasAnyActiveFilter}
+        selectedId={selectedId}
+        selectedIds={selectedIds}
+        visibleColumns={visibleColumns}
+        columnWidths={columnWidths}
+        onColumnWidthChange={setColumnWidth}
+        onToggleColumnVisibility={toggleColumnVisibility}
+        onResetColumns={resetColumns}
+        onSelectSession={(id) => {
+          setSelectedId(id);
+          const paused = pausedBreakpoints.find((p) => p.sessionId === id);
+          if (paused) {
+            openBreakpointsAt("intercept", paused.breakpointId);
+          }
+        }}
+        onToggleSelectSession={toggleSessionSelection}
+        onSelectSessionRange={selectSessionRange}
+        onSelectAllSessions={selectSessions}
+        onSortedSessionsChange={(list) => {
+          sortedSessionsRef.current = list;
+        }}
+        onFocusInspector={handleFocusInspector}
+        onOpenStatistics={handleOpenStatisticsForSession}
+        onOpenTrafficStatistics={openTrafficStatisticsModal}
+        onToggleWaterfallView={() => setTrafficViewMode("waterfall")}
+        onDeleteSessions={(ids) => void deleteSessions(ids)}
+        onReplaySessions={(ids) => void replaySessions(ids)}
+        onUnmarkSessions={(ids) => void unmarkSessions(ids)}
+        onCopyUrl={copyUrlsForIds}
+        onCopyCurl={(id) => void copySessionAsCurl(id)}
+        onGenerateClientCode={(id) => void openCodeGeneratorForSession(id)}
+        onCopyHeaders={(id, kind) => void copySessionHeaders(id, kind)}
+        onCompareWithSession={(id) => {
+          setInlineDiffDismissed(false);
+          compareWithSession(id);
+        }}
+        onSwapCompare={swapCompareSessions}
+        onOpenDiffModal={() => openDiffWithPairSmart()}
+        onAnnotateSessions={openAnnotationFor}
+        onSendToComposer={(id) => void loadSessionIntoComposer(id)}
+        onCreateRuleFromSession={(s) => void handleCreateRuleFromSession(s)}
+        onAddBreakpoint={(stage, pattern) =>
+          void applyQuickExecBpu(stage, pattern)
+        }
+        onExportSelectedSessions={(ids, fmt) =>
+          void exportSelectedSessionsAs(ids, fmt)
+        }
+        onExportOpenApi={(ids) => openOpenApiExportModal(ids)}
+        onSaveSessionBody={(id, isResponse) =>
+          void saveSessionBodyAs(id, isResponse)
+        }
+        onFilterByHost={handleFilterByHost}
+        onFilterByStatus={handleFilterByStatus}
+        onFilterByProcess={(proc) => quickFilterByProcess(proc, "include")}
+        onFilterByClientIp={(ip) => quickFilterByClientIp(ip, "include")}
+        onAddClientIpToAllowlist={(ip) => void addLanClientToAllowlist(ip)}
+        onAlwaysInspectHost={(host) => void quickAlwaysInspectHost(host)}
+        onAlwaysPassthroughHost={(host) =>
+          void quickAlwaysPassthroughHost(host)
+        }
+        onAddHostToTlsBypass={(host) => void quickAddTlsBypassHost(host)}
+        onDisableFollowTail={() => setFollowTail(false)}
+        onToggleCapture={() => void toggleProxy()}
+        onToggleFollowTail={() => setFollowTail((v) => !v)}
+        onClearAllSessions={() => void clearAllSessions()}
+        onImportArchive={() => void importArchiveDialog()}
+        onSaveAllSessions={() => void exportAllSessionsAs()}
+        onResetFilters={handleResetAllTrafficFilters}
+        onNotify={showToast}
+        thresholds={thresholds}
+        followTail={followTail}
+      />
+    );
 
   const renderInspectorOrDiff = () =>
     showInlineSessionDiff ? (
@@ -3532,6 +3780,9 @@ const AppContent: React.FC = () => {
         onResetColumns={resetColumns}
         onResetPanelLayout={handleResetPanelLayout}
         onOpenThemeGallery={() => openPreferencesAt("uiColumns")}
+        trafficViewMode={trafficViewMode}
+        onSetTrafficViewMode={handleSetTrafficViewMode}
+        onOpenTrafficStatistics={() => openTrafficStatisticsModal("filtered")}
         onReplaySelected={() => {
           if (effectiveSelectedIds.length > 0) {
             void replaySessions(effectiveSelectedIds);
@@ -3711,6 +3962,60 @@ const AppContent: React.FC = () => {
                     {filteredSessions.length.toLocaleString()} /{" "}
                     {sessions.length.toLocaleString()}
                   </span>
+                }
+                actions={
+                  <div className="flex items-center gap-1.5">
+                    <div
+                      role="group"
+                      aria-label="Traffic view mode"
+                      className="inline-flex items-center rounded border border-hairline bg-canvas p-0.5 text-[11px]"
+                    >
+                      <button
+                        type="button"
+                        aria-pressed={trafficViewMode === "grid"}
+                        onClick={() => setTrafficViewMode("grid")}
+                        title="Table Grid View"
+                        className={`inline-flex h-5 items-center gap-1 rounded px-1.5 font-medium transition-colors ${
+                          trafficViewMode === "grid"
+                            ? "bg-selected text-fg"
+                            : "text-muted hover:text-fg"
+                        }`}
+                      >
+                        <Table2 className="h-3 w-3" aria-hidden="true" />
+                        <span>Grid</span>
+                      </button>
+                      <button
+                        type="button"
+                        aria-pressed={trafficViewMode === "waterfall"}
+                        onClick={() => setTrafficViewMode("waterfall")}
+                        title="Waterfall Timeline View"
+                        className={`inline-flex h-5 items-center gap-1 rounded px-1.5 font-medium transition-colors ${
+                          trafficViewMode === "waterfall"
+                            ? "bg-selected text-fg"
+                            : "text-muted hover:text-fg"
+                        }`}
+                      >
+                        <BarChartHorizontal
+                          className="h-3 w-3"
+                          aria-hidden="true"
+                        />
+                        <span>Waterfall</span>
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={filteredSessions.length === 0}
+                      onClick={() => openTrafficStatisticsModal("filtered")}
+                      title="Открыть сводную статистику трафика и Markdown-отчёт"
+                      className="inline-flex h-6 items-center gap-1 rounded border border-hairline bg-elevated px-2 text-[11px] font-medium text-fg transition-colors hover:border-strong hover:bg-hover disabled:cursor-not-allowed disabled:opacity-45"
+                    >
+                      <BarChart3
+                        className="h-3 w-3 text-accent"
+                        aria-hidden="true"
+                      />
+                      <span>Statistics</span>
+                    </button>
+                  </div>
                 }
               />
 
@@ -4496,6 +4801,24 @@ const AppContent: React.FC = () => {
         onNotify={showToast}
       />
 
+      <TrafficStatisticsModal
+        open={trafficStatsModalOpen}
+        onClose={() => setTrafficStatsModalOpen(false)}
+        filteredSessions={filteredSessions}
+        selectedSessions={selectedSessions}
+        totalCapturedCount={sessions.length}
+        filterQuery={filterQuery}
+        initialScope={trafficStatsInitialScope}
+        onSelectSession={(id) => {
+          setActiveSection("traffic");
+          setInlineDiffDismissed(true);
+          setSelectedId(id);
+          setInspectorCollapsed(false);
+        }}
+        onFilterByHost={handleFilterByHost}
+        onNotify={showToast}
+      />
+
       <CommandPalette
         open={paletteOpen}
         onClose={() => setPaletteOpen(false)}
@@ -4511,6 +4834,10 @@ const AppContent: React.FC = () => {
         onQuickOpenClientCerts={() =>
           openPreferencesAt("tlsCertificates", "clientCerts")
         }
+        onQuickOpenTrafficStatistics={() =>
+          openTrafficStatisticsModal("filtered")
+        }
+        onQuickOpenWaterfall={() => handleSetTrafficViewMode("waterfall")}
       />
 
       <dialog

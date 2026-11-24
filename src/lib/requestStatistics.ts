@@ -92,8 +92,16 @@ export interface WorldwidePerformanceEstimate {
   reusedConnection: boolean;
 }
 
+export type StatusBucketGroup =
+  | "2xx"
+  | "3xx"
+  | "4xx"
+  | "5xx"
+  | "Pending"
+  | "Other";
+
 export interface StatusBucket {
-  group: "2xx" | "3xx" | "4xx" | "5xx" | "Other";
+  group: StatusBucketGroup;
   label: string;
   count: number;
   percent: number;
@@ -110,9 +118,23 @@ export interface MimeBucket {
   color: string;
 }
 
+export interface HostBucket {
+  host: string;
+  count: number;
+  errorCount: number;
+  bytes: number;
+  wireBytes: number;
+  totalDurationMs: number;
+  avgDurationMs: number;
+  maxDurationMs: number;
+  percentOfRequests: number;
+  percentOfBytes: number;
+}
+
 export interface MultiSessionStatistics {
   requestCount: number;
   completedCount: number;
+  pendingCount: number;
   errorCount: number;
   reusedCount: number;
   coldCount: number;
@@ -132,14 +154,77 @@ export interface MultiSessionStatistics {
   p50LatencyMs: number;
   p95LatencyMs: number;
   p99LatencyMs: number;
+  ttfbCount: number;
   avgTtfbMs: number | null;
   p50TtfbMs: number | null;
   p95TtfbMs: number | null;
   p99TtfbMs: number | null;
   statusBuckets: StatusBucket[];
+  allStatusBuckets: StatusBucket[];
   mimeBuckets: MimeBucket[];
+  hostBuckets: HostBucket[];
   topSlowest: SessionSummary[];
   topLargest: SessionSummary[];
+}
+
+export type WaterfallPhaseKey = "dns" | "connect" | "tls" | "ttfb" | "receive";
+
+export interface WaterfallPhaseDef {
+  key: WaterfallPhaseKey;
+  summaryField: "dnsMs" | "connectMs" | "tlsMs" | "ttfbMs" | "receiveMs";
+  label: string;
+  shortLabel: string;
+  color: string;
+  description: string;
+}
+
+export interface WaterfallPhaseSegment {
+  key: WaterfallPhaseKey;
+  label: string;
+  shortLabel: string;
+  durationMs: number;
+  widthPercent: number;
+  sharePercent: number;
+  color: string;
+  description: string;
+}
+
+export interface SessionWaterfallBreakdown {
+  segments: WaterfallPhaseSegment[];
+  recordedPhaseSumMs: number;
+  totalDurationMs: number;
+  isFallback: boolean;
+  fallbackColor: string;
+  fallbackLabel: string;
+}
+
+export interface WaterfallRowTiming {
+  session: SessionSummary;
+  startMs: number;
+  offsetMs: number;
+  durationMs: number;
+  endOffsetMs: number;
+}
+
+export interface WaterfallTimelineData {
+  rows: WaterfallRowTiming[];
+  minStartMs: number;
+  maxEndMs: number;
+  totalSpanMs: number;
+  hasValidTimestamps: boolean;
+}
+
+export interface TimeRulerTick {
+  offsetMs: number;
+  label: string;
+  positionPercent: number;
+}
+
+export interface TrafficStatisticsMarkdownOptions {
+  scopeLabel?: string;
+  totalCapturedCount?: number;
+  filterQuery?: string;
+  generatedAtIso?: string;
 }
 
 export const WORLDWIDE_REGION_PROFILES: WorldwideRegionProfile[] = [
@@ -349,6 +434,52 @@ const MIME_COLORS = [
   "#64748b",
 ];
 
+/**
+ * Compact 5-phase waterfall definitions reusing Stage 34 timing semantics from `SessionSummary`.
+ */
+export const WATERFALL_PHASE_DEFS: readonly WaterfallPhaseDef[] = [
+  {
+    key: "dns",
+    summaryField: "dnsMs",
+    label: "DNS Lookup",
+    shortLabel: "DNS",
+    color: "#2dd4bf",
+    description: "Upstream hostname DNS resolution (0 ms if pooled/reused).",
+  },
+  {
+    key: "connect",
+    summaryField: "connectMs",
+    label: "TCP Connect",
+    shortLabel: "TCP",
+    color: "#f59e0b",
+    description: "TCP three-way handshake to upstream server.",
+  },
+  {
+    key: "tls",
+    summaryField: "tlsMs",
+    label: "TLS Handshake",
+    shortLabel: "TLS",
+    color: "#a855f7",
+    description: "TLS negotiation and certificate verification with upstream.",
+  },
+  {
+    key: "ttfb",
+    summaryField: "ttfbMs",
+    label: "Wait (TTFB)",
+    shortLabel: "TTFB",
+    color: "#10b981",
+    description: "Waiting for first response byte after sending request.",
+  },
+  {
+    key: "receive",
+    summaryField: "receiveMs",
+    label: "Download",
+    shortLabel: "Download",
+    color: "#3b82f6",
+    description: "Reading full response body from upstream server.",
+  },
+] as const;
+
 function isFiniteNonNeg(val: unknown): val is number {
   return typeof val === "number" && Number.isFinite(val) && val >= 0;
 }
@@ -390,6 +521,40 @@ function parseIsoEpochMsPrecise(iso: string): number {
   const padded = fracMatch[1].padEnd(6, "0").slice(0, 6);
   const microsRemainder = Number(padded.slice(3, 6));
   return Number.isFinite(microsRemainder) ? ms + microsRemainder / 1000 : ms;
+}
+
+/**
+ * Parses a `SessionSummary.timestamp` string into epoch milliseconds (or ms-of-day
+ * for legacy clock-only `HH:mm:ss.SSS` values). Returns `NaN` if unparseable.
+ */
+export function parseSessionTimestampMs(timestamp: string): number {
+  const trimmed = timestamp.trim();
+  if (!trimmed) return NaN;
+
+  const isoMs = parseIsoEpochMsPrecise(trimmed);
+  if (Number.isFinite(isoMs)) return isoMs;
+
+  const clockMatch = trimmed.match(/^(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d+))?$/);
+  if (clockMatch) {
+    const hh = Number(clockMatch[1]);
+    const mm = Number(clockMatch[2]);
+    const ss = Number(clockMatch[3]);
+    const fracRaw = clockMatch[4] ?? "";
+    const fracMs =
+      fracRaw.length > 0
+        ? Number(fracRaw.padEnd(6, "0").slice(0, 6)) / 1000
+        : 0;
+    if (
+      Number.isFinite(hh) &&
+      Number.isFinite(mm) &&
+      Number.isFinite(ss) &&
+      Number.isFinite(fracMs)
+    ) {
+      return ((hh * 3600 + mm * 60 + ss) * 1000) + fracMs;
+    }
+  }
+
+  return NaN;
 }
 
 function estimateRawHeadersBytes(
@@ -724,7 +889,10 @@ export function estimateWorldwidePerformance(
 /**
  * Computes interpolated percentile `p` (0..100) from an ascending sorted numeric array.
  */
-export function computePercentile(sortedValues: number[], p: number): number {
+export function computePercentile(
+  sortedValues: ArrayLike<number>,
+  p: number
+): number {
   if (sortedValues.length === 0) return 0;
   if (sortedValues.length === 1) return sortedValues[0];
   const clampedP = Math.max(0, Math.min(100, p));
@@ -735,6 +903,13 @@ export function computePercentile(sortedValues: number[], p: number): number {
   const weight = rank - lowerIdx;
   return (
     sortedValues[lowerIdx] * (1 - weight) + sortedValues[upperIdx] * weight
+  );
+}
+
+export function isSessionPending(session: SessionSummary): boolean {
+  return (
+    Boolean(session.breakpointPaused) ||
+    (session.status === 0 && !session.error && !session.tlsBypassed)
   );
 }
 
@@ -754,14 +929,36 @@ function classifyMimeGroup(contentType: string): string {
   return ct;
 }
 
+function insertTopK(
+  list: SessionSummary[],
+  item: SessionSummary,
+  score: (s: SessionSummary) => number,
+  k = 5
+): void {
+  const itemScore = score(item);
+  if (list.length === k && itemScore <= score(list[k - 1])) {
+    return;
+  }
+  let insertAt = list.length;
+  while (insertAt > 0 && itemScore > score(list[insertAt - 1])) {
+    insertAt -= 1;
+  }
+  list.splice(insertAt, 0, item);
+  if (list.length > k) {
+    list.pop();
+  }
+}
+
 /**
- * Aggregates Fiddler-style multi-selection KPIs, percentile latency/TTFB, status & MIME breakdowns.
+ * Aggregates Fiddler-style multi-selection or full-sample KPIs, percentile latency/TTFB,
+ * status (`2xx/3xx/4xx/5xx/Pending/Other`), MIME, host breakdowns, and Top-5 tables in a single O(N) pass.
  */
 export function aggregateSessionsStatistics(
   sessions: SessionSummary[]
 ): MultiSessionStatistics {
   const requestCount = sessions.length;
   let completedCount = 0;
+  let pendingCount = 0;
   let errorCount = 0;
   let reusedCount = 0;
   let coldCount = 0;
@@ -770,21 +967,23 @@ export function aggregateSessionsStatistics(
   let bytesReceivedDecoded = 0;
   let bytesReceivedWire = 0;
   let cumulativeDurationMs = 0;
+  let cumulativeTtfbMs = 0;
 
-  const latencies: number[] = [];
+  const latencies = new Float64Array(requestCount);
   const ttfbs: number[] = [];
 
   let minStartMs = Number.POSITIVE_INFINITY;
   let maxEndMs = Number.NEGATIVE_INFINITY;
 
   const statusAcc: Record<
-    StatusBucket["group"],
+    StatusBucketGroup,
     { count: number; bytes: number; label: string; color: string }
   > = {
     "2xx": { count: 0, bytes: 0, label: "2xx Success", color: "#10b981" },
     "3xx": { count: 0, bytes: 0, label: "3xx Redirect", color: "#f59e0b" },
     "4xx": { count: 0, bytes: 0, label: "4xx Client Err", color: "#f97316" },
     "5xx": { count: 0, bytes: 0, label: "5xx Server Err", color: "#ef4444" },
+    Pending: { count: 0, bytes: 0, label: "Pending", color: "#38bdf8" },
     Other: { count: 0, bytes: 0, label: "Other / WS / Tunnel", color: "#8b5cf6" },
   };
 
@@ -793,24 +992,48 @@ export function aggregateSessionsStatistics(
     { count: number; bytes: number; wireBytes: number }
   >();
 
-  for (const s of sessions) {
-    const dur = Math.max(0, s.durationMs);
-    latencies.push(dur);
+  const hostAcc = new Map<
+    string,
+    {
+      count: number;
+      errorCount: number;
+      bytes: number;
+      wireBytes: number;
+      totalDurationMs: number;
+      maxDurationMs: number;
+    }
+  >();
+
+  const topSlowest: SessionSummary[] = [];
+  const topLargest: SessionSummary[] = [];
+
+  for (let i = 0; i < requestCount; i += 1) {
+    const s = sessions[i];
+    const dur = Math.max(0, Number.isFinite(s.durationMs) ? s.durationMs : 0);
+    latencies[i] = dur;
     cumulativeDurationMs += dur;
 
     if (isFiniteNonNeg(s.ttfbMs)) {
       ttfbs.push(s.ttfbMs);
+      cumulativeTtfbMs += s.ttfbMs;
     }
 
-    if (s.status > 0) completedCount += 1;
-    if (s.error || s.status >= 400) errorCount += 1;
+    const pending = isSessionPending(s);
+    if (pending) {
+      pendingCount += 1;
+    } else if (s.status > 0) {
+      completedCount += 1;
+    }
+
+    const isErr = Boolean(s.error || s.status >= 400);
+    if (isErr) errorCount += 1;
 
     if (s.serverConnReused === true) reusedCount += 1;
     else if (s.serverConnReused === false) coldCount += 1;
     else unknownReuseCount += 1;
 
     const reqBytes = isFiniteNonNeg(s.requestSize) ? s.requestSize : 0;
-    const decBytes = Math.max(0, s.bodySize);
+    const decBytes = Math.max(0, Number.isFinite(s.bodySize) ? s.bodySize : 0);
     const wireBytes = isFiniteNonNeg(s.wireBodySize)
       ? s.wireBodySize
       : decBytes;
@@ -819,14 +1042,15 @@ export function aggregateSessionsStatistics(
     bytesReceivedDecoded += decBytes;
     bytesReceivedWire += wireBytes;
 
-    const parsedStart = Date.parse(s.timestamp);
+    const parsedStart = parseSessionTimestampMs(s.timestamp);
     if (Number.isFinite(parsedStart)) {
       if (parsedStart < minStartMs) minStartMs = parsedStart;
       if (parsedStart + dur > maxEndMs) maxEndMs = parsedStart + dur;
     }
 
-    const bucketKey: StatusBucket["group"] =
-      s.status >= 200 && s.status < 300
+    const bucketKey: StatusBucketGroup = pending
+      ? "Pending"
+      : s.status >= 200 && s.status < 300
         ? "2xx"
         : s.status >= 300 && s.status < 400
           ? "3xx"
@@ -839,29 +1063,55 @@ export function aggregateSessionsStatistics(
     statusAcc[bucketKey].bytes += wireBytes;
 
     const mimeGroup = classifyMimeGroup(s.contentType);
-    const existing = mimeAcc.get(mimeGroup) ?? { count: 0, bytes: 0, wireBytes: 0 };
-    existing.count += 1;
-    existing.bytes += decBytes;
-    existing.wireBytes += wireBytes;
-    mimeAcc.set(mimeGroup, existing);
+    const existingMime = mimeAcc.get(mimeGroup);
+    if (existingMime) {
+      existingMime.count += 1;
+      existingMime.bytes += decBytes;
+      existingMime.wireBytes += wireBytes;
+    } else {
+      mimeAcc.set(mimeGroup, { count: 1, bytes: decBytes, wireBytes });
+    }
+
+    const hostKey = s.host.trim() || "(unknown)";
+    const existingHost = hostAcc.get(hostKey);
+    if (existingHost) {
+      existingHost.count += 1;
+      if (isErr) existingHost.errorCount += 1;
+      existingHost.bytes += decBytes;
+      existingHost.wireBytes += wireBytes;
+      existingHost.totalDurationMs += dur;
+      if (dur > existingHost.maxDurationMs) existingHost.maxDurationMs = dur;
+    } else {
+      hostAcc.set(hostKey, {
+        count: 1,
+        errorCount: isErr ? 1 : 0,
+        bytes: decBytes,
+        wireBytes,
+        totalDurationMs: dur,
+        maxDurationMs: dur,
+      });
+    }
+
+    insertTopK(topSlowest, s, (x) => x.durationMs, 5);
+    insertTopK(topLargest, s, (x) => x.bodySize, 5);
   }
 
-  latencies.sort((a, b) => a - b);
-  ttfbs.sort((a, b) => a - b);
+  latencies.sort();
+  const sortedTtfbs = Float64Array.from(ttfbs);
+  sortedTtfbs.sort();
 
   const avgLatencyMs =
-    latencies.length > 0 ? cumulativeDurationMs / latencies.length : 0;
-  const minLatencyMs = latencies.length > 0 ? latencies[0] : 0;
-  const maxLatencyMs =
-    latencies.length > 0 ? latencies[latencies.length - 1] : 0;
+    requestCount > 0 ? cumulativeDurationMs / requestCount : 0;
+  const minLatencyMs = requestCount > 0 ? latencies[0] : 0;
+  const maxLatencyMs = requestCount > 0 ? latencies[requestCount - 1] : 0;
 
   const avgTtfbMs =
-    ttfbs.length > 0
-      ? ttfbs.reduce((a, b) => a + b, 0) / ttfbs.length
-      : null;
+    sortedTtfbs.length > 0 ? cumulativeTtfbMs / sortedTtfbs.length : null;
 
   const overallWallElapsedMs =
-    Number.isFinite(minStartMs) && Number.isFinite(maxEndMs) && maxEndMs >= minStartMs
+    Number.isFinite(minStartMs) &&
+    Number.isFinite(maxEndMs) &&
+    maxEndMs >= minStartMs
       ? maxEndMs - minStartMs
       : cumulativeDurationMs;
 
@@ -878,23 +1128,32 @@ export function aggregateSessionsStatistics(
   const reuseRatePercent =
     knownReuseTotal > 0 ? (reusedCount / knownReuseTotal) * 100 : null;
 
-  const statusBuckets: StatusBucket[] = (
-    Object.keys(statusAcc) as StatusBucket["group"][]
-  )
-    .filter((k) => statusAcc[k].count > 0)
-    .map((group) => ({
-      group,
-      label: statusAcc[group].label,
-      count: statusAcc[group].count,
-      percent: requestCount > 0 ? (statusAcc[group].count / requestCount) * 100 : 0,
-      bytes: statusAcc[group].bytes,
-      color: statusAcc[group].color,
-    }));
+  const statusOrder: StatusBucketGroup[] = [
+    "2xx",
+    "3xx",
+    "4xx",
+    "5xx",
+    "Pending",
+    "Other",
+  ];
+  const makeStatusBucket = (group: StatusBucketGroup): StatusBucket => ({
+    group,
+    label: statusAcc[group].label,
+    count: statusAcc[group].count,
+    percent: requestCount > 0 ? (statusAcc[group].count / requestCount) * 100 : 0,
+    bytes: statusAcc[group].bytes,
+    color: statusAcc[group].color,
+  });
 
-  const mimeTotalBytes = Array.from(mimeAcc.values()).reduce(
-    (acc, v) => acc + v.wireBytes,
-    0
-  );
+  const statusBuckets: StatusBucket[] = statusOrder
+    .filter((k) => statusAcc[k].count > 0)
+    .map(makeStatusBucket);
+
+  const allStatusBuckets: StatusBucket[] = statusOrder
+    .filter((k) => k !== "Other" || statusAcc[k].count > 0)
+    .map(makeStatusBucket);
+
+  const mimeTotalBytes = bytesReceivedWire;
   const mimeBuckets: MimeBucket[] = Array.from(mimeAcc.entries())
     .sort((a, b) => b[1].wireBytes - a[1].wireBytes || b[1].count - a[1].count)
     .map(([mimeGroup, val], idx) => ({
@@ -907,16 +1166,31 @@ export function aggregateSessionsStatistics(
       color: MIME_COLORS[idx % MIME_COLORS.length],
     }));
 
-  const topSlowest = [...sessions]
-    .sort((a, b) => b.durationMs - a.durationMs)
-    .slice(0, 5);
-  const topLargest = [...sessions]
-    .sort((a, b) => b.bodySize - a.bodySize)
-    .slice(0, 5);
+  const hostBuckets: HostBucket[] = Array.from(hostAcc.entries())
+    .sort(
+      (a, b) =>
+        b[1].count - a[1].count ||
+        b[1].wireBytes - a[1].wireBytes ||
+        a[0].localeCompare(b[0])
+    )
+    .map(([host, val]) => ({
+      host,
+      count: val.count,
+      errorCount: val.errorCount,
+      bytes: val.bytes,
+      wireBytes: val.wireBytes,
+      totalDurationMs: val.totalDurationMs,
+      avgDurationMs: val.count > 0 ? val.totalDurationMs / val.count : 0,
+      maxDurationMs: val.maxDurationMs,
+      percentOfRequests: requestCount > 0 ? (val.count / requestCount) * 100 : 0,
+      percentOfBytes:
+        bytesReceivedWire > 0 ? (val.wireBytes / bytesReceivedWire) * 100 : 0,
+    }));
 
   return {
     requestCount,
     completedCount,
+    pendingCount,
     errorCount,
     reusedCount,
     coldCount,
@@ -936,15 +1210,290 @@ export function aggregateSessionsStatistics(
     p50LatencyMs: computePercentile(latencies, 50),
     p95LatencyMs: computePercentile(latencies, 95),
     p99LatencyMs: computePercentile(latencies, 99),
+    ttfbCount: sortedTtfbs.length,
     avgTtfbMs,
-    p50TtfbMs: ttfbs.length > 0 ? computePercentile(ttfbs, 50) : null,
-    p95TtfbMs: ttfbs.length > 0 ? computePercentile(ttfbs, 95) : null,
-    p99TtfbMs: ttfbs.length > 0 ? computePercentile(ttfbs, 99) : null,
+    p50TtfbMs:
+      sortedTtfbs.length > 0 ? computePercentile(sortedTtfbs, 50) : null,
+    p95TtfbMs:
+      sortedTtfbs.length > 0 ? computePercentile(sortedTtfbs, 95) : null,
+    p99TtfbMs:
+      sortedTtfbs.length > 0 ? computePercentile(sortedTtfbs, 99) : null,
     statusBuckets,
+    allStatusBuckets,
     mimeBuckets,
+    hostBuckets,
     topSlowest,
     topLargest,
   };
+}
+
+function resolveWaterfallFallbackStyle(session: SessionSummary): {
+  color: string;
+  label: string;
+} {
+  if (isSessionPending(session)) {
+    return {
+      color: "#38bdf8",
+      label: session.breakpointPaused ? "Paused (Breakpoint)" : "Pending",
+    };
+  }
+  if (session.error || session.status >= 500) {
+    return {
+      color: "#ef4444",
+      label: session.status >= 500 ? `${session.status} Server Error` : "Transport Error",
+    };
+  }
+  if (session.status >= 400) {
+    return { color: "#f97316", label: `${session.status} Client Error` };
+  }
+  if (session.status >= 300) {
+    return { color: "#f59e0b", label: `${session.status} Redirect` };
+  }
+  const scheme = session.scheme.toLowerCase();
+  if (session.status === 101 || scheme === "ws" || scheme === "wss") {
+    return { color: "#8b5cf6", label: "WebSocket" };
+  }
+  const ct = session.contentType.toLowerCase();
+  if (ct.includes("text/event-stream")) {
+    return { color: "#14b8a6", label: "SSE Stream" };
+  }
+  if (
+    ct.includes("json") ||
+    ct.includes("graphql") ||
+    ct.includes("grpc") ||
+    ct.includes("protobuf")
+  ) {
+    return { color: "#3b82f6", label: "API / JSON" };
+  }
+  if (ct.includes("javascript") || ct.includes("ecmascript")) {
+    return { color: "#eab308", label: "JavaScript" };
+  }
+  if (ct.includes("text/css")) {
+    return { color: "#6366f1", label: "CSS" };
+  }
+  if (ct.includes("text/html")) {
+    return { color: "#06b6d4", label: "HTML" };
+  }
+  if (ct.startsWith("image/")) {
+    return { color: "#ec4899", label: "Image" };
+  }
+  if (ct.startsWith("font/") || ct.includes("woff")) {
+    return { color: "#a855f7", label: "Font" };
+  }
+  return {
+    color: "#10b981",
+    label: session.status >= 200 ? `${session.status} OK` : "HTTP",
+  };
+}
+
+/**
+ * Resolves compact `SessionSummary` timing fields (`dnsMs`, `connectMs`, `tlsMs`,
+ * `ttfbMs`, `receiveMs`) into stacked Waterfall Timeline segments, falling back
+ * to a single semantic status/MIME bar when per-phase data is absent.
+ */
+export function buildSessionWaterfallPhases(
+  session: SessionSummary
+): SessionWaterfallBreakdown {
+  const totalDurationMs = Math.max(
+    0,
+    Number.isFinite(session.durationMs) ? session.durationMs : 0
+  );
+  const fallback = resolveWaterfallFallbackStyle(session);
+
+  let hasAnyPhaseField = false;
+  let recordedPhaseSumMs = 0;
+  const rawSegments: {
+    def: WaterfallPhaseDef;
+    durationMs: number;
+  }[] = [];
+
+  for (const def of WATERFALL_PHASE_DEFS) {
+    const val = session[def.summaryField];
+    if (isFiniteNonNeg(val)) {
+      hasAnyPhaseField = true;
+      recordedPhaseSumMs += val;
+      if (val > 0) {
+        rawSegments.push({ def, durationMs: val });
+      }
+    }
+  }
+
+  if (!hasAnyPhaseField || rawSegments.length === 0) {
+    return {
+      segments: [],
+      recordedPhaseSumMs: 0,
+      totalDurationMs,
+      isFallback: true,
+      fallbackColor: fallback.color,
+      fallbackLabel: fallback.label,
+    };
+  }
+
+  const scaleBase = Math.max(totalDurationMs, recordedPhaseSumMs, 0.001);
+  const segments: WaterfallPhaseSegment[] = rawSegments.map(
+    ({ def, durationMs }) => ({
+      key: def.key,
+      label: def.label,
+      shortLabel: def.shortLabel,
+      durationMs,
+      widthPercent: (durationMs / scaleBase) * 100,
+      sharePercent:
+        recordedPhaseSumMs > 0 ? (durationMs / recordedPhaseSumMs) * 100 : 0,
+      color: def.color,
+      description: def.description,
+    })
+  );
+
+  return {
+    segments,
+    recordedPhaseSumMs,
+    totalDurationMs,
+    isFallback: false,
+    fallbackColor: fallback.color,
+    fallbackLabel: fallback.label,
+  };
+}
+
+/**
+ * Computes relative Waterfall Timeline offsets (`offsetMs = startMs - minStartMs`)
+ * across a session list in O(N) time.
+ */
+export function buildWaterfallTimelineData(
+  sessions: SessionSummary[]
+): WaterfallTimelineData {
+  const count = sessions.length;
+  if (count === 0) {
+    return {
+      rows: [],
+      minStartMs: 0,
+      maxEndMs: 0,
+      totalSpanMs: 1,
+      hasValidTimestamps: false,
+    };
+  }
+
+  const parsedStarts = new Float64Array(count);
+  let minStartMs = Number.POSITIVE_INFINITY;
+  let maxEndMs = Number.NEGATIVE_INFINITY;
+  let hasValidTimestamps = false;
+
+  for (let i = 0; i < count; i += 1) {
+    const s = sessions[i];
+    const dur = Math.max(0, Number.isFinite(s.durationMs) ? s.durationMs : 0);
+    const startMs = parseSessionTimestampMs(s.timestamp);
+    parsedStarts[i] = startMs;
+    if (Number.isFinite(startMs)) {
+      hasValidTimestamps = true;
+      if (startMs < minStartMs) minStartMs = startMs;
+      if (startMs + dur > maxEndMs) maxEndMs = startMs + dur;
+    }
+  }
+
+  if (!hasValidTimestamps) {
+    let maxDur = 1;
+    const rows: WaterfallRowTiming[] = new Array(count);
+    for (let i = 0; i < count; i += 1) {
+      const s = sessions[i];
+      const dur = Math.max(0, Number.isFinite(s.durationMs) ? s.durationMs : 0);
+      if (dur > maxDur) maxDur = dur;
+      rows[i] = {
+        session: s,
+        startMs: 0,
+        offsetMs: 0,
+        durationMs: dur,
+        endOffsetMs: dur,
+      };
+    }
+    return {
+      rows,
+      minStartMs: 0,
+      maxEndMs: maxDur,
+      totalSpanMs: Math.max(1, maxDur),
+      hasValidTimestamps: false,
+    };
+  }
+
+  const rows: WaterfallRowTiming[] = new Array(count);
+  for (let i = 0; i < count; i += 1) {
+    const s = sessions[i];
+    const dur = Math.max(0, Number.isFinite(s.durationMs) ? s.durationMs : 0);
+    const rawStart = parsedStarts[i];
+    const effectiveStart = Number.isFinite(rawStart) ? rawStart : minStartMs;
+    const offsetMs = Math.max(0, effectiveStart - minStartMs);
+    const endOffsetMs = offsetMs + dur;
+    if (minStartMs + endOffsetMs > maxEndMs) {
+      maxEndMs = minStartMs + endOffsetMs;
+    }
+    rows[i] = {
+      session: s,
+      startMs: effectiveStart,
+      offsetMs,
+      durationMs: dur,
+      endOffsetMs,
+    };
+  }
+
+  return {
+    rows,
+    minStartMs,
+    maxEndMs,
+    totalSpanMs: Math.max(1, maxEndMs - minStartMs),
+    hasValidTimestamps: true,
+  };
+}
+
+export function formatRulerOffset(offsetMs: number): string {
+  if (!Number.isFinite(offsetMs) || offsetMs <= 0) return "0 ms";
+  if (offsetMs < 1000) {
+    return offsetMs < 10 && offsetMs % 1 !== 0
+      ? `${offsetMs.toFixed(1)} ms`
+      : `${Math.round(offsetMs)} ms`;
+  }
+  if (offsetMs < 60_000) {
+    const secs = offsetMs / 1000;
+    return secs >= 10 && Number.isInteger(secs)
+      ? `${secs.toFixed(0)} s`
+      : `${secs.toFixed(secs < 10 ? 2 : 1)} s`;
+  }
+  const totalSecs = Math.round(offsetMs / 1000);
+  const mins = Math.floor(totalSecs / 60);
+  const remSecs = totalSecs % 60;
+  return remSecs === 0 ? `${mins}m` : `${mins}m ${remSecs}s`;
+}
+
+/**
+ * Generates non-overlapping "nice" millisecond/second tick positions for a Waterfall ruler.
+ */
+export function computeTimeRulerTicks(
+  totalSpanMs: number,
+  trackWidthPx: number
+): TimeRulerTick[] {
+  const safeSpan = Math.max(1, Number.isFinite(totalSpanMs) ? totalSpanMs : 1);
+  const safeWidth = Math.max(120, Number.isFinite(trackWidthPx) ? trackWidthPx : 600);
+  const targetCount = Math.max(2, Math.min(30, Math.floor(safeWidth / 110)));
+  const rawStep = safeSpan / targetCount;
+
+  const niceSteps = [
+    1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1_000, 2_000, 5_000, 10_000,
+    15_000, 30_000, 60_000, 120_000, 300_000, 600_000, 1_800_000, 3_600_000,
+  ];
+  let step = niceSteps.find((candidate) => candidate >= rawStep);
+  if (!step) {
+    const pow10 = Math.pow(10, Math.floor(Math.log10(rawStep)));
+    const mult = rawStep / pow10;
+    step = (mult <= 1 ? 1 : mult <= 2 ? 2 : mult <= 5 ? 5 : 10) * pow10;
+  }
+
+  const ticks: TimeRulerTick[] = [];
+  for (let ms = 0; ms <= safeSpan; ms += step) {
+    ticks.push({
+      offsetMs: ms,
+      label: formatRulerOffset(ms),
+      positionPercent: (ms / safeSpan) * 100,
+    });
+    if (ticks.length > 64) break;
+  }
+  return ticks;
 }
 
 /**
@@ -1112,6 +1661,151 @@ export function formatStatisticsMarkdown(
         `| ${p.label} | ${formatMsPrecise(p.durationMs)} | ${p.percent.toFixed(1)}% |`
     ),
   ];
+
+  return lines.join("\n");
+}
+
+function escapeMdTableCell(value: string): string {
+  return value
+    .replace(/\r?\n/g, " ")
+    .replace(/\|/g, "\\|")
+    .replace(/`/g, "\\`");
+}
+
+/**
+ * Generates a comprehensive GitHub-flavored Markdown report from pre-aggregated
+ * `MultiSessionStatistics` (reusing Stage 34 metrics without recomputing on 10,000+ rows).
+ */
+export function formatTrafficStatisticsMarkdown(
+  stats: MultiSessionStatistics,
+  options?: TrafficStatisticsMarkdownOptions
+): string {
+  const scopeLabel = options?.scopeLabel ?? "Filtered Sample";
+  const countPart =
+    typeof options?.totalCapturedCount === "number" &&
+    options.totalCapturedCount !== stats.requestCount
+      ? `${stats.requestCount.toLocaleString("en-US")} of ${options.totalCapturedCount.toLocaleString("en-US")} sessions`
+      : `${stats.requestCount.toLocaleString("en-US")} sessions`;
+
+  const lines: string[] = [
+    `# FluxProxy Traffic Statistics Report`,
+    "",
+    `- **Scope**: ${scopeLabel} (${countPart})`,
+  ];
+
+  if (options?.filterQuery?.trim()) {
+    lines.push(
+      `- **Active Filter**: \`${escapeMdTableCell(options.filterQuery.trim())}\``
+    );
+  }
+  if (options?.generatedAtIso) {
+    lines.push(`- **Generated At**: \`${options.generatedAtIso}\``);
+  }
+
+  if (stats.requestCount === 0) {
+    lines.push("", "_No captured sessions in this selection._");
+    return lines.join("\n");
+  }
+
+  const errorPct = ((stats.errorCount / stats.requestCount) * 100).toFixed(1);
+  const pendingPct = ((stats.pendingCount / stats.requestCount) * 100).toFixed(1);
+
+  lines.push(
+    "",
+    "## Summary Metrics",
+    "",
+    "| Metric | Value |",
+    "| --- | --- |",
+    `| Total Sessions | ${stats.requestCount.toLocaleString("en-US")} (${stats.completedCount.toLocaleString("en-US")} completed, ${stats.pendingCount.toLocaleString("en-US")} pending (${pendingPct}%), ${stats.errorCount.toLocaleString("en-US")} errors (${errorPct}%)) |`,
+    `| Overall Wall Elapsed | ${formatDuration(Math.round(stats.overallWallElapsedMs))} (cumulative: ${formatDuration(Math.round(stats.cumulativeDurationMs))}) |`,
+    `| Decoded Body Size | ${formatBytes(stats.bytesReceivedDecoded)} (${stats.bytesReceivedDecoded.toLocaleString("en-US")} B) |`,
+    `| Wire Body Size | ${formatBytes(stats.bytesReceivedWire)} (${stats.bytesReceivedWire.toLocaleString("en-US")} B)${stats.compressionSavedBytes > 0 ? ` — saved ${formatBytes(stats.compressionSavedBytes)} (${stats.compressionSavingsPercent.toFixed(1)}%)` : ""} |`,
+    `| Request Bytes Sent | ${formatBytes(stats.bytesSent)} (${stats.bytesSent.toLocaleString("en-US")} B) |`,
+    `| Duration (Avg / Median / P95 / P99) | ${formatMsPrecise(stats.avgLatencyMs)} / ${formatMsPrecise(stats.p50LatencyMs)} / ${formatMsPrecise(stats.p95LatencyMs)} / ${formatMsPrecise(stats.p99LatencyMs)} |`,
+    `| Duration (Min / Max) | ${formatMsPrecise(stats.minLatencyMs)} / ${formatMsPrecise(stats.maxLatencyMs)} |`
+  );
+
+  if (stats.avgTtfbMs !== null) {
+    lines.push(
+      `| TTFB (Avg / Median / P95 / P99) | ${formatMsPrecise(stats.avgTtfbMs)} / ${formatMsPrecise(stats.p50TtfbMs)} / ${formatMsPrecise(stats.p95TtfbMs)} / ${formatMsPrecise(stats.p99TtfbMs)} (${stats.ttfbCount.toLocaleString("en-US")}/${stats.requestCount.toLocaleString("en-US")}) |`
+    );
+  }
+
+  if (stats.reuseRatePercent !== null) {
+    lines.push(
+      `| Connection Reuse | ${stats.reusedCount.toLocaleString("en-US")}/${(stats.reusedCount + stats.coldCount).toLocaleString("en-US")} (${stats.reuseRatePercent.toFixed(1)}%) |`
+    );
+  }
+
+  lines.push(
+    "",
+    "## Status Code Distribution",
+    "",
+    "| Status Group | Count | Share | Wire Bytes |",
+    "| --- | ---: | ---: | ---: |",
+    ...stats.allStatusBuckets.map(
+      (b) =>
+        `| ${b.label} | ${b.count.toLocaleString("en-US")} | ${b.percent.toFixed(1)}% | ${formatBytes(b.bytes)} |`
+    )
+  );
+
+  if (stats.mimeBuckets.length > 0) {
+    const topMimes = stats.mimeBuckets.slice(0, 10);
+    lines.push(
+      "",
+      "## Breakdown by Content-Type",
+      "",
+      "| Content-Type | Requests | Decoded Size | Wire Size | Wire Share |",
+      "| --- | ---: | ---: | ---: | ---: |",
+      ...topMimes.map(
+        (m) =>
+          `| \`${escapeMdTableCell(m.mimeGroup)}\` | ${m.count.toLocaleString("en-US")} | ${formatBytes(m.bytes)} | ${formatBytes(m.wireBytes)} | ${m.percentOfBytes.toFixed(1)}% |`
+      )
+    );
+  }
+
+  if (stats.hostBuckets.length > 0) {
+    const topHosts = stats.hostBuckets.slice(0, 10);
+    lines.push(
+      "",
+      `## Breakdown by Host (${stats.hostBuckets.length.toLocaleString("en-US")} unique)`,
+      "",
+      "| Host | Requests | Share | Errors | Wire Size | Avg Duration |",
+      "| --- | ---: | ---: | ---: | ---: | ---: |",
+      ...topHosts.map(
+        (h) =>
+          `| \`${escapeMdTableCell(h.host)}\` | ${h.count.toLocaleString("en-US")} | ${h.percentOfRequests.toFixed(1)}% | ${h.errorCount.toLocaleString("en-US")} | ${formatBytes(h.wireBytes)} | ${formatMsPrecise(h.avgDurationMs)} |`
+      )
+    );
+  }
+
+  if (stats.topSlowest.length > 0) {
+    lines.push(
+      "",
+      "## Top 5 Slowest URLs",
+      "",
+      "| # | Method | Status | URL | Duration | TTFB |",
+      "| --- | --- | ---: | --- | ---: | ---: |",
+      ...stats.topSlowest.map(
+        (s) =>
+          `| #${s.id} | ${escapeMdTableCell(s.method)} | ${s.status || "Pending"} | \`${escapeMdTableCell(`${s.host}${s.path}`)}\` | ${formatDuration(s.durationMs)} | ${isFiniteNonNeg(s.ttfbMs) ? formatMsPrecise(s.ttfbMs) : "—"} |`
+      )
+    );
+  }
+
+  if (stats.topLargest.length > 0) {
+    lines.push(
+      "",
+      "## Top 5 Heaviest URLs",
+      "",
+      "| # | Method | Status | URL | Decoded Size | Wire Size |",
+      "| --- | --- | ---: | --- | ---: | ---: |",
+      ...stats.topLargest.map((s) => {
+        const wire = isFiniteNonNeg(s.wireBodySize) ? s.wireBodySize : s.bodySize;
+        return `| #${s.id} | ${escapeMdTableCell(s.method)} | ${s.status || "Pending"} | \`${escapeMdTableCell(`${s.host}${s.path}`)}\` | ${formatBytes(s.bodySize)} | ${formatBytes(wire)} |`;
+      })
+    );
+  }
 
   return lines.join("\n");
 }

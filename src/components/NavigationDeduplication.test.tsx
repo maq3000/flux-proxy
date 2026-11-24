@@ -319,6 +319,9 @@ describe("Stage 38 Navigation & Panel Deduplication", () => {
         onResetColumns={vi.fn()}
         onResetPanelLayout={vi.fn()}
         onOpenThemeGallery={vi.fn()}
+        trafficViewMode="grid"
+        onSetTrafficViewMode={vi.fn()}
+        onOpenTrafficStatistics={vi.fn()}
         sessionRetentionLimit={10_000}
         onSetSessionRetentionLimit={vi.fn()}
         onOpenCustomRetentionLimit={vi.fn()}
@@ -354,6 +357,9 @@ describe("Stage 38 Navigation & Panel Deduplication", () => {
     expect(screen.getByText("Code Generator")).toBeTruthy();
     expect(screen.getByText("Root CA")).toBeTruthy();
     expect(screen.getByText("Shortcuts")).toBeTruthy();
+    expect(screen.getByText("Traffic View: Waterfall Timeline")).toBeTruthy();
+    expect(screen.getByText("Traffic Statistics Summary…")).toBeTruthy();
+    expect(screen.getByText("Traffic Statistics Report…")).toBeTruthy();
   });
 
   it("SessionInspector removes the duplicate top summary bar Wizard button", () => {

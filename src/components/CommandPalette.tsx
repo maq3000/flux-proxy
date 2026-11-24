@@ -192,6 +192,8 @@ interface CommandPaletteProps {
   onQuickOpenSanitizedExport?: () => void;
   onQuickOpenProxyDoctor?: () => void;
   onQuickOpenClientCerts?: () => void;
+  onQuickOpenTrafficStatistics?: () => void;
+  onQuickOpenWaterfall?: () => void;
 }
 
 export const CommandPalette: React.FC<CommandPaletteProps> = ({
@@ -203,6 +205,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   onQuickOpenSanitizedExport,
   onQuickOpenProxyDoctor,
   onQuickOpenClientCerts,
+  onQuickOpenTrafficStatistics,
+  onQuickOpenWaterfall,
 }) => {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -348,6 +352,43 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       });
     }
 
+    if (
+      onQuickOpenTrafficStatistics &&
+      (q === "stats" ||
+        q.startsWith("stats ") ||
+        q === "statistics" ||
+        q === "report")
+    ) {
+      items.push({
+        id: "quickexec-traffic-statistics",
+        category: "Traffic",
+        group: "quickexec",
+        label: "Traffic Statistics — сводная статистика и Markdown-отчёт",
+        description:
+          "2xx–5xx/Pending, объём wire/decoded, Avg/Median/P95 Latency и TTFB, MIME, хосты, топ-5 URL",
+        statusBadge: "Report",
+        shortcut: "Enter",
+        perform: () => onQuickOpenTrafficStatistics(),
+      });
+    }
+
+    if (
+      onQuickOpenWaterfall &&
+      (q === "waterfall" || q.startsWith("waterfall ") || q === "timeline")
+    ) {
+      items.push({
+        id: "quickexec-waterfall-timeline",
+        category: "View",
+        group: "quickexec",
+        label: "Waterfall Timeline — многофазная каскадная диаграмма",
+        description:
+          "Переключить Traffic на виртуализированный таймлайн с фазами DNS / TCP / TLS / TTFB / Download",
+        statusBadge: "Waterfall",
+        shortcut: "Enter",
+        perform: () => onQuickOpenWaterfall(),
+      });
+    }
+
     return items;
   }, [
     query,
@@ -356,6 +397,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     onQuickOpenSanitizedExport,
     onQuickOpenProxyDoctor,
     onQuickOpenClientCerts,
+    onQuickOpenTrafficStatistics,
+    onQuickOpenWaterfall,
   ]);
 
   const matchedStatic = useMemo(() => {

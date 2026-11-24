@@ -115,6 +115,7 @@ describe("contextMenuBuilders across all application zones", () => {
       onCompareWithSession: vi.fn(),
       onOpenDiffModal: vi.fn(),
       onOpenStatistics: vi.fn(),
+      onOpenTrafficStatistics: vi.fn(),
       onCopyUrl: vi.fn(),
       onCopyCurl: vi.fn(),
       onGenerateClientCode: vi.fn(),
@@ -142,6 +143,7 @@ describe("contextMenuBuilders across all application zones", () => {
     const composerItem = flat.find((i) => i.id === "row-composer");
     expect(composerItem && composerItem.type !== "separator" && composerItem.type !== "header" && composerItem.type !== "submenu" ? composerItem.shortcut : null).toBe("E");
     expect(labels).toContain("Открыть Statistics");
+    expect(labels).toContain("Traffic Statistics Report (Sample)…");
     expect(labels).toContain("Copy as cURL");
     expect(labels).toContain("Save Selected as HAR (.har)");
     expect(labels).toContain("Save Selected as Fiddler SAZ (.saz)");
@@ -190,6 +192,8 @@ describe("contextMenuBuilders across all application zones", () => {
       followTail: true,
       hasActiveFilters: true,
       onSelectAllVisible: vi.fn(),
+      onOpenTrafficStatistics: vi.fn(),
+      onToggleWaterfallView: vi.fn(),
       onToggleCapture: vi.fn(),
       onToggleFollowTail: vi.fn(),
       onImportArchive: vi.fn(),
@@ -200,6 +204,8 @@ describe("contextMenuBuilders across all application zones", () => {
     });
     const emptyLabels = getLabels(emptyItems);
     expect(emptyLabels).toContain("Select All Visible Sessions");
+    expect(emptyLabels).toContain("Traffic Statistics Report…");
+    expect(emptyLabels).toContain("Switch to Waterfall Timeline");
     expect(emptyLabels).toContain("Pause Capture");
     expect(emptyLabels).toContain("Follow Tail (Auto-Scroll)");
     expect(emptyLabels).toContain("Import Archive…");

@@ -2,14 +2,19 @@ import { describe, expect, it } from "vitest";
 import {
   aggregateSessionsStatistics,
   buildFiddlerTimestampRows,
+  buildSessionWaterfallPhases,
+  buildWaterfallTimelineData,
   computePercentile,
+  computeTimeRulerTicks,
   computeTransferMetrics,
   estimateWorldwidePerformance,
   formatFiddlerClock,
   formatFiddlerStatisticsText,
   formatStatisticsMarkdown,
   formatTimeCellTooltip,
+  formatTrafficStatisticsMarkdown,
   normalizeTimingPhases,
+  parseSessionTimestampMs,
 } from "./requestStatistics";
 import type { SessionDetail, SessionSummary } from "../types/proxy";
 
@@ -318,5 +323,108 @@ describe("requestStatistics", () => {
     const proxiedTxt = formatFiddlerStatisticsText(proxiedDetail);
     expect(proxiedTxt).toContain("via 10.0.0.2:8080");
     expect(proxiedTxt).toContain("Upstream Proxy:       HTTP 10.0.0.2:8080");
+  });
+
+  it("parses ISO/clock timestamps and builds Waterfall timeline offsets, multi-phase segments, fallback bars, and ruler ticks", () => {
+    expect(parseSessionTimestampMs("2026-11-24T12:00:00.250Z")).toBe(
+      Date.parse("2026-11-24T12:00:00.250Z")
+    );
+    expect(parseSessionTimestampMs("12:00:00.500")).toBe(
+      12 * 3600 * 1000 + 500
+    );
+    expect(Number.isNaN(parseSessionTimestampMs("invalid-ts"))).toBe(true);
+
+    const s1 = makeSampleDetail({ reused: false }).summary;
+    const s2: SessionSummary = {
+      ...s1,
+      id: 43,
+      status: 500,
+      timestamp: "2026-11-22T12:00:00.400Z",
+      durationMs: 200,
+      dnsMs: null,
+      connectMs: null,
+      tlsMs: null,
+      ttfbMs: null,
+      receiveMs: null,
+    };
+
+    const wf1 = buildSessionWaterfallPhases(s1);
+    expect(wf1.isFallback).toBe(false);
+    expect(wf1.segments.map((seg) => seg.key)).toEqual([
+      "dns",
+      "connect",
+      "tls",
+      "ttfb",
+      "receive",
+    ]);
+
+    const wf2 = buildSessionWaterfallPhases(s2);
+    expect(wf2.isFallback).toBe(true);
+    expect(wf2.segments).toHaveLength(0);
+    expect(wf2.fallbackLabel).toContain("500");
+
+    const timeline = buildWaterfallTimelineData([s1, s2]);
+    expect(timeline.hasValidTimestamps).toBe(true);
+    expect(timeline.rows[0].offsetMs).toBe(0);
+    expect(timeline.rows[1].offsetMs).toBeCloseTo(300, 1);
+    expect(timeline.totalSpanMs).toBeCloseTo(500, 1);
+
+    const ticks = computeTimeRulerTicks(timeline.totalSpanMs, 660);
+    expect(ticks.length).toBeGreaterThanOrEqual(2);
+    expect(ticks[0].offsetMs).toBe(0);
+    expect(ticks[0].label).toBe("0 ms");
+  });
+
+  it("aggregates Pending status, hostBuckets, and 10,000+ sessions in O(N) and generates full Markdown reports", () => {
+    const baseMs = Date.parse("2026-11-24T09:00:00.000Z");
+    const sessions: SessionSummary[] = Array.from({ length: 10_000 }, (_, i) => ({
+      id: i + 1,
+      status: i === 9_999 ? 0 : i % 20 === 0 ? 500 : i % 10 === 0 ? 404 : 200,
+      protocol: "HTTPS/2",
+      scheme: "https",
+      method: i % 3 === 0 ? "POST" : "GET",
+      host: i % 2 === 0 ? "api.fluxproxy.dev" : "cdn.fluxproxy.dev",
+      path: `/v1/resource/${i}`,
+      url: `https://${i % 2 === 0 ? "api.fluxproxy.dev" : "cdn.fluxproxy.dev"}/v1/resource/${i}`,
+      contentType: i % 2 === 0 ? "application/json" : "image/webp",
+      bodySize: (i + 1) * 10,
+      wireBodySize: (i + 1) * 5,
+      requestSize: 200,
+      durationMs: (i % 500) + 1,
+      ttfbMs: i === 9_999 ? null : (i % 200) + 1,
+      serverConnReused: i % 4 !== 0,
+      timestamp: new Date(baseMs + i * 2).toISOString(),
+      isMocked: false,
+    }));
+
+    const agg = aggregateSessionsStatistics(sessions);
+    expect(agg.requestCount).toBe(10_000);
+    expect(agg.pendingCount).toBe(1);
+    expect(agg.ttfbCount).toBe(9_999);
+    expect(agg.allStatusBuckets.map((b) => b.group)).toEqual([
+      "2xx",
+      "3xx",
+      "4xx",
+      "5xx",
+      "Pending",
+    ]);
+    expect(agg.hostBuckets).toHaveLength(2);
+    expect(agg.hostBuckets[0].count).toBe(5_000);
+    expect(agg.topLargest[0].id).toBe(10_000);
+    expect(agg.topSlowest).toHaveLength(5);
+    expect(agg.topSlowest[0].durationMs).toBe(500);
+
+    const report = formatTrafficStatisticsMarkdown(agg, {
+      scopeLabel: "Filtered Sample",
+      totalCapturedCount: 10_000,
+      filterQuery: "fluxproxy.dev",
+    });
+    expect(report).toContain("# FluxProxy Traffic Statistics Report");
+    expect(report).toContain("10,000 sessions");
+    expect(report).toContain("`fluxproxy.dev`");
+    expect(report).toContain("| Pending | 1 |");
+    expect(report).toContain("## Breakdown by Host (2 unique)");
+    expect(report).toContain("## Top 5 Slowest URLs");
+    expect(report).toContain("## Top 5 Heaviest URLs");
   });
 });

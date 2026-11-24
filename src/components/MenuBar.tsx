@@ -92,6 +92,9 @@ interface MenuBarProps {
   onResetColumns: () => void;
   onResetPanelLayout: () => void;
   onOpenThemeGallery?: () => void;
+  trafficViewMode?: "grid" | "waterfall";
+  onSetTrafficViewMode?: (mode: "grid" | "waterfall") => void;
+  onOpenTrafficStatistics?: () => void;
   // Tools
   sessionRetentionLimit: number | null;
   onSetSessionRetentionLimit: (limit: number | null) => void;
@@ -333,6 +336,9 @@ export const MenuBar: React.FC<MenuBarProps> = ({
   onResetColumns,
   onResetPanelLayout,
   onOpenThemeGallery,
+  trafficViewMode = "grid",
+  onSetTrafficViewMode,
+  onOpenTrafficStatistics,
   sessionRetentionLimit,
   onSetSessionRetentionLimit,
   onOpenCustomRetentionLimit,
@@ -1583,6 +1589,49 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 <span>Reset Panel Layout to Default</span>
               </button>
 
+              {(onSetTrafficViewMode || onOpenTrafficStatistics) && (
+                <>
+                  <hr />
+                  {onSetTrafficViewMode && (
+                    <div role="group" aria-label="Traffic View Mode">
+                      <button
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={trafficViewMode === "grid"}
+                        onClick={(e) =>
+                          activateCommand(e, () => onSetTrafficViewMode("grid"))
+                        }
+                      >
+                        <span>Traffic View: Table Grid</span>
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={trafficViewMode === "waterfall"}
+                        onClick={(e) =>
+                          activateCommand(e, () =>
+                            onSetTrafficViewMode("waterfall")
+                          )
+                        }
+                      >
+                        <span>Traffic View: Waterfall Timeline</span>
+                      </button>
+                    </div>
+                  )}
+                  {onOpenTrafficStatistics && (
+                    <button
+                      type="button"
+                      disabled={filteredCount === 0}
+                      onClick={(e) =>
+                        activateCommand(e, onOpenTrafficStatistics)
+                      }
+                    >
+                      <span>Traffic Statistics Summary…</span>
+                    </button>
+                  )}
+                </>
+              )}
+
               <hr />
 
               <div role="group" aria-label="Workspace Section">
@@ -1734,6 +1783,15 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                   Ctrl+D
                 </span>
               </button>
+              {onOpenTrafficStatistics && (
+                <button
+                  type="button"
+                  disabled={filteredCount === 0}
+                  onClick={(e) => activateCommand(e, onOpenTrafficStatistics)}
+                >
+                  <span>Traffic Statistics Report…</span>
+                </button>
+              )}
               <button
                 type="button"
                 onClick={(e) => activateCommand(e, onOpenTextWizard)}
