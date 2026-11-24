@@ -449,6 +449,8 @@ pub struct ProxyFilterBackendConfig {
     pub filter_query: Option<String>,
     #[serde(default)]
     pub use_regex_query: Option<bool>,
+    #[serde(default)]
+    pub lan_client_allowlist: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

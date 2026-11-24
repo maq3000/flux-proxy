@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import {
   clearPersistedPanelLayouts,
   COLUMN_MIN_WIDTHS,
@@ -45,11 +45,9 @@ export {
 export type { ColumnDefinition, InspectorSplitDirection, ToolbarGroupDefinition };
 
 export function useUiPreferences() {
-  const didSyncRef = useRef(false);
-  if (!didSyncRef.current) {
-    didSyncRef.current = true;
+  useEffect(() => {
     useUiStore.getState().syncUiFromLocalStorage();
-  }
+  }, []);
 
   const layout = useUiStore((s) => s.layout);
   const toolbarGroups = useUiStore((s) => s.toolbarGroups);

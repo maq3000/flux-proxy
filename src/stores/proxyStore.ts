@@ -314,7 +314,7 @@ function buildInitialStatusFromStorage(): ProxyStatus {
   };
 }
 
-function readInitialProxySlice() {
+function readPersistedProxyConfigFromLocalStorage() {
   const sessionRetentionLimit = loadPersistedRetentionLimit();
   const dropNonMatching = loadProxyJson<boolean>(
     LS_DROP_NON_MATCHING_KEY,
@@ -370,32 +370,39 @@ function readInitialProxySlice() {
     sanitizeUpstreamTimeoutsForStore(savedUpstreamTimeouts);
 
   return {
+    status: buildInitialStatusFromStorage(),
+    followTail,
+    sessionRetentionLimit,
+    dropNonMatching,
+    clearDbOnExit,
+    hasPersistedClearDbOnExit: readHasPersistedClearDbOnExit(),
+    breakpointConfig,
+    hostRemapRules,
+    throttleConfig,
+    upstreamProxyConfig,
+    upstreamTimeouts,
+  };
+}
+
+function readInitialProxySlice() {
+  const persisted = readPersistedProxyConfigFromLocalStorage();
+  return {
     sessions: [] as SessionSummary[],
     selectedId: null as number | null,
     selectedIds: [] as number[],
     selectedDetail: null as SessionDetail | null,
     diffLeftDetail: null as SessionDetail | null,
     diffRightDetail: null as SessionDetail | null,
-    status: buildInitialStatusFromStorage(),
-    followTail,
     toastMessage: null as string | null,
-    sessionRetentionLimit,
-    dropNonMatching,
-    clearDbOnExit,
-    hasPersistedClearDbOnExit: readHasPersistedClearDbOnExit(),
     storageStats: {
       ramSessions: 0,
       sqliteSizeBytes: 0,
       droppedSessionsCount: 0,
-      sessionRetentionLimit,
-      dropNonMatching,
+      sessionRetentionLimit: persisted.sessionRetentionLimit,
+      dropNonMatching: persisted.dropNonMatching,
     } as StorageStats,
-    breakpointConfig,
     pausedBreakpoints: [] as PausedBreakpointItem[],
-    hostRemapRules,
-    throttleConfig,
-    upstreamProxyConfig,
-    upstreamTimeouts,
+    ...persisted,
   };
 }
 
@@ -805,6 +812,6 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
   },
 
   syncFromLocalStorage: () => {
-    set(readInitialProxySlice());
+    set(readPersistedProxyConfigFromLocalStorage());
   },
 }));

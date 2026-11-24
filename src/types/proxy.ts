@@ -308,6 +308,7 @@ export interface ProxyFilterBackendConfig {
   quickCategory?: string | null;
   filterQuery?: string | null;
   useRegexQuery?: boolean | null;
+  lanClientAllowlist?: string[];
 }
 
 export interface FilterPreset {
@@ -367,6 +368,7 @@ export interface ClientCertificateEntry {
   commonName: string;
   expiresAt: string;
   enabled: boolean;
+  ephemeral?: boolean;
 }
 
 export interface AddClientCertificateInput {
@@ -376,6 +378,7 @@ export interface AddClientCertificateInput {
   keyPath?: string | null;
   password?: string | null;
   enabled?: boolean;
+  ephemeral?: boolean;
 }
 
 export type DoctorCheckStatus = "ok" | "warning" | "error";

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 import {
   resolveEffectiveThemeTokens,
   type CustomColorOverrides,
@@ -27,11 +27,9 @@ export {
 export type { StatusFgTokenKey, ThemePreference, ThemePresetId, ThemeTokenKey };
 
 export function useTheme() {
-  const didSyncRef = useRef(false);
-  if (!didSyncRef.current) {
-    didSyncRef.current = true;
+  useEffect(() => {
     useUiStore.getState().syncThemeFromLocalStorage();
-  }
+  }, []);
 
   const systemDark = useUiStore((s) => s.systemDark);
   const preference = useUiStore((s) => s.preference);

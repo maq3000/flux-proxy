@@ -1147,3 +1147,48 @@ fn tls_rules_and_header_mutations_precompile_regexes_on_config_update() {
     assert_eq!(resp_headers[0].name, "X-Auth");
     assert_eq!(resp_headers[0].value, "rx");
 }
+
+#[test]
+fn lan_client_allowlist_matches_exact_ips_cidrs_and_always_allows_loopback() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let engine = ProxyFilterEngine::new();
+    let remote_v4: IpAddr = "192.168.1.42".parse().unwrap();
+    let remote_other: IpAddr = "10.20.30.40".parse().unwrap();
+    let loopback_v4: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let loopback_v6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    let mapped_loopback: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+    let mapped_lan: IpAddr = "::ffff:192.168.1.42".parse().unwrap();
+
+    // Empty allowlist permits all LAN peers
+    assert!(engine.is_lan_client_allowed(remote_v4));
+    assert!(engine.is_lan_client_allowed(remote_other));
+    assert!(engine.is_lan_client_allowed(loopback_v4));
+
+    // Exact IP + CIDR IPv4 + CIDR IPv6
+    let mut cfg = default_backend_config();
+    cfg.lan_client_allowlist = vec![
+        " 192.168.1.42 ".into(),
+        "172.16.0.0/16".into(),
+        "[fe80::]/10".into(),
+    ];
+    engine.update_config(cfg);
+
+    assert!(engine.is_lan_client_allowed(loopback_v4));
+    assert!(engine.is_lan_client_allowed(loopback_v6));
+    assert!(engine.is_lan_client_allowed(mapped_loopback));
+    assert!(engine.is_lan_client_allowed(remote_v4));
+    assert!(engine.is_lan_client_allowed(mapped_lan));
+    assert!(engine.is_lan_client_allowed("172.16.254.5".parse().unwrap()));
+    assert!(engine.is_lan_client_allowed("fe80::1234:abcd".parse().unwrap()));
+    assert!(!engine.is_lan_client_allowed("192.168.1.43".parse().unwrap()));
+    assert!(!engine.is_lan_client_allowed(remote_other));
+    assert!(!engine.is_lan_client_allowed("2001:db8::1".parse().unwrap()));
+
+    // Non-empty allowlist containing only malformed entries must fail closed for LAN clients (still allowing loopback)
+    let mut bad_cfg = default_backend_config();
+    bad_cfg.lan_client_allowlist = vec!["not-an-ip".into(), "192.168.1.1/99".into()];
+    engine.update_config(bad_cfg);
+    assert!(engine.is_lan_client_allowed(loopback_v4));
+    assert!(!engine.is_lan_client_allowed(remote_v4));
+}

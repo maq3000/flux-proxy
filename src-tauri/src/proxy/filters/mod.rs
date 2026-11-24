@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
@@ -395,6 +396,117 @@ impl CompiledHeaderMutationRule {
     }
 }
 
+#[derive(Clone, Debug)]
+enum CompiledLanClientRule {
+    V4Cidr { network: u32, mask: u32 },
+    V6Cidr { network: u128, mask: u128 },
+}
+
+fn canonicalize_peer_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+    }
+}
+
+impl CompiledLanClientRule {
+    fn parse(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some((addr_raw, prefix_raw)) = trimmed.split_once('/') {
+            let addr_clean = addr_raw.trim().trim_matches(['[', ']']);
+            let prefix: u8 = prefix_raw.trim().parse().ok()?;
+            match addr_clean.parse::<IpAddr>().ok()? {
+                IpAddr::V4(v4) => {
+                    if prefix > 32 {
+                        return None;
+                    }
+                    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+                    Some(Self::V4Cidr {
+                        network: u32::from(v4) & mask,
+                        mask,
+                    })
+                }
+                IpAddr::V6(v6) => {
+                    if prefix > 128 {
+                        return None;
+                    }
+                    let mask = if prefix == 0 {
+                        0
+                    } else {
+                        u128::MAX << (128 - prefix)
+                    };
+                    Some(Self::V6Cidr {
+                        network: u128::from(v6) & mask,
+                        mask,
+                    })
+                }
+            }
+        } else {
+            let addr_clean = trimmed.trim_matches(['[', ']']);
+            let ip = canonicalize_peer_ip(addr_clean.parse::<IpAddr>().ok()?);
+            match ip {
+                IpAddr::V4(v4) => Some(Self::V4Cidr {
+                    network: u32::from(v4),
+                    mask: u32::MAX,
+                }),
+                IpAddr::V6(v6) => Some(Self::V6Cidr {
+                    network: u128::from(v6),
+                    mask: u128::MAX,
+                }),
+            }
+        }
+    }
+
+    fn matches(&self, canonical_ip: IpAddr) -> bool {
+        match (self, canonical_ip) {
+            (Self::V4Cidr { network, mask }, IpAddr::V4(v4)) => {
+                (u32::from(v4) & *mask) == *network
+            }
+            (Self::V6Cidr { network, mask }, IpAddr::V6(v6)) => {
+                (u128::from(v6) & *mask) == *network
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct CompiledLanAllowlist {
+    has_entries: bool,
+    rules: Vec<CompiledLanClientRule>,
+}
+
+impl CompiledLanAllowlist {
+    fn compile(entries: &[String]) -> Self {
+        let mut has_entries = false;
+        let mut rules = Vec::new();
+        for raw in entries {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            has_entries = true;
+            if let Some(rule) = CompiledLanClientRule::parse(trimmed) {
+                rules.push(rule);
+            }
+        }
+        Self { has_entries, rules }
+    }
+
+    fn matches(&self, canonical_ip: IpAddr) -> bool {
+        if !self.has_entries {
+            return true;
+        }
+        self.rules.iter().any(|rule| rule.matches(canonical_ip))
+    }
+}
+
 struct FilterEngineState {
     config: ProxyFilterBackendConfig,
     compiled_tls_bypass_rules: CompiledHostRuleList,
@@ -404,6 +516,7 @@ struct FilterEngineState {
     compiled_capture_host_list: CompiledCaptureHostList,
     compiled_capture_matrix: CompiledCaptureMatrix,
     compiled_query_regex: Option<Regex>,
+    compiled_lan_allowlist: CompiledLanAllowlist,
     static_asset_ext_re: Regex,
 }
 
@@ -490,6 +603,20 @@ impl ProxyFilterEngine {
             .read()
             .map(|g| g.config.drop_non_matching_on_capture)
             .unwrap_or(false)
+    }
+
+    /// Evaluates whether a peer TCP IP address is permitted by the configured `lan_client_allowlist`.
+    /// Loopback addresses (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`) are always permitted, and an empty
+    /// allowlist permits all LAN clients.
+    pub fn is_lan_client_allowed(&self, peer_ip: IpAddr) -> bool {
+        let canonical = canonicalize_peer_ip(peer_ip);
+        if canonical.is_loopback() {
+            return true;
+        }
+        self.state
+            .read()
+            .map(|g| g.compiled_lan_allowlist.matches(canonical))
+            .unwrap_or(true)
     }
 
     /// Fast lock-minimal predicate invoked on request completion in `server.rs` when deciding
@@ -1077,6 +1204,7 @@ pub fn default_backend_config() -> ProxyFilterBackendConfig {
         quick_category: None,
         filter_query: None,
         use_regex_query: None,
+        lan_client_allowlist: Vec::new(),
     }
 }
 
@@ -1101,6 +1229,7 @@ fn build_filter_engine_state(config: ProxyFilterBackendConfig) -> FilterEngineSt
     } else {
         None
     };
+    let compiled_lan_allowlist = CompiledLanAllowlist::compile(&config.lan_client_allowlist);
     let static_asset_ext_re =
         Regex::new(r"(?i)\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|css|map)(\?|$)").unwrap();
 
@@ -1113,6 +1242,7 @@ fn build_filter_engine_state(config: ProxyFilterBackendConfig) -> FilterEngineSt
         compiled_capture_host_list,
         compiled_capture_matrix,
         compiled_query_regex,
+        compiled_lan_allowlist,
         static_asset_ext_re,
     }
 }

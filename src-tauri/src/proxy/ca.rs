@@ -160,27 +160,7 @@ fn format_command_error(stderr: &str, stdout: &str, fallback: &str) -> String {
 }
 
 fn write_private_key_securely(path: &Path, pem_contents: &str) -> Result<(), std::io::Error> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(pem_contents.as_bytes())?;
-        file.sync_all()?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::write(path, pem_contents)
-    }
+    crate::proxy::dpapi::write_protected_key_bytes(path, pem_contents.as_bytes())
 }
 
 fn enforce_private_key_permissions(path: &Path) -> Result<(), std::io::Error> {
@@ -234,9 +214,10 @@ impl CertificateAuthority {
                     if legacy_key_pem_path.exists() {
                         let _ = fs::remove_file(&legacy_key_pem_path);
                     }
-                    fs::read_to_string(&key_pem_path)?
+                    crate::proxy::dpapi::read_protected_key_string(&key_pem_path)?
                 } else {
-                    let migrated = fs::read_to_string(&legacy_key_pem_path)?;
+                    let migrated =
+                        crate::proxy::dpapi::read_protected_key_string(&legacy_key_pem_path)?;
                     write_private_key_securely(&key_pem_path, &migrated)?;
                     let _ = fs::remove_file(&legacy_key_pem_path);
                     migrated
@@ -1022,6 +1003,43 @@ mod tests {
             active_fp
         ));
         assert!(!output_contains_sha256_fingerprint("", "short"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn encrypts_ca_key_with_dpapi_and_migrates_legacy_plain_pem() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxproxy_ca_dpapi_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        let ca1 = CertificateAuthority::init_or_load(&dir).expect("init CA");
+        let fp1 = ca1.info().sha256_fingerprint;
+        let key_path = ca1.key_pem_path().to_path_buf();
+
+        let disk_after_init = fs::read_to_string(&key_path).unwrap();
+        assert!(disk_after_init.starts_with(crate::proxy::dpapi::DPAPI_PREFIX));
+        assert!(!disk_after_init.contains("-----BEGIN"));
+
+        // Reload encrypted CA key
+        let ca2 = CertificateAuthority::init_or_load(&dir).expect("reload DPAPI CA");
+        assert_eq!(ca2.info().sha256_fingerprint, fp1);
+
+        // Overwrite with legacy plain PEM and verify transparent migration on reload
+        let plain_key_pem = ca1.ca_key.serialize_pem();
+        fs::write(&key_path, plain_key_pem.as_bytes()).unwrap();
+        assert!(fs::read_to_string(&key_path)
+            .unwrap()
+            .starts_with("-----BEGIN"));
+
+        let ca3 = CertificateAuthority::init_or_load(&dir).expect("migrate legacy plain PEM CA");
+        assert_eq!(ca3.info().sha256_fingerprint, fp1);
+        let disk_after_migration = fs::read_to_string(&key_path).unwrap();
+        assert!(disk_after_migration.starts_with(crate::proxy::dpapi::DPAPI_PREFIX));
+        assert!(!disk_after_migration.contains("-----BEGIN"));
 
         let _ = fs::remove_dir_all(&dir);
     }

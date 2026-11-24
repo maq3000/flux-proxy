@@ -68,15 +68,6 @@ import type {
 } from "../types/proxy";
 
 export function useProxySessions() {
-  const didSyncRef = useRef(false);
-  if (!didSyncRef.current) {
-    didSyncRef.current = true;
-    useProxyStore.getState().syncFromLocalStorage();
-    useFilterStore
-      .getState()
-      .syncFromLocalStorage(useProxyStore.getState().dropNonMatching);
-  }
-
   const sessions = useProxyStore((s) => s.sessions);
   const setSessions = useProxyStore((s) => s.setSessions);
   const selectedId = useProxyStore((s) => s.selectedId);
@@ -99,13 +90,6 @@ export function useProxySessions() {
     },
     [setSelectedIdState, setSelectedIds]
   );
-
-  const initialAutoSysProxy = useMemo(
-    () => loadProxyJson<boolean | null>(LS_AUTO_SYSPROXY_KEY, null),
-    []
-  );
-  const initialBindConfig = useMemo(() => loadPersistedBindConfig(), []);
-  const initialPort = useMemo(() => loadPersistedProxyPort(), []);
 
   const status = useProxyStore((s) => s.status);
   const setStatus = useProxyStore((s) => s.setStatus);
@@ -384,6 +368,29 @@ export function useProxySessions() {
     }
 
     async function bootstrap() {
+      useProxyStore.getState().syncFromLocalStorage();
+      const syncedProxyState = useProxyStore.getState();
+      useFilterStore
+        .getState()
+        .syncFromLocalStorage(syncedProxyState.dropNonMatching);
+      const syncedFilterState = useFilterStore.getState();
+
+      sessionRetentionLimitRef.current = syncedProxyState.sessionRetentionLimit;
+      dropNonMatchingRef.current = syncedProxyState.dropNonMatching;
+      hasPersistedClearDbOnExitRef.current =
+        syncedProxyState.hasPersistedClearDbOnExit;
+      clearDbOnExitRef.current = syncedProxyState.clearDbOnExit;
+      statusRef.current = syncedProxyState.status;
+      breakpointConfigRef.current = syncedProxyState.breakpointConfig;
+      backendFilterConfigRef.current = syncedFilterState.backendFilterConfig;
+
+      const initialAutoSysProxy = loadProxyJson<boolean | null>(
+        LS_AUTO_SYSPROXY_KEY,
+        null
+      );
+      const initialBindConfig = loadPersistedBindConfig();
+      const initialPort = loadPersistedProxyPort();
+
       // Push persisted retention limit, dropNonMatching, TLS Bypass, Header Mutation & Breakpoint rules into Rust / Preview engine on boot
       await safeIpc(
         "setSessionRetentionLimit",
@@ -1705,6 +1712,47 @@ export function useProxySessions() {
 
   const quickAddTlsBypassHost = quickAlwaysPassthroughHost;
 
+  const updateLanClientAllowlist = useCallback(
+    async (nextList: string[]) => {
+      const seen = new Set<string>();
+      const cleaned: string[] = [];
+      for (const raw of nextList) {
+        const trimmed = raw.trim();
+        if (!trimmed || seen.has(trimmed)) continue;
+        seen.add(trimmed);
+        cleaned.push(trimmed);
+      }
+      await updateBackendFilterConfig({
+        ...backendFilterConfigRef.current,
+        lanClientAllowlist: cleaned,
+      });
+      showToast(
+        cleaned.length > 0
+          ? `🛡️ LAN Client Allowlist обновлён (${cleaned.length} записей)`
+          : "🛡️ LAN Client Allowlist очищен (разрешены все LAN-устройства)"
+      );
+    },
+    [updateBackendFilterConfig, showToast]
+  );
+
+  const addLanClientToAllowlist = useCallback(
+    async (clientIp: string) => {
+      const clean = clientIp.trim();
+      if (!clean) return;
+      const existing = backendFilterConfigRef.current.lanClientAllowlist ?? [];
+      if (existing.some((item) => item.trim() === clean)) {
+        showToast(`🛡️ IP ${clean} уже в LAN Client Allowlist`);
+        return;
+      }
+      await updateBackendFilterConfig({
+        ...backendFilterConfigRef.current,
+        lanClientAllowlist: [...existing, clean],
+      });
+      showToast(`🛡️ IP ${clean} добавлен в LAN Client Allowlist`);
+    },
+    [updateBackendFilterConfig, showToast]
+  );
+
   const toggleForceNoCache = useCallback(async () => {
     const targetState = !isForceNoCacheActive;
     const nextMutations = backendFilterConfig.headerMutations.map((m) =>
@@ -2967,6 +3015,8 @@ export function useProxySessions() {
     quickAlwaysInspectHost,
     quickAlwaysPassthroughHost,
     quickAddTlsBypassHost,
+    updateLanClientAllowlist,
+    addLanClientToAllowlist,
     isForceNoCacheActive,
     toggleForceNoCache,
     activeFilterBadgeCount,

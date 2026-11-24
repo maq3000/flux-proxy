@@ -73,13 +73,13 @@
 - **Zero-Buffering видео/CDN-стриминг и надежность upstream**: Потоковая передача медиа, `206 Partial Content` и крупных ответов без буферизации, мгновенный сброс активных MITM-туннелей в Passthrough при изменении правил и диагностика сбоев с полной цепочкой причин (`err.source()`).
 - **Расшифровка HTTPS на лету и Zstandard (`zstd`)**: Динамическая генерация X.509 сертификатов (ECDSA P-256) под целевые домены через `rcgen` с LRU-кэшированием (`moka`), прозрачная потоковая распаковка `Content-Encoding: zstd` (RFC 8878) с лимитами от OOM-бомб, сохранение оригинального `Content-Length` для `HEAD` и точное снятие `Content-Encoding` только для распакованных слоёв.
 - **Избирательный перехват (Selective MITM & TLS Bypass 2.0)**: Режимы *Intercept All* и *Targeted Allowlist* (с защитой от подмены внутреннего заголовка `Host`), переключение `Table View` ↔ `Bulk Text Editor`, диалог `Quick Paste…`, импорт/экспорт TXT/JSON, **11 готовых Quick-Packs** (включая *OCSP / CRL PKI*, *Payment Gateways*, *Gaming & Anti-Cheat*, *РФ FinTech & Госуслуги* и *Video & CDN*), сброс к рекомендованным PKI-дефолтам, предкомпилированные Regex-правила с поддержкой суффиксов `.domain.com` и IPv6, lock-free счётчики попаданий `Hits: N` и бейдж `TUNNEL` в таблице.
-- **Клиентские сертификаты (mTLS, `Ctrl+Shift+C`)**: Хранилище сертификатов **PKCS#12 (`.p12` / `.pfx`)** и **PEM** с привязкой к точным и wildcard-маскам доменов (`*.corp.local`), изоляцией файлов строго внутри `app_data_dir/client_certs` (без утечки паролей/ключей в профили настроек и без подстановки хозяйских mTLS-сертификатов внешним LAN-клиентам) и кэшируемыми mTLS-клиентами upstream на базе `moka`.
+- **Клиентские сертификаты (mTLS, `Ctrl+Shift+C`)**: Хранилище сертификатов **PKCS#12 (`.p12` / `.pfx`)** и **PEM** с привязкой к точным и wildcard-маскам доменов (`*.corp.local`), прозрачным шифрованием приватных ключей на диске через **Windows DPAPI** (`FLUX_DPAPI_V1:<base64>`, автоматическая миграция старых PEM-файлов, права `0600` на Unix), режимом **`Session-only (In-Memory)`** (`RAM ONLY` — ключ и сертификат хранятся только в RAM и не записываются на диск), изоляцией от внешних LAN-клиентов и передачей mTLS-идентичности через инструментированный `UpstreamHttpClient` (`tokio-rustls`).
 - **Блокировка обхода через HTTP/3 (QUIC)**: Автоматическое удаление заголовков `Alt-Svc` и `Alternate-Protocol`, предотвращающее уход современных браузеров в UDP-туннель мимо системного прокси.
 - **Перехват WebSocket (WS/WSS), ручная инъекция фреймов и SSE**: Инкрементальное декодирование кадров в реальном времени ($O(1)$ append без лишних аллокаций, `tokio-tungstenite`), конкурентный двунаправленный релей без взаимных блокировок с upstream-таймаутом подключения и полной передачей заголовков авторизации/субпротоколов (включая SignalR), а также **ручная инъекция WebSocket-фреймов** в активные соединения (`Text` / `JSON` / `Hex (Binary)` → *Send to Server* / *Send to Client*).
-- **Инструментированный транспорт, Fiddler-тайминги и статистика (`SessionTimers`)**: Собственный коннектор на базе `hyper-util` + `tokio-rustls` с замером фаз `DNS`, `TCP Connect`, `TLS Handshake`, `Send`, `Wait (TTFB)` и `Content Download`, учётом wire vs decoded байт, реального TLS-протокола/шифра/ALPN и переиспользования keep-alive сокетов (`CltReuse` / `Reused`).
+- **Инструментированный транспорт, Fiddler-тайминги и статистика (`SessionTimers`)**: Собственный коннектор на базе `hyper-util` + `tokio-rustls` с замером фаз `DNS`, `TCP Connect`, `TLS Handshake`, `Send`, `Wait (TTFB)` и `Content Download`, учётом wire vs decoded байт, реального TLS-протокола/шифра/ALPN, переиспользования keep-alive сокетов (`CltReuse` / `Reused`), раздельными таймаутами `Connect` / `Response Headers (TTFB)` (по умолчанию `Unlimited`) / `Composer` и RAII-финализацией оборванных клиентом запросов со статусом `499`.
 - **Виртуальный DNS (`HOSTS Remapping`, `Ctrl+Shift+H`) и Bandwidth Throttling**: Локальное перенаправление доменов и wildcard-масок на заданный IP/порт с сохранением TLS SNI и заголовка `Host` (бейдж `REMAP`), а также эмуляция медленных каналов и офлайна (*GPRS*, *Slow 3G*, *Fast 3G*, *LTE / 4G*, *Offline HTTP 503*, *Custom*) с шейпингом чтения/записи и RTT-задержкой.
-- **Каскадирование через внешний прокси (`Upstream Proxy Chaining`, `Ctrl+Shift+U`)**: Поддержка исходящих `HTTP`, `HTTPS CONNECT` и `SOCKS5` (RFC 1928/1929) прокси с опциональной аутентификацией (пароль хранится только в RAM и не попадает в экспортируемые профили) и гибким `bypass_list` (`localhost`, `<local>`, CIDR, `*.domain`, glob, `host:port`) для HTTP, HTTPS/mTLS, `CONNECT`-туннелей, Composer и WebSocket.
-- **Гибкая привязка к IP и адаптерам ОС (Dual Listener)**: Точный выбор сетевого интерфейса (*Loopback Only*, *All Interfaces `0.0.0.0`* или *Specific Interface* — Wi-Fi / Ethernet / WSL / VPN + опциональный одновременный loopback-листенер), защита от LAN SSRF к локальным сервисам `127.0.0.1` / `localhost` / `::ffff:127.0.0.1`, автоматический откат системного прокси при сбое бинда, неблокирующий Tokio-рантайм (`spawn_blocking` для OS/SQLite), кэш процессов (`pid_name_cache`, до 4096 записей) и проверка доверия Root CA по точному SHA-256 отпечатку.
+- **Каскадирование через внешний прокси (`Upstream Proxy Chaining`, `Ctrl+Shift+U`)**: Поддержка исходящих `HTTP`, `HTTPS CONNECT` и `SOCKS5` (RFC 1928/1929) прокси с опциональной аутентификацией (пароль хранится только в RAM и не попадает в экспортируемые профили), индикацией **`via <proxy>`** в `Server IP` / `Statistics` и гибким `bypass_list` (`localhost`, `<local>`, CIDR, `*.domain`, glob, `host:port`) для HTTP, HTTPS/mTLS, `CONNECT`-туннелей, Composer и WebSocket.
+- **Гибкая привязка к IP и контроль LAN-доступа (`Dual Listener` + `LAN Client Allowlist`)**: Точный выбор сетевого интерфейса (*Loopback Only*, *All Interfaces `0.0.0.0`* или *Specific Interface* — Wi-Fi / Ethernet / WSL / VPN + опциональный одновременный loopback-листенер), опциональный белый список **`LAN Client Allowlist`** (точные IPv4/IPv6 и CIDR-подсети — неразрешённые внешние устройства получают `403 Forbidden` до записи сессии, loopback разрешён всегда), защита от LAN SSRF к локальным сервисам `127.0.0.1` / `localhost` / `::ffff:127.0.0.1`, автоматический откат системного прокси при сбое бинда, неблокирующий Tokio-рантайм (`spawn_blocking` для OS/SQLite), кэш процессов (`pid_name_cache`, до 4096 записей) и проверка доверия Root CA по точному SHA-256 отпечатку.
 
 ### 🛠 Инструменты анализа и модификации
 - **Протокольные анализаторы и статистика в Session Inspector**:
@@ -89,7 +89,7 @@
   - **SSE & LLM Stream Inspector**: разбор потоков `text/event-stream` и сборка чанков ответов нейросетей (OpenAI, Anthropic, Gemini) в единый связный текст в один клик.
   - **gRPC & Protobuf Wire Decoder**: декодирование бинарных Protobuf-сообщений и проекция в JSON без `.proto`-файлов.
   - **Auth & Caching Inspectors**: аудит безопасности Basic/Bearer/JWT токенов и анализ HTTP-кэширования по RFC 9111.
-  - **Multipart Form Inspector**: разбор `multipart/form-data` с мини-превью загружаемых изображений.
+  - **Multipart Form Inspector**: разбор `multipart/form-data` с безопасным мини-превью растровых изображений (`PNG`, `JPEG`, `GIF`, `WebP`, `BMP`, `ICO`; `image/svg+xml` исключён из рендера).
 - **Эргономика таблицы и адаптивный интерфейс**:
   - Интерактивная сортировка всех **12 колонок** таблицы (`ASC` / `DESC`, включая опциональные колонки **`TTFB`** и **`Server IP`** и пофазный tooltip на ячейке `Time`), массовое выделение видимых сессий (`Ctrl+A`), автоподбор ширины колонок из контекстного меню шапки (**Auto-fit**), однострочный **Slim Toolbar (`Ctrl+Shift+T`)** и персистентность геометрии всех сплит-панелей и ориентации Инспектора между перезапусками.
 - **Диагностический мастер «Proxy Doctor» (`Ctrl+Shift+D`)**:
@@ -102,7 +102,7 @@
 - **Python Scripting Engine (`Alt+5`)**:
   - Программируемая обработка и мокирование трафика на лету с помощью хуков `on_request(request)` и `on_response(response, request)` через долгоживущий IPC-процесс Python 3 (fail-open, таймаут 1500 мс с разделением ожидания очереди от таймаута пайпа без убийства воркера), встроенный Monaco Editor, готовые пресеты и живую консоль вывода. Подробнее см. [**PYTHON_SCRIPTING_GUIDE.md**](PYTHON_SCRIPTING_GUIDE.md) и [**PYTHON_SCRIPTING_AI_GUIDE.md**](PYTHON_SCRIPTING_AI_GUIDE.md).
 - **HTTP Composer 2.0, Code Generator & Session Diff**:
-  - Конструктор запросов с поддержкой **Drag-and-Drop** строк из таблицы, параллельным режимом (*Split Composer*), умным **Import / Paste cURL** (поддержка POSIX Bash, Windows cmd и PowerShell прямо при вставке в URL или через диалог) и генератором клиентского кода на **5 языках** (8 таргетов: *JavaScript `fetch`/`axios`*, *Python `requests`/`httpx`*, *Go `net/http`*, *Rust `reqwest`*, *cURL Bash/PowerShell*).
+  - Конструктор запросов с поддержкой **Drag-and-Drop** строк из таблицы, параллельным режимом (*Split Composer*), чекбоксом **`Run Python Scripts`** (по умолчанию хуки `on_request` / `on_response` применяются к Composer и `Replay`), настройкой таймаута и кнопкой отмены **`Cancel`**, умным **Import / Paste cURL** (поддержка POSIX Bash, Windows cmd и PowerShell прямо при вставке в URL или через диалог) и генератором клиентского кода на **5 языках** (8 таргетов: *JavaScript `fetch`/`axios`*, *Python `requests`/`httpx`*, *Go `net/http`*, *Rust `reqwest`*, *cURL Bash/PowerShell*).
   - Визуальное сравнение двух сессий (**Session Diff**, `Ctrl+D`) с сортировкой ключей JSON и фильтрацией динамических заголовков.
 - **Генератор спецификаций OpenAPI 3.0.3 / Swagger**:
   - Автоматический синтез OpenAPI 3.0.3 контрактов (`YAML` / `JSON`) по выбранным или всем захваченным сессиям (`File → Export as OpenAPI 3.0 Spec…` или контекстное меню таблицы): параметризация числовых/UUID-сегментов (`{id}`, `{uuid}`), рекурсивное слияние JSON Schema, безопасный вынос `Authorization` / `Cookie` / `X-Api-Key` в `components.securitySchemes` без раскрытия секретов и предпросмотр в Monaco Editor.
@@ -123,7 +123,7 @@
   - Поддержка **Drag-and-Drop** файлов `.har`, `.saz` и `.json` прямо в окно программы.
 - **Централизованные настройки, профили и единый старт (`Preferences`, `Ctrl+,`)**:
   - Единое окно управления интерфейсом, портом прокси (с сохранением стартового порта в `proxy_port.pref` без двойного запуска), колонками, фильтрами и правилами.
-  - Версионированный экспорт и импорт профиля настроек (`fluxproxy-settings-v1.json`, лимит 16 MiB) с превью изменений (и предупреждением о наличии Python-скрипта — по умолчанию импортируемые скрипты отключаются в целях безопасности до явного подтверждения доверия), сохранением конфигурации точек останова (`breakpoints`), правил санитизации, **HOSTS Remapping**, **Bandwidth Throttling**, беспарольной конфигурации **Upstream Proxy** и ориентации сплит-панелей, а также транзакционным применением с откатом при сбое.
+  - Версионированный экспорт и импорт профиля настроек (`fluxproxy-settings-v1.json`, лимит 16 MiB) с превью изменений (и предупреждением о наличии Python-скрипта — по умолчанию импортируемые скрипты отключаются в целях безопасности до явного подтверждения доверия), сохранением конфигурации точек останова (`breakpoints`), правил санитизации, **HOSTS Remapping**, **Bandwidth Throttling**, **`UpstreamTimeouts`**, **`LAN Client Allowlist`**, беспарольной конфигурации **Upstream Proxy** и ориентации сплит-панелей, а также транзакционным применением с откатом при сбое.
 
 ---
 
@@ -155,15 +155,15 @@
 | Компонент | Назначение | Используемые технологии |
 | :--- | :--- | :--- |
 | **Desktop Runtime** | Оконный менеджер, нативные диалоги, IPC, CSP | [Tauri v2](https://tauri.app/) (Rust 2021), `rfd` |
-| **Сетевой движок** | Инструментированный HTTP/HTTPS транспорт, upstream-прокси и шейпинг | `tokio`, `hyper 1.5`, `hyper-util`, `reqwest` |
-| **TLS, Root CA & mTLS** | MITM-расшифровка, управление доверием ОС, клиентские сертификаты | `rustls`, `tokio-rustls`, `rcgen`, `moka`, `p12-keystore`, `x509-parser` |
+| **Сетевой движок** | Инструментированный HTTP/HTTPS транспорт, upstream-прокси и шейпинг | `tokio`, `hyper 1.5`, `hyper-util` |
+| **TLS, Root CA & mTLS** | MITM-расшифровка, шифрование ключей (DPAPI), доверие ОС и mTLS | `rustls`, `tokio-rustls`, `rcgen`, `moka`, `p12-keystore`, `x509-parser`, `windows-sys` (Win32 DPAPI) |
 | **WebSockets** | Перехват, декодирование и ручная инъекция фреймов WS/WSS | `tokio-tungstenite`, `DashMap` |
 | **Python Scripting** | Долгоживущий IPC-раннер хуков `on_request` / `on_response` | Python 3 subprocess (`JSON Lines`, fail-open 1500 ms) |
 | **Хранилище и архивы** | Ring Buffer в RAM, база SQLite, экспорт/импорт HAR/SAZ с таймингами | `DashMap` + `rusqlite` (WAL) + `zip` |
 | **Кодеки и сжатие** | Сжатие/распаковка и кодировки | `flate2` (Gzip/Deflate), `brotli`, `zstd`, `base64`, `hex`, `sha2` |
 | **Frontend UI и State** | Модульный интерфейс, 8 тем-пресетов, state-сторы и `React.lazy()` | `React 18`, `TypeScript 5.6`, `Zustand 5`, `Vite 6`, `Tailwind CSS` |
 | **Виртуализация и код** | Скроллинг 60 FPS, редакторы, OpenAPI и diff-сравнение | `@tanstack/react-virtual 3`, `@monaco-editor/react` |
-| **Тестирование и CI** | 92 frontend-теста + 149 Rust-тестов, матрица Windows/Linux/macOS | `Vitest 3`, `@testing-library/react`, `cargo clippy`, GitHub Actions |
+| **Тестирование и CI** | 96 frontend-тестов + 170 Rust-тестов, матрица Windows/Linux/macOS | `Vitest 3`, `@testing-library/react`, `cargo clippy`, GitHub Actions |
 
 ---
 
@@ -188,7 +188,7 @@
 │   │   ├── HexViewer.tsx                # Виртуализированный шестнадцатеричный инспектор байтов
 │   │   ├── InspectorProtocolPanels.tsx  # Панели SSE/LLM, WS (+ инъекция фреймов), gRPC/Protobuf, Auth, Cache, Multipart
 │   │   ├── FilterDrawer.tsx             # Матрица фильтров, пороги шума, Selective MITM 2.0 (Bulk / Quick Paste), мутации
-│   │   ├── ComposerPanel.tsx            # Конструктор HTTP-запросов с Import / Paste cURL
+│   │   ├── ComposerPanel.tsx            # Конструктор HTTP-запросов (Import cURL, Run Python Scripts, Cancel)
 │   │   ├── CodeSnippetModal.tsx         # Модальный генератор клиентского кода на 5 языках (Monaco)
 │   │   ├── OpenApiExportModal.tsx       # Экспорт захваченных сессий в OpenAPI 3.0.3 (YAML / JSON)
 │   │   ├── AutoResponderPanel.tsx       # Правила подмены ответов и эмуляции задержек
@@ -198,19 +198,19 @@
 │   │   ├── SessionDiffView.tsx          # Визуальное сравнение двух сессий
 │   │   ├── SanitizedExportModal.tsx     # Экспорт сессий с очисткой PII и секретов (Ctrl+Shift+S)
 │   │   ├── ProxyDoctorModal.tsx         # Диагностический мастер самопроверки и автоисправления (Ctrl+Shift+D)
-│   │   ├── SettingsModal.tsx            # Настройки, галерея 8 тем-пресетов, редактор палитры и профили (Ctrl+,)
+│   │   ├── SettingsModal.tsx            # Настройки, тема, Upstream Timeouts и профили (Ctrl+,)
 │   │   ├── HostRemapModal.tsx           # Управление правилами виртуального DNS (HOSTS Remapping, Ctrl+Shift+H)
 │   │   ├── UpstreamProxyModal.tsx       # Настройка каскадного прокси HTTP / HTTPS / SOCKS5 (Ctrl+Shift+U)
 │   │   ├── TextWizardModal.tsx          # Декодер JWT, Base64, URL, Hex, Gzip/Brotli/Zstd
-│   │   ├── MobileSetupModal.tsx         # Мастер подключения iOS/Android по Wi-Fi с QR-кодом
+│   │   ├── MobileSetupModal.tsx         # Мастер подключения iOS/Android по Wi-Fi с QR-кодом и LAN Client Allowlist
 │   │   ├── CertificateModal.tsx         # Установка, проверка и удаление Root CA
-│   │   ├── ClientCertificatesModal.tsx  # Хранилище клиентских сертификатов mTLS (.p12 / .pfx / .pem, Ctrl+Shift+C)
+│   │   ├── ClientCertificatesModal.tsx  # Хранилище mTLS (.p12/.pfx/.pem, DPAPI и режим Session-only RAM ONLY)
 │   │   ├── CommandPalette.tsx           # Командная палитра и QuickExec (Ctrl+K)
 │   │   ├── TopToolbar.tsx               # Панель управления, Slim Toolbar, селектор Throttling и пресетов
 │   │   └── MenuBar.tsx                  # Главное меню приложения
 │   ├── stores/                          # Zustand-сторы (proxyStore.ts, filterStore.ts, uiStore.ts)
-│   ├── hooks/                           # Хуки управления сессиями, темой, раскладкой и тесты (*.test.tsx)
-│   ├── lib/                             # Движки фильтров, статистики, cURL/кодогенерации, OpenAPI, тем, настроек и тесты
+│   ├── hooks/                           # Хуки (useProxySessions, useGlobalShortcuts, useTheme, useUiPreferences) и тесты
+│   ├── lib/                             # Движки фильтров, статистики, previewEngine.ts, тонкий tauriBridge.ts (<1000 строк) и тесты
 │   └── types/                           # TypeScript-интерфейсы сессий, таймингов, правил и схемы настроек
 │
 └── src-tauri/                           # Исходный код Core & MITM Proxy (Rust)
@@ -222,14 +222,15 @@
         ├── models.rs                    # Модели сессий, SessionTimings, SessionTransferStats, фильтров и статистики
         ├── proxy/                       # Асинхронное ядро MITM-прокси
         │   ├── server/                  # Модульный прокси-сервер (mod, http_handler, connect_tunnel, websocket_relay, composer_exec, mobile_portal)
-        │   ├── filters/                 # Selective MITM 2.0 (hit counters), парсеры и тесты (mod, parsers, tests)
+        │   ├── filters/                 # Selective MITM 2.0 (hit counters), LAN Client Allowlist, парсеры и тесты
         │   ├── upstream_client.rs       # Инструментированный hyper-util + tokio-rustls транспорт с замером фаз
         │   ├── upstream_proxy.rs        # Каскадирование HTTP / HTTPS CONNECT / SOCKS5 и bypass_list
         │   ├── hosts.rs                 # Виртуальный DNS (HostRemapRegistry) с сохранением TLS SNI
         │   ├── throttle.rs              # Шейпинг пропускной способности и эмуляция RTT / Offline 503
         │   ├── doctor.rs                # Самодиагностика порта, Root CA, SysProxy, VPN, Firewall и /health
+        │   ├── dpapi.rs                 # Windows DPAPI-шифрование приватных ключей (FLUX_DPAPI_V1) и автомиграция
         │   ├── ca.rs                    # Генерация Root CA, сертификатов доменов и управление хранилищем ОС
-        │   ├── client_certs.rs          # Хранилище клиентских сертификатов mTLS (PKCS#12 / PEM) и кэш клиентов
+        │   ├── client_certs.rs          # Хранилище mTLS (PKCS#12 / PEM), DPAPI и режим Session-only (In-Memory)
         │   ├── breakpoints.rs           # Менеджер живых точек останова
         │   ├── rules.rs                 # Движок правил AutoResponder
         │   ├── codec.rs                 # Сжатие/распаковка и преобразования данных для TextWizard
@@ -410,13 +411,14 @@ curl -x http://127.0.0.1:8888 https://httpbin.org/get -k
 - ✅ Встроенный **Python Scripting Engine (`Alt+5`)** для программируемой модификации и мокирования трафика (`on_request` / `on_response`) через долгоживущий IPC-процесс с fail-open защитой 1500 мс, встроенным Monaco Editor и живой консолью логов (см. [**PYTHON_SCRIPTING_GUIDE.md**](PYTHON_SCRIPTING_GUIDE.md) и [**PYTHON_SCRIPTING_AI_GUIDE.md**](PYTHON_SCRIPTING_AI_GUIDE.md)).
 - ✅ **Галерея 8 цветовых тем и редактор палитры**: пресеты *Flux Dark*, *Flux Light*, *Dracula*, *Tokyo Night*, *Nord*, *Fiddler Classic*, *GitHub Dark*, *Monokai Pro*, кастомная настройка CSS-токенов и синхронизация темы Monaco Editor.
 - ✅ **Selective MITM & Bypass 2.0**: переключение `Table View` ↔ `Bulk Text Editor`, диалог `Quick Paste…`, импорт/экспорт TXT/JSON, 11 курируемых Quick-Packs, PKI/OCSP/CRL-дефолты, lock-free счётчики `Hits: N` и бейдж `TUNNEL`.
-- ✅ **Клиентские сертификаты (mTLS, `Ctrl+Shift+C`)**: хранилище PKCS#12 (`.p12`/`.pfx`) и PEM с масками доменов (`*.corp.local`) и кэшированием mTLS-клиентов в `moka`.
-- ✅ **Composer 2.0 & Кодогенератор**: умный импорт / вставка команд **cURL** (Bash / cmd / PowerShell) и генератор клиентского кода на 5 языках (8 вариантов: JS, Python, Go, Rust, cURL).
+- ✅ **Клиентские сертификаты (mTLS, `Ctrl+Shift+C`)**: хранилище PKCS#12 (`.p12`/`.pfx`) и PEM с масками доменов (`*.corp.local`), прозрачным шифрованием ключей Windows DPAPI (`FLUX_DPAPI_V1`) и режимом **`Session-only (In-Memory)`** (`RAM ONLY`).
+- ✅ **Composer 2.0 & Кодогенератор**: умный импорт / вставка команд **cURL** (Bash / cmd / PowerShell), паритет Python-хуков (`Run Python Scripts`), кнопка отмены **`Cancel`** и генератор клиентского кода на 5 языках (8 вариантов: JS, Python, Go, Rust, cURL).
 - ✅ **Генератор OpenAPI 3.0.3 / Swagger**: автоматический вывод контракта (`YAML` / `JSON`) с параметризацией `{id}` / `{uuid}`, слиянием JSON Schema и безопасными `components.securitySchemes`.
-- ✅ **Тестирование и CI/CD**: 12 наборов Vitest (92 frontend-теста) + 149 Rust-тестов и кроссплатформенный GitHub Actions CI (`ubuntu-latest`, `windows-latest`, `macos-latest`, `clippy -D warnings`, `NODE_OPTIONS=--max-old-space-size=4096`).
+- ✅ **Тестирование и CI/CD**: 12 наборов Vitest (96 frontend-тестов) + 170 Rust-тестов и кроссплатформенный GitHub Actions CI (`ubuntu-latest`, `windows-latest`, `macos-latest`, `clippy -D warnings`, `NODE_OPTIONS=--max-old-space-size=4096`).
 - ✅ **Аудит безопасности, целостности и надёжности (`v0.4.1`)**: защита импорта профилей настроек от скрытого RCE (`SEC-01`), изоляция файлового IPC и лимит 16 MiB (`SEC-02`), блокировка LAN SSRF и утечки хозяйских mTLS (`SEC-03`), полная санитизация `camelCase` JSON / SSE / WebSocket (включая SignalR/Socket.IO/Bearer/JWT) / `Location` / `Referer` (`SEC-04`), лимиты декомпрессии и поддержка `zstd` в `.saz` (`SEC-05`, `BUG-12`), консистентность `next_id` и выгруженных тел при рестарте и `VACUUM` (`BUG-01`, `BUG-03`, `BUG-11`), устойчивый bootstrap UI (`BUG-02`, `BUG-08`, `PERF-01`), RAII-очистка Breakpoints (`BUG-04`), конкурентный релей WebSocket (`BUG-05`), сверка SHA-256 Root CA (`BUG-06`), фиксы `HEAD` / `Content-Encoding` (`BUG-07`), предкомпиляция Regex + IPv6 / `.domain.com` (`BUG-09`, `PERF-03`), откат `sysproxy` (`BUG-10`) и неразрушающий fail-open очереди Python-воркера (`PERF-04`).
 - ✅ **Архитектурная декомпозиция и оптимизация бандла (`v0.5.0`, `ARCH-01`, `PERF-05`)**: модульное разбиение Rust-ядра (`proxy/server/`, `proxy/filters/`, `storage/export_import/`) и UI-компонентов, внедрение **Zustand 5**, `React.lazy()` + `Suspense`, ленивый `getPreviewEngine()` и удаление чанка `ts.worker` (7.05 МБ).
 - ✅ **Fiddler-тайминги, статистика запросов и сетевая маршрутизация (`v0.5.0`)**: инструментированный `UpstreamHttpClient` (`hyper-util` + `tokio-rustls`), панель **`Statistics`** (Single & Multi-Selection с SVG-диаграммами и *Estimated Worldwide Performance*), колонки `TTFB` / `Server IP`, реальный round-trip таймингов HAR/SAZ, **HOSTS Remapping (`Ctrl+Shift+H`)**, **Bandwidth Throttling**, **Upstream Proxy Chaining (`Ctrl+Shift+U`)** (`HTTP`/`HTTPS`/`SOCKS5`) и **ручная инъекция WebSocket-фреймов**.
+- ✅ **Стабилизация ядра, раздельные таймауты и защита ключей (`Этапы 35, 39, 36`)**: унификация маршрутизации `HOSTS Remapping` + `Upstream Proxy` (`via <proxy>` в `Server IP`) + WebSocket, атомарное сохранение инъектированных WS-фреймов, лимит `64 MiB` ответа, раздельные `Upstream Timeouts` (`Connect` / `TTFB Unlimited` / `Composer`) с кнопкой `Cancel` и RAII-гардом `499`, Windows **DPAPI** (`FLUX_DPAPI_V1`) + режим **`Session-only (In-Memory)`**, **`LAN Client Allowlist`** (`403 Forbidden`), запрет SVG в превью Multipart (`SEC-02`), чистота `syncFromLocalStorage` (`CONC-01`), $O(1)$/`find` для `selectedSessions` (`PERF-03`), удаление мёртвого кода `reqwest` (`ARCH-01`) и вынос `previewEngine.ts` / `useGlobalShortcuts.ts` (`ARCH-02`).
 
 ### Ближайшие этапы разработки:
 - 🔜 **P2** — Виртуализированный многофазный **Waterfall Timeline** и модальная сводная статистика трафика по всей отфильтрованной выборке (Этап 12).

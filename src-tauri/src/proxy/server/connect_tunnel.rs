@@ -52,6 +52,13 @@ pub(super) async fn handle_outer_proxy_request(
     client_conn: ClientConnContext,
     ctx: Arc<SharedProxyContext>,
 ) -> Response<ProxyBoxBody> {
+    if !ctx.filters.is_lan_client_allowed(client_addr.ip()) {
+        return plain_response(
+            StatusCode::FORBIDDEN,
+            "Forbidden: client IP is not in the LAN Client Allowlist",
+        );
+    }
+
     if req.method() == Method::CONNECT {
         let authority = match req.uri().authority() {
             Some(auth) => auth.to_string(),
@@ -750,6 +757,21 @@ pub(super) async fn handle_outer_proxy_request(
                             changed = filter_updates_rx.changed() => {
                                 if changed.is_err() {
                                     let _ = conn.as_mut().await;
+                                    break;
+                                }
+                                if !conn_ctx.filters.is_lan_client_allowed(client_addr.ip()) {
+                                    tracing::info!(
+                                        "Gracefully shutting down active MITM tunnel for {}:{} after LAN Client Allowlist update excluded {}",
+                                        mitm_host,
+                                        port,
+                                        client_addr.ip()
+                                    );
+                                    conn.as_mut().graceful_shutdown();
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(2),
+                                        conn.as_mut(),
+                                    )
+                                    .await;
                                     break;
                                 }
                                 if let ConnectTunnelDecision::Passthrough(reason) =

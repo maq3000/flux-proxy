@@ -131,6 +131,11 @@ function readInitialFilterSlice(dropNonMatching: boolean) {
     quickCategory: "all",
     filterQuery: "",
     useRegexQuery: false,
+    lanClientAllowlist: Array.isArray(savedBackend.lanClientAllowlist)
+      ? savedBackend.lanClientAllowlist.filter(
+          (item): item is string => typeof item === "string"
+        )
+      : [],
   };
 
   return {
@@ -343,6 +348,7 @@ export const useFilterStore = create<FilterStoreState>((set) => ({
       quickCategory: "all",
       filterQuery: "",
       useRegexQuery: false,
+      lanClientAllowlist: structuredClone(detail.proxy.lanClientAllowlist ?? []),
     };
 
     set({

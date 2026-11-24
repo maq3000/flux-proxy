@@ -137,9 +137,10 @@
 11. Запись сессии в TrafficStore и отправка ответа клиенту
 ```
 
-### Отображение в таблице трафика
+### Отображение в таблице трафика и работа в Composer / Replay
 - **`MOCK`** — запрос перехвачен скриптом через `request["mock_response"]` (в деталях сессии правило обозначается как `python-script`, а для HTTPS указывается `TLS 1.3 (MITM Python Mock)`).
 - **`HDR`** — `on_request` или `on_response` изменил метод, URL, заголовки, статус или тело.
+- **Паритет Request Composer (`Alt+2`) и Replay (`R` / `Ctrl+R`):** запросы, отправляемые вручную через Composer (`composer_exec.rs`) или повторно через `Replay`, **по умолчанию проходят через тот же конвейер `on_request` / `on_response`** (для автоматического пересчёта динамических HMAC-подписей и токенов). Чтобы отправить «сырой» запрос в обход Python-скриптов, снимите чекбокс **`Run Python Scripts`** в панели **Composer** (`skipPythonScripts: true`).
 
 ---
 
@@ -438,6 +439,7 @@ def on_response(response, request):
 | **Размер тела > 4 MiB** (`MAX_SCRIPT_BODY_BYTES = 4 194 304` байт) | Хук для этого сообщения пропускается (`WARN` в консоли). | Воркер работает штатно. |
 
 ### Какой трафик не обрабатывается скриптами
+- **Запросы Composer с отключённым `Run Python Scripts`** (`skipPythonScripts: true`) — сознательно отправляются в обход `on_request` и `on_response` как «сырой» запрос.
 - **TLS Passthrough / Bypass** — домены, идущие через прямой зашифрованный TCP-туннель. Если сайт не расшифровывается в режиме *Targeted Only*, нажмите ПКМ по строке в таблице трафика → **Always inspect (`домен`)**.
 - **WebSocket (`ws://` / `wss://`)** — handshake и фреймы WebSocket не передаются в Python-хуки.
 - **Встроенный портал `http://flux.proxy/*`** — обслуживается напрямую.

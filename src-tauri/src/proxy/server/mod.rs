@@ -46,6 +46,7 @@ pub const MAX_CAPTURED_REQUEST_BODY_BYTES: usize = MAX_CAPTURED_BODY_BYTES;
 pub const MAX_BUFFERED_RESPONSE_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB OOM cap for buffered responses
 const ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES: usize = 256 * 1024; // 256 KiB
 const STREAM_TEXT_PREVIEW_MAX_BYTES: usize = 64 * 1024; // 64 KiB cap for text/* or application/* large-stream previews
+#[cfg(test)]
 const DEFAULT_UPSTREAM_TIMEOUT_SEC: u64 = crate::models::DEFAULT_CONNECT_TIMEOUT_SEC;
 pub(super) const FLUXPROXY_ERROR_HEADER: &str = "X-FluxProxy-Error";
 pub(super) const FLUXPROXY_ERR_UPSTREAM_CONNECT_TIMEOUT: &str = "upstream-connect-timeout";
@@ -122,10 +123,7 @@ pub mod http_handler;
 pub mod mobile_portal;
 pub mod websocket_relay;
 
-pub use http_handler::{
-    build_upstream_client_with_identity, build_upstream_client_with_options,
-    parse_sse_events_from_bytes,
-};
+pub use http_handler::parse_sse_events_from_bytes;
 pub type ProxyController = ProxyEngineController;
 
 use connect_tunnel::handle_outer_proxy_request;
@@ -4370,12 +4368,15 @@ mod tests {
             "error sending request for url -> client error (Connect) -> ConnectionReset"
         );
 
-        // Verify real reqwest error source traversal + safe 1-time idempotent retry on stale pool drop
+        // Verify real reqwest error source traversal
         let dead_probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_port = dead_probe.local_addr().unwrap().port();
         drop(dead_probe);
 
-        let client = build_upstream_client(false).expect("build_upstream_client should succeed");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("reqwest test client should build");
         let req_err = client
             .get(format!("http://127.0.0.1:{dead_port}/unreachable"))
             .send()
@@ -4386,50 +4387,6 @@ mod tests {
             formatted_real.contains(" -> "),
             "expected reqwest error chain with ` -> `, got: {formatted_real}"
         );
-        assert!(is_idempotent_retry_method(&reqwest::Method::GET));
-        assert!(is_idempotent_retry_method(&reqwest::Method::HEAD));
-        assert!(is_idempotent_retry_method(&reqwest::Method::OPTIONS));
-        assert!(!is_idempotent_retry_method(&reqwest::Method::POST));
-
-        // Simulate stale pooled keep-alive connection:
-        // Connection 1 responds OK to prime the pool, then closes right as request #2 arrives;
-        // Connection 2 succeeds with `200 OK recovered` on the automatic 1-time retry.
-        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream_listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            // Connection 1: serve request 1, read request 2 and drop abruptly mid-keepalive
-            let (mut sock1, _) = upstream_listener.accept().await.unwrap();
-            let mut buf = [0u8; 2048];
-            let _ = sock1.read(&mut buf).await;
-            let _ = sock1
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nprimed")
-                .await;
-            let _ = sock1.flush().await;
-            let _ = sock1.read(&mut buf).await;
-            drop(sock1);
-
-            // Connection 2 (retry): succeed
-            let (mut sock2, _) = upstream_listener.accept().await.unwrap();
-            let _ = sock2.read(&mut buf).await;
-            let _ = sock2
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nrecovered")
-                .await;
-            let _ = sock2.shutdown().await;
-        });
-
-        let pool_client = build_upstream_client(false).unwrap();
-        let prime_url = format!("http://{upstream_addr}/prime");
-        let r1 = send_upstream_with_retry(&pool_client, &reqwest::Method::GET, |c| c.get(&prime_url))
-            .await
-            .unwrap();
-        assert_eq!(r1.text().await.unwrap(), "primed");
-
-        let retry_url = format!("http://{upstream_addr}/second");
-        let r2 = send_upstream_with_retry(&pool_client, &reqwest::Method::GET, |c| c.get(&retry_url))
-            .await
-            .expect("idempotent GET should recover via 1-time retry after stale pool drop");
-        assert_eq!(r2.status().as_u16(), 200);
-        assert_eq!(r2.text().await.unwrap(), "recovered");
     }
 
     #[tokio::test]
@@ -8744,6 +8701,171 @@ def on_response(response, request):
         }));
 
         release.notify_one();
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn lan_client_allowlist_blocks_disallowed_lan_peers_with_403_without_recording() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-lan-allowlist-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let mut cfg = crate::proxy::filters::default_backend_config();
+        cfg.lan_client_allowlist = vec!["192.168.1.50".into(), "10.8.0.0/24".into()];
+        filters.update_config(cfg);
+
+        let breakpoints = Arc::new(BreakpointEngine::new(None));
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("lan-allowlist.sqlite")).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints,
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
+            store: store.clone(),
+            upstream_http_client: test_upstream_http_client(None),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(proxy_addr.port()),
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            )),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let scripted_peers: Vec<SocketAddr> = vec![
+            "192.168.1.99:54321".parse().unwrap(),
+            "192.168.1.99:54322".parse().unwrap(),
+            "192.168.1.50:54323".parse().unwrap(),
+            "127.0.0.1:54324".parse().unwrap(),
+        ];
+        let proxy_ctx = ctx.clone();
+        tokio::spawn(async move {
+            for peer_addr in scripted_peers {
+                if let Ok((tcp_stream, _)) = proxy_listener.accept().await {
+                    let io = TokioIo::new(tcp_stream);
+                    let c = proxy_ctx.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req: Request<Incoming>| {
+                            let inner_c = c.clone();
+                            async move {
+                                Ok::<_, Infallible>(
+                                    handle_outer_proxy_request(
+                                        req,
+                                        peer_addr,
+                                        None,
+                                        ClientConnContext::new(),
+                                        inner_c,
+                                    )
+                                    .await,
+                                )
+                            }
+                        });
+                        let _ = AutoConnBuilder::new(TokioExecutor::new())
+                            .serve_connection_with_upgrades(io, service)
+                            .await;
+                    });
+                }
+            }
+        });
+
+        // 1. Disallowed LAN peer -> plain HTTP rejected with 403 without creating TrafficStore entry
+        {
+            let mut sock = TcpStream::connect(proxy_addr).await.unwrap();
+            sock.write_all(
+                b"GET http://flux.proxy/health HTTP/1.1\r\nHost: flux.proxy\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut buf = Vec::new();
+            let _ = sock.read_to_end(&mut buf).await;
+            let resp = String::from_utf8_lossy(&buf);
+            assert!(
+                resp.starts_with("HTTP/1.1 403"),
+                "expected 403 for disallowed HTTP peer, got: {resp}"
+            );
+            assert!(
+                store.list_summaries().is_empty(),
+                "disallowed HTTP request must not create TrafficStore session"
+            );
+        }
+
+        // 2. Disallowed LAN peer -> CONNECT tunnel rejected with 403 without creating TrafficStore entry
+        {
+            let mut sock = TcpStream::connect(proxy_addr).await.unwrap();
+            sock.write_all(
+                b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut buf = [0u8; 512];
+            let n = sock.read(&mut buf).await.unwrap();
+            let resp = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                resp.starts_with("HTTP/1.1 403"),
+                "expected 403 for disallowed CONNECT peer, got: {resp}"
+            );
+            assert!(
+                store.list_summaries().is_empty(),
+                "disallowed CONNECT request must not create TrafficStore session"
+            );
+        }
+
+        // 3. Allowlisted LAN peer -> succeeds (200 OK)
+        {
+            let mut sock = TcpStream::connect(proxy_addr).await.unwrap();
+            sock.write_all(
+                b"GET http://flux.proxy/health HTTP/1.1\r\nHost: flux.proxy\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut buf = Vec::new();
+            let _ = sock.read_to_end(&mut buf).await;
+            let resp = String::from_utf8_lossy(&buf);
+            assert!(
+                resp.starts_with("HTTP/1.1 200"),
+                "expected 200 for allowlisted peer, got: {resp}"
+            );
+        }
+
+        // 4. Loopback peer -> always succeeds (200 OK)
+        {
+            let mut sock = TcpStream::connect(proxy_addr).await.unwrap();
+            sock.write_all(
+                b"GET http://flux.proxy/health HTTP/1.1\r\nHost: flux.proxy\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut buf = Vec::new();
+            let _ = sock.read_to_end(&mut buf).await;
+            let resp = String::from_utf8_lossy(&buf);
+            assert!(
+                resp.starts_with("HTTP/1.1 200"),
+                "expected 200 for loopback peer, got: {resp}"
+            );
+        }
+
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

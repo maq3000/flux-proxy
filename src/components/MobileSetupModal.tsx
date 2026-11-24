@@ -7,11 +7,14 @@ import {
   Copy,
   ExternalLink,
   Network,
+  Plus,
   QrCode,
   RefreshCw,
   ShieldAlert,
+  ShieldCheck,
   Smartphone,
   Terminal,
+  Trash2,
   Wifi,
   X,
 } from "lucide-react";
@@ -21,6 +24,8 @@ import type { NetworkInterfaceInfo, ProxyStatus } from "../types/proxy";
 interface MobileSetupModalProps {
   open: boolean;
   status: ProxyStatus;
+  lanClientAllowlist?: string[];
+  onUpdateLanClientAllowlist?: (next: string[]) => Promise<void>;
   onSetAllowRemote: (allow: boolean) => Promise<void>;
   onToggleProxy: () => Promise<void>;
   onClose: () => void;
@@ -99,9 +104,33 @@ function isValidCustomProxyHost(raw: string): boolean {
   );
 }
 
+function isValidLanAllowlistToken(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) return false;
+  const slashIdx = trimmed.indexOf("/");
+  if (slashIdx >= 0) {
+    if (trimmed.indexOf("/", slashIdx + 1) >= 0) return false;
+    const addrRaw = trimmed.slice(0, slashIdx).trim().replace(/^\[|\]$/g, "");
+    const prefixRaw = trimmed.slice(slashIdx + 1).trim();
+    if (!/^\d{1,3}$/.test(prefixRaw)) return false;
+    const prefix = Number(prefixRaw);
+    if (isValidIpv4Address(addrRaw)) {
+      return prefix >= 0 && prefix <= 32;
+    }
+    if (isValidIpv6Address(addrRaw)) {
+      return prefix >= 0 && prefix <= 128;
+    }
+    return false;
+  }
+  const addrClean = trimmed.replace(/^\[|\]$/g, "");
+  return isValidIpv4Address(addrClean) || isValidIpv6Address(addrClean);
+}
+
 export const MobileSetupModal: React.FC<MobileSetupModalProps> = ({
   open,
   status,
+  lanClientAllowlist = [],
+  onUpdateLanClientAllowlist,
   onSetAllowRemote,
   onToggleProxy,
   onClose,
@@ -114,6 +143,9 @@ export const MobileSetupModal: React.FC<MobileSetupModalProps> = ({
   const [customIp, setCustomIp] = useState<string>("");
   const [loadingIfaces, setLoadingIfaces] = useState<boolean>(false);
   const [switchingRemote, setSwitchingRemote] = useState<boolean>(false);
+  const [allowlistDraft, setAllowlistDraft] = useState<string>("");
+  const [allowlistError, setAllowlistError] = useState<string | null>(null);
+  const [savingAllowlist, setSavingAllowlist] = useState<boolean>(false);
 
   const [guideTab, setGuideTab] = useState<GuidePlatformTab>("ios");
   const [qrMode, setQrMode] = useState<QrMode>("cert");
@@ -284,6 +316,64 @@ export const MobileSetupModal: React.FC<MobileSetupModalProps> = ({
     }
   };
 
+  const handleAddAllowlistTokens = async () => {
+    if (!onUpdateLanClientAllowlist) return;
+    const tokens = allowlistDraft
+      .split(/[\s,;]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (tokens.length === 0) {
+      setAllowlistError("Введите IPv4/IPv6-адрес или CIDR (например, 192.168.1.42 или 192.168.1.0/24).");
+      return;
+    }
+    const invalid = tokens.find((tok) => !isValidLanAllowlistToken(tok));
+    if (invalid) {
+      setAllowlistError(
+        `Некорректный IP или CIDR: '${invalid}'. Пример: 192.168.1.42 или 192.168.1.0/24.`
+      );
+      return;
+    }
+    setAllowlistError(null);
+    setSavingAllowlist(true);
+    try {
+      const merged = [...lanClientAllowlist];
+      for (const tok of tokens) {
+        if (!merged.includes(tok)) {
+          merged.push(tok);
+        }
+      }
+      await onUpdateLanClientAllowlist(merged);
+      setAllowlistDraft("");
+    } catch (err) {
+      setAllowlistError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingAllowlist(false);
+    }
+  };
+
+  const handleRemoveAllowlistToken = async (token: string) => {
+    if (!onUpdateLanClientAllowlist) return;
+    setSavingAllowlist(true);
+    try {
+      await onUpdateLanClientAllowlist(
+        lanClientAllowlist.filter((item) => item !== token)
+      );
+    } finally {
+      setSavingAllowlist(false);
+    }
+  };
+
+  const handleClearAllowlist = async () => {
+    if (!onUpdateLanClientAllowlist || lanClientAllowlist.length === 0) return;
+    setSavingAllowlist(true);
+    try {
+      await onUpdateLanClientAllowlist([]);
+      setAllowlistError(null);
+    } finally {
+      setSavingAllowlist(false);
+    }
+  };
+
   const handlePlatformTabKeyDown = (
     e: React.KeyboardEvent<HTMLDivElement>
   ) => {
@@ -397,6 +487,113 @@ export const MobileSetupModal: React.FC<MobileSetupModalProps> = ({
               </button>
             )}
           </div>
+        </div>
+
+        {/* 1b. LAN Client Allowlist (Optional IP / CIDR Restriction) */}
+        <div className="space-y-2.5 rounded-lg border border-hairline bg-canvas p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <ShieldCheck
+                className="h-4 w-4 shrink-0 text-accent"
+                aria-hidden="true"
+              />
+              <div>
+                <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-fg">
+                  <span>LAN Client Allowlist (Белый список устройств)</span>
+                  <span
+                    className={`rounded px-1.5 py-0.5 font-mono text-[10px] font-semibold ${
+                      lanClientAllowlist.length > 0
+                        ? "bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/35"
+                        : "bg-surface text-muted ring-1 ring-hairline"
+                    }`}
+                  >
+                    {lanClientAllowlist.length > 0
+                      ? `Restricted: ${lanClientAllowlist.length}`
+                      : "Open (все LAN IP)"}
+                  </span>
+                </div>
+                <p className="mt-0.5 text-[11px] text-muted">
+                  Ограничивает доступ к прокси только указанными IP или CIDR-подсетями (остальные внешние клиенты получают{" "}
+                  <code>403 Forbidden</code>; <code>127.0.0.1</code> / <code>::1</code> разрешены всегда).
+                </p>
+              </div>
+            </div>
+
+            {lanClientAllowlist.length > 0 && onUpdateLanClientAllowlist && (
+              <button
+                type="button"
+                disabled={savingAllowlist}
+                onClick={() => void handleClearAllowlist()}
+                className="inline-flex shrink-0 items-center gap-1 rounded border border-rose-500/35 bg-rose-500/10 px-2 py-1 text-[11px] font-medium text-rose-300 hover:bg-rose-500/20 disabled:opacity-50"
+              >
+                <Trash2 className="h-3 w-3" aria-hidden="true" />
+                <span>Очистить список</span>
+              </button>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <label htmlFor="lan-client-allowlist-input" className="sr-only">
+              IP-адрес или CIDR-маска разрешённого LAN-устройства
+            </label>
+            <input
+              id="lan-client-allowlist-input"
+              type="text"
+              value={allowlistDraft}
+              onChange={(e) => {
+                setAllowlistDraft(e.target.value);
+                if (allowlistError) setAllowlistError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void handleAddAllowlistTokens();
+                }
+              }}
+              placeholder="192.168.1.42 или 192.168.1.0/24 (через запятую)"
+              spellCheck={false}
+              className="min-w-[220px] flex-1 rounded-md border border-strong bg-surface px-2.5 py-1.5 font-mono text-[11px] text-fg placeholder:text-subtle focus:border-accent focus:outline-none"
+            />
+            <button
+              type="button"
+              disabled={savingAllowlist || !onUpdateLanClientAllowlist}
+              onClick={() => void handleAddAllowlistTokens()}
+              className="inline-flex shrink-0 items-center gap-1 rounded-md bg-accent px-3 py-1.5 text-[11px] font-semibold text-white hover:opacity-90 disabled:opacity-50"
+            >
+              <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Добавить</span>
+            </button>
+          </div>
+
+          {allowlistError && (
+            <p role="alert" className="text-[11px] text-rose-400">
+              {allowlistError}
+            </p>
+          )}
+
+          {lanClientAllowlist.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 pt-0.5">
+              {lanClientAllowlist.map((entry) => (
+                <span
+                  key={entry}
+                  className="inline-flex items-center gap-1 rounded-full border border-accent/35 bg-accent/10 px-2.5 py-0.5 font-mono text-[11px] text-fg"
+                >
+                  <span>{entry}</span>
+                  {onUpdateLanClientAllowlist && (
+                    <button
+                      type="button"
+                      disabled={savingAllowlist}
+                      onClick={() => void handleRemoveAllowlistToken(entry)}
+                      aria-label={`Удалить ${entry} из LAN Allowlist`}
+                      className="rounded-full p-0.5 text-muted hover:bg-surface hover:text-rose-300"
+                    >
+                      <X className="h-3 w-3" aria-hidden="true" />
+                    </button>
+                  )}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* 2. Top Grid: Local IP & Proxy Endpoint + QR Code Generator */}

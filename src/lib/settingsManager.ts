@@ -330,6 +330,7 @@ export function createDefaultSettingsProfile(): FluxUserSettingsProfile {
         bypassList: [...DEFAULT_UPSTREAM_PROXY_BYPASS_LIST],
       },
       upstreamTimeouts: { ...DEFAULT_UPSTREAM_TIMEOUT_CONFIG },
+      lanClientAllowlist: [],
     },
     autoResponder: {
       enabled: true,
@@ -470,6 +471,12 @@ const SCHEMA_MIGRATIONS: Record<number, SchemaMigrationFn> = {
       isPlainObject(draft.sanitizationOptions)
     ) {
       proxy.sanitizationOptions = draft.sanitizationOptions;
+    }
+    if (
+      proxy.lanClientAllowlist === undefined &&
+      Array.isArray(draft.lanClientAllowlist)
+    ) {
+      proxy.lanClientAllowlist = draft.lanClientAllowlist;
     }
 
     const autoResponder: Record<string, unknown> = { ...existingAutoResp };
@@ -1172,6 +1179,40 @@ function sanitizeUpstreamTimeoutConfig(
     responseHeaderTimeoutSec,
     composerTimeoutSec,
   };
+}
+
+function sanitizeLanClientAllowlist(
+  raw: unknown,
+  warnings: string[]
+): string[] {
+  if (raw === undefined || raw === null) {
+    return [];
+  }
+  if (!Array.isArray(raw)) {
+    warnings.push(
+      "Поле «proxy.lanClientAllowlist» повреждено — сброшено к пустому списку."
+    );
+    return [];
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  let hadNonString = false;
+  for (const item of raw) {
+    if (typeof item !== "string") {
+      hadNonString = true;
+      continue;
+    }
+    const trimmed = item.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  if (hadNonString) {
+    warnings.push(
+      "Некорректные нестроковые записи в «proxy.lanClientAllowlist» пропущены."
+    );
+  }
+  return out;
 }
 
 function sanitizeHeaderMutations(
@@ -2233,6 +2274,10 @@ export function validateAndMigrateSettingsProfileWithReport(
         rawProxy.upstreamTimeouts,
         warnings
       ),
+      lanClientAllowlist: sanitizeLanClientAllowlist(
+        rawProxy.lanClientAllowlist,
+        warnings
+      ),
     },
     autoResponder: {
       enabled: sanitizeBoolean(
@@ -2604,6 +2649,10 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
         live.proxy?.upstreamTimeouts ?? storedUpstreamTimeoutsRaw,
         []
       ),
+      lanClientAllowlist: sanitizeLanClientAllowlist(
+        live.proxy?.lanClientAllowlist ?? storedBackendCfg.lanClientAllowlist,
+        []
+      ),
     },
     autoResponder: {
       enabled:
@@ -2764,6 +2813,7 @@ export function buildSettingsImportPreview(
         t.composerTimeoutSec === 0 ? "Unlimited" : `${t.composerTimeoutSec}s`;
       return `Connect ${t.connectTimeoutSec}s / TTFB ${ttfb} / Composer ${cmp}`;
     })(),
+    lanClientAllowlistCount: (incoming.proxy.lanClientAllowlist ?? []).length,
     autoResponderEnabled: incoming.autoResponder.enabled,
     totalRulesCount,
     currentTotalRulesCount,
@@ -2835,6 +2885,9 @@ export function buildBackendFilterConfigFromProfile(
     quickCategory: "all",
     filterQuery: "",
     useRegexQuery: false,
+    lanClientAllowlist: structuredClone(
+      profile.proxy.lanClientAllowlist ?? []
+    ),
   };
 }
 

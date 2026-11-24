@@ -288,6 +288,15 @@ export function hasMultipartOrFormPayload(
   );
 }
 
+export const SAFE_RASTER_IMAGE_MIMES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "image/bmp",
+  "image/x-icon",
+]);
+
 export function parseMultipartBody(
   headers: HeaderPair[],
   bodyBase64: string,
@@ -441,8 +450,13 @@ export function parseMultipartBody(
     }
 
     let imageDataUrl: string | undefined;
-    if (sniffedMime.startsWith("image/") && contentBytes.length > 0 && contentBytes.length <= 4 * 1024 * 1024) {
-      imageDataUrl = `data:${sniffedMime.split(";")[0]};base64,${bytesToBase64(contentBytes, false)}`;
+    const baseMime = sniffedMime.split(";")[0].trim().toLowerCase();
+    if (
+      SAFE_RASTER_IMAGE_MIMES.has(baseMime) &&
+      contentBytes.length > 0 &&
+      contentBytes.length <= 4 * 1024 * 1024
+    ) {
+      imageDataUrl = `data:${baseMime};base64,${bytesToBase64(contentBytes, false)}`;
     }
 
     parts.push({

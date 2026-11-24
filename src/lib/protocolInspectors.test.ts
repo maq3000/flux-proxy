@@ -210,6 +210,43 @@ describe("protocolInspectors — Multipart / URL-Encoded Form inspector", () => 
     expect(missing.detected).toBe(false);
     expect(missing.error).toBeTruthy();
   });
+
+  it("SEC-02: excludes image/svg+xml from imageDataUrl while preserving safe raster previews and text fallback", () => {
+    const boundary = "----SvgSecBoundary";
+    const svgText = '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>';
+    const bodyText = [
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="icon"; filename="evil.svg"',
+      "Content-Type: image/svg+xml",
+      "",
+      svgText,
+      `--${boundary}`,
+      'Content-Disposition: form-data; name="sniffed"; filename="sniffed.svg"',
+      "Content-Type: application/octet-stream",
+      "",
+      svgText,
+      `--${boundary}--`,
+      "",
+    ].join("\r\n");
+
+    const parsed = parseMultipartBody(
+      [
+        {
+          name: "Content-Type",
+          value: `multipart/form-data; boundary=${boundary}`,
+        },
+      ],
+      encodeTextToBase64(bodyText)
+    );
+
+    expect(parsed.detected).toBe(true);
+    expect(parsed.parts).toHaveLength(2);
+    for (const part of parsed.parts) {
+      expect(part.contentType).toBe("image/svg+xml");
+      expect(part.imageDataUrl).toBeUndefined();
+      expect(part.textPreview).toContain("<svg");
+    }
+  });
 });
 
 describe("protocolInspectors — Protobuf & gRPC wire decoder", () => {

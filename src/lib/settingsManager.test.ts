@@ -1176,4 +1176,66 @@ describe("settingsManager — applySettingsProfile & transactional rollback", ()
       composerTimeoutSec: 240,
     });
   });
+
+  it("stage 36: validates, migrates, previews, exports, applies and rolls back lanClientAllowlist", async () => {
+    const defaults = createDefaultSettingsProfile();
+    expect(defaults.proxy.lanClientAllowlist).toEqual([]);
+
+    // Legacy schemaVersion: 1 profile without lanClientAllowlist migrates silently
+    const legacyRaw = JSON.parse(JSON.stringify(defaults)) as Record<
+      string,
+      unknown
+    >;
+    delete (legacyRaw.proxy as Record<string, unknown>).lanClientAllowlist;
+    const legacyReport =
+      validateAndMigrateSettingsProfileWithReport(legacyRaw);
+    expect(legacyReport.warnings).toHaveLength(0);
+    expect(legacyReport.profile.proxy.lanClientAllowlist).toEqual([]);
+
+    // Non-string entries & duplicates are sanitized with a warning
+    const dirtyIncoming = {
+      ...legacyRaw,
+      proxy: {
+        ...(legacyRaw.proxy as Record<string, unknown>),
+        lanClientAllowlist: [" 192.168.1.42 ", "", 123, "192.168.1.42", "10.0.0.0/24"],
+      },
+    };
+    const dirtyReport =
+      validateAndMigrateSettingsProfileWithReport(dirtyIncoming);
+    expect(dirtyReport.profile.proxy.lanClientAllowlist).toEqual([
+      "192.168.1.42",
+      "10.0.0.0/24",
+    ]);
+    expect(
+      dirtyReport.warnings.some((w) => w.includes("lanClientAllowlist"))
+    ).toBe(true);
+
+    // Export preview + apply + localStorage + export round-trip + rollback
+    const profile = createDefaultSettingsProfile();
+    profile.proxy.lanClientAllowlist = ["192.168.1.42", "192.168.2.0/24"];
+    const preview = buildSettingsImportPreview(profile);
+    expect(preview.lanClientAllowlistCount).toBe(2);
+
+    vi.useFakeTimers();
+    await applySettingsProfile(profile);
+    vi.runOnlyPendingTimers();
+    expect(mockState.filterCfg.lanClientAllowlist).toEqual([
+      "192.168.1.42",
+      "192.168.2.0/24",
+    ]);
+    const exported = collectCurrentSettingsProfile();
+    expect(exported.proxy.lanClientAllowlist).toEqual([
+      "192.168.1.42",
+      "192.168.2.0/24",
+    ]);
+
+    const failing = createDefaultSettingsProfile();
+    failing.proxy.lanClientAllowlist = ["172.16.0.1"];
+    mockProxyBridge.setPythonScript.mockRejectedValueOnce(new Error("boom-lan"));
+    await expect(applySettingsProfile(failing)).rejects.toThrow("boom-lan");
+    expect(mockState.filterCfg.lanClientAllowlist).toEqual([
+      "192.168.1.42",
+      "192.168.2.0/24",
+    ]);
+  });
 });

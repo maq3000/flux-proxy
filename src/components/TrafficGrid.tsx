@@ -17,6 +17,7 @@ import {
   RotateCcw,
   RotateCw,
   Send,
+  ShieldCheck,
   ShieldOff,
   Smartphone,
   Sparkles,
@@ -84,6 +85,7 @@ interface TrafficGridProps {
   onSaveSessionBody?: (id: number, isResponse: boolean) => void;
   onFilterByProcess?: (processName: string) => void;
   onFilterByClientIp?: (clientIp: string) => void;
+  onAddClientIpToAllowlist?: (clientIp: string) => void;
   onAlwaysInspectHost?: (hostOrPattern: string) => void;
   onAlwaysPassthroughHost?: (hostOrPattern: string) => void;
   onAddHostToTlsBypass?: (host: string) => void;
@@ -380,6 +382,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
   onSaveSessionBody,
   onFilterByProcess,
   onFilterByClientIp,
+  onAddClientIpToAllowlist,
   onAlwaysInspectHost,
   onAlwaysPassthroughHost,
   onAddHostToTlsBypass,
@@ -2057,6 +2060,26 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
                 />
                 <span className="truncate">
                   Фильтровать по IP устройства ({ctxSession.clientIp})
+                </span>
+              </button>
+            )}
+
+          {ctxSession &&
+            isRemoteClientIp(ctxSession.clientIp) &&
+            onAddClientIpToAllowlist && (
+              <button
+                type="button"
+                onClick={() => {
+                  closeContextMenu();
+                  onAddClientIpToAllowlist(ctxSession.clientIp!);
+                }}
+              >
+                <ShieldCheck
+                  className="h-3.5 w-3.5 shrink-0 text-emerald-400"
+                  aria-hidden="true"
+                />
+                <span className="truncate">
+                  Разрешить IP в LAN Allowlist ({ctxSession.clientIp})
                 </span>
               </button>
             )}

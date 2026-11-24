@@ -95,6 +95,8 @@ export interface FluxUserProxySettings {
   upstreamProxy?: FluxUserUpstreamProxySettings;
   /** Split upstream timeout configuration (Connect / TTFB / Composer) */
   upstreamTimeouts?: UpstreamTimeoutConfig;
+  /** Optional LAN client IP / CIDR allowlist when listening on 0.0.0.0 or a LAN interface */
+  lanClientAllowlist?: string[];
 }
 
 /** Security: Upstream proxy password is omitted by type and never exported in settings profiles. */
@@ -160,6 +162,7 @@ export interface SettingsImportPreviewSummary {
   throttlePreset?: ThrottlePreset;
   upstreamProxySummary?: string | null;
   upstreamTimeoutsSummary?: string;
+  lanClientAllowlistCount?: number;
   autoResponderEnabled: boolean;
   totalRulesCount: number;
   currentTotalRulesCount: number;

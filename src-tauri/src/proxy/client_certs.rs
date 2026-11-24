@@ -1,8 +1,8 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use moka::sync::Cache;
@@ -14,7 +14,6 @@ use x509_parser::extensions::GeneralName;
 
 use crate::models::ProxyError;
 use crate::proxy::hosts::HostRemapRegistry;
-use crate::proxy::server::build_upstream_client_with_options;
 use crate::proxy::upstream_client::UpstreamHttpClient;
 use crate::proxy::upstream_proxy::UpstreamProxyManager;
 
@@ -41,6 +40,8 @@ pub struct ClientCertificateEntry {
     pub common_name: String,
     pub expires_at: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub ephemeral: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +57,8 @@ pub struct AddClientCertificateRequest {
     pub password: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub ephemeral: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -338,7 +341,7 @@ fn parse_rustls_client_auth_from_pem(
     Ok((certs, priv_key))
 }
 
-fn validate_identity_pem_with_reqwest(pem_bytes: &[u8]) -> Result<(), ProxyError> {
+fn validate_identity_pem(pem_bytes: &[u8]) -> Result<(), ProxyError> {
     let (certs, key) = parse_rustls_client_auth_from_pem(pem_bytes)?;
     UpstreamHttpClient::build(
         None,
@@ -397,7 +400,7 @@ pub fn parse_pkcs12_identity(
     pem_text.push_str(&pem::encode(&key_block));
 
     let identity_pem_bytes = pem_text.into_bytes();
-    validate_identity_pem_with_reqwest(&identity_pem_bytes)?;
+    validate_identity_pem(&identity_pem_bytes)?;
 
     Ok(ParsedClientCertificate {
         common_name,
@@ -492,7 +495,7 @@ pub fn parse_pem_identity(
     normalized_pem.push_str(&pem::encode(&key_block));
 
     let identity_pem_bytes = normalized_pem.into_bytes();
-    validate_identity_pem_with_reqwest(&identity_pem_bytes)?;
+    validate_identity_pem(&identity_pem_bytes)?;
 
     Ok(ParsedClientCertificate {
         common_name,
@@ -597,12 +600,19 @@ fn validate_cert_source_path(
     Ok((path, ext))
 }
 
+struct EphemeralClientIdentity {
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    #[allow(dead_code)]
+    certified_key: Arc<rustls::sign::CertifiedKey>,
+}
+
 /// Manages mTLS client certificates (`.p12`/`.pfx` and `.pem`), domain bindings,
-/// `0600` vault storage, and cached upstream HTTP/TLS clients.
+/// DPAPI / `0600` vault storage, session-only in-memory certificates, and cached upstream HTTP/TLS clients.
 pub struct ClientCertificateStore {
     storage_dir: Option<PathBuf>,
     entries: RwLock<Vec<ClientCertificateEntry>>,
-    client_cache: Cache<String, reqwest::Client>,
+    ephemeral_identities: RwLock<HashMap<String, EphemeralClientIdentity>>,
     upstream_client_cache: Cache<String, Arc<UpstreamHttpClient>>,
     id_seq: AtomicU64,
 }
@@ -617,17 +627,21 @@ impl ClientCertificateStore {
         let entries = if registry_path.is_file() {
             enforce_secure_file_permissions(&registry_path)?;
             let raw = fs::read_to_string(&registry_path)?;
-            let parsed: Vec<ClientCertificateEntry> =
+            let mut parsed: Vec<ClientCertificateEntry> =
                 serde_json::from_str(&raw).map_err(|e| {
                     ProxyError::Custom(format!(
                         "Не удалось прочитать реестр клиентских сертификатов: {e}"
                     ))
                 })?;
+            parsed.retain(|entry| !entry.ephemeral);
             for entry in &parsed {
                 let stored = Path::new(&entry.stored_cert_path);
                 match resolve_path_strictly_inside_dir(&dir, stored) {
                     Ok(safe_stored) => {
                         let _ = enforce_secure_file_permissions(&safe_stored);
+                        if entry.format == ClientCertificateFormat::Pem && safe_stored.is_file() {
+                            let _ = crate::proxy::dpapi::read_protected_key_bytes(&safe_stored);
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -643,6 +657,10 @@ impl ClientCertificateStore {
                             resolve_path_strictly_inside_dir(&dir, &identity_path)
                         {
                             let _ = enforce_secure_file_permissions(&safe_identity);
+                            if safe_identity.is_file() {
+                                let _ =
+                                    crate::proxy::dpapi::read_protected_key_bytes(&safe_identity);
+                            }
                         }
                     } else {
                         tracing::warn!(
@@ -660,7 +678,7 @@ impl ClientCertificateStore {
         Ok(Self {
             storage_dir: Some(dir),
             entries: RwLock::new(entries),
-            client_cache: Cache::builder().max_capacity(CLIENT_CACHE_CAPACITY).build(),
+            ephemeral_identities: RwLock::new(HashMap::new()),
             upstream_client_cache: Cache::builder().max_capacity(CLIENT_CACHE_CAPACITY).build(),
             id_seq: AtomicU64::new(1),
         })
@@ -671,7 +689,7 @@ impl ClientCertificateStore {
         Self {
             storage_dir: None,
             entries: RwLock::new(Vec::new()),
-            client_cache: Cache::builder().max_capacity(CLIENT_CACHE_CAPACITY).build(),
+            ephemeral_identities: RwLock::new(HashMap::new()),
             upstream_client_cache: Cache::builder().max_capacity(CLIENT_CACHE_CAPACITY).build(),
             id_seq: AtomicU64::new(1),
         }
@@ -679,8 +697,8 @@ impl ClientCertificateStore {
 
     #[cfg(test)]
     pub(crate) fn cache_entry_count(&self) -> u64 {
-        self.client_cache.run_pending_tasks();
-        self.client_cache.entry_count()
+        self.upstream_client_cache.run_pending_tasks();
+        self.upstream_client_cache.entry_count()
     }
 
     fn persist_registry(&self, entries: &[ClientCertificateEntry]) -> Result<(), ProxyError> {
@@ -688,7 +706,9 @@ impl ClientCertificateStore {
             return Ok(());
         };
         ensure_secure_dir(dir)?;
-        let json = serde_json::to_vec_pretty(entries).map_err(|e| {
+        let persistent: Vec<&ClientCertificateEntry> =
+            entries.iter().filter(|entry| !entry.ephemeral).collect();
+        let json = serde_json::to_vec_pretty(&persistent).map_err(|e| {
             ProxyError::Custom(format!(
                 "Не удалось сериализовать реестр клиентских сертификатов: {e}"
             ))
@@ -781,20 +801,44 @@ impl ClientCertificateStore {
 
         let seq = self.id_seq.fetch_add(1, Ordering::Relaxed);
         let id = format!("mcert-{}-{seq}", Utc::now().timestamp_millis());
+        let is_ephemeral = req.ephemeral;
 
-        let stored_cert_path = if let Some(ref dir) = self.storage_dir {
+        let stored_cert_path = if is_ephemeral {
+            let (certs, key) = parse_rustls_client_auth_from_pem(&parsed.identity_pem_bytes)?;
+            let signing_key =
+                rustls::crypto::ring::sign::any_supported_type(&key).map_err(ProxyError::Rustls)?;
+            let certified_key = Arc::new(rustls::sign::CertifiedKey::new(certs.clone(), signing_key));
+            let mut eph_guard = self.ephemeral_identities.write().map_err(|_| {
+                ProxyError::Custom("Ошибка блокировки RAM-хранилища клиентских сертификатов.".into())
+            })?;
+            eph_guard.insert(
+                id.clone(),
+                EphemeralClientIdentity {
+                    certs,
+                    key,
+                    certified_key,
+                },
+            );
+            "in-memory".to_string()
+        } else if let Some(ref dir) = self.storage_dir {
             ensure_secure_dir(dir)?;
             match format {
                 ClientCertificateFormat::Pkcs12 => {
                     let archive_path = dir.join(format!("{id}.{cert_ext}"));
                     write_bytes_securely(&archive_path, &cert_bytes)?;
                     let identity_path = dir.join(format!("{id}.identity.pem"));
-                    write_bytes_securely(&identity_path, &parsed.identity_pem_bytes)?;
+                    crate::proxy::dpapi::write_protected_key_bytes(
+                        &identity_path,
+                        &parsed.identity_pem_bytes,
+                    )?;
                     archive_path.display().to_string()
                 }
                 ClientCertificateFormat::Pem => {
                     let pem_path = dir.join(format!("{id}.pem"));
-                    write_bytes_securely(&pem_path, &parsed.identity_pem_bytes)?;
+                    crate::proxy::dpapi::write_protected_key_bytes(
+                        &pem_path,
+                        &parsed.identity_pem_bytes,
+                    )?;
                     pem_path.display().to_string()
                 }
             }
@@ -812,7 +856,7 @@ impl ClientCertificateStore {
             .unwrap_or_else(|| parsed.common_name.clone());
 
         let entry = ClientCertificateEntry {
-            id,
+            id: id.clone(),
             domain_pattern,
             label,
             format,
@@ -820,15 +864,28 @@ impl ClientCertificateStore {
             common_name: parsed.common_name,
             expires_at: parsed.expires_at,
             enabled: req.enabled.unwrap_or(true),
+            ephemeral: is_ephemeral,
         };
 
         {
-            let mut guard = self.entries.write().map_err(|_| {
-                ProxyError::Custom("Ошибка блокировки реестра клиентских сертификатов.".into())
-            })?;
+            let mut guard = match self.entries.write() {
+                Ok(g) => g,
+                Err(_) => {
+                    if is_ephemeral {
+                        if let Ok(mut eph_guard) = self.ephemeral_identities.write() {
+                            eph_guard.remove(&id);
+                        }
+                    }
+                    return Err(ProxyError::Custom(
+                        "Ошибка блокировки реестра клиентских сертификатов.".into(),
+                    ));
+                }
+            };
             let mut next = guard.clone();
             next.push(entry.clone());
-            self.persist_registry(&next)?;
+            if !is_ephemeral {
+                self.persist_registry(&next)?;
+            }
             *guard = next;
         }
 
@@ -853,7 +910,9 @@ impl ClientCertificateStore {
             };
             item.enabled = enabled;
             let cloned = item.clone();
-            self.persist_registry(&next)?;
+            if !cloned.ephemeral {
+                self.persist_registry(&next)?;
+            }
             *guard = next;
             cloned
         };
@@ -874,12 +933,18 @@ impl ClientCertificateStore {
             };
             let mut next = guard.clone();
             let removed = next.remove(pos);
-            self.persist_registry(&next)?;
+            if !removed.ephemeral {
+                self.persist_registry(&next)?;
+            }
             *guard = next.clone();
             (removed, next)
         };
 
-        if let Some(ref dir) = self.storage_dir {
+        if removed.ephemeral {
+            if let Ok(mut eph_guard) = self.ephemeral_identities.write() {
+                eph_guard.remove(&removed.id);
+            }
+        } else if let Some(ref dir) = self.storage_dir {
             let stored_path = Path::new(&removed.stored_cert_path);
             match resolve_path_strictly_inside_dir(dir, stored_path) {
                 Ok(safe_stored) => match fs::remove_file(&safe_stored) {
@@ -957,8 +1022,34 @@ impl ClientCertificateStore {
     }
 
     pub fn invalidate_client_cache(&self) {
-        self.client_cache.invalidate_all();
         self.upstream_client_cache.invalidate_all();
+    }
+
+    fn load_client_auth_for_entry(
+        &self,
+        entry: &ClientCertificateEntry,
+    ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), ProxyError> {
+        if entry.ephemeral {
+            let guard = self.ephemeral_identities.read().map_err(|_| {
+                ProxyError::Custom("Ошибка блокировки RAM-хранилища клиентских сертификатов.".into())
+            })?;
+            let ident = guard.get(&entry.id).ok_or_else(|| {
+                ProxyError::Custom(format!(
+                    "In-memory mTLS-сертификат '{}' отсутствует в текущей сессии.",
+                    entry.id
+                ))
+            })?;
+            return Ok((ident.certs.clone(), ident.key.clone_key()));
+        }
+
+        let identity_path = self.resolve_identity_pem_path(entry)?;
+        let pem_bytes = crate::proxy::dpapi::read_protected_key_bytes(&identity_path).map_err(|e| {
+            ProxyError::Custom(format!(
+                "Не удалось прочитать файл mTLS-идентичности '{}': {e}",
+                identity_path.display()
+            ))
+        })?;
+        parse_rustls_client_auth_from_pem(&pem_bytes)
     }
 
     /// Resolves and parses the matching mTLS certificate & private key for `host` as raw `rustls` types.
@@ -977,14 +1068,7 @@ impl ClientCertificateStore {
         let Some(entry) = self.match_certificate_for_host(host) else {
             return Ok(None);
         };
-        let identity_path = self.resolve_identity_pem_path(&entry)?;
-        let pem_bytes = fs::read(&identity_path).map_err(|e| {
-            ProxyError::Custom(format!(
-                "Не удалось прочитать файл mTLS-идентичности '{}': {e}",
-                identity_path.display()
-            ))
-        })?;
-        let (certs, key) = parse_rustls_client_auth_from_pem(&pem_bytes)?;
+        let (certs, key) = self.load_client_auth_for_entry(&entry)?;
         Ok(Some((certs, key, entry)))
     }
 
@@ -1008,14 +1092,7 @@ impl ClientCertificateStore {
             return Ok(Some((cached, entry)));
         }
 
-        let identity_path = self.resolve_identity_pem_path(&entry)?;
-        let pem_bytes = fs::read(&identity_path).map_err(|e| {
-            ProxyError::Custom(format!(
-                "Не удалось прочитать файл mTLS-идентичности '{}': {e}",
-                identity_path.display()
-            ))
-        })?;
-        let (certs, key) = parse_rustls_client_auth_from_pem(&pem_bytes)?;
+        let (certs, key) = self.load_client_auth_for_entry(&entry)?;
         let client = UpstreamHttpClient::build(
             host_remap,
             upstream_proxy,
@@ -1032,58 +1109,6 @@ impl ClientCertificateStore {
         self.upstream_client_cache
             .insert(cache_key, Arc::clone(&arc_client));
         Ok(Some((arc_client, entry)))
-    }
-
-    /// Returns a cached or freshly constructed `reqwest::Client` configured with the matching
-    /// mTLS client certificate for `host`, or `Ok(None)` if no enabled certificate matches.
-    pub fn get_or_build_client(
-        &self,
-        host: &str,
-        follow_redirects: bool,
-    ) -> Result<Option<(reqwest::Client, ClientCertificateEntry)>, ProxyError> {
-        self.get_or_build_client_with_resolver(host, follow_redirects, None)
-    }
-
-    pub fn get_or_build_client_with_resolver(
-        &self,
-        host: &str,
-        follow_redirects: bool,
-        dns_resolver: Option<Arc<HostRemapRegistry>>,
-    ) -> Result<Option<(reqwest::Client, ClientCertificateEntry)>, ProxyError> {
-        let Some(entry) = self.match_certificate_for_host(host) else {
-            return Ok(None);
-        };
-
-        let resolver_tag = if dns_resolver.is_some() { "remap" } else { "sys" };
-        let cache_key = format!("{}:redirect={follow_redirects}:dns={resolver_tag}", entry.id);
-        if let Some(cached) = self.client_cache.get(&cache_key) {
-            return Ok(Some((cached, entry)));
-        }
-
-        let identity_path = self.resolve_identity_pem_path(&entry)?;
-        let pem_bytes = fs::read(&identity_path).map_err(|e| {
-            ProxyError::Custom(format!(
-                "Не удалось прочитать файл mTLS-идентичности '{}': {e}",
-                identity_path.display()
-            ))
-        })?;
-        let identity = reqwest::Identity::from_pem(&pem_bytes).map_err(|e| {
-            ProxyError::Custom(format!(
-                "Ошибка загрузки mTLS-идентичности для '{}': {e}",
-                entry.domain_pattern
-            ))
-        })?;
-        let client =
-            build_upstream_client_with_options(follow_redirects, Some(identity), dns_resolver)
-                .map_err(|e| {
-                    ProxyError::Custom(format!(
-                        "Ошибка сборки mTLS-клиента для '{}': {e}",
-                        entry.domain_pattern
-                    ))
-                })?;
-
-        self.client_cache.insert(cache_key, client.clone());
-        Ok(Some((client, entry)))
     }
 }
 
@@ -1232,6 +1257,7 @@ mod tests {
                 key_path: None,
                 password: Some("pw1".into()),
                 enabled: Some(true),
+                ephemeral: false,
             })
             .unwrap();
         let e_sub = store
@@ -1242,6 +1268,7 @@ mod tests {
                 key_path: None,
                 password: Some("pw2".into()),
                 enabled: Some(true),
+                ephemeral: false,
             })
             .unwrap();
         let e_exact = store
@@ -1252,6 +1279,7 @@ mod tests {
                 key_path: None,
                 password: Some("pw3".into()),
                 enabled: Some(true),
+                ephemeral: false,
             })
             .unwrap();
 
@@ -1313,6 +1341,7 @@ mod tests {
                 key_path: None,
                 password: Some(secret_password.into()),
                 enabled: Some(true),
+                ephemeral: false,
             })
             .unwrap();
 
@@ -1339,29 +1368,51 @@ mod tests {
         assert!(!registry_raw.contains(secret_password));
         assert!(!registry_raw.contains("password"));
 
-        // Cache populates separately for follow_redirects=false and follow_redirects=true
+        // Cache populates separately for sys vs remap resolvers
+        let timeout_sec = Arc::new(AtomicU64::new(crate::models::DEFAULT_CONNECT_TIMEOUT_SEC));
+        let remap = Arc::new(HostRemapRegistry::new());
         assert_eq!(store.cache_entry_count(), 0);
-        assert!(store.get_or_build_client("api.vault.test", false).unwrap().is_some());
+        assert!(store
+            .get_or_build_upstream_client("api.vault.test", None, None, Arc::clone(&timeout_sec))
+            .unwrap()
+            .is_some());
         assert_eq!(store.cache_entry_count(), 1);
-        assert!(store.get_or_build_client("api.vault.test", false).unwrap().is_some());
+        assert!(store
+            .get_or_build_upstream_client("api.vault.test", None, None, Arc::clone(&timeout_sec))
+            .unwrap()
+            .is_some());
         assert_eq!(store.cache_entry_count(), 1);
-        assert!(store.get_or_build_client("api.vault.test", true).unwrap().is_some());
+        assert!(store
+            .get_or_build_upstream_client(
+                "api.vault.test",
+                Some(Arc::clone(&remap)),
+                None,
+                Arc::clone(&timeout_sec)
+            )
+            .unwrap()
+            .is_some());
         assert_eq!(store.cache_entry_count(), 2);
 
         // Toggle invalidates cache and disables matching
         store.toggle_certificate(&added.id, false).unwrap();
         assert_eq!(store.cache_entry_count(), 0);
-        assert!(store.get_or_build_client("api.vault.test", false).unwrap().is_none());
+        assert!(store
+            .get_or_build_upstream_client("api.vault.test", None, None, Arc::clone(&timeout_sec))
+            .unwrap()
+            .is_none());
 
         store.toggle_certificate(&added.id, true).unwrap();
-        assert!(store.get_or_build_client("api.vault.test", false).unwrap().is_some());
+        assert!(store
+            .get_or_build_upstream_client("api.vault.test", None, None, Arc::clone(&timeout_sec))
+            .unwrap()
+            .is_some());
         assert_eq!(store.cache_entry_count(), 1);
 
         // Reloading from disk keeps entries and builds mTLS client without needing the password again
         let reloaded_store = ClientCertificateStore::init_or_load(&app_data).unwrap();
         assert_eq!(reloaded_store.list().len(), 1);
         assert!(reloaded_store
-            .get_or_build_client("api.vault.test", false)
+            .get_or_build_upstream_client("api.vault.test", None, None, Arc::clone(&timeout_sec))
             .unwrap()
             .is_some());
 
@@ -1409,6 +1460,7 @@ mod tests {
                 common_name: "victim".into(),
                 expires_at: "2030-01-01T00:00:00Z".into(),
                 enabled: true,
+                ephemeral: false,
             },
             ClientCertificateEntry {
                 id: "tampered-traversal".into(),
@@ -1419,6 +1471,7 @@ mod tests {
                 common_name: "victim".into(),
                 expires_at: "2030-01-01T00:00:00Z".into(),
                 enabled: true,
+                ephemeral: false,
             },
             ClientCertificateEntry {
                 id: "../../outside/external".into(),
@@ -1429,6 +1482,7 @@ mod tests {
                 common_name: "victim".into(),
                 expires_at: "2030-01-01T00:00:00Z".into(),
                 enabled: true,
+                ephemeral: false,
             },
         ];
 
@@ -1441,14 +1495,30 @@ mod tests {
         let store = ClientCertificateStore::init_or_load(&app_data).unwrap();
 
         // 1. Reading external cert/key via tampered registry entries MUST fail
+        let timeout_sec = Arc::new(AtomicU64::new(crate::models::DEFAULT_CONNECT_TIMEOUT_SEC));
         assert!(store
-            .get_or_build_client("direct.internal.corp", false)
+            .get_or_build_upstream_client(
+                "direct.internal.corp",
+                None,
+                None,
+                Arc::clone(&timeout_sec)
+            )
             .is_err());
         assert!(store
-            .get_or_build_client("traversal.internal.corp", false)
+            .get_or_build_upstream_client(
+                "traversal.internal.corp",
+                None,
+                None,
+                Arc::clone(&timeout_sec)
+            )
             .is_err());
         assert!(store
-            .get_or_build_client("p12id.internal.corp", false)
+            .get_or_build_upstream_client(
+                "p12id.internal.corp",
+                None,
+                None,
+                Arc::clone(&timeout_sec)
+            )
             .is_err());
 
         // 2. Removing tampered entries MUST NOT delete external files outside storage_dir
@@ -1474,8 +1544,187 @@ mod tests {
             key_path: None,
             password: None,
             enabled: Some(true),
+            ephemeral: false,
         };
         assert!(store.add_certificate(bad_req).is_err());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ephemeral_session_only_certificates_stay_in_ram_and_never_touch_disk() {
+        let tmp = unique_test_dir("ephemeral_ram_only");
+        let app_data = tmp.join("app_data");
+        let import_dir = tmp.join("imports");
+        fs::create_dir_all(&import_dir).unwrap();
+
+        let (cert_der, cert_pem, key_der, key_pem) =
+            mint_self_signed_client_cert("ram-only.corp.local", 90);
+        let p12_path = import_dir.join("ram.p12");
+        fs::write(&p12_path, build_pkcs12_bytes(&cert_der, &key_der, "ram-pw")).unwrap();
+        let pem_path = import_dir.join("ram.pem");
+        fs::write(&pem_path, format!("{cert_pem}{key_pem}")).unwrap();
+
+        let store = ClientCertificateStore::init_or_load(&app_data).unwrap();
+        let eph_p12 = store
+            .add_certificate(AddClientCertificateRequest {
+                domain_pattern: "*.ram-p12.local".into(),
+                label: Some("RAM P12".into()),
+                cert_path: p12_path.display().to_string(),
+                key_path: None,
+                password: Some("ram-pw".into()),
+                enabled: Some(true),
+                ephemeral: true,
+            })
+            .unwrap();
+        assert!(eph_p12.ephemeral);
+        assert_eq!(eph_p12.stored_cert_path, "in-memory");
+
+        let eph_pem = store
+            .add_certificate(AddClientCertificateRequest {
+                domain_pattern: "*.ram-pem.local".into(),
+                label: Some("RAM PEM".into()),
+                cert_path: pem_path.display().to_string(),
+                key_path: None,
+                password: None,
+                enabled: Some(true),
+                ephemeral: true,
+            })
+            .unwrap();
+        assert!(eph_pem.ephemeral);
+        assert_eq!(eph_pem.stored_cert_path, "in-memory");
+
+        // Vault directory must remain completely empty (no .identity.pem, no .pem, no registry.json)
+        let vault_dir = app_data.join(CLIENT_CERTS_DIR_NAME);
+        let vault_files: Vec<_> = fs::read_dir(&vault_dir).unwrap().collect();
+        assert!(
+            vault_files.is_empty(),
+            "ephemeral certs must not write any files to vault_dir"
+        );
+
+        // Both upstream HTTP client and raw rustls auth loader resolve ephemeral entries
+        let timeout_sec = Arc::new(AtomicU64::new(crate::models::DEFAULT_CONNECT_TIMEOUT_SEC));
+        let (_, matched_p12) = store
+            .get_or_build_upstream_client("svc.ram-p12.local", None, None, Arc::clone(&timeout_sec))
+            .unwrap()
+            .expect("ephemeral p12 upstream client");
+        assert!(matched_p12.ephemeral);
+        assert!(store
+            .load_rustls_client_auth_for_host("ws.ram-pem.local")
+            .unwrap()
+            .is_some());
+
+        // Adding a persistent cert later must NOT serialize ephemeral entries into registry.json
+        let persisted = store
+            .add_certificate(AddClientCertificateRequest {
+                domain_pattern: "disk.corp.local".into(),
+                label: Some("Disk Cert".into()),
+                cert_path: pem_path.display().to_string(),
+                key_path: None,
+                password: None,
+                enabled: Some(true),
+                ephemeral: false,
+            })
+            .unwrap();
+        assert!(!persisted.ephemeral);
+        let registry_raw = fs::read_to_string(vault_dir.join(REGISTRY_FILE_NAME)).unwrap();
+        assert!(!registry_raw.contains(&eph_p12.id));
+        assert!(!registry_raw.contains(&eph_pem.id));
+        assert!(registry_raw.contains(&persisted.id));
+
+        // Toggling and removing ephemeral cert works purely in RAM
+        let toggled = store.toggle_certificate(&eph_p12.id, false).unwrap();
+        assert!(!toggled.enabled);
+        assert!(store
+            .get_or_build_upstream_client("svc.ram-p12.local", None, None, Arc::clone(&timeout_sec))
+            .unwrap()
+            .is_none());
+        store.remove_certificate(&eph_p12.id).unwrap();
+        assert_eq!(store.list().len(), 2);
+
+        // Reloading from disk only loads persistent certs (ephemeral entries are gone)
+        let reloaded = ClientCertificateStore::init_or_load(&app_data).unwrap();
+        assert_eq!(reloaded.list().len(), 1);
+        assert_eq!(reloaded.list()[0].id, persisted.id);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn dpapi_encrypts_mtls_keys_and_migrates_legacy_plain_pem() {
+        let tmp = unique_test_dir("dpapi_mtls_vault");
+        let app_data = tmp.join("app_data");
+        let import_dir = tmp.join("imports");
+        fs::create_dir_all(&import_dir).unwrap();
+
+        let (cert_der, cert_pem, key_der, key_pem) =
+            mint_self_signed_client_cert("dpapi.corp.local", 90);
+        let source_p12 = import_dir.join("dpapi.p12");
+        fs::write(&source_p12, build_pkcs12_bytes(&cert_der, &key_der, "pw")).unwrap();
+        let source_pem = import_dir.join("dpapi.pem");
+        let combined_plain_pem = format!("{cert_pem}{key_pem}");
+        fs::write(&source_pem, &combined_plain_pem).unwrap();
+
+        let store = ClientCertificateStore::init_or_load(&app_data).unwrap();
+        let p12_entry = store
+            .add_certificate(AddClientCertificateRequest {
+                domain_pattern: "p12.dpapi.local".into(),
+                label: None,
+                cert_path: source_p12.display().to_string(),
+                key_path: None,
+                password: Some("pw".into()),
+                enabled: Some(true),
+                ephemeral: false,
+            })
+            .unwrap();
+        let pem_entry = store
+            .add_certificate(AddClientCertificateRequest {
+                domain_pattern: "pem.dpapi.local".into(),
+                label: None,
+                cert_path: source_pem.display().to_string(),
+                key_path: None,
+                password: None,
+                enabled: Some(true),
+                ephemeral: false,
+            })
+            .unwrap();
+
+        let vault_dir = app_data.join(CLIENT_CERTS_DIR_NAME);
+        let p12_identity_path = vault_dir.join(format!("{}.identity.pem", p12_entry.id));
+        let pem_stored_path = PathBuf::from(&pem_entry.stored_cert_path);
+
+        let p12_disk = fs::read_to_string(&p12_identity_path).unwrap();
+        let pem_disk = fs::read_to_string(&pem_stored_path).unwrap();
+        assert!(p12_disk.starts_with(crate::proxy::dpapi::DPAPI_PREFIX));
+        assert!(!p12_disk.contains("-----BEGIN"));
+        assert!(pem_disk.starts_with(crate::proxy::dpapi::DPAPI_PREFIX));
+        assert!(!pem_disk.contains("-----BEGIN"));
+
+        let timeout_sec = Arc::new(AtomicU64::new(crate::models::DEFAULT_CONNECT_TIMEOUT_SEC));
+        assert!(store
+            .get_or_build_upstream_client("p12.dpapi.local", None, None, Arc::clone(&timeout_sec))
+            .unwrap()
+            .is_some());
+        assert!(store
+            .load_rustls_client_auth_for_host("pem.dpapi.local")
+            .unwrap()
+            .is_some());
+
+        // Simulate legacy plaintext PEM on disk -> must load cleanly and migrate in-place to DPAPI
+        fs::write(&pem_stored_path, combined_plain_pem.as_bytes()).unwrap();
+        assert!(fs::read_to_string(&pem_stored_path)
+            .unwrap()
+            .starts_with("-----BEGIN"));
+
+        let reloaded = ClientCertificateStore::init_or_load(&app_data).unwrap();
+        assert!(reloaded
+            .load_rustls_client_auth_for_host("pem.dpapi.local")
+            .unwrap()
+            .is_some());
+        let migrated_disk = fs::read_to_string(&pem_stored_path).unwrap();
+        assert!(migrated_disk.starts_with(crate::proxy::dpapi::DPAPI_PREFIX));
+        assert!(!migrated_disk.contains("-----BEGIN"));
 
         let _ = fs::remove_dir_all(&tmp);
     }

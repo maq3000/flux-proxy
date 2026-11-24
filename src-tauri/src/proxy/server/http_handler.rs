@@ -41,7 +41,7 @@ use super::{
     record_completed_session, record_in_flight_session_with_remap,
     request_targets_loopback_or_unspecified, resolve_protocol_label,
     should_use_host_mtls_for_peer, ClientConnContext, ProxyBoxBody, SharedProxyContext,
-    DEFAULT_UPSTREAM_TIMEOUT_SEC, MAX_BUFFERED_RESPONSE_BODY_BYTES, MAX_CAPTURED_BODY_BYTES,
+    MAX_BUFFERED_RESPONSE_BODY_BYTES, MAX_CAPTURED_BODY_BYTES,
     MAX_CAPTURED_REQUEST_BODY_BYTES, MAX_CONTENT_ENCODING_LAYERS, STREAM_TEXT_PREVIEW_MAX_BYTES,
     ZSTD_SPAWN_BLOCKING_THRESHOLD_BYTES,
 };
@@ -140,53 +140,6 @@ where
     }
 }
 
-/// Builds the shared upstream HTTP/HTTPS `reqwest::Client` with keep-alive, pool timeouts,
-/// native root CAs (`rustls-tls-native-roots`), optional mTLS `Identity`, optional custom DNS
-/// resolver (`HostRemapRegistry`), and `.no_proxy()` to prevent loopback recursion.
-pub fn build_upstream_client_with_options(
-    follow_redirects: bool,
-    identity: Option<reqwest::Identity>,
-    dns_resolver: Option<Arc<HostRemapRegistry>>,
-) -> Result<reqwest::Client, reqwest::Error> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let redirect_policy = if follow_redirects {
-        reqwest::redirect::Policy::default()
-    } else {
-        reqwest::redirect::Policy::none()
-    };
-    let mut builder = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(redirect_policy)
-        .connect_timeout(Duration::from_secs(DEFAULT_UPSTREAM_TIMEOUT_SEC))
-        .tcp_keepalive(Some(Duration::from_secs(30)))
-        .http2_keep_alive_interval(Some(Duration::from_secs(20)))
-        .http2_keep_alive_timeout(Duration::from_secs(10))
-        .http2_keep_alive_while_idle(true)
-        .pool_idle_timeout(Some(Duration::from_secs(35)));
-    if let Some(id) = identity {
-        builder = builder.identity(id);
-    }
-    if let Some(resolver) = dns_resolver {
-        builder = builder.dns_resolver(resolver);
-    }
-    builder.build()
-}
-
-pub fn build_upstream_client_with_identity(
-    follow_redirects: bool,
-    identity: Option<reqwest::Identity>,
-) -> Result<reqwest::Client, reqwest::Error> {
-    build_upstream_client_with_options(follow_redirects, identity, None)
-}
-
-/// Builds the shared upstream HTTP/HTTPS `reqwest::Client` without a client mTLS identity.
-#[cfg(test)]
-pub(crate) fn build_upstream_client(
-    follow_redirects: bool,
-) -> Result<reqwest::Client, reqwest::Error> {
-    build_upstream_client_with_options(follow_redirects, None, None)
-}
-
 pub(super) struct PreparedUpstreamTarget {
     pub upstream_url: String,
     pub host_header_override: Option<String>,
@@ -277,84 +230,6 @@ pub(crate) fn format_error_chain(err: &dyn std::error::Error) -> String {
         current = source.source();
     }
     parts.join(" -> ")
-}
-
-#[cfg(test)]
-#[inline]
-pub(super) fn is_idempotent_retry_method(method: &reqwest::Method) -> bool {
-    matches!(
-        *method,
-        reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
-    )
-}
-
-#[cfg(test)]
-pub(super) fn is_stale_pool_connection_error(err: &reqwest::Error) -> bool {
-    if !(err.is_request() || err.is_connect()) {
-        return false;
-    }
-
-    let mut current: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(err);
-    while let Some(source) = current {
-        if let Some(io_err) = source.downcast_ref::<std::io::Error>() {
-            if matches!(
-                io_err.kind(),
-                std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::NotConnected
-            ) {
-                return true;
-            }
-        }
-        if let Some(hyper_err) = source.downcast_ref::<hyper::Error>() {
-            if hyper_err.is_incomplete_message()
-                || hyper_err.is_canceled()
-                || hyper_err.is_closed()
-            {
-                return true;
-            }
-        }
-        let msg = source.to_string().to_ascii_lowercase();
-        if msg.contains("incompletemessage")
-            || msg.contains("incomplete message")
-            || msg.contains("connection closed before message completed")
-            || msg.contains("connection reset")
-            || msg.contains("broken pipe")
-            || msg.contains("unexpected eof")
-            || msg.contains("unexpectedeof")
-            || msg.contains("canceled")
-        {
-            return true;
-        }
-        current = source.source();
-    }
-
-    false
-}
-
-#[cfg(test)]
-pub(super) async fn send_upstream_with_retry<F>(
-    client: &reqwest::Client,
-    method: &reqwest::Method,
-    build_req: F,
-) -> Result<reqwest::Response, reqwest::Error>
-where
-    F: Fn(&reqwest::Client) -> reqwest::RequestBuilder,
-{
-    match build_req(client).send().await {
-        Ok(resp) => Ok(resp),
-        Err(err) if is_idempotent_retry_method(method) && is_stale_pool_connection_error(&err) => {
-            tracing::debug!(
-                "Retrying idempotent {} request once after stale pooled connection drop: {}",
-                method,
-                format_error_chain(&err)
-            );
-            build_req(client).send().await
-        }
-        Err(err) => Err(err),
-    }
 }
 
 pub(crate) fn extract_content_encoding_tokens(headers: &[HeaderPair]) -> Vec<String> {
@@ -769,6 +644,13 @@ pub(super) async fn handle_intercepted_request(
     client_conn: ClientConnContext,
     ctx: Arc<SharedProxyContext>,
 ) -> Response<ProxyBoxBody> {
+    if !ctx.filters.is_lan_client_allowed(client_addr.ip()) {
+        return plain_response(
+            StatusCode::FORBIDDEN,
+            "Forbidden: client IP is not in the LAN Client Allowlist",
+        );
+    }
+
     let start = Instant::now();
     let start_utc = Utc::now();
     let timestamp = start_utc.to_rfc3339();

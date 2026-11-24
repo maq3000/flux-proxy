@@ -3,6 +3,7 @@ pub mod ca;
 pub mod client_certs;
 pub mod codec;
 pub mod doctor;
+pub mod dpapi;
 pub mod filters;
 pub mod hosts;
 pub mod network;

@@ -12,6 +12,12 @@ import type {
   StorageStats,
 } from "../types/proxy";
 import { DEFAULT_BACKEND_FILTER_CONFIG } from "../lib/filterEngine";
+import {
+  LS_FOLLOW_TAIL_KEY,
+  LS_RETENTION_LIMIT_KEY,
+  useProxyStore,
+} from "../stores/proxyStore";
+import { useFilterStore } from "../stores/filterStore";
 
 const {
   mockDefaultBp,
@@ -336,6 +342,35 @@ function resetHookEnv(): void {
   listeners.breakpoints.clear();
   listeners.status.clear();
   listeners.stats.clear();
+
+  useProxyStore.setState({
+    sessions: [],
+    selectedId: null,
+    selectedIds: [],
+    selectedDetail: null,
+    diffLeftDetail: null,
+    diffRightDetail: null,
+    pausedBreakpoints: [],
+    toastMessage: null,
+    followTail: true,
+    sessionRetentionLimit: 10_000,
+    dropNonMatching: false,
+    clearDbOnExit: false,
+    hasPersistedClearDbOnExit: false,
+    status: structuredClone(mockState.status),
+    storageStats: {
+      ramSessions: 0,
+      sqliteSizeBytes: 0,
+      droppedSessionsCount: 0,
+      sessionRetentionLimit: 10_000,
+      dropNonMatching: false,
+    },
+  });
+  useFilterStore.setState({
+    filterQuery: "",
+    useRegex: false,
+    quickCategory: "all",
+  });
 }
 
 describe("useProxySessions — Port lifecycle, StrictMode & Replay", () => {
@@ -751,5 +786,92 @@ describe("useProxySessions — Port lifecycle, StrictMode & Replay", () => {
     );
     expect(result.current.toastMessage).toContain("127.0.0.1");
     warnSpy.mockRestore();
+  });
+
+  it("syncFromLocalStorage updates persisted config without wiping runtime sessions or selection ([CONC-01])", () => {
+    const sampleSession: SessionSummary = {
+      id: 42,
+      status: 200,
+      protocol: "HTTP/1.1",
+      scheme: "https",
+      method: "GET",
+      host: "example.com",
+      path: "/api",
+      url: "https://example.com/api",
+      contentType: "application/json",
+      bodySize: 256,
+      durationMs: 18,
+      timestamp: "2026-01-01T00:00:00Z",
+      isMocked: false,
+      clientIp: "127.0.0.1",
+      serverIp: "93.184.216.34",
+    };
+    const sampleDetail: SessionDetail = {
+      summary: sampleSession,
+      requestHeaders: [],
+      responseHeaders: [],
+      requestBodyBase64: "",
+      responseBodyBase64: "e30=",
+      requestBodyText: null,
+      responseBodyText: "{}",
+      clientAddr: "127.0.0.1:54321",
+      websocketFrames: [],
+    };
+    const sampleBreakpoint: PausedBreakpointItem = {
+      breakpointId: "bp-42",
+      sessionId: 42,
+      stage: "request",
+      createdAt: "2026-01-01T00:00:00Z",
+      timeoutSecs: 120,
+      scheme: "https",
+      method: "GET",
+      url: "https://example.com/api",
+      host: "example.com",
+      path: "/api",
+      requestHeaders: [],
+      requestBodyBase64: "",
+      requestBodyText: null,
+      responseStatus: null,
+      responseHeaders: [],
+      responseBodyBase64: "",
+      responseBodyText: null,
+    };
+    const customStats: StorageStats = {
+      ramSessions: 1,
+      sqliteSizeBytes: 4096,
+      droppedSessionsCount: 3,
+      sessionRetentionLimit: 25_000,
+      dropNonMatching: true,
+    };
+
+    useProxyStore.setState({
+      sessions: [sampleSession],
+      selectedId: 42,
+      selectedIds: [42],
+      selectedDetail: sampleDetail,
+      diffLeftDetail: sampleDetail,
+      diffRightDetail: sampleDetail,
+      pausedBreakpoints: [sampleBreakpoint],
+      storageStats: customStats,
+      toastMessage: "keep-me",
+    });
+
+    window.localStorage.setItem(LS_FOLLOW_TAIL_KEY, "false");
+    window.localStorage.setItem(LS_RETENTION_LIMIT_KEY, "25000");
+
+    useProxyStore.getState().syncFromLocalStorage();
+
+    const next = useProxyStore.getState();
+    expect(next.followTail).toBe(false);
+    expect(next.sessionRetentionLimit).toBe(25_000);
+    expect(next.sessions).toEqual([sampleSession]);
+    expect(next.selectedId).toBe(42);
+    expect(next.selectedIds).toEqual([42]);
+    expect(next.selectedDetail).toEqual(sampleDetail);
+    expect(next.diffLeftDetail).toEqual(sampleDetail);
+    expect(next.diffRightDetail).toEqual(sampleDetail);
+    expect(next.pausedBreakpoints).toEqual([sampleBreakpoint]);
+    expect(next.storageStats).toEqual(customStats);
+    expect(next.toastMessage).toBe("keep-me");
   });
 });

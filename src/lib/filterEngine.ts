@@ -346,6 +346,7 @@ export const DEFAULT_BACKEND_FILTER_CONFIG: ProxyFilterBackendConfig = {
   quickCategory: "all",
   filterQuery: "",
   useRegexQuery: false,
+  lanClientAllowlist: [],
 };
 
 export const TLS_BYPASS_QUICK_PACKS: {

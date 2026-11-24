@@ -1,8 +1,7 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::RwLock;
 
 use regex::Regex;
-use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 use crate::models::ProxyError;
 
@@ -253,8 +252,8 @@ impl CompiledHostRemapRule {
     }
 }
 
-/// Thread-safe Virtual DNS / HOSTS Remapping registry.
-/// Implements `reqwest::dns::Resolve` so HTTP and HTTPS requests preserve original
+/// Thread-safe Virtual DNS / HOSTS Remapping registry used by `UpstreamHttpClient`
+/// and `CONNECT` passthrough tunnels so HTTP/HTTPS requests preserve original
 /// `Host` header & TLS SNI while opening TCP connections to the remapped target IP/port.
 #[derive(Debug, Default)]
 pub struct HostRemapRegistry {
@@ -363,55 +362,9 @@ impl HostRemapRegistry {
     }
 }
 
-impl Resolve for HostRemapRegistry {
-    fn resolve(&self, name: Name) -> Resolving {
-        let host_str = name.as_str().to_string();
-        let matched = self.match_host(&host_str);
-
-        Box::pin(async move {
-            if let Some(rule) = matched {
-                // `port == 0` tells `hyper_util::client::legacy::connect::HttpConnector` to use the
-                // URL's default/explicit port, whereas a non-zero `target_port` overrides it when
-                // the upstream URL has no explicit port.
-                let port = rule.target_port.unwrap_or(0);
-                let target_clean = rule.target_host.trim_matches(['[', ']']);
-
-                if let Ok(ip) = target_clean.parse::<IpAddr>() {
-                    let addrs: Addrs = Box::new(std::iter::once(SocketAddr::new(ip, port)));
-                    return Ok(addrs);
-                }
-
-                let resolved: Vec<SocketAddr> = tokio::net::lookup_host((target_clean, port))
-                    .await?
-                    .collect();
-                if resolved.is_empty() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::AddrNotAvailable,
-                        format!(
-                            "No addresses resolved for remapped host '{}'",
-                            rule.target_host
-                        ),
-                    )
-                    .into());
-                }
-                let addrs: Addrs = Box::new(resolved.into_iter());
-                return Ok(addrs);
-            }
-
-            let clean = host_str.trim_matches(['[', ']']);
-            let resolved: Vec<SocketAddr> = tokio::net::lookup_host((clean, 0u16))
-                .await?
-                .collect();
-            let addrs: Addrs = Box::new(resolved.into_iter());
-            Ok(addrs)
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
 
     fn sample_rule(id: &str, source: &str, target: &str, port: Option<u16>) -> HostRemapRule {
         HostRemapRule {
@@ -493,38 +446,6 @@ mod tests {
         assert!(registry
             .set_rules(vec![sample_rule("1", "api.test", "127.0.0.1", Some(0))])
             .is_err());
-    }
-
-    #[tokio::test]
-    async fn reqwest_resolve_returns_remapped_ip_and_port() {
-        let registry = HostRemapRegistry::new();
-        registry
-            .set_rules(vec![
-                sample_rule("r1", "api.virtual.invalid", "127.0.0.1", Some(18443)),
-                sample_rule("r2", "default-port.virtual.invalid", "127.0.0.1", None),
-            ])
-            .unwrap();
-
-        let addrs1: Vec<SocketAddr> = registry
-            .resolve(Name::from_str("api.virtual.invalid").unwrap())
-            .await
-            .unwrap()
-            .collect();
-        assert_eq!(addrs1, vec!["127.0.0.1:18443".parse().unwrap()]);
-
-        let addrs2: Vec<SocketAddr> = registry
-            .resolve(Name::from_str("default-port.virtual.invalid").unwrap())
-            .await
-            .unwrap()
-            .collect();
-        assert_eq!(addrs2, vec!["127.0.0.1:0".parse().unwrap()]);
-
-        let fallback_addrs: Vec<SocketAddr> = registry
-            .resolve(Name::from_str("localhost").unwrap())
-            .await
-            .unwrap()
-            .collect();
-        assert!(!fallback_addrs.is_empty());
     }
 
     #[test]

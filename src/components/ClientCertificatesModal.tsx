@@ -165,6 +165,7 @@ export const ClientCertificatesModal: React.FC<ClientCertificatesModalProps> = (
   const passwordInputId = useId();
   const passwordHintId = useId();
   const passwordToggleWarningId = useId();
+  const ephemeralCheckboxId = useId();
 
   const [entries, setEntries] = useState<ClientCertificateEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -184,6 +185,7 @@ export const ClientCertificatesModal: React.FC<ClientCertificatesModalProps> = (
   const [keyPath, setKeyPath] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [ephemeral, setEphemeral] = useState(false);
 
   const supportsNativeSwitch =
     typeof HTMLInputElement !== "undefined" &&
@@ -335,6 +337,7 @@ export const ClientCertificatesModal: React.FC<ClientCertificatesModalProps> = (
         keyPath: isPemSelected && keyPath.trim() ? keyPath.trim() : null,
         password: !isPemSelected && password ? password : null,
         enabled: true,
+        ephemeral,
       });
 
       setEntries((prev) => [...prev, created]);
@@ -348,6 +351,7 @@ export const ClientCertificatesModal: React.FC<ClientCertificatesModalProps> = (
       setKeyPath("");
       setPassword("");
       setShowPassword(false);
+      setEphemeral(false);
 
       const msg = `mTLS сертификат '${created.commonName}' привязан к '${created.domainPattern}'`;
       setFeedback({ tone: "success", text: msg });
@@ -418,6 +422,7 @@ export const ClientCertificatesModal: React.FC<ClientCertificatesModalProps> = (
         if (dialogRef.current) dialogRef.current.returnValue = "";
         setPassword("");
         setShowPassword(false);
+        setEphemeral(false);
         onClose();
       }}
       {...({ closedby: "any" } as Record<string, string>)}
@@ -698,12 +703,36 @@ export const ClientCertificatesModal: React.FC<ClientCertificatesModalProps> = (
             )}
           </div>
 
+          <div className="rounded-md border border-hairline bg-surface/60 px-3 py-2">
+            <label
+              htmlFor={ephemeralCheckboxId}
+              className="flex cursor-pointer items-start gap-2"
+            >
+              <input
+                id={ephemeralCheckboxId}
+                type="checkbox"
+                checked={ephemeral}
+                onChange={(e) => setEphemeral(e.target.checked)}
+                className="mt-0.5 h-3.5 w-3.5 rounded border-strong accent-amber-500"
+              />
+              <span className="flex flex-col gap-0.5">
+                <span className="text-[11px] font-medium text-fg">
+                  Session-only (In-Memory, do not save key to disk)
+                </span>
+                <span className="text-[10px] text-subtle">
+                  Сертификат и закрытый ключ хранятся только в оперативной памяти (RAM) до закрытия FluxProxy и не записываются на диск.
+                </span>
+              </span>
+            </label>
+          </div>
+
           <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
             <span className="inline-flex items-center gap-1.5 text-[11px] text-muted">
               <Lock aria-hidden="true" className="h-3 w-3 text-emerald-400" />
               <span>
-                Копия сохраняется с правами <code>0600</code> в локальном
-                хранилище приложения
+                {ephemeral
+                  ? "Хранится только в RAM на время текущей сессии (на диск не сохраняется)"
+                  : "Приватный ключ шифруется Windows DPAPI / правами 0600 в локальном хранилище"}
               </span>
             </span>
             <button
@@ -841,6 +870,14 @@ export const ClientCertificatesModal: React.FC<ClientCertificatesModalProps> = (
                               <span className="rounded border border-hairline bg-elevated px-1.5 py-0.2 font-mono text-[10px] uppercase text-sky-400">
                                 {entry.format === "pkcs12" ? "PKCS#12" : "PEM"}
                               </span>
+                              {entry.ephemeral && (
+                                <span
+                                  title="Хранится только в RAM (не записан на диск)"
+                                  className="rounded border border-amber-500/40 bg-amber-500/12 px-1.5 py-0.2 font-mono text-[10px] font-semibold uppercase text-amber-300"
+                                >
+                                  RAM ONLY
+                                </span>
+                              )}
                             </div>
                             <span
                               className="max-w-[220px] truncate text-[11px] text-muted"
