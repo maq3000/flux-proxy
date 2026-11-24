@@ -590,6 +590,7 @@ export const SessionStatisticsPanel: React.FC<SessionStatisticsPanelProps> = ({
           <div
             role="group"
             aria-label="Request lifecycle phase timing segments"
+            onMouseLeave={() => setHoveredPhase(null)}
             className="flex h-6 w-full overflow-hidden rounded border border-hairline bg-canvas"
           >
             {timingSummary.phases.map((phase) => {
@@ -631,7 +632,7 @@ export const SessionStatisticsPanel: React.FC<SessionStatisticsPanelProps> = ({
             <div
               id={activeTooltipId}
               role="tooltip"
-              className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded border border-strong bg-canvas px-2.5 py-1.5 text-[11px] shadow-popover"
+              className="pointer-events-none absolute left-0 right-0 top-full z-20 mt-1.5 flex flex-wrap items-center justify-between gap-2 rounded border border-strong bg-canvas px-2.5 py-1.5 text-[11px] shadow-popover"
             >
               <div className="flex items-center gap-2">
                 <span
@@ -655,21 +656,13 @@ export const SessionStatisticsPanel: React.FC<SessionStatisticsPanelProps> = ({
         {/* Phase Legend */}
         <div className="mt-2.5 flex flex-wrap gap-x-3 gap-y-1">
           {timingSummary.phases.map((phase) => (
-            <button
+            <div
               key={`legend-${phase.key}`}
-              type="button"
-              onMouseEnter={() => setHoveredPhase(phase)}
-              onMouseLeave={() =>
-                setHoveredPhase((cur) => (cur?.key === phase.key ? null : cur))
-              }
-              onFocus={() => setHoveredPhase(phase)}
-              onBlur={() =>
-                setHoveredPhase((cur) => (cur?.key === phase.key ? null : cur))
-              }
+              data-phase-legend={phase.key}
               className={`inline-flex items-center gap-1.5 rounded px-1 py-0.5 text-[11px] transition-colors ${
                 hoveredPhase?.key === phase.key
                   ? "bg-canvas text-fg ring-1 ring-hairline"
-                  : "text-muted hover:text-fg"
+                  : "text-muted"
               }`}
             >
               <span
@@ -681,7 +674,7 @@ export const SessionStatisticsPanel: React.FC<SessionStatisticsPanelProps> = ({
               <span className="font-mono tabular-nums text-fg">
                 {formatMsPrecise(phase.durationMs)}
               </span>
-            </button>
+            </div>
           ))}
         </div>
       </section>

@@ -1763,20 +1763,74 @@ export const App: React.FC = () => {
     [autoResponderEnabled, persistAutoResponderStorage, showToast]
   );
 
+  const activeTargetHostsCount = useMemo(
+    () =>
+      (backendFilterConfig.tlsTargetRules ?? []).filter(
+        (r) => r.enabled && !r.pattern.trim().startsWith("!")
+      ).length,
+    [backendFilterConfig.tlsTargetRules]
+  );
+
+  const enabledTlsBypassCount = useMemo(
+    () =>
+      (backendFilterConfig.tlsBypassRules ?? []).filter((r) => r.enabled).length,
+    [backendFilterConfig.tlsBypassRules]
+  );
+
+  const activeRulesCount = autoResponderEnabled
+    ? rules.filter((r) => r.enabled).length
+    : 0;
+  const enabledBreakpointRulesCount = breakpointConfig.rules.filter(
+    (r) => r.enabled
+  ).length;
+  const breakpointsArmed =
+    breakpointConfig.breakBeforeRequest ||
+    breakpointConfig.breakAfterResponse ||
+    enabledBreakpointRulesCount > 0;
+  const activeThemePresetName = useMemo(
+    () => THEME_PRESETS.find((p) => p.id === themePreset)?.name ?? themePreset,
+    [themePreset]
+  );
+
   const commands: PaletteCommand[] = useMemo(
     () => [
       {
+        id: "toggle-proxy",
+        category: "Proxy",
+        group: "capture",
+        label: status.running
+          ? "Pause MITM Capture & Rollback OS System Proxy"
+          : status.autoSystemProxy
+            ? `Start MITM Capture & Enable OS System Proxy (127.0.0.1:${status.port})`
+            : `Start Local MITM Proxy Listener Only (127.0.0.1:${status.port})`,
+        description: status.running
+          ? `Остановить прослушивание порта :${status.port} и откатить системный прокси`
+          : `Запустить захват HTTP/HTTPS/WS трафика на порту :${status.port}`,
+        statusBadge: status.running
+          ? `ON :${status.port}`
+          : `OFF :${status.port}`,
+        shortcut: "F12",
+        keywords: ["proxy", "start", "stop", "capture", "listen", "прокси", "захват"],
+        perform: () => void toggleProxy(),
+      },
+      {
         id: "select-all-sessions",
         category: "Traffic",
+        group: "capture",
         label: "Select All Visible Sessions in Traffic Grid",
+        description: "Выделить все отфильтрованные строки в таблице трафика",
         shortcut: "Ctrl+A",
+        keywords: ["select", "all", "выделить"],
         perform: () => handleSelectAllSessions(),
       },
       {
         id: "replay-selected",
         category: "Traffic",
+        group: "capture",
         label: "Replay выбранной сессии напрямую в upstream",
+        description: "Повторно отправить выбранные запросы с текущими правилами и скриптами",
         shortcut: "R / Ctrl+R",
+        keywords: ["replay", "resend", "повтор"],
         perform: () => {
           if (effectiveSelectedIds.length > 0) {
             void replaySessions(effectiveSelectedIds);
@@ -1788,7 +1842,9 @@ export const App: React.FC = () => {
       {
         id: "delete-selected",
         category: "Traffic",
+        group: "capture",
         label: "Удалить выбранные сессии из списка",
+        description: "Удалить выделенные запросы из буфера памяти таблицы",
         shortcut: "Del",
         perform: () => {
           if (effectiveSelectedIds.length > 0) {
@@ -1799,14 +1855,19 @@ export const App: React.FC = () => {
       {
         id: "clear-all",
         category: "Traffic",
+        group: "capture",
         label: "Clear All Captured Traffic Sessions",
+        description: "Очистить все захваченные сессии из оперативной памяти",
         shortcut: "Ctrl+X",
         perform: () => void clearAllSessions(),
       },
       {
         id: "copy-curl",
         category: "Traffic",
+        group: "tools",
         label: "Copy Selected Session as cURL",
+        description: "Скопировать выбранный запрос в буфер обмена как команду curl",
+        keywords: ["curl", "copy", "cli"],
         perform: () => {
           if (selectedId !== null) void copySessionAsCurl(selectedId);
         },
@@ -1814,7 +1875,9 @@ export const App: React.FC = () => {
       {
         id: "generate-client-code",
         category: "Traffic",
+        group: "tools",
         label: "Generate Client Code… (JavaScript, Python, Go, Rust, cURL)",
+        description: "Сгенерировать код HTTP-клиента по выбранной сессии в Monaco",
         keywords: [
           "code",
           "snippet",
@@ -1841,23 +1904,29 @@ export const App: React.FC = () => {
       {
         id: "open-session-diff",
         category: "Session Diff",
+        group: "tools",
         label:
           "Открыть Session Diff — сравнение заголовков, кук и JSON двух сессий (Monaco DiffEditor)",
+        description: "Сравнение двух запросов/ответов с подсветкой различий заголовков и тела",
         shortcut: "Ctrl+D",
         perform: () => openDiffWithPairSmart(),
       },
       {
         id: "annotate-session",
         category: "Annotations",
+        group: "capture",
         label:
           "Добавить комментарий и цветовую заливку к выбранной сессии (Comment / Mark)",
+        description: "Установить цветную метку и заметку для выбранных сессий",
         shortcut: "M",
         perform: () => openAnnotationFor(effectiveSelectedIds),
       },
       {
         id: "unmark-session",
         category: "Annotations",
+        group: "capture",
         label: "Снять цветовую метку с выбранных сессий (Unmark)",
+        description: "Убрать пользовательский маркер и комментарий с выделенных строк",
         shortcut: "U",
         perform: () => {
           if (effectiveSelectedIds.length > 0) {
@@ -1868,7 +1937,11 @@ export const App: React.FC = () => {
       {
         id: "filter-marked-sessions",
         category: "Annotations",
+        group: "capture",
         label: "Показать только помеченные сессии (Marked / Comments)",
+        description: "Отфильтровать таблицу по сессиям с комментариями или цветовыми метками",
+        statusBadge:
+          markedSessionsCount > 0 ? `Помечено: ${markedSessionsCount}` : "0",
         perform: () => {
           setActiveSection("traffic");
           setQuickCategory("marked");
@@ -1877,14 +1950,18 @@ export const App: React.FC = () => {
       {
         id: "inspect-hex",
         category: "Inspector",
+        group: "capture",
         label: "Открыть выбранную сессию во вкладке Hex View",
+        description: "Побайтовый шестнадцатеричный дамп и Decoded ASCII в инспекторе",
         perform: handleInspectInHex,
       },
       {
         id: "open-session-statistics",
         category: "Inspector",
+        group: "capture",
         label:
           "Открыть Statistics — пофазные тайминги (DNS/TCP/TLS/TTFB) и сводка выделенных сессий",
+        description: "Шкала фаз соединения, метрики сжатия, TLS и оценка задержек по регионам",
         keywords: [
           "statistics",
           "timings",
@@ -1901,52 +1978,71 @@ export const App: React.FC = () => {
       {
         id: "toggle-compact-toolbar",
         category: "View",
+        group: "settings",
         label: compactToolbar
           ? "Выключить Slim / Compact Toolbar"
           : "Включить Slim / Compact Toolbar",
+        description: "Переключить компактный однострочный режим верхней панели инструментов",
+        statusBadge: compactToolbar ? "ON" : "OFF",
         shortcut: "Ctrl+Shift+T",
         perform: toggleCompactToolbar,
       },
       {
         id: "toggle-sidebar",
         category: "View",
+        group: "settings",
         label: sidebarCollapsed
           ? "Показать боковую панель (Sidebar)"
           : "Скрыть боковую панель (Sidebar)",
+        description: "Свернуть или развернуть левую навигационную панель вкладок",
+        statusBadge: sidebarCollapsed ? "Свёрнут" : "Открыт",
         shortcut: "Ctrl+B",
         perform: toggleSidebar,
       },
       {
         id: "toggle-inspector",
         category: "View",
+        group: "settings",
         label: inspectorCollapsed
           ? "Развернуть панель Session Inspector"
           : "Свернуть панель Session Inspector",
+        description: "Показать или скрыть панель детального разбора выбранной сессии",
+        statusBadge: inspectorCollapsed ? "Свёрнут" : "Открыт",
         shortcut: "Space",
         perform: toggleInspector,
       },
       {
         id: "dock-inspector-bottom",
         category: "View",
+        group: "settings",
         label: "Расположить Session Inspector снизу (Bottom Split)",
+        description: "Горизонтальное разделение: таблица сверху, инспектор снизу",
+        statusBadge: inspectorPosition === "bottom" ? "Активно" : undefined,
         perform: () => setInspectorPosition("bottom"),
       },
       {
         id: "dock-inspector-right",
         category: "View",
+        group: "settings",
         label: "Расположить Session Inspector справа (Right Split)",
+        description: "Вертикальное разделение: таблица слева, инспектор справа",
+        statusBadge: inspectorPosition === "right" ? "Активно" : undefined,
         perform: () => setInspectorPosition("right"),
       },
       {
         id: "reset-columns",
         category: "View",
+        group: "settings",
         label: "Сбросить ширину и видимость колонок таблицы",
+        description: "Восстановить стандартный набор и ширину колонок Traffic Grid",
         perform: resetColumns,
       },
       {
         id: "reset-panel-layout",
         category: "View",
+        group: "settings",
         label: "Reset Panel Layout to Default",
+        description: "Сбросить сохранённые пропорции разделителей сплит-панелей",
         keywords: [
           "split",
           "panels",
@@ -1960,15 +2056,19 @@ export const App: React.FC = () => {
       {
         id: "open-shortcuts-modal",
         category: "Help",
+        group: "settings",
         label: "Показать справку по горячим клавишам (Keyboard Shortcuts)",
+        description: "Полный список клавиатурных комбинаций таблицы, инспектора и фильтров",
         shortcut: "?",
         perform: () => setShortcutsModalOpen(true),
       },
       {
         id: "run-proxy-doctor",
         category: "Diagnostics",
+        group: "tools",
         label:
           "Run Proxy Doctor… (Диагностика порта, Root CA, SysProxy, VPN, Firewall и loopback)",
+        description: "Автоматическая проверка 6 компонентов среды и исправление проблем в 1 клик",
         shortcut: "Ctrl+Shift+D",
         keywords: [
           "doctor",
@@ -1987,46 +2087,66 @@ export const App: React.FC = () => {
       {
         id: "open-text-wizard",
         category: "TextWizard",
+        group: "tools",
         label:
           "Открыть TextWizard & JWT Decoder (Base64, URL, Gzip/Brotli/Zstd, Hex, Timestamp)",
+        description: "Инструмент кодирования, декодирования, разбора JWT и сжатия текста",
         shortcut: "Ctrl+E",
         perform: () => openTextWizardAt("jwt"),
       },
       {
         id: "open-jwt-inspector",
         category: "TextWizard",
+        group: "tools",
         label: "JWT Inspector: декодировать Header / Claims и проверить exp",
+        description: "Быстрый разбор структуры JSON Web Token и валидности подписи/срока",
         perform: () => openTextWizardAt("jwt"),
       },
       {
         id: "open-compression-codec",
         category: "TextWizard",
+        group: "tools",
         label: "TextWizard: Сжатие и распаковка Gzip / Brotli / Deflate / Zstd",
+        description: "Конвертер сжатых payload и проверка размера до/после компрессии",
         perform: () => openTextWizardAt("compression"),
       },
       {
         id: "toggle-bp-request",
         category: "Breakpoints",
+        group: "filters",
         label: breakpointConfig.breakBeforeRequest
           ? "Отключить Break on Request (перехват до отправки на апстрим)"
           : "Включить Break on Request — ставить запросы на паузу в Monaco",
+        description: "Глобальная пауза всех исходящих запросов для ручного редактирования",
+        statusBadge: breakpointConfig.breakBeforeRequest ? "ON" : "OFF",
         shortcut: "F11",
         perform: () => void toggleBreakBeforeRequest(),
       },
       {
         id: "toggle-bp-response",
         category: "Breakpoints",
+        group: "filters",
         label: breakpointConfig.breakAfterResponse
           ? "Отключить Break on Response (перехват ответа сервера)"
           : "Включить Break on Response — править JSON или код 500 на лету",
+        description: "Глобальная пауза всех ответов перед возвратом в браузер или приложение",
+        statusBadge: breakpointConfig.breakAfterResponse ? "ON" : "OFF",
         shortcut: "Alt+F11",
         perform: () => void toggleBreakAfterResponse(),
       },
       {
         id: "open-bp-rules",
         category: "Breakpoints",
+        group: "filters",
         label:
           "Открыть Live Breakpoints и правила `bpu` / `bpafter` (или введите `bpu <url>` выше)",
+        description: "Очередь перехваченных пакетов в Monaco и настройка условных правил",
+        statusBadge:
+          pausedBreakpoints.length > 0
+            ? `Пауза: ${pausedBreakpoints.length} · Правил: ${enabledBreakpointRulesCount}`
+            : enabledBreakpointRulesCount > 0
+              ? `Правил: ${enabledBreakpointRulesCount}`
+              : "0 правил",
         perform: () =>
           openBreakpointsAt(
             pausedBreakpoints.length > 0 ? "intercept" : "rules"
@@ -2035,121 +2155,179 @@ export const App: React.FC = () => {
       {
         id: "disable-all-breakpoints",
         category: "Breakpoints",
+        group: "filters",
         label: "Снять все точки останова и отпустить ожидающие запросы",
+        description: "Выключить глобальные и условные брейкпоинты и продолжить все паузы",
+        statusBadge:
+          pausedBreakpoints.length > 0
+            ? `В очереди: ${pausedBreakpoints.length}`
+            : breakpointsArmed
+              ? "Активно"
+              : "OFF",
         shortcut: "Shift+F11",
         perform: () => void disableAllBreakpoints(),
       },
       {
         id: "open-filters-matrix",
         category: "Filters",
+        group: "filters",
         label: "Открыть Таблицу фильтров и Пресеты (Include / Exclude / PID)",
+        description: "Многострочные правила фильтрации трафика, процессы и пресеты",
+        statusBadge:
+          activeFilterBadgeCount > 0
+            ? `Активно: ${activeFilterBadgeCount}`
+            : "Выкл",
         shortcut: "Alt+4",
         perform: () => openFilterDrawerAt("matrix"),
       },
       {
         id: "open-hosts-list-filter",
         category: "Filters",
+        group: "filters",
         label:
           "Открыть Массовый фильтр хостов и URL (Hosts List: Show only Whitelist / Hide Blacklist)",
+        description: "Фильтрация трафика по списку доменов, маскам * и регулярным выражениям",
+        statusBadge: hostListFilter.enabled
+          ? `${hostListFilter.mode === "whitelist" ? "Allow" : "Block"} (${compiledHostList.activeCount})`
+          : "OFF",
         perform: () => openFilterDrawerAt("hostsList"),
       },
       {
         id: "open-tls-bypass",
         category: "TLS / CA",
+        group: "filters",
         label:
           "Открыть настройки Selective TLS MITM: Target Allowlist & Bypass",
+        description: "Настройка целевых доменов расшифровки, Quick-Packs и Bulk Editor",
+        statusBadge:
+          backendFilterConfig.tlsInterceptMode === "targetedOnly"
+            ? `Targeted (${activeTargetHostsCount})`
+            : `Bypass (${enabledTlsBypassCount})`,
         perform: () => openFilterDrawerAt("tlsBypass"),
       },
       {
         id: "toggle-tls-mitm-mode",
         category: "TLS / CA",
+        group: "filters",
         label:
           backendFilterConfig.tlsInterceptMode === "targetedOnly"
             ? "Переключить в Mode: Intercept All (расшифровка всего, кроме Bypass)"
             : "Включить Mode: Targeted Only (Allowlist) — «Чистый проброс» всего, кроме целевых хостов",
+        description: "Переключение между полной расшифровкой HTTPS и режимом целевого списка",
+        statusBadge:
+          backendFilterConfig.tlsInterceptMode === "targetedOnly"
+            ? `Targeted (${activeTargetHostsCount})`
+            : "Intercept All",
         perform: () => void toggleTlsInterceptMode(),
       },
       {
         id: "preset-backend-api",
         category: "Preset",
+        group: "filters",
         label: "Применить пресет: «Только API бэкенда»",
+        description: "Оставить JSON/GraphQL/API-запросы и скрыть статику со шрифтами",
+        statusBadge:
+          activePresetId === "preset-backend-api" ? "Активно" : undefined,
         perform: () => applyPreset("preset-backend-api"),
       },
       {
         id: "preset-hide-noise",
         category: "Preset",
+        group: "filters",
         label: "Применить пресет: «Скрыть аналитику и фоновый шум ОС»",
+        description: "Скрыть телеметрию, трекеры и служебные фоновые запросы",
+        statusBadge:
+          activePresetId === "preset-hide-os-noise" ? "Активно" : undefined,
         perform: () => applyPreset("preset-hide-os-noise"),
       },
       {
         id: "toggle-nocache",
         category: "Filters",
+        group: "filters",
         label: isForceNoCacheActive
           ? "Отключить принудительный обход кэша (If-Modified-Since / ETag)"
           : "Включить принудительный обход кэша (Удалять If-Modified-Since / ETag)",
+        description: "Удаляет заголовки условного кэширования для получения свежих ответов 200",
+        statusBadge: isForceNoCacheActive ? "ON" : "OFF",
         perform: () => void toggleForceNoCache(),
       },
       {
         id: "reset-filters",
         category: "Filters",
+        group: "filters",
         label: "Сбросить все табличные фильтры и пороги шума",
+        description: "Очистить матрицу фильтров, список хостов и пороговые значения",
         perform: resetAdvancedFilters,
       },
       {
         id: "connect-mobile-device",
         category: "Proxy",
+        group: "network",
         label:
           "Connect Mobile Device — iOS & Android Wi-Fi Proxy + QR Code (flux.proxy)",
+        description: "LAN IP, QR-код установки Root CA и шаблон Android network_security_config",
+        statusBadge:
+          status.allowRemote || status.bindAddr === "0.0.0.0"
+            ? `LAN :${status.port}`
+            : `Local :${status.port}`,
         shortcut: "Ctrl+Shift+M",
         perform: () => setMobileModalOpen(true),
       },
       {
         id: "toggle-allow-remote",
         category: "Proxy",
+        group: "network",
         label:
           status.allowRemote || status.bindAddr === "0.0.0.0"
             ? "Отключить удаленные подключения (слушать только 127.0.0.1)"
             : "Разрешить подключения с удаленных устройств (0.0.0.0 / LAN Wi-Fi)",
+        description: "Переключить привязку прокси между локальной петлёй и сетевыми интерфейсами",
+        statusBadge:
+          status.allowRemote || status.bindAddr === "0.0.0.0"
+            ? "LAN (0.0.0.0)"
+            : "127.0.0.1",
         perform: () => void toggleAllowRemote(),
-      },
-      {
-        id: "toggle-proxy",
-        category: "Proxy",
-        label: status.running
-          ? "Pause MITM Capture & Rollback OS System Proxy"
-          : status.autoSystemProxy
-            ? `Start MITM Capture & Enable OS System Proxy (127.0.0.1:${status.port})`
-            : `Start Local MITM Proxy Listener Only (127.0.0.1:${status.port})`,
-        shortcut: "F12",
-        perform: () => void toggleProxy(),
       },
       {
         id: "toggle-system-proxy",
         category: "Proxy",
+        group: "network",
         label: status.systemProxyError
           ? `Переподключить системный прокси ОС (127.0.0.1:${status.port})`
           : status.systemProxyEnabled
             ? "Отключить системный прокси ОС (оставить только локальный порт HTTP_PROXY)"
             : `Включить системный прокси ОС (направить браузеры на 127.0.0.1:${status.port})`,
+        description: "Регистрация FluxProxy в качестве системного HTTP/HTTPS прокси ОС",
+        statusBadge: status.systemProxyError
+          ? "Ошибка"
+          : status.systemProxyEnabled
+            ? "ON"
+            : "OFF",
         perform: () => void toggleSystemProxy(),
       },
       {
         id: "stress-10k",
         category: "Benchmark",
+        group: "tools",
         label: "Generate +10,000 Sessions (Test Virtualized Scrolling)",
+        description: "Сгенерировать 10 000 тестовых сессий для проверки производительности таблицы",
         perform: generateStress10k,
       },
       {
         id: "view-traffic",
         category: "View",
+        group: "settings",
         label: "Switch to Traffic Viewer & Session Inspector",
+        description: "Переключиться на основную таблицу перехваченного трафика",
         shortcut: "Alt+1",
         perform: () => setActiveSection("traffic"),
       },
       {
         id: "view-composer",
         category: "View",
+        group: "tools",
         label: "Switch to Request Composer",
+        description: "Открыть конструктор HTTP-запросов с импортом cURL и генератором кода",
         shortcut: "Alt+2",
         keywords: ["composer", "curl", "import", "paste", "request", "http"],
         perform: () => setActiveSection("composer"),
@@ -2157,9 +2335,12 @@ export const App: React.FC = () => {
       {
         id: "toggle-docked-composer",
         category: "View",
+        group: "settings",
         label: dockedComposer
           ? "Hide Docked Split Composer"
           : "Dock Composer Split Beside Traffic Viewer (Drag & Drop)",
+        description: "Показать или скрыть боковую панель Composer рядом с таблицей трафика",
+        statusBadge: dockedComposer ? "Открыт" : "OFF",
         perform: () => {
           setActiveSection("traffic");
           setDockedComposer((v) => !v);
@@ -2168,14 +2349,22 @@ export const App: React.FC = () => {
       {
         id: "view-rules",
         category: "AutoResponder",
+        group: "tools",
         label: "Open AutoResponder & Latency Simulation Rules",
+        description: "Правила локальных моков ответов, подмены статусов и искусственной задержки",
+        statusBadge: autoResponderEnabled
+          ? `ON (${activeRulesCount}/${rules.length})`
+          : `OFF (${rules.length})`,
         shortcut: "Alt+3",
         perform: () => setActiveSection("rules"),
       },
       {
         id: "view-scripts",
         category: "Scripting",
+        group: "tools",
         label: "Open Python Scripting Engine (on_request / on_response)",
+        description: "Редактор Python-хуков с живой консолью stdout/stderr и пресетами",
+        statusBadge: scriptEnabled ? "ON" : "OFF",
         shortcut: "Alt+5",
         keywords: ["python", "script", "hmac", "mock", "on_request", "on_response"],
         perform: () => setActiveSection("scripts"),
@@ -2183,21 +2372,28 @@ export const App: React.FC = () => {
       {
         id: "toggle-python-script",
         category: "Scripting",
+        group: "tools",
         label: scriptEnabled
           ? "Disable Python Scripting Engine"
           : "Enable Python Scripting Engine",
+        description: "Включить или выключить выполнение Python-хуков на проходящем трафике",
+        statusBadge: scriptEnabled ? "ON" : "OFF",
         perform: () => void handleTogglePythonScript(!scriptEnabled),
       },
       {
         id: "root-ca",
         category: "TLS / CA",
+        group: "filters",
         label: "Inspect or Install HTTPS MITM Root CA Certificate",
+        description: "Проверить статус доверия ОС, отпечаток SHA-256 и установить Root CA",
         perform: () => setCertModalOpen(true),
       },
       {
         id: "client-certificates",
         category: "TLS / mTLS",
+        group: "filters",
         label: "Client Certificates… (mTLS — .p12 / .pfx / .pem)",
+        description: "Хранилище клиентских сертификатов с поддержкой DPAPI и режима In-Memory",
         shortcut: "Ctrl+Shift+C",
         keywords: [
           "mtls",
@@ -2216,7 +2412,13 @@ export const App: React.FC = () => {
       {
         id: "host-remap",
         category: "DNS / Routing",
+        group: "network",
         label: "HOSTS Remapping… (Virtual DNS перенаправление доменов)",
+        description: "Виртуальный DNS для маршрутизации доменов на локальные или стендовые IP",
+        statusBadge:
+          activeHostRemapCount > 0
+            ? `Правил: ${activeHostRemapCount}`
+            : "0 правил",
         shortcut: "Ctrl+Shift+H",
         keywords: [
           "hosts",
@@ -2233,7 +2435,10 @@ export const App: React.FC = () => {
       {
         id: "upstream-proxy-chaining",
         category: "Tools",
+        group: "network",
         label: "Upstream Proxy Chaining… (HTTP / HTTPS / SOCKS5)",
+        description: "Цепочка вышестоящего прокси с аутентификацией и списком обхода bypass",
+        statusBadge: upstreamProxyActiveLabel ?? "OFF",
         shortcut: "Ctrl+Shift+U",
         keywords: [
           "upstream",
@@ -2251,7 +2456,16 @@ export const App: React.FC = () => {
         (presetDef) => ({
           id: `throttle-preset-${presetDef.id}`,
           category: "Throttling",
+          group: "network" as const,
           label: `Network Throttling: ${presetDef.label} (${presetDef.summary})`,
+          description:
+            presetDef.id === "none"
+              ? "Отключить ограничение скорости и задержку RTT"
+              : presetDef.id === "offline"
+                ? "Имитировать отсутствие сети с ответом HTTP 503"
+                : `Ограничить канал ↓${presetDef.downloadKbps} / ↑${presetDef.uploadKbps} Kbps и RTT ${presetDef.latencyMs} ms`,
+          statusBadge:
+            throttleConfig.preset === presetDef.id ? "Активно" : undefined,
           keywords: [
             "throttle",
             "bandwidth",
@@ -2276,21 +2490,27 @@ export const App: React.FC = () => {
       {
         id: "save-all-archive",
         category: "Storage",
+        group: "tools",
         label: "Save All Sessions As... (.har, .saz, .json)",
+        description: "Экспортировать все захваченные сессии в стандартный архив",
         shortcut: "Ctrl+S",
         perform: () => void exportAllSessionsAs(),
       },
       {
         id: "save-selected-archive",
         category: "Storage",
+        group: "tools",
         label: "Save Selected Sessions... (.har, .saz, .json)",
+        description: "Экспортировать только выделенные в таблице сессии",
         perform: () => void exportSelectedSessionsAs(),
       },
       {
         id: "export-sanitized-sessions",
         category: "Security",
+        group: "tools",
         label:
           "Export Sanitized Sessions… (PII & Secrets Redaction for HAR / SAZ / JSON / Raw)",
+        description: "Безопасный экспорт с маскированием токенов, Cookie, PII и секретов",
         shortcut: "Ctrl+Shift+S",
         keywords: [
           "sanitize",
@@ -2310,89 +2530,132 @@ export const App: React.FC = () => {
       {
         id: "export-openapi-spec",
         category: "Traffic",
+        group: "tools",
         label: "Export as OpenAPI 3.0 Spec… (YAML / JSON)",
+        description: "Автогенерация схемы OpenAPI 3.0.3 по выбранным API-запросам",
         keywords: ["openapi", "swagger", "spec", "yaml", "json", "schema", "api"],
         perform: () => openOpenApiExportModal(),
       },
       {
         id: "import-archive",
         category: "Storage",
+        group: "tools",
         label: "Open / Import Archive... (.har, .saz, .json)",
+        description: "Загрузить сохранённый трафик из HAR 1.2, Fiddler SAZ или JSON",
         shortcut: "Ctrl+O",
         perform: () => void importArchiveDialog(),
       },
       {
         id: "sqlite-save",
         category: "Storage",
+        group: "capture",
         label: "Save Captured Sessions to SQLite Database",
+        description: "Сохранить текущие сессии из оперативной памяти в sessions.sqlite",
         perform: () => void saveToSqlite(),
       },
       {
         id: "sqlite-load",
         category: "Storage",
+        group: "capture",
         label: "Restore Sessions from SQLite Database",
+        description: "Восстановить сохранённую историю сессий из базы SQLite",
         perform: () => void loadFromSqlite(),
       },
       {
         id: "clear-sqlite-db",
         category: "Storage",
+        group: "capture",
         label: "Purge & Compact SQLite Archive (VACUUM / Free Disk)...",
+        description: "Удалить архивные записи из SQLite и освободить место на диске",
         perform: () => setConfirmSqlitePurgeOpen(true),
       },
       {
         id: "toggle-drop-non-matching",
         category: "Storage",
+        group: "capture",
         label: dropNonMatching
           ? "Disable Drop Non-Matching Traffic on Capture"
           : "Enable Drop Non-Matching Traffic on Capture (Save RAM)",
+        description: "Отбрасывать не попадающий под фильтры трафик на лету для экономии ОЗУ",
+        statusBadge: dropNonMatching ? "ON" : "OFF",
         perform: () => void toggleDropNonMatching(),
       },
       {
         id: "retention-all",
         category: "Storage",
+        group: "capture",
         label: "Session Retention Limit: Keep All Sessions (Unlimited)",
+        description: "Отключить ограничение кольцевого буфера (хранить все сессии в RAM)",
+        statusBadge: sessionRetentionLimit === null ? "Активно" : undefined,
         perform: () => void setSessionRetentionLimit(null),
       },
       {
         id: "retention-1000",
         category: "Storage",
+        group: "capture",
         label: "Session Retention Limit: Keep 1,000 Sessions",
+        description: "Хранить в оперативной памяти последние 1 000 сессий (FIFO)",
+        statusBadge: sessionRetentionLimit === 1000 ? "Активно" : undefined,
         perform: () => void setSessionRetentionLimit(1000),
       },
       {
         id: "retention-10000",
         category: "Storage",
+        group: "capture",
         label: "Session Retention Limit: Keep 10,000 Sessions (Default)",
+        description: "Стандартный лимит кольцевого буфера: 10 000 последних сессий",
+        statusBadge: sessionRetentionLimit === 10000 ? "Активно" : undefined,
         perform: () => void setSessionRetentionLimit(10000),
       },
       {
         id: "retention-custom",
         category: "Storage",
+        group: "capture",
         label: "Session Retention Limit: Enter Custom Limit...",
+        description: "Задать произвольное количество сессий для кольцевого буфера",
+        statusBadge:
+          sessionRetentionLimit !== null &&
+          sessionRetentionLimit !== 1000 &&
+          sessionRetentionLimit !== 10000
+            ? String(sessionRetentionLimit)
+            : undefined,
         perform: handleOpenCustomRetentionLimit,
       },
       {
         id: "theme-dark",
         category: "Theme",
+        group: "settings",
         label: "Set Theme: Dark",
+        description: "Принудительно включить тёмную цветовую схему интерфейса",
+        statusBadge: preference === "dark" ? "Активно" : undefined,
         perform: () => setTheme("dark"),
       },
       {
         id: "theme-light",
         category: "Theme",
+        group: "settings",
         label: "Set Theme: Light",
+        description: "Принудительно включить светлую цветовую схему интерфейса",
+        statusBadge: preference === "light" ? "Активно" : undefined,
         perform: () => setTheme("light"),
       },
       {
         id: "theme-system",
         category: "Theme",
+        group: "settings",
         label: "Set Theme: Follow OS System Preference",
+        description: "Автоматически синхронизировать светлую/тёмную схему с темой ОС",
+        statusBadge:
+          preference === "system" ? `Система (${resolvedTheme})` : undefined,
         perform: () => setTheme("system"),
       },
       {
         id: "open-theme-gallery",
         category: "Theme",
+        group: "settings",
         label: "Theme Gallery & Custom Palette… (8 тем-пресетов и редактор цветов)",
+        description: "Выбор цветовой темы и точная настройка токенов палитры с Monaco",
+        statusBadge: activeThemePresetName,
         keywords: [
           "theme",
           "preset",
@@ -2412,7 +2675,10 @@ export const App: React.FC = () => {
       ...THEME_PRESETS.map((preset) => ({
         id: `theme-preset-${preset.id}`,
         category: "Theme",
+        group: "settings" as const,
         label: `Set Theme Preset: ${preset.name} (${preset.baseScheme === "dark" ? "Dark" : "Light"})`,
+        description: preset.description,
+        statusBadge: themePreset === preset.id ? "Активно" : undefined,
         keywords: [
           "theme",
           "preset",
@@ -2425,45 +2691,64 @@ export const App: React.FC = () => {
       {
         id: "open-preferences",
         category: "Settings",
+        group: "settings",
         label: "Preferences... — Открыть настройки и управление профилем",
+        description: "Порт прокси, таймауты, интерфейсы, колонки, фильтры и профиль JSON",
         shortcut: "Ctrl+,",
         perform: () => openPreferencesAt("general"),
       },
       {
         id: "export-settings-profile",
         category: "Settings",
+        group: "settings",
         label:
           "Export Settings Profile (JSON)... — Сохранить fluxproxy-settings-v1.json",
+        description: "Выгрузить переносимый профиль настроек FluxProxy (schemaVersion: 1)",
         perform: () => void handleExportSettingsProfile(),
       },
       {
         id: "import-settings-profile",
         category: "Settings",
+        group: "settings",
         label:
           "Import Settings Profile... — Загрузить профиль настроек с превью",
+        description: "Импортировать профиль настроек JSON с предварительным просмотром изменений",
         perform: () => void handleImportSettingsProfileDialog(),
       },
       {
         id: "reset-all-settings-defaults",
         category: "Settings",
+        group: "settings",
         label:
           "Reset All Settings to Defaults... — Сбросить все настройки к дефолтам",
+        description: "Восстановить все параметры приложения и правил к заводским значениям",
         perform: () => void handleResetAllSettings(false),
       },
     ],
     [
+      activeFilterBadgeCount,
+      activeHostRemapCount,
+      activePresetId,
+      activeRulesCount,
+      activeTargetHostsCount,
+      activeThemePresetName,
       applyPreset,
+      autoResponderEnabled,
       backendFilterConfig.tlsInterceptMode,
       breakpointConfig.breakAfterResponse,
       breakpointConfig.breakBeforeRequest,
+      breakpointsArmed,
       clearAllSessions,
       compactToolbar,
+      compiledHostList.activeCount,
       copySessionAsCurl,
       deleteSessions,
       disableAllBreakpoints,
       dockedComposer,
       dropNonMatching,
       effectiveSelectedIds,
+      enabledBreakpointRulesCount,
+      enabledTlsBypassCount,
       exportAllSessionsAs,
       exportSelectedSessionsAs,
       generateStress10k,
@@ -2471,16 +2756,20 @@ export const App: React.FC = () => {
       handleExportSettingsProfile,
       handleImportSettingsProfileDialog,
       handleInspectInHex,
-      handleOpenStatistics,
       handleOpenCustomRetentionLimit,
+      handleOpenStatistics,
       handleResetAllSettings,
       handleResetPanelLayout,
       handleSelectAllSessions,
       handleTogglePythonScript,
+      hostListFilter.enabled,
+      hostListFilter.mode,
       importArchiveDialog,
       inspectorCollapsed,
+      inspectorPosition,
       isForceNoCacheActive,
       loadFromSqlite,
+      markedSessionsCount,
       openAnnotationFor,
       openBreakpointsAt,
       openCodeGeneratorForSession,
@@ -2491,12 +2780,16 @@ export const App: React.FC = () => {
       openSanitizedExportModal,
       openTextWizardAt,
       pausedBreakpoints.length,
+      preference,
       replaySessions,
       resetAdvancedFilters,
       resetColumns,
+      resolvedTheme,
+      rules.length,
       saveToSqlite,
       scriptEnabled,
       selectedId,
+      sessionRetentionLimit,
       setInspectorPosition,
       setQuickCategory,
       setSessionRetentionLimit,
@@ -2511,6 +2804,8 @@ export const App: React.FC = () => {
       status.running,
       status.systemProxyEnabled,
       status.systemProxyError,
+      themePreset,
+      throttleConfig.preset,
       toggleAllowRemote,
       toggleBreakAfterResponse,
       toggleBreakBeforeRequest,
@@ -2523,24 +2818,9 @@ export const App: React.FC = () => {
       toggleSystemProxy,
       toggleTlsInterceptMode,
       unmarkSessions,
+      upstreamProxyActiveLabel,
     ]
   );
-
-  const activeTargetHostsCount = useMemo(
-    () =>
-      (backendFilterConfig.tlsTargetRules ?? []).filter(
-        (r) => r.enabled && !r.pattern.trim().startsWith("!")
-      ).length,
-    [backendFilterConfig.tlsTargetRules]
-  );
-
-  const activeRulesCount = autoResponderEnabled
-    ? rules.filter((r) => r.enabled).length
-    : 0;
-  const breakpointsArmed =
-    breakpointConfig.breakBeforeRequest ||
-    breakpointConfig.breakAfterResponse ||
-    breakpointConfig.rules.some((r) => r.enabled);
   const showInlineSessionDiff =
     selectedIds.length === 2 && !inlineDiffDismissed;
   const selectedSessions = useMemo(() => {

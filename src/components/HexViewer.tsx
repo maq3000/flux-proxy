@@ -46,10 +46,23 @@ export const HexViewer: React.FC<HexViewerProps> = ({
     >
       <div className="sticky top-0 z-10 mb-1.5 flex min-w-max items-center gap-4 border-b border-hairline bg-canvas pb-1 pt-3 text-[10px] font-semibold uppercase tracking-wider text-subtle">
         <span className="w-20 shrink-0">Offset</span>
-        <span className="w-[360px] shrink-0">
-          00 01 02 03 04 05 06 07 &nbsp;08 09 0A 0B 0C 0D 0E 0F
-        </span>
-        <span className="shrink-0">Decoded ASCII</span>
+        <div
+          aria-label="Hex byte columns 00 to 0F"
+          className="flex w-[392px] shrink-0 items-center tracking-normal tabular-nums"
+        >
+          {COL_INDICES.map((colIdx) => (
+            <span
+              key={colIdx}
+              data-header-col={colIdx}
+              className={`inline-flex h-5 w-6 shrink-0 items-center justify-center font-mono text-xs font-semibold ${
+                colIdx === 8 ? "ml-2" : ""
+              }`}
+            >
+              {colIdx.toString(16).padStart(2, "0").toUpperCase()}
+            </span>
+          ))}
+        </div>
+        <span className="min-w-[164px] shrink-0">Decoded ASCII</span>
       </div>
 
       <div
@@ -87,40 +100,58 @@ export const HexViewer: React.FC<HexViewerProps> = ({
               onMouseLeave={(e) => {
                 delete e.currentTarget.dataset.hoverCol;
               }}
-              className="hex-row flex items-center gap-4 whitespace-pre hover:bg-hover/50"
+              className="hex-row flex min-w-max items-center gap-4 hover:bg-hover/50"
             >
               <span className="w-20 shrink-0 text-subtle tabular-nums">
                 {rowStart.toString(16).padStart(8, "0").toUpperCase()}
               </span>
 
-              <span className="w-[360px] shrink-0 tabular-nums">
+              <div className="flex w-[392px] shrink-0 items-center tabular-nums">
                 {COL_INDICES.map((colIdx) => {
                   const absOffset = rowStart + colIdx;
                   const val = colIdx < slice.length ? slice[colIdx] : null;
 
+                  if (val === null) {
+                    return (
+                      <span
+                        key={colIdx}
+                        aria-hidden="true"
+                        className={`inline-flex h-5 w-6 shrink-0 items-center justify-center font-mono text-xs ${
+                          colIdx === 8 ? "ml-2" : ""
+                        }`}
+                      />
+                    );
+                  }
+
                   return (
-                    <React.Fragment key={colIdx}>
-                      {colIdx === 8 ? " " : ""}
-                      {val !== null ? (
-                        <span
-                          data-byte-col={colIdx}
-                          data-byte-offset={absOffset}
-                          className={`inline-block rounded px-0.5 ${
-                            val === 0 ? "text-subtle" : "text-fg"
-                          }`}
-                        >
-                          {val.toString(16).padStart(2, "0").toUpperCase()}
-                        </span>
-                      ) : (
-                        <span className="inline-block px-0.5">{"  "}</span>
-                      )}{" "}
-                    </React.Fragment>
+                    <span
+                      key={colIdx}
+                      data-byte-col={colIdx}
+                      data-byte-offset={absOffset}
+                      className={`inline-flex h-5 w-6 shrink-0 items-center justify-center rounded font-mono text-xs ${
+                        colIdx === 8 ? "ml-2" : ""
+                      } ${val === 0 ? "text-subtle" : "text-fg"}`}
+                    >
+                      {val.toString(16).padStart(2, "0").toUpperCase()}
+                    </span>
                   );
                 })}
-              </span>
+              </div>
 
-              <span className="shrink-0 text-sky-400/90">
-                {Array.from(slice, (b, colIdx) => {
+              <div className="flex min-w-[164px] shrink-0 items-center whitespace-pre text-sky-400/90">
+                {COL_INDICES.map((colIdx) => {
+                  if (colIdx >= slice.length) {
+                    return (
+                      <span
+                        key={colIdx}
+                        aria-hidden="true"
+                        className={`inline-block w-2.5 shrink-0 text-center ${
+                          colIdx === 8 ? "ml-1" : ""
+                        }`}
+                      />
+                    );
+                  }
+                  const b = slice[colIdx];
                   const absOffset = rowStart + colIdx;
                   const ch = b >= 32 && b <= 126 ? String.fromCharCode(b) : ".";
                   return (
@@ -128,13 +159,15 @@ export const HexViewer: React.FC<HexViewerProps> = ({
                       key={colIdx}
                       data-byte-col={colIdx}
                       data-byte-offset={absOffset}
-                      className={b < 32 || b > 126 ? "rounded text-subtle" : "rounded"}
+                      className={`inline-block w-2.5 shrink-0 rounded text-center ${
+                        colIdx === 8 ? "ml-1" : ""
+                      } ${b < 32 || b > 126 ? "text-subtle" : ""}`}
                     >
                       {ch}
                     </span>
                   );
                 })}
-              </span>
+              </div>
             </div>
           );
         })}
