@@ -1,10 +1,20 @@
 import React, { useMemo, useRef } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { useContextMenu } from "../hooks/useContextMenu";
+import {
+  buildHexViewerContextMenu,
+  copyTextToClipboard,
+} from "../lib/contextMenuBuilders";
 import { decodeBase64ToBytes } from "../lib/formatters";
+import { bytesToHex } from "../lib/textWizard";
+import type { TextWizardTab } from "./TextWizardPanel";
 
 interface HexViewerProps {
   base64Data: string;
   maxBytes?: number;
+  onOpenTextWizard?: (text: string, tab: TextWizardTab) => void;
+  onSaveBodyAs?: () => void;
+  onNotify?: (msg: string) => void;
 }
 
 const BYTES_PER_ROW = 16;
@@ -14,8 +24,12 @@ const COL_INDICES = Array.from({ length: BYTES_PER_ROW }, (_, i) => i);
 export const HexViewer: React.FC<HexViewerProps> = ({
   base64Data,
   maxBytes = 16_384,
+  onOpenTextWizard,
+  onSaveBodyAs,
+  onNotify,
 }) => {
   const scrollParentRef = useRef<HTMLDivElement>(null);
+  const { openContextMenu } = useContextMenu();
 
   const bytes = useMemo(() => {
     const decoded = decodeBase64ToBytes(base64Data);
@@ -31,9 +45,69 @@ export const HexViewer: React.FC<HexViewerProps> = ({
     overscan: 16,
   });
 
+  const handleHexContextMenu = (
+    e: React.MouseEvent,
+    rowStart: number | null,
+    rowSlice: Uint8Array | null
+  ) => {
+    const sel = typeof window !== "undefined" ? window.getSelection() : null;
+    if (
+      sel &&
+      !sel.isCollapsed &&
+      sel.toString().trim().length > 0 &&
+      scrollParentRef.current?.contains(sel.anchorNode)
+    ) {
+      return;
+    }
+
+    const rowHex = rowSlice ? bytesToHex(rowSlice, " ") : "";
+    const rowAscii = rowSlice
+      ? Array.from(rowSlice, (b) =>
+          b >= 32 && b <= 126 ? String.fromCharCode(b) : "."
+        ).join("")
+      : "";
+
+    openContextMenu(
+      e,
+      buildHexViewerContextMenu({
+        rowOffset: rowStart,
+        totalBytes: bytes.length,
+        hasRow: Boolean(rowSlice && rowSlice.length > 0),
+        onCopyRowHex: () =>
+          void copyTextToClipboard(rowHex, onNotify, "Скопирована строка Hex"),
+        onCopyRowAscii: () =>
+          void copyTextToClipboard(
+            rowAscii,
+            onNotify,
+            "Скопирована строка ASCII"
+          ),
+        onCopyAllHex: () =>
+          void copyTextToClipboard(
+            bytesToHex(bytes, " "),
+            onNotify,
+            `Скопирован Hex (${bytes.length} B)`
+          ),
+        onCopyAllBase64: () =>
+          void copyTextToClipboard(
+            base64Data,
+            onNotify,
+            "Скопировано в Base64"
+          ),
+        onOpenInTextWizard: onOpenTextWizard
+          ? () => onOpenTextWizard(bytesToHex(bytes, " "), "hex")
+          : undefined,
+        onSaveBodyAs,
+      }),
+      { ariaLabel: "Hex Viewer Context Menu" }
+    );
+  };
+
   if (bytes.length === 0) {
     return (
-      <div className="flex h-full items-center justify-center font-mono text-xs text-subtle">
+      <div
+        onContextMenu={(e) => handleHexContextMenu(e, null, null)}
+        className="flex h-full items-center justify-center font-mono text-xs text-subtle"
+      >
         Empty payload (0 bytes)
       </div>
     );
@@ -42,6 +116,7 @@ export const HexViewer: React.FC<HexViewerProps> = ({
   return (
     <div
       ref={scrollParentRef}
+      onContextMenu={(e) => handleHexContextMenu(e, null, null)}
       className="h-full overflow-auto bg-canvas px-3 pb-3 font-mono text-xs leading-5 select-text"
     >
       <div className="sticky top-0 z-10 mb-1.5 flex min-w-max items-center gap-4 border-b border-hairline bg-canvas pb-1 pt-3 text-[10px] font-semibold uppercase tracking-wider text-subtle">
@@ -100,6 +175,7 @@ export const HexViewer: React.FC<HexViewerProps> = ({
               onMouseLeave={(e) => {
                 delete e.currentTarget.dataset.hoverCol;
               }}
+              onContextMenu={(e) => handleHexContextMenu(e, rowStart, slice)}
               className="hex-row flex min-w-max items-center gap-4 hover:bg-hover/50"
             >
               <span className="w-20 shrink-0 text-subtle tabular-nums">

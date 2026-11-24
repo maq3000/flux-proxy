@@ -6,6 +6,8 @@ import {
   PanelBottom,
   PanelRight,
 } from "lucide-react";
+import { useContextMenu } from "../hooks/useContextMenu";
+import { buildInspectorChromeContextMenu } from "../lib/contextMenuBuilders";
 import type { InspectorDockPosition, SessionSummary } from "../types/proxy";
 
 export interface CollapsedInspectorBarProps {
@@ -15,6 +17,8 @@ export interface CollapsedInspectorBarProps {
   onExpand: () => void;
   onOpenStatistics: () => void;
   onChangePosition: (next: InspectorDockPosition) => void;
+  onToggleSplitDirection?: () => void;
+  onResetPanelLayout?: () => void;
 }
 
 function getStatusToneClass(status: number): string {
@@ -40,7 +44,26 @@ export const CollapsedInspectorBar: React.FC<CollapsedInspectorBarProps> = ({
   onExpand,
   onOpenStatistics,
   onChangePosition,
+  onToggleSplitDirection,
+  onResetPanelLayout,
 }) => {
+  const { openContextMenu } = useContextMenu();
+
+  const handleBarContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    openContextMenu(
+      e,
+      buildInspectorChromeContextMenu({
+        inspectorCollapsed: true,
+        inspectorPosition: position,
+        onExpandOrCollapse: onExpand,
+        onSetPosition: onChangePosition,
+        onToggleSplitDirection,
+        onResetPanelLayout,
+      }),
+      { ariaLabel: "Collapsed Inspector Context Menu" }
+    );
+  };
+
   if (position === "right") {
     return (
       <div
@@ -48,6 +71,7 @@ export const CollapsedInspectorBar: React.FC<CollapsedInspectorBarProps> = ({
         aria-orientation="vertical"
         aria-label="Collapsed Session Inspector"
         data-testid="collapsed-inspector-bar"
+        onContextMenu={handleBarContextMenu}
         className="flex h-full w-7 shrink-0 select-none flex-col items-center justify-between border-l border-hairline bg-surface py-1.5"
       >
         <button
@@ -113,6 +137,7 @@ export const CollapsedInspectorBar: React.FC<CollapsedInspectorBarProps> = ({
       role="toolbar"
       aria-label="Collapsed Session Inspector"
       data-testid="collapsed-inspector-bar"
+      onContextMenu={handleBarContextMenu}
       className="flex h-7 w-full shrink-0 select-none items-center justify-between gap-2 border-t border-hairline bg-surface px-2 text-xs"
     >
       <button

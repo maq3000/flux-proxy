@@ -31,6 +31,7 @@ import {
   Target,
 } from "lucide-react";
 import {
+  buildCurlCommand,
   buildRawHttpRequest,
   buildRawHttpResponse,
   decodeBase64ToBytes,
@@ -40,6 +41,15 @@ import {
   parseQueryParams,
   tryFormatJson,
 } from "../lib/formatters";
+import { useContextMenu, type ContextMenuEventLike } from "../hooks/useContextMenu";
+import {
+  buildCookieRowContextMenu,
+  buildImagePreviewContextMenu,
+  buildInspectorChromeContextMenu,
+  buildInspectorSummaryContextMenu,
+  buildKeyValueRowContextMenu,
+  copyTextToClipboard,
+} from "../lib/contextMenuBuilders";
 
 const SAFE_RASTER_IMAGE_MIMES = new Set([
   "image/png",
@@ -66,6 +76,8 @@ import {
   type InspectorSplitDirection,
 } from "../hooks/useUiPreferences";
 import type {
+  HeaderMutationDirection,
+  HeaderMutationOp,
   HeaderPair,
   InspectorDockPosition,
   InspectorTab,
@@ -103,6 +115,17 @@ interface SessionInspectorProps {
   externalHexTrigger?: number;
   onReplaySession?: (id: number) => void;
   onSendToComposer: (id: number) => void;
+  onCopyCurl?: (id: number) => void;
+  onCreateRuleFromSession?: (session: SessionSummary) => void;
+  onFilterByHost?: (host: string) => void;
+  onQuickFilterByValue?: (value: string) => void;
+  onAddHeaderMutationRule?: (
+    direction: HeaderMutationDirection,
+    operation: HeaderMutationOp,
+    headerName: string,
+    headerValue: string,
+    host?: string
+  ) => void;
   onFilterByProcess?: (processName: string) => void;
   onFilterByClientIp?: (clientIp: string) => void;
   onAlwaysInspectHost?: (host: string) => void;
@@ -115,6 +138,8 @@ interface SessionInspectorProps {
   onResumePairDiff?: () => void;
   onSaveBodyFile?: (sessionId: number, isResponse: boolean) => void;
   onOpenTimeoutSettings?: () => void;
+  onResetPanelLayout?: () => void;
+  onNotify?: (msg: string) => void;
 }
 
 const REQUEST_TABS: { id: InspectorTab; label: string }[] = [
@@ -162,6 +187,11 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
   externalHexTrigger = 0,
   onReplaySession,
   onSendToComposer,
+  onCopyCurl,
+  onCreateRuleFromSession,
+  onFilterByHost,
+  onQuickFilterByValue,
+  onAddHeaderMutationRule,
   onFilterByProcess,
   onFilterByClientIp,
   onAlwaysInspectHost,
@@ -174,7 +204,10 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
   onResumePairDiff,
   onSaveBodyFile,
   onOpenTimeoutSettings,
+  onResetPanelLayout,
+  onNotify,
 }) => {
+  const { openContextMenu } = useContextMenu();
   const [reqTab, setReqTab] = useState<InspectorTab>("headers");
   const [respTab, setRespTab] = useState<InspectorTab>("json");
   const [inspectorMode, setInspectorMode] = useState<"inspectors" | "statistics">(
@@ -718,6 +751,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
             detail={null}
             selectedSessions={selectedSessions}
             onSelectSession={onSelectSession}
+            onNotify={onNotify}
           />
         </div>
       </div>
@@ -810,6 +844,145 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
             ? "text-status3xx-fg"
             : "text-status2xx-fg";
 
+  const handleSummaryBarContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    const sel = typeof window !== "undefined" ? window.getSelection() : null;
+    if (
+      sel &&
+      !sel.isCollapsed &&
+      sel.toString().trim().length > 0 &&
+      e.currentTarget.contains(sel.anchorNode)
+    ) {
+      return;
+    }
+
+    openContextMenu(
+      e,
+      buildInspectorSummaryContextMenu({
+        summary,
+        inspectorPosition,
+        onCopyUrl: () =>
+          void copyTextToClipboard(
+            summary.url,
+            onNotify,
+            `Скопирован URL: ${summary.url}`
+          ),
+        onCopyHost: () =>
+          void copyTextToClipboard(
+            summary.host,
+            onNotify,
+            `Скопирован Host: ${summary.host}`
+          ),
+        onCopyPath: () =>
+          void copyTextToClipboard(
+            summary.path || "/",
+            onNotify,
+            `Скопирован Path: ${summary.path || "/"}`
+          ),
+        onCopyCurl: () => {
+          if (onCopyCurl) {
+            onCopyCurl(summary.id);
+          } else {
+            void copyTextToClipboard(
+              buildCurlCommand(effectiveDetail),
+              onNotify,
+              `Скопирована cURL-команда для #${summary.id}`
+            );
+          }
+        },
+        onReplay: onReplaySession
+          ? () => onReplaySession(summary.id)
+          : undefined,
+        onEditInComposer: () => onSendToComposer(summary.id),
+        onAddBpu: onQuickAddBpu
+          ? () => onQuickAddBpu(summary.path.split("?")[0] || summary.host)
+          : undefined,
+        onCreateAutoResponderRule: onCreateRuleFromSession
+          ? () => onCreateRuleFromSession(summary)
+          : undefined,
+        onFilterByHost: onFilterByHost
+          ? () => onFilterByHost(summary.host)
+          : undefined,
+        onDecodeUrlInTextWizard: onOpenTextWizard
+          ? () => onOpenTextWizard(summary.url, "url")
+          : undefined,
+        onToggleDock: onChangeInspectorPosition
+          ? () =>
+              onChangeInspectorPosition(
+                inspectorPosition === "bottom" ? "right" : "bottom"
+              )
+          : undefined,
+        onCollapseInspector,
+      }),
+      { ariaLabel: `Session #${summary.id} Summary Context Menu` }
+    );
+  };
+
+  const handleInspectorSplitContextMenu = (e: ContextMenuEventLike) => {
+    openContextMenu(
+      e,
+      buildInspectorChromeContextMenu({
+        inspectorCollapsed: false,
+        inspectorPosition,
+        onExpandOrCollapse: () => onCollapseInspector?.(),
+        onSetPosition: (pos) => onChangeInspectorPosition?.(pos),
+        onToggleSplitDirection: handleToggleSplitDirection,
+        onResetPanelLayout: onResetPanelLayout ?? handleResetInspectorSplit,
+      }),
+      { ariaLabel: "Inspector Split Context Menu" }
+    );
+  };
+
+  const svgSourceText = isSvgImage
+    ? effectiveDetail.responseBodyText ??
+      (effectiveDetail.responseBodyBase64
+        ? new TextDecoder().decode(
+            decodeBase64ToBytes(effectiveDetail.responseBodyBase64)
+          )
+        : "")
+    : "";
+
+  const handleImageContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    const sel = typeof window !== "undefined" ? window.getSelection() : null;
+    if (
+      sel &&
+      !sel.isCollapsed &&
+      sel.toString().trim().length > 0 &&
+      e.currentTarget.contains(sel.anchorNode)
+    ) {
+      return;
+    }
+
+    const payloadToCopy = isSvgImage
+      ? svgSourceText
+      : effectiveDetail.responseBodyBase64
+        ? `data:${responseMime};base64,${effectiveDetail.responseBodyBase64}`
+        : "";
+
+    openContextMenu(
+      e,
+      buildImagePreviewContextMenu({
+        contentType: summary.contentType,
+        isSvg: isSvgImage,
+        onSaveAs: onSaveBodyFile
+          ? () => onSaveBodyFile(summary.id, true)
+          : undefined,
+        onCopyUrl: () =>
+          void copyTextToClipboard(
+            summary.url,
+            onNotify,
+            "Скопирован URL изображения"
+          ),
+        onCopyPayload: () =>
+          void copyTextToClipboard(
+            payloadToCopy,
+            onNotify,
+            isSvgImage ? "Скопирован исходник SVG" : "Скопирован Base64 Data URI"
+          ),
+      }),
+      { ariaLabel: isSvgImage ? "SVG Source Context Menu" : "Image Context Menu" }
+    );
+  };
+
   return (
     <div
       ref={resolvedContainerRef}
@@ -819,7 +992,10 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
       className="pane-contain flex h-full flex-col bg-surface focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-accent/50"
     >
       {/* Compact Session Summary Bar */}
-      <div className="flex h-8 shrink-0 items-center justify-between gap-2 border-b border-hairline bg-elevated/60 px-2.5">
+      <div
+        onContextMenu={handleSummaryBarContextMenu}
+        className="flex h-8 shrink-0 items-center justify-between gap-2 border-b border-hairline bg-elevated/60 px-2.5"
+      >
         <div className="flex min-w-0 items-center gap-2 font-mono text-xs">
           <span className="rounded bg-status3xx-bg px-1.5 py-0.5 font-semibold text-status3xx-fg">
             {summary.method}
@@ -1174,6 +1350,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
             detail={effectiveDetail}
             selectedSessions={selectedSessions}
             onSelectSession={onSelectSession}
+            onNotify={onNotify}
           />
         </div>
       ) : (
@@ -1282,17 +1459,37 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
             {reqTab === "headers" && (
               <KeyValueTable
                 items={effectiveDetail.requestHeaders}
+                kind="requestHeaders"
                 emptyLabel="No request headers"
+                onOpenTextWizard={onOpenTextWizard}
+                onFilterByValue={onQuickFilterByValue}
+                onAddHeaderMutationRule={
+                  onAddHeaderMutationRule
+                    ? (dir, op, name, val) =>
+                        onAddHeaderMutationRule(dir, op, name, val, summary.host)
+                    : undefined
+                }
+                onNotify={onNotify}
               />
             )}
             {reqTab === "params" && (
               <KeyValueTable
                 items={queryParams}
+                kind="params"
                 emptyLabel="No URL query parameters present"
+                onOpenTextWizard={onOpenTextWizard}
+                onFilterByValue={onQuickFilterByValue}
+                onNotify={onNotify}
               />
             )}
             {reqTab === "cookies" && (
-              <CookiesTable items={reqCookies} emptyLabel="No request cookies" />
+              <CookiesTable
+                items={reqCookies}
+                emptyLabel="No request cookies"
+                onOpenTextWizard={onOpenTextWizard}
+                onFilterByValue={onQuickFilterByValue}
+                onNotify={onNotify}
+              />
             )}
             {reqTab === "auth" && (
               <AuthInspectorPanel
@@ -1417,7 +1614,16 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   onLoad={() => void handleLoadRequestBody()}
                 />
               ) : (
-                <HexViewer base64Data={effectiveDetail.requestBodyBase64} />
+                <HexViewer
+                  base64Data={effectiveDetail.requestBodyBase64}
+                  onOpenTextWizard={onOpenTextWizard}
+                  onSaveBodyAs={
+                    onSaveBodyFile
+                      ? () => onSaveBodyFile(summary.id, false)
+                      : undefined
+                  }
+                  onNotify={onNotify}
+                />
               ))}
           </div>
           </div>
@@ -1425,6 +1631,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
 
         <PanelResizeHandle
           onDoubleClick={handleResetInspectorSplit}
+          onContextMenu={handleInspectorSplitContextMenu}
           title="Double-click to reset Request/Response split"
           className={
             effectiveSplitDirection === "vertical"
@@ -1563,13 +1770,26 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                 {respTab === "headers" && (
               <KeyValueTable
                 items={effectiveDetail.responseHeaders}
+                kind="responseHeaders"
                 emptyLabel="No response headers"
+                onOpenTextWizard={onOpenTextWizard}
+                onFilterByValue={onQuickFilterByValue}
+                onAddHeaderMutationRule={
+                  onAddHeaderMutationRule
+                    ? (dir, op, name, val) =>
+                        onAddHeaderMutationRule(dir, op, name, val, summary.host)
+                    : undefined
+                }
+                onNotify={onNotify}
               />
             )}
             {respTab === "cookies" && (
               <CookiesTable
                 items={respCookies}
                 emptyLabel="No Set-Cookie headers in response"
+                onOpenTextWizard={onOpenTextWizard}
+                onFilterByValue={onQuickFilterByValue}
+                onNotify={onNotify}
               />
             )}
             {respTab === "caching" && (
@@ -1585,6 +1805,8 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
               <SseInspectorPanel
                 detail={effectiveDetail}
                 monacoTheme={monacoTheme}
+                onOpenTextWizard={onOpenTextWizard}
+                onNotify={onNotify}
               />
             )}
             {respTab === "ws" && (
@@ -1593,6 +1815,8 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                 sessionId={effectiveDetail.summary.id}
                 isWsOpen={Boolean(effectiveDetail.summary.wsOpen)}
                 onFrameInjected={handleFrameInjected}
+                onOpenTextWizard={onOpenTextWizard}
+                onNotify={onNotify}
               />
             )}
             {respTab === "protobuf" &&
@@ -1702,7 +1926,10 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   onLoad={() => void handleLoadResponseBody()}
                 />
               ) : isSafeRasterImage && effectiveDetail.responseBodyBase64 ? (
-                <div className="flex h-full flex-col items-center justify-center gap-3 overflow-auto p-4 checkerboard-bg">
+                <div
+                  onContextMenu={handleImageContextMenu}
+                  className="flex h-full flex-col items-center justify-center gap-3 overflow-auto p-4 checkerboard-bg"
+                >
                   <img
                     src={`data:${responseMime};base64,${effectiveDetail.responseBodyBase64}`}
                     alt={summary.path}
@@ -1713,7 +1940,10 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   </span>
                 </div>
               ) : isSvgImage ? (
-                <div className="flex h-full flex-col overflow-hidden bg-surface">
+                <div
+                  onContextMenu={handleImageContextMenu}
+                  className="flex h-full flex-col overflow-hidden bg-surface"
+                >
                   <div className="flex shrink-0 items-center justify-between border-b border-hairline bg-status4xx-bg/40 px-3 py-1.5 text-[11px] text-status4xx-fg">
                     <span>
                       SVG-изображение (<code>image/svg+xml</code>) отображается как безопасный текстовый исходник во избежание активного содержимого / XSS.
@@ -1723,12 +1953,7 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                     </span>
                   </div>
                   <pre className="flex-1 overflow-auto p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap break-words text-fg select-text">
-                    {effectiveDetail.responseBodyText ??
-                      (effectiveDetail.responseBodyBase64
-                        ? new TextDecoder().decode(
-                            decodeBase64ToBytes(effectiveDetail.responseBodyBase64)
-                          )
-                        : "<!-- Empty SVG payload -->")}
+                    {svgSourceText || "<!-- Empty SVG payload -->"}
                   </pre>
                 </div>
               ) : (
@@ -1750,7 +1975,16 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   onLoad={() => void handleLoadResponseBody()}
                 />
               ) : (
-                <HexViewer base64Data={effectiveDetail.responseBodyBase64} />
+                <HexViewer
+                  base64Data={effectiveDetail.responseBodyBase64}
+                  onOpenTextWizard={onOpenTextWizard}
+                  onSaveBodyAs={
+                    onSaveBodyFile
+                      ? () => onSaveBodyFile(summary.id, true)
+                      : undefined
+                  }
+                  onNotify={onNotify}
+                />
               ))}
               </>
             )}
@@ -1818,10 +2052,30 @@ const OffloadedBodyNotice: React.FC<{
   );
 };
 
-const KeyValueTable: React.FC<{ items: HeaderPair[]; emptyLabel: string }> = ({
+const KeyValueTable: React.FC<{
+  items: HeaderPair[];
+  kind: "requestHeaders" | "responseHeaders" | "params";
+  emptyLabel: string;
+  onOpenTextWizard?: (text: string, tab: TextWizardTab) => void;
+  onFilterByValue?: (value: string) => void;
+  onAddHeaderMutationRule?: (
+    direction: HeaderMutationDirection,
+    operation: HeaderMutationOp,
+    headerName: string,
+    headerValue: string
+  ) => void;
+  onNotify?: (msg: string) => void;
+}> = ({
   items,
+  kind,
   emptyLabel,
+  onOpenTextWizard,
+  onFilterByValue,
+  onAddHeaderMutationRule,
+  onNotify,
 }) => {
+  const { openContextMenu } = useContextMenu();
+
   if (items.length === 0) {
     return (
       <div className="flex h-full items-center justify-center text-xs text-subtle">
@@ -1829,6 +2083,62 @@ const KeyValueTable: React.FC<{ items: HeaderPair[]; emptyLabel: string }> = ({
       </div>
     );
   }
+
+  const isHeader = kind === "requestHeaders" || kind === "responseHeaders";
+
+  const handleRowContextMenu = (
+    e: React.MouseEvent<HTMLTableRowElement>,
+    item: HeaderPair
+  ) => {
+    const sel = typeof window !== "undefined" ? window.getSelection() : null;
+    if (
+      sel &&
+      !sel.isCollapsed &&
+      sel.toString().trim().length > 0 &&
+      e.currentTarget.contains(sel.anchorNode)
+    ) {
+      return;
+    }
+
+    const pairText = isHeader
+      ? `${item.name}: ${item.value}`
+      : `${item.name}=${item.value}`;
+    const allText = items
+      .map((it) => (isHeader ? `${it.name}: ${it.value}` : `${it.name}=${it.value}`))
+      .join("\n");
+
+    openContextMenu(
+      e,
+      buildKeyValueRowContextMenu({
+        kind,
+        item,
+        allItems: items,
+        onCopyValue: () =>
+          void copyTextToClipboard(
+            item.value,
+            onNotify,
+            `Скопировано значение ${item.name}`
+          ),
+        onCopyPair: () =>
+          void copyTextToClipboard(pairText, onNotify, `Скопировано: ${pairText}`),
+        onCopyName: () =>
+          void copyTextToClipboard(item.name, onNotify, `Скопировано: ${item.name}`),
+        onCopyAll: () =>
+          void copyTextToClipboard(
+            allText,
+            onNotify,
+            isHeader
+              ? `Скопированы все заголовки (${items.length})`
+              : `Скопированы все параметры (${items.length})`
+          ),
+        onDecodeInTextWizard: onOpenTextWizard,
+        onFilterByValue,
+        onAddHeaderMutationRule,
+      }),
+      { ariaLabel: `${item.name} Context Menu` }
+    );
+  };
+
   return (
     <div className="h-full overflow-auto p-2 select-text">
       <table className="w-full border-collapse font-mono text-xs">
@@ -1836,6 +2146,7 @@ const KeyValueTable: React.FC<{ items: HeaderPair[]; emptyLabel: string }> = ({
           {items.map((item, idx) => (
             <tr
               key={`${item.name}-${idx}`}
+              onContextMenu={(e) => handleRowContextMenu(e, item)}
               className="border-b border-hairline/60 hover:bg-hover/40"
             >
               <td className="w-48 py-1.5 pr-3 align-top font-semibold text-accent">
@@ -1853,7 +2164,12 @@ const KeyValueTable: React.FC<{ items: HeaderPair[]; emptyLabel: string }> = ({
 const CookiesTable: React.FC<{
   items: { name: string; value: string; attributes: string }[];
   emptyLabel: string;
-}> = ({ items, emptyLabel }) => {
+  onOpenTextWizard?: (text: string, tab: TextWizardTab) => void;
+  onFilterByValue?: (value: string) => void;
+  onNotify?: (msg: string) => void;
+}> = ({ items, emptyLabel, onOpenTextWizard, onFilterByValue, onNotify }) => {
+  const { openContextMenu } = useContextMenu();
+
   if (items.length === 0) {
     return (
       <div className="flex h-full items-center justify-center text-xs text-subtle">
@@ -1861,6 +2177,56 @@ const CookiesTable: React.FC<{
       </div>
     );
   }
+
+  const handleRowContextMenu = (
+    e: React.MouseEvent<HTMLTableRowElement>,
+    cookie: { name: string; value: string; attributes: string }
+  ) => {
+    const sel = typeof window !== "undefined" ? window.getSelection() : null;
+    if (
+      sel &&
+      !sel.isCollapsed &&
+      sel.toString().trim().length > 0 &&
+      e.currentTarget.contains(sel.anchorNode)
+    ) {
+      return;
+    }
+
+    const pairText = `${cookie.name}=${cookie.value}`;
+    const allText = items.map((c) => `${c.name}=${c.value}`).join("; ");
+
+    openContextMenu(
+      e,
+      buildCookieRowContextMenu({
+        cookie,
+        allCookies: items,
+        onCopyValue: () =>
+          void copyTextToClipboard(
+            cookie.value,
+            onNotify,
+            `Скопировано значение cookie ${cookie.name}`
+          ),
+        onCopyPair: () =>
+          void copyTextToClipboard(pairText, onNotify, `Скопировано: ${pairText}`),
+        onCopyName: () =>
+          void copyTextToClipboard(
+            cookie.name,
+            onNotify,
+            `Скопировано: ${cookie.name}`
+          ),
+        onCopyAll: () =>
+          void copyTextToClipboard(
+            allText,
+            onNotify,
+            `Скопированы все cookies (${items.length})`
+          ),
+        onDecodeInTextWizard: onOpenTextWizard,
+        onFilterByValue,
+      }),
+      { ariaLabel: `Cookie ${cookie.name} Context Menu` }
+    );
+  };
+
   return (
     <div className="h-full overflow-auto p-2 select-text">
       <table className="w-full border-collapse font-mono text-xs">
@@ -1873,7 +2239,11 @@ const CookiesTable: React.FC<{
         </thead>
         <tbody>
           {items.map((c, idx) => (
-            <tr key={`${c.name}-${idx}`} className="border-b border-hairline/60">
+            <tr
+              key={`${c.name}-${idx}`}
+              onContextMenu={(e) => handleRowContextMenu(e, c)}
+              className="border-b border-hairline/60 hover:bg-hover/40"
+            >
               <td className="py-1.5 pr-3 font-semibold text-status4xx-fg">
                 {c.name}
               </td>

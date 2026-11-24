@@ -27,6 +27,13 @@ import {
   X,
 } from "lucide-react";
 import { TRAFFIC_COLUMNS } from "../hooks/useUiPreferences";
+import { useContextMenu } from "../hooks/useContextMenu";
+import {
+  buildQuickFilterInputContextMenu,
+  buildTopToolbarContextMenu,
+  captureEditableSelection,
+  findEditableTextTarget,
+} from "../lib/contextMenuBuilders";
 import {
   SESSION_RETENTION_PRESETS,
   THROTTLE_PRESET_DEFINITIONS,
@@ -76,6 +83,8 @@ interface TopToolbarProps {
   onToggleFollowTail: () => void;
   // Layout & View Customization
   compactToolbar?: boolean;
+  onToggleCompactToolbar?: () => void;
+  onResetPanelLayout?: () => void;
   sidebarCollapsed: boolean;
   onToggleSidebar: () => void;
   toolbarGroups: Record<ToolbarGroupId, boolean>;
@@ -210,6 +219,8 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   followTail,
   onToggleFollowTail,
   compactToolbar = false,
+  onToggleCompactToolbar,
+  onResetPanelLayout,
   sidebarCollapsed,
   onToggleSidebar,
   toolbarGroups,
@@ -499,12 +510,54 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
     }
   };
 
+  const { openContextMenu } = useContextMenu();
   const visibleColumnsCount = TRAFFIC_COLUMNS.filter(
     (c) => visibleColumns[c.id]
   ).length;
 
+  const handleToolbarContextMenu = (e: React.MouseEvent<HTMLElement>) => {
+    if (e.defaultPrevented) return;
+    const target = e.target as HTMLElement | null;
+    if (findEditableTextTarget(target) || target?.closest("[popover]")) {
+      return;
+    }
+    openContextMenu(
+      e,
+      buildTopToolbarContextMenu({
+        compactToolbar,
+        sidebarCollapsed,
+        onToggleCompactToolbar,
+        onToggleSidebar,
+        onResetPanelLayout,
+        onOpenAppearanceSettings,
+      }),
+      { ariaLabel: "Toolbar Context Menu" }
+    );
+  };
+
+  const handleQuickFilterContextMenu = (
+    e: React.MouseEvent<HTMLInputElement>
+  ) => {
+    const inputEl = e.currentTarget;
+    const snapshot = captureEditableSelection(inputEl);
+    openContextMenu(
+      e,
+      buildQuickFilterInputContextMenu({
+        input: inputEl,
+        snapshot,
+        hasQuery: filterQuery.length > 0,
+        useRegex,
+        onClearFilter: () => onFilterQueryChange(""),
+        onToggleRegex,
+        onNotify,
+      }),
+      { ariaLabel: "Quick Filter Context Menu", restoreFocusTo: inputEl }
+    );
+  };
+
   return (
     <header
+      onContextMenu={handleToolbarContextMenu}
       className={`no-scrollbar flex shrink-0 items-center justify-between overflow-x-auto border-b border-hairline bg-surface ${
         compactToolbar
           ? "compact-toolbar h-7 gap-1 px-1.5"
@@ -1411,6 +1464,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
               type="text"
               value={filterQuery}
               onChange={(e) => onFilterQueryChange(e.target.value)}
+              onContextMenu={handleQuickFilterContextMenu}
               onKeyDown={(e) => {
                 if (e.key === "Escape") {
                   e.preventDefault();

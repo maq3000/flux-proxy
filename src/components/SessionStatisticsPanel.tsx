@@ -14,6 +14,11 @@ import {
   Server,
   Zap,
 } from "lucide-react";
+import { useContextMenu } from "../hooks/useContextMenu";
+import {
+  buildStatisticsContextMenu,
+  copyTextToClipboard,
+} from "../lib/contextMenuBuilders";
 import { formatBytes, formatDuration } from "../lib/formatters";
 import {
   aggregateSessionsStatistics,
@@ -32,6 +37,7 @@ interface SessionStatisticsPanelProps {
   detail: SessionDetail | null;
   selectedSessions?: SessionSummary[];
   onSelectSession?: (id: number) => void;
+  onNotify?: (msg: string) => void;
 }
 
 function getStatusBadgeClass(status: number): string {
@@ -56,7 +62,9 @@ export const SessionStatisticsPanel: React.FC<SessionStatisticsPanelProps> = ({
   detail,
   selectedSessions,
   onSelectSession,
+  onNotify,
 }) => {
+  const { openContextMenu } = useContextMenu();
   const isMultiMode = Boolean(selectedSessions && selectedSessions.length >= 2);
   const baseTooltipId = useId();
   const [hoveredPhase, setHoveredPhase] =
@@ -115,6 +123,48 @@ export const SessionStatisticsPanel: React.FC<SessionStatisticsPanelProps> = ({
     }
   };
 
+  const handleStatsContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    const sel = typeof window !== "undefined" ? window.getSelection() : null;
+    if (
+      sel &&
+      !sel.isCollapsed &&
+      sel.toString().trim().length > 0 &&
+      e.currentTarget.contains(sel.anchorNode)
+    ) {
+      return;
+    }
+
+    const serverIp =
+      !isMultiMode && detail
+        ? detail.transferStats?.serverIp || detail.summary.serverIp || null
+        : null;
+    const title =
+      isMultiMode && selectedSessions
+        ? `Statistics (${selectedSessions.length} sessions)`
+        : detail
+          ? `Statistics (#${detail.summary.id} ${detail.summary.host})`
+          : "Statistics";
+
+    openContextMenu(
+      e,
+      buildStatisticsContextMenu({
+        title,
+        serverIp,
+        onCopyMarkdown: () => void handleCopy("md"),
+        onCopyText: () => void handleCopy("text"),
+        onCopyServerIp: serverIp
+          ? () =>
+              void copyTextToClipboard(
+                serverIp,
+                onNotify,
+                `Скопирован Server IP: ${serverIp}`
+              )
+          : undefined,
+      }),
+      { ariaLabel: "Session Statistics Context Menu" }
+    );
+  };
+
   if (isMultiMode && multiStats && selectedSessions) {
     const maxMimeWireBytes = Math.max(
       1,
@@ -123,7 +173,10 @@ export const SessionStatisticsPanel: React.FC<SessionStatisticsPanelProps> = ({
     const totalStatusCount = Math.max(1, multiStats.requestCount);
 
     return (
-      <div className="flex h-full flex-col overflow-auto bg-surface p-3 text-xs text-fg">
+      <div
+        onContextMenu={handleStatsContextMenu}
+        className="flex h-full flex-col overflow-auto bg-surface p-3 text-xs text-fg"
+      >
         {/* Top Action Bar */}
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-hairline pb-2">
           <div className="flex items-center gap-2">
@@ -488,7 +541,10 @@ export const SessionStatisticsPanel: React.FC<SessionStatisticsPanelProps> = ({
     : undefined;
 
   return (
-    <div className="flex h-full flex-col overflow-auto bg-surface p-3 text-xs text-fg">
+    <div
+      onContextMenu={handleStatsContextMenu}
+      className="flex h-full flex-col overflow-auto bg-surface p-3 text-xs text-fg"
+    >
       {/* Header Summary + Copy Controls */}
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-hairline pb-2">
         <div className="flex min-w-0 flex-wrap items-center gap-2">

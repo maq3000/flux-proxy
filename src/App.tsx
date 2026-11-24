@@ -25,7 +25,20 @@ import { Sidebar } from "./components/Sidebar";
 import type { TextWizardTab } from "./components/TextWizardPanel";
 import { TopToolbar } from "./components/TopToolbar";
 import { TrafficGrid } from "./components/TrafficGrid";
+import { ContextMenuProvider } from "./components/ui/ContextMenu";
 import { SectionHeader } from "./components/ui/SectionHeader";
+import { useContextMenu, type ContextMenuEventLike } from "./hooks/useContextMenu";
+import {
+  buildEditableInputMenuItems,
+  buildFooterContextMenu,
+  buildInspectorChromeContextMenu,
+  buildSelectionContextMenuItems,
+  captureEditableSelection,
+  copyTextToClipboard,
+  findEditableTextTarget,
+  getActiveReadOnlySelection,
+  shouldPreserveNativeContextMenu,
+} from "./lib/contextMenuBuilders";
 
 const BreakpointsPanel = React.lazy(() =>
   import("./components/BreakpointsPanel").then((m) => ({
@@ -106,6 +119,9 @@ import type {
   ActiveNavSection,
   AutoResponderRule,
   ComposedRequest,
+  HeaderMutationDirection,
+  HeaderMutationOp,
+  HeaderMutationRule,
   PythonScriptPreset,
   SessionDetail,
   SessionSummary,
@@ -120,7 +136,8 @@ import type {
   SettingsModalTab,
 } from "./types/settings";
 
-export const App: React.FC = () => {
+const AppContent: React.FC = () => {
+  const { openContextMenu, closeContextMenu } = useContextMenu();
   const {
     preference,
     resolvedTheme,
@@ -2965,10 +2982,289 @@ export const App: React.FC = () => {
     [selectedDetail, selectedId, sessions]
   );
 
+  const handleQuickFilterByQuery = useCallback(
+    (query: string) => {
+      const clean = query.trim();
+      if (!clean) return;
+      setUseRegex(false);
+      setFilterQuery(clean);
+      setActiveSection("traffic");
+      showToast(`Фильтр трафика: "${clean.slice(0, 48)}"`);
+    },
+    [setActiveSection, setFilterQuery, setUseRegex, showToast]
+  );
+
+  const handleFilterByHost = useCallback(
+    (host: string) => {
+      const clean = host.split(":")[0].trim();
+      if (!clean) return;
+      setMatrixEnabled(true);
+      setFilterRules((prev) => {
+        const exists = prev.some(
+          (r) =>
+            r.enabled &&
+            r.action === "include" &&
+            r.field === "host" &&
+            r.operator === "contains" &&
+            r.value.toLowerCase() === clean.toLowerCase()
+        );
+        if (exists) return prev;
+        return [
+          ...prev,
+          {
+            id: `f-host-${Date.now()}`,
+            enabled: true,
+            action: "include",
+            logicalOp: "OR",
+            field: "host",
+            operator: "contains",
+            value: clean,
+          },
+        ];
+      });
+      setActiveSection("traffic");
+      showToast(`Фильтр по хосту: ${clean}`);
+    },
+    [setActiveSection, setFilterRules, setMatrixEnabled, showToast]
+  );
+
+  const handleFilterByStatus = useCallback(
+    (statusCode: number) => {
+      if (!Number.isFinite(statusCode) || statusCode <= 0) return;
+      const val = String(statusCode);
+      setMatrixEnabled(true);
+      setFilterRules((prev) => {
+        const exists = prev.some(
+          (r) =>
+            r.enabled &&
+            r.action === "include" &&
+            r.field === "status" &&
+            r.operator === "equals" &&
+            r.value === val
+        );
+        if (exists) return prev;
+        return [
+          ...prev,
+          {
+            id: `f-status-${Date.now()}`,
+            enabled: true,
+            action: "include",
+            logicalOp: "OR",
+            field: "status",
+            operator: "equals",
+            value: val,
+          },
+        ];
+      });
+      setActiveSection("traffic");
+      showToast(`Фильтр по статусу: ${statusCode}`);
+    },
+    [setActiveSection, setFilterRules, setMatrixEnabled, showToast]
+  );
+
+  const handleResetAllTrafficFilters = useCallback(() => {
+    setFilterQuery("");
+    setUseRegex(false);
+    setQuickCategory("all");
+    resetAdvancedFilters();
+  }, [resetAdvancedFilters, setFilterQuery, setQuickCategory, setUseRegex]);
+
+  const handleAddHeaderMutationRule = useCallback(
+    async (
+      direction: HeaderMutationDirection,
+      operation: HeaderMutationOp,
+      headerName: string,
+      headerValue: string,
+      host?: string
+    ) => {
+      const cleanName = headerName.trim();
+      if (!cleanName) return;
+      const urlPattern = host?.split(":")[0].trim() || "*";
+      const nextRule: HeaderMutationRule = {
+        id: `hm-${Date.now()}`,
+        enabled: true,
+        name:
+          operation === "remove"
+            ? `Remove ${cleanName} (${direction})`
+            : `Set ${cleanName} (${direction})`,
+        direction,
+        operation,
+        headerName: cleanName,
+        headerValue: operation === "remove" ? "" : headerValue,
+        urlPattern,
+      };
+      await updateBackendFilterConfig({
+        ...backendFilterConfig,
+        headerMutationsEnabled: true,
+        headerMutations: [nextRule, ...backendFilterConfig.headerMutations],
+      });
+      showToast(
+        operation === "remove"
+          ? `Добавлено правило Header Mutation: Remove ${cleanName}`
+          : `Добавлено правило Header Mutation: Set ${cleanName}`
+      );
+      openPreferencesAt("filters", "headers");
+    },
+    [
+      backendFilterConfig,
+      openPreferencesAt,
+      showToast,
+      updateBackendFilterConfig,
+    ]
+  );
+
+  const handleOpenStatisticsForSession = useCallback(
+    (sessionId: number) => {
+      setInlineDiffDismissed(true);
+      setSelectedId(sessionId);
+      setInspectorCollapsed(false);
+      setStatisticsTriggerSeq((n) => n + 1);
+    },
+    [setInspectorCollapsed, setSelectedId]
+  );
+
+  const primaryProxyAddress = useMemo(() => {
+    const host =
+      status.bindMode === "specific" &&
+      status.specificBindIp &&
+      status.alsoBindLoopback === false
+        ? status.specificBindIp
+        : "127.0.0.1";
+    return `${host}:${status.port}`;
+  }, [
+    status.alsoBindLoopback,
+    status.bindMode,
+    status.port,
+    status.specificBindIp,
+  ]);
+
+  const handleCopyProxyAddress = useCallback(() => {
+    void copyTextToClipboard(
+      primaryProxyAddress,
+      showToast,
+      `Скопирован адрес прокси: ${primaryProxyAddress}`
+    );
+  }, [primaryProxyAddress, showToast]);
+
+  const handleRootContextMenu = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (e.defaultPrevented) return;
+      if (shouldPreserveNativeContextMenu(e.target)) {
+        return;
+      }
+
+      const editable = findEditableTextTarget(e.target);
+      if (editable) {
+        const snapshot = captureEditableSelection(editable);
+        openContextMenu(
+          e,
+          buildEditableInputMenuItems({
+            target: editable,
+            snapshot,
+            onNotify: showToast,
+          }),
+          { ariaLabel: "Text Editing Context Menu", restoreFocusTo: editable }
+        );
+        return;
+      }
+
+      const selectedText = getActiveReadOnlySelection();
+      if (selectedText.length > 0) {
+        openContextMenu(
+          e,
+          buildSelectionContextMenuItems({
+            selectedText,
+            onOpenTextWizard: (text, tab) => openTextWizardAt(tab, text),
+            onQuickFilter: handleQuickFilterByQuery,
+            onNotify: showToast,
+          }),
+          { ariaLabel: "Selection Context Menu" }
+        );
+        return;
+      }
+
+      // Suppress raw WebView2 browser menu (Back / Reload / Print / Inspect)
+      e.preventDefault();
+      closeContextMenu({ restoreFocus: false });
+    },
+    [
+      closeContextMenu,
+      handleQuickFilterByQuery,
+      openContextMenu,
+      openTextWizardAt,
+      showToast,
+    ]
+  );
+
+  const handleResizeHandleContextMenu = useCallback(
+    (e: ContextMenuEventLike) => {
+      openContextMenu(
+        e,
+        buildInspectorChromeContextMenu({
+          inspectorCollapsed,
+          inspectorPosition,
+          onExpandOrCollapse: toggleInspector,
+          onSetPosition: setInspectorPosition,
+          onToggleSplitDirection: toggleInspectorSplitDirection,
+          onResetPanelLayout: handleResetPanelLayout,
+        }),
+        { ariaLabel: "Panel Layout Context Menu" }
+      );
+    },
+    [
+      handleResetPanelLayout,
+      inspectorCollapsed,
+      inspectorPosition,
+      openContextMenu,
+      setInspectorPosition,
+      toggleInspector,
+      toggleInspectorSplitDirection,
+    ]
+  );
+
+  const handleFooterContextMenu = useCallback(
+    (e: React.MouseEvent<HTMLElement>) => {
+      openContextMenu(
+        e,
+        buildFooterContextMenu({
+          proxyAddress: primaryProxyAddress,
+          proxyRunning: status.running,
+          systemProxyEnabled: status.systemProxyEnabled,
+          onToggleCapture: () => void toggleProxy(),
+          onToggleSystemProxy: () => void toggleSystemProxy(),
+          onCopyProxyAddress: handleCopyProxyAddress,
+          onCopyCliEnv: copyCliProxyEnv,
+          onRunProxyDoctor: () =>
+            openPreferencesAt("diagnosticsBackup", "proxyDoctor"),
+          onPurgeSqlite: () => setConfirmSqlitePurgeOpen(true),
+        }),
+        { ariaLabel: "Status Footer Context Menu" }
+      );
+    },
+    [
+      copyCliProxyEnv,
+      handleCopyProxyAddress,
+      openContextMenu,
+      openPreferencesAt,
+      primaryProxyAddress,
+      status.running,
+      status.systemProxyEnabled,
+      toggleProxy,
+      toggleSystemProxy,
+    ]
+  );
+
+  const hasAnyActiveFilter = Boolean(
+    filterQuery.trim() || quickCategory !== "all" || activeFilterBadgeCount > 0
+  );
+
   const renderTrafficGrid = () => (
     <TrafficGrid
       gridRef={trafficGridRef}
       sessions={filteredSessions}
+      totalSessionsCount={sessions.length}
+      proxyRunning={status.running}
+      hasActiveFilters={hasAnyActiveFilter}
       selectedId={selectedId}
       selectedIds={selectedIds}
       visibleColumns={visibleColumns}
@@ -2990,6 +3286,7 @@ export const App: React.FC = () => {
         sortedSessionsRef.current = list;
       }}
       onFocusInspector={handleFocusInspector}
+      onOpenStatistics={handleOpenStatisticsForSession}
       onDeleteSessions={(ids) => void deleteSessions(ids)}
       onReplaySessions={(ids) => void replaySessions(ids)}
       onUnmarkSessions={(ids) => void unmarkSessions(ids)}
@@ -3006,6 +3303,9 @@ export const App: React.FC = () => {
       onAnnotateSessions={openAnnotationFor}
       onSendToComposer={(id) => void loadSessionIntoComposer(id)}
       onCreateRuleFromSession={(s) => void handleCreateRuleFromSession(s)}
+      onAddBreakpoint={(stage, pattern) =>
+        void applyQuickExecBpu(stage, pattern)
+      }
       onExportSelectedSessions={(ids, fmt) =>
         void exportSelectedSessionsAs(ids, fmt)
       }
@@ -3013,6 +3313,8 @@ export const App: React.FC = () => {
       onSaveSessionBody={(id, isResponse) =>
         void saveSessionBodyAs(id, isResponse)
       }
+      onFilterByHost={handleFilterByHost}
+      onFilterByStatus={handleFilterByStatus}
       onFilterByProcess={(proc) => quickFilterByProcess(proc, "include")}
       onFilterByClientIp={(ip) => quickFilterByClientIp(ip, "include")}
       onAddClientIpToAllowlist={(ip) => void addLanClientToAllowlist(ip)}
@@ -3020,6 +3322,12 @@ export const App: React.FC = () => {
       onAlwaysPassthroughHost={(host) => void quickAlwaysPassthroughHost(host)}
       onAddHostToTlsBypass={(host) => void quickAddTlsBypassHost(host)}
       onDisableFollowTail={() => setFollowTail(false)}
+      onToggleCapture={() => void toggleProxy()}
+      onToggleFollowTail={() => setFollowTail((v) => !v)}
+      onClearAllSessions={() => void clearAllSessions()}
+      onImportArchive={() => void importArchiveDialog()}
+      onSaveAllSessions={() => void exportAllSessionsAs()}
+      onResetFilters={handleResetAllTrafficFilters}
       onNotify={showToast}
       thresholds={thresholds}
       followTail={followTail}
@@ -3050,6 +3358,7 @@ export const App: React.FC = () => {
             setStatisticsTriggerSeq((n) => n + 1);
           }}
           onCloseDiff={() => setInlineDiffDismissed(true)}
+          onNotify={showToast}
         />
       </React.Suspense>
     ) : (
@@ -3076,6 +3385,13 @@ export const App: React.FC = () => {
         externalHexTrigger={hexTriggerSeq}
         onReplaySession={(id) => void replaySessions([id])}
         onSendToComposer={(id) => void loadSessionIntoComposer(id)}
+        onCopyCurl={(id) => void copySessionAsCurl(id)}
+        onCreateRuleFromSession={(s) => void handleCreateRuleFromSession(s)}
+        onFilterByHost={handleFilterByHost}
+        onQuickFilterByValue={handleQuickFilterByQuery}
+        onAddHeaderMutationRule={(dir, op, name, val, host) =>
+          void handleAddHeaderMutationRule(dir, op, name, val, host)
+        }
         onFilterByProcess={(proc) => quickFilterByProcess(proc, "include")}
         onFilterByClientIp={(ip) => quickFilterByClientIp(ip, "include")}
         onAlwaysInspectHost={(host) => void quickAlwaysInspectHost(host)}
@@ -3090,11 +3406,14 @@ export const App: React.FC = () => {
           void saveSessionBodyAs(id, isResponse)
         }
         onOpenTimeoutSettings={handleOpenTimeoutSettings}
+        onResetPanelLayout={handleResetPanelLayout}
+        onNotify={showToast}
       />
     );
 
   return (
     <div
+      onContextMenu={handleRootContextMenu}
       onDragEnter={handleRootDragEnter}
       onDragOver={handleRootDragOver}
       onDragLeave={handleRootDragLeave}
@@ -3313,6 +3632,8 @@ export const App: React.FC = () => {
             followTail={followTail}
             onToggleFollowTail={() => setFollowTail((v) => !v)}
             compactToolbar={compactToolbar}
+            onToggleCompactToolbar={toggleCompactToolbar}
+            onResetPanelLayout={handleResetPanelLayout}
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={toggleSidebar}
             toolbarGroups={toolbarGroups}
@@ -3416,6 +3737,7 @@ export const App: React.FC = () => {
                         <>
                           <PanelResizeHandle
                             onDoubleClick={handleResetBottomInnerGroup}
+                            onContextMenu={handleResizeHandleContextMenu}
                             title="Double-click to reset Traffic / Inspector split"
                             className="h-1 w-full bg-hairline transition-colors hover:bg-accent/60"
                           />
@@ -3442,6 +3764,8 @@ export const App: React.FC = () => {
                         onExpand={handleFocusInspector}
                         onOpenStatistics={handleOpenStatistics}
                         onChangePosition={setInspectorPosition}
+                        onToggleSplitDirection={toggleInspectorSplitDirection}
+                        onResetPanelLayout={handleResetPanelLayout}
                       />
                     )}
                   </div>
@@ -3470,6 +3794,7 @@ export const App: React.FC = () => {
                         <>
                           <PanelResizeHandle
                             onDoubleClick={handleResetRightGroup}
+                            onContextMenu={handleResizeHandleContextMenu}
                             title="Double-click to reset workspace panel split"
                             className="w-1 bg-hairline transition-colors hover:bg-accent/60"
                           />
@@ -3496,6 +3821,8 @@ export const App: React.FC = () => {
                         onExpand={handleFocusInspector}
                         onOpenStatistics={handleOpenStatistics}
                         onChangePosition={setInspectorPosition}
+                        onToggleSplitDirection={toggleInspectorSplitDirection}
+                        onResetPanelLayout={handleResetPanelLayout}
                       />
                     )}
                   </div>
@@ -3556,6 +3883,7 @@ export const App: React.FC = () => {
                     persistAutoResponderStorage(autoResponderEnabled, next);
                     showToast("Deleted AutoResponder rule");
                   }}
+                  onNotify={showToast}
                 />
               </div>
             )}
@@ -3589,6 +3917,7 @@ export const App: React.FC = () => {
                     onUpdateConfig={updateBreakpointConfig}
                     onResolve={resolvePausedBreakpoint}
                     onResumeAll={resumeAllBreakpoints}
+                    onNotify={showToast}
                   />
                 </React.Suspense>
               </div>
@@ -3632,6 +3961,7 @@ export const App: React.FC = () => {
                     onToggleEnabled={handleTogglePythonScript}
                     onRefreshStatus={handleRefreshPythonStatus}
                     onClearLogs={() => setScriptConsoleLogs([])}
+                    onNotify={showToast}
                   />
                 </React.Suspense>
               </div>
@@ -3667,6 +3997,7 @@ export const App: React.FC = () => {
                     onSelectPair={handleSelectDiffTabPair}
                     onSwapPair={handleSwapDiffTabPair}
                     onAnnotateSession={(id) => openAnnotationFor([id])}
+                    onNotify={showToast}
                   />
                 </React.Suspense>
               </div>
@@ -3705,7 +4036,10 @@ export const App: React.FC = () => {
       </div>
 
       {/* Compact Status Footer */}
-      <footer className="flex h-6 shrink-0 items-center justify-between gap-3 border-t border-hairline bg-surface px-3 font-mono text-[11px] text-muted">
+      <footer
+        onContextMenu={handleFooterContextMenu}
+        className="flex h-6 shrink-0 items-center justify-between gap-3 border-t border-hairline bg-surface px-3 font-mono text-[11px] text-muted"
+      >
         <div className="flex min-w-0 items-center gap-2.5 truncate">
           <span className="truncate">
             Engine:{" "}
@@ -4286,5 +4620,11 @@ export const App: React.FC = () => {
     </div>
   );
 };
+
+export const App: React.FC = () => (
+  <ContextMenuProvider>
+    <AppContent />
+  </ContextMenuProvider>
+);
 
 export default App;

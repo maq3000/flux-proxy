@@ -456,58 +456,160 @@ dialog.drawer-dialog::backdrop {
   }
 }
 
-/* Pointer-positioned right-click context menu popover with nested focusgroup="menu nomemory" */
-.session-context-menu {
+/* Unified viewport-aware right-click context menu & nested submenu (ContextMenu.tsx) */
+.flux-context-menu,
+.flux-context-submenu {
   position: fixed;
   inset: auto;
-  top: var(--ctx-menu-top, 0px);
-  left: var(--ctx-menu-left, 0px);
   margin: 0;
   padding: 0;
-  max-height: calc(100vh - 16px);
+  overscroll-behavior: contain;
+  user-select: none;
+}
+
+.flux-context-menu {
+  overflow-y: auto;
+}
+
+.flux-context-submenu {
+  overflow: visible;
+}
+
+.flux-context-submenu > .flux-context-menu-list {
+  max-height: inherit;
   overflow-y: auto;
   overscroll-behavior: contain;
 }
 
-[popover].session-context-menu:is(:popover-open, .\:popover-open) {
+[popover].flux-context-menu:is(:popover-open, .\:popover-open, [data-open="true"]),
+[popover].flux-context-submenu:is(:popover-open, .\:popover-open, [data-open="true"]) {
   display: block;
 }
 
-.session-context-menu [focusgroup~="menu"] {
-  --menu-icon-size: 1rem;
+.flux-context-submenu[data-bridge]::before {
+  content: "";
+  position: absolute;
+  inset: -100vh -100vw;
+  --bridge-slack: 5px;
+  --bridge-side: sign(var(--pointer-x, 0px));
+  --bridge-edge: calc(50% + var(--bridge-side) * (50% - 100vw));
+  --bridge-apex: calc(100vw + var(--pointer-x, 0px) + var(--bridge-side) * var(--bridge-slack));
+  clip-path: polygon(
+    var(--bridge-apex) calc(100vh + var(--pointer-y, 0px) - var(--bridge-slack)),
+    var(--bridge-edge) 100vh,
+    var(--bridge-edge) calc(100% - 100vh),
+    var(--bridge-apex) calc(100vh + var(--pointer-y, 0px) + var(--bridge-slack))
+  );
+}
+
+@supports not (width: calc(sign(1px) * 1px)) {
+  .flux-context-submenu[data-bridge]::before {
+    --bridge-edge: clamp(100vw, 50% + var(--pointer-x, 0px) * 1e6, 100% - 100vw);
+    --bridge-apex: calc(
+      100vw + var(--pointer-x, 0px) +
+        clamp(-1 * var(--bridge-slack), var(--pointer-x, 0px) * 1e6, var(--bridge-slack))
+    );
+  }
+}
+
+.flux-context-menu-list {
   display: flex;
   flex-direction: column;
   padding: 0.25rem;
 }
 
-.session-context-menu [focusgroup~="menu"] > button {
+.flux-context-item {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.45rem;
   width: 100%;
+  min-block-size: 1.75rem;
   border-radius: 0.375rem;
-  padding: 0.35rem 0.5rem;
+  padding: 0.3rem 0.5rem 0.3rem 0.4rem;
   text-align: left;
   font-size: 0.75rem;
-  line-height: 1.15rem;
+  line-height: 1.1rem;
   color: var(--text-primary);
+  background: transparent;
+  cursor: pointer;
 }
 
-.session-context-menu [focusgroup~="menu"] > button:hover,
-.session-context-menu [focusgroup~="menu"] > button:focus-visible {
+.flux-context-item:hover:not(:disabled),
+.flux-context-item:focus-visible:not(:disabled),
+.flux-context-item[aria-expanded="true"]:not(:disabled) {
   background-color: var(--bg-hover);
   outline: none;
 }
 
-.session-context-menu [focusgroup~="menu"] .hint {
-  margin-inline-start: auto;
-  padding-inline-start: 0.75rem;
+.flux-context-item:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--accent-primary);
 }
 
-.session-context-menu [focusgroup~="menu"] > hr {
+.flux-context-item:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.flux-context-item-danger {
+  color: var(--status-5xx-fg);
+}
+
+.flux-context-item-danger:hover:not(:disabled),
+.flux-context-item-danger:focus-visible:not(:disabled) {
+  background-color: var(--status-5xx-bg);
+}
+
+.flux-context-leading {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  inline-size: 1rem;
+  block-size: 1rem;
+  color: var(--text-secondary);
+}
+
+.flux-context-item-danger .flux-context-leading {
+  color: var(--status-5xx-fg);
+}
+
+.flux-context-hint {
+  display: inline-flex;
+  align-items: center;
+  margin-inline-start: auto;
+  padding-inline-start: 0.85rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.65rem;
+  color: var(--text-muted);
+}
+
+.flux-context-separator {
   margin: 0.25rem 0.25rem;
   border: 0;
   border-top: 1px solid var(--border-hairline);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .flux-context-menu,
+  .flux-context-submenu {
+    opacity: 0;
+    transition: opacity 0.1s ease-out;
+  }
+
+  .flux-context-menu:is(:popover-open, .\:popover-open, [data-open="true"]),
+  .flux-context-submenu:is(:popover-open, .\:popover-open, [data-open="true"]) {
+    opacity: 1;
+    @starting-style {
+      opacity: 0;
+    }
+  }
+}
+
+@media (forced-colors: active) {
+  .flux-context-item:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
 }
 
 /* Native accessible checkbox styling preserving OS :focus-visible indicators */

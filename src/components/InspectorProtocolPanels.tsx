@@ -21,7 +21,15 @@ import {
   Wand2,
   XCircle,
 } from "lucide-react";
-import { formatBytes } from "../lib/formatters";
+import { useContextMenu } from "../hooks/useContextMenu";
+import {
+  buildSseEventContextMenu,
+  buildWsFrameContextMenu,
+  copyTextToClipboard,
+  detectTextWizardTab,
+} from "../lib/contextMenuBuilders";
+import { formatBytes, tryFormatJson } from "../lib/formatters";
+import { textToHex } from "../lib/textWizard";
 import {
   analyzeAuth,
   analyzeCaching,
@@ -44,8 +52,11 @@ import type { TextWizardTab } from "./TextWizardPanel";
 export const SseInspectorPanel: React.FC<{
   detail: SessionDetail;
   monacoTheme: string;
-}> = ({ detail, monacoTheme }) => {
+  onOpenTextWizard?: (text: string, tab: TextWizardTab) => void;
+  onNotify?: (msg: string) => void;
+}> = ({ detail, monacoTheme, onOpenTextWizard, onNotify }) => {
   const captionId = useId();
+  const { openContextMenu } = useContextMenu();
   const [selectedIdx, setSelectedIdx] = useState<number>(1);
   const [copiedStream, setCopiedStream] = useState(false);
 
@@ -58,6 +69,59 @@ export const SseInspectorPanel: React.FC<{
     analysis.events.find((e) => e.index === selectedIdx) ??
     analysis.events[0] ??
     null;
+
+  const fullSseStreamText = useMemo(() => {
+    if (detail.responseBodyText && detail.responseBodyText.trim()) {
+      return detail.responseBodyText;
+    }
+    if (analysis.reconstructedText) {
+      return analysis.reconstructedText;
+    }
+    return analysis.events
+      .map((ev) => `event: ${ev.event}\ndata: ${ev.data}`)
+      .join("\n\n");
+  }, [analysis.events, analysis.reconstructedText, detail.responseBodyText]);
+
+  const handleSseRowContextMenu = (
+    e: React.MouseEvent<HTMLTableRowElement>,
+    ev: (typeof analysis.events)[number]
+  ) => {
+    const sel = typeof window !== "undefined" ? window.getSelection() : null;
+    if (
+      sel &&
+      !sel.isCollapsed &&
+      sel.toString().trim().length > 0 &&
+      e.currentTarget.contains(sel.anchorNode)
+    ) {
+      return;
+    }
+    setSelectedIdx(ev.index);
+    openContextMenu(
+      e,
+      buildSseEventContextMenu({
+        eventIndex: ev.index,
+        eventName: ev.isDoneSentinel ? "[DONE]" : ev.event,
+        eventData: ev.data,
+        hasFullStream: fullSseStreamText.length > 0,
+        onCopyEventData: () =>
+          void copyTextToClipboard(
+            ev.data,
+            onNotify,
+            `Скопированы данные SSE #${ev.index}`
+          ),
+        onCopyFullStream: () =>
+          void copyTextToClipboard(
+            fullSseStreamText,
+            onNotify,
+            "Скопирован полный поток SSE"
+          ),
+        onDecodeInTextWizard: onOpenTextWizard
+          ? () => onOpenTextWizard(ev.data, detectTextWizardTab(ev.data))
+          : undefined,
+      }),
+      { ariaLabel: `SSE Chunk #${ev.index} Context Menu` }
+    );
+  };
 
   if (!analysis.isSse) {
     return (
@@ -165,6 +229,7 @@ export const SseInspectorPanel: React.FC<{
                   <tr
                     key={ev.index}
                     onClick={() => setSelectedIdx(ev.index)}
+                    onContextMenu={(e) => handleSseRowContextMenu(e, ev)}
                     className={`cursor-pointer border-b border-hairline/50 transition-colors ${
                       isSelected ? "bg-selected text-fg" : "hover:bg-hover/60"
                     }`}
@@ -292,12 +357,22 @@ export const WebSocketFramesPanel: React.FC<{
   sessionId?: number;
   isWsOpen?: boolean;
   onFrameInjected?: (frame: WebSocketFrameRecord) => void;
-}> = ({ frames, sessionId, isWsOpen = false, onFrameInjected }) => {
+  onOpenTextWizard?: (text: string, tab: TextWizardTab) => void;
+  onNotify?: (msg: string) => void;
+}> = ({
+  frames,
+  sessionId,
+  isWsOpen = false,
+  onFrameInjected,
+  onOpenTextWizard,
+  onNotify,
+}) => {
   const captionId = useId();
   const modeGroupName = useId();
   const payloadId = useId();
   const payloadErrId = useId();
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const { openContextMenu } = useContextMenu();
 
   const [mode, setMode] = useState<WsPayloadMode>("text");
   const [payload, setPayload] = useState("");
@@ -399,6 +474,83 @@ export const WebSocketFramesPanel: React.FC<{
 
   const canInject = isWsOpen && sessionId !== undefined;
 
+  const handleWsRowContextMenu = (
+    e: React.MouseEvent<HTMLTableRowElement>,
+    frame: WebSocketFrameRecord
+  ) => {
+    const sel = typeof window !== "undefined" ? window.getSelection() : null;
+    if (
+      sel &&
+      !sel.isCollapsed &&
+      sel.toString().trim().length > 0 &&
+      e.currentTarget.contains(sel.anchorNode)
+    ) {
+      return;
+    }
+
+    const formattedJson = tryFormatJson(frame.payloadPreview);
+    const hexPayload =
+      frame.opcode.toLowerCase() === "binary" &&
+      inspectHexPayload(frame.payloadPreview).valid
+        ? frame.payloadPreview
+        : textToHex(frame.payloadPreview, " ");
+
+    openContextMenu(
+      e,
+      buildWsFrameContextMenu({
+        frame,
+        canReuseInInject: canInject,
+        isJsonPayload: formattedJson.valid,
+        onCopyPayload: () =>
+          void copyTextToClipboard(
+            frame.payloadPreview,
+            onNotify,
+            `Скопирован payload WS #${frame.index}`
+          ),
+        onCopyPrettyJson: () => {
+          if (!formattedJson.valid) return;
+          void copyTextToClipboard(
+            formattedJson.formatted,
+            onNotify,
+            `Скопирован JSON WS #${frame.index}`
+          );
+        },
+        onCopyHex: () =>
+          void copyTextToClipboard(
+            hexPayload,
+            onNotify,
+            `Скопирован Hex WS #${frame.index}`
+          ),
+        onReuseInInject: () => {
+          if (!canInject) return;
+          if (formattedJson.valid) {
+            setMode("json");
+            setPayload(formattedJson.formatted);
+          } else if (frame.opcode.toLowerCase() === "binary") {
+            setMode("hex");
+            setPayload(hexPayload);
+          } else {
+            setMode("text");
+            setPayload(frame.payloadPreview);
+          }
+          setFieldError(null);
+          setInjectError(null);
+          window.requestAnimationFrame(() => {
+            textareaRef.current?.focus();
+          });
+        },
+        onDecodeInTextWizard: onOpenTextWizard
+          ? () =>
+              onOpenTextWizard(
+                frame.payloadPreview,
+                detectTextWizardTab(frame.payloadPreview)
+              )
+          : undefined,
+      }),
+      { ariaLabel: `WebSocket Frame #${frame.index} Context Menu` }
+    );
+  };
+
   return (
     <div className="flex h-full flex-col overflow-hidden">
       {/* Status Header */}
@@ -468,6 +620,7 @@ export const WebSocketFramesPanel: React.FC<{
                 {frames.map((f) => (
                   <tr
                     key={`${f.index}-${f.timestamp}`}
+                    onContextMenu={(e) => handleWsRowContextMenu(e, f)}
                     className="border-b border-hairline/50 hover:bg-hover/40"
                   >
                     <th className="px-2 py-1.5 text-left text-subtle">

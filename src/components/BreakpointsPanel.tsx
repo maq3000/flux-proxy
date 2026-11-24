@@ -13,6 +13,11 @@ import {
   Trash2,
   Zap,
 } from "lucide-react";
+import { useContextMenu } from "../hooks/useContextMenu";
+import {
+  buildBreakpointRuleContextMenu,
+  copyTextToClipboard,
+} from "../lib/contextMenuBuilders";
 import { statusReasonPhrase, tryFormatJson } from "../lib/formatters";
 import { getMonacoThemeName } from "../lib/monaco";
 import { isTauriRuntime, proxyBridge } from "../lib/tauriBridge";
@@ -41,6 +46,7 @@ export interface BreakpointsPanelProps {
   onUpdateConfig: (next: BreakpointConfig) => Promise<BreakpointConfig>;
   onResolve: (resolution: BreakpointResolution) => Promise<boolean>;
   onResumeAll: (action: BreakpointAction) => Promise<void>;
+  onNotify?: (msg: string) => void;
 }
 
 const HTTP_METHODS = [
@@ -67,7 +73,9 @@ export const BreakpointsPanel: React.FC<BreakpointsPanelProps> = ({
   onUpdateConfig,
   onResolve,
   onResumeAll,
+  onNotify,
 }) => {
+  const { openContextMenu } = useContextMenu();
   const monacoTheme = getMonacoThemeName(resolvedTheme);
 
   const [tab, setTab] = useState<BreakpointsPanelMode>(() =>
@@ -267,6 +275,37 @@ export const BreakpointsPanel: React.FC<BreakpointsPanelProps> = ({
       rules: [rule, ...config.rules],
     });
     setNewRulePattern("");
+  };
+
+  const handleRuleContextMenu = (
+    e: React.MouseEvent<HTMLDivElement>,
+    rule: BreakpointRule
+  ) => {
+    openContextMenu(
+      e,
+      buildBreakpointRuleContextMenu({
+        rule,
+        onToggleEnabled: () =>
+          void onUpdateConfig({
+            ...config,
+            rules: config.rules.map((item) =>
+              item.id === rule.id ? { ...item, enabled: !item.enabled } : item
+            ),
+          }),
+        onCopyPattern: () =>
+          void copyTextToClipboard(
+            rule.urlPattern,
+            onNotify,
+            `Скопирован шаблон Breakpoint: ${rule.urlPattern}`
+          ),
+        onDelete: () =>
+          void onUpdateConfig({
+            ...config,
+            rules: config.rules.filter((item) => item.id !== rule.id),
+          }),
+      }),
+      { ariaLabel: `Breakpoint Rule ${rule.urlPattern} Context Menu` }
+    );
   };
 
   const remainingSec = activeItem
@@ -893,6 +932,7 @@ export const BreakpointsPanel: React.FC<BreakpointsPanelProps> = ({
                 config.rules.map((r) => (
                   <div
                     key={r.id}
+                    onContextMenu={(e) => handleRuleContextMenu(e, r)}
                     className="flex items-center justify-between gap-2 rounded-lg border border-hairline bg-canvas px-3 py-2 font-mono text-xs"
                   >
                     <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5">

@@ -1,36 +1,26 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
-  Archive,
   ArrowLeftRight,
-  Code2,
-  Copy,
-  Download,
-  Eraser,
-  FileCode2,
-  FileJson,
-  FileText,
   Flame,
   GitCompareArrows,
   Maximize2,
   MessageSquarePlus,
-  RotateCcw,
-  RotateCw,
-  Send,
-  ShieldCheck,
-  ShieldOff,
   Smartphone,
-  Sparkles,
-  Target,
-  Terminal,
   Trash2,
   X,
 } from "lucide-react";
+import { useContextMenu } from "../hooks/useContextMenu";
 import {
   TRAFFIC_COLUMNS,
   type ColumnDefinition,
 } from "../hooks/useUiPreferences";
-import { extractParentWildcardDomain } from "../lib/filterEngine";
+import {
+  buildTrafficEmptyContextMenu,
+  buildTrafficHeaderContextMenu,
+  buildTrafficRowContextMenu,
+  isRemoteClientIp,
+} from "../lib/contextMenuBuilders";
 import {
   formatBytes,
   formatDuration,
@@ -40,7 +30,6 @@ import {
   formatMsPrecise,
   formatTimeCellTooltip,
 } from "../lib/requestStatistics";
-import { getSectionMeta } from "../lib/sectionRegistry";
 import { hexToRgba } from "../lib/sessionDiff";
 import type {
   ColumnId,
@@ -52,6 +41,9 @@ import type {
 interface TrafficGridProps {
   gridRef?: React.RefObject<HTMLDivElement>;
   sessions: SessionSummary[];
+  totalSessionsCount?: number;
+  proxyRunning?: boolean;
+  hasActiveFilters?: boolean;
   selectedId: number | null;
   selectedIds: number[];
   visibleColumns: Record<ColumnId, boolean>;
@@ -65,6 +57,7 @@ interface TrafficGridProps {
   onSelectAllSessions?: (ids: number[]) => void;
   onSortedSessionsChange?: (sessions: SessionSummary[]) => void;
   onFocusInspector: () => void;
+  onOpenStatistics?: (id: number) => void;
   onDeleteSessions: (ids: number[]) => void;
   onReplaySessions: (ids: number[]) => void;
   onUnmarkSessions: (ids: number[]) => void;
@@ -78,12 +71,15 @@ interface TrafficGridProps {
   onAnnotateSessions: (ids: number[]) => void;
   onSendToComposer: (id: number) => void;
   onCreateRuleFromSession: (session: SessionSummary) => void;
+  onAddBreakpoint?: (stage: "request" | "response", pattern: string) => void;
   onExportSelectedSessions?: (
     ids: number[],
     format: "har" | "saz" | "raw"
   ) => void;
   onExportOpenApi?: (ids: number[]) => void;
   onSaveSessionBody?: (id: number, isResponse: boolean) => void;
+  onFilterByHost?: (host: string) => void;
+  onFilterByStatus?: (status: number) => void;
   onFilterByProcess?: (processName: string) => void;
   onFilterByClientIp?: (clientIp: string) => void;
   onAddClientIpToAllowlist?: (clientIp: string) => void;
@@ -91,6 +87,12 @@ interface TrafficGridProps {
   onAlwaysPassthroughHost?: (hostOrPattern: string) => void;
   onAddHostToTlsBypass?: (host: string) => void;
   onDisableFollowTail?: () => void;
+  onToggleCapture?: () => void;
+  onToggleFollowTail?: () => void;
+  onClearAllSessions?: () => void;
+  onImportArchive?: () => void;
+  onSaveAllSessions?: () => void;
+  onResetFilters?: () => void;
   onNotify?: (msg: string) => void;
   thresholds: NoiseThresholdsConfig;
   followTail: boolean;
@@ -162,18 +164,6 @@ function compareSessions(
         STRING_SORT_LOCALE_OPTS
       );
   }
-}
-
-function isRemoteClientIp(ip?: string | null): ip is string {
-  if (!ip) return false;
-  const clean = ip.trim().toLowerCase();
-  return (
-    clean.length > 0 &&
-    clean !== "127.0.0.1" &&
-    clean !== "::1" &&
-    clean !== "localhost" &&
-    clean !== "0.0.0.0"
-  );
 }
 
 function buildGridTemplate(
@@ -279,79 +269,12 @@ export function computeAutoFitWidth(
   );
 }
 
-function closePopoverSafe(pop: HTMLElement | null) {
-  if (!pop) return;
-  if ("popover" in HTMLElement.prototype) {
-    try {
-      if (pop.matches(":popover-open")) {
-        pop.hidePopover();
-      }
-    } catch {
-      // ignore
-    } finally {
-      pop.classList.remove(":popover-open");
-    }
-  } else {
-    pop.classList.remove(":popover-open");
-  }
-}
-
-function openFixedContextPopover(
-  pop: HTMLElement | null,
-  clientX: number,
-  clientY: number,
-  estWidth: number,
-  estHeight: number
-) {
-  if (!pop) return;
-  const clampedLeft = Math.max(
-    8,
-    Math.min(clientX, window.innerWidth - estWidth - 8)
-  );
-  const clampedTop = Math.max(
-    8,
-    Math.min(clientY, window.innerHeight - estHeight - 8)
-  );
-  pop.style.setProperty("--ctx-menu-left", `${Math.round(clampedLeft)}px`);
-  pop.style.setProperty("--ctx-menu-top", `${Math.round(clampedTop)}px`);
-
-  if ("popover" in HTMLElement.prototype) {
-    let openedViaFallback = false;
-    try {
-      if (pop.matches(":popover-open")) {
-        pop.hidePopover();
-      }
-      pop.showPopover();
-    } catch {
-      pop.classList.add(":popover-open");
-      openedViaFallback = true;
-    } finally {
-      if (!openedViaFallback) {
-        pop.classList.remove(":popover-open");
-      }
-    }
-  } else {
-    pop.classList.add(":popover-open");
-  }
-
-  // Re-clamp using actual rendered dimensions so tall menus never clip off-screen
-  const actualW = pop.offsetWidth || estWidth;
-  const actualH = pop.offsetHeight || estHeight;
-  const finalLeft = Math.max(
-    8,
-    Math.min(clientX, window.innerWidth - actualW - 8)
-  );
-  const finalTop = Math.max(
-    8,
-    Math.min(clientY, window.innerHeight - actualH - 8)
-  );
-  pop.style.setProperty("--ctx-menu-left", `${Math.round(finalLeft)}px`);
-  pop.style.setProperty("--ctx-menu-top", `${Math.round(finalTop)}px`);
-}
-
 export const TrafficGrid: React.FC<TrafficGridProps> = ({
   gridRef,
   sessions,
+  totalSessionsCount,
+  proxyRunning = true,
+  hasActiveFilters = false,
   selectedId,
   selectedIds,
   visibleColumns,
@@ -365,6 +288,7 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
   onSelectAllSessions,
   onSortedSessionsChange,
   onFocusInspector,
+  onOpenStatistics,
   onDeleteSessions,
   onReplaySessions,
   onUnmarkSessions,
@@ -378,9 +302,12 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
   onAnnotateSessions,
   onSendToComposer,
   onCreateRuleFromSession,
+  onAddBreakpoint,
   onExportSelectedSessions,
   onExportOpenApi,
   onSaveSessionBody,
+  onFilterByHost,
+  onFilterByStatus,
   onFilterByProcess,
   onFilterByClientIp,
   onAddClientIpToAllowlist,
@@ -388,21 +315,23 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
   onAlwaysPassthroughHost,
   onAddHostToTlsBypass,
   onDisableFollowTail,
+  onToggleCapture,
+  onToggleFollowTail,
+  onClearAllSessions,
+  onImportArchive,
+  onSaveAllSessions,
+  onResetFilters,
   thresholds,
   followTail,
 }) => {
+  const { openContextMenu } = useContextMenu();
   const internalGridRef = useRef<HTMLDivElement>(null);
   const resolvedGridRef = gridRef ?? internalGridRef;
   const scrollParentRef = useRef<HTMLDivElement>(null);
-  const ctxPopoverRef = useRef<HTMLDivElement>(null);
-  const ctxFocusGroupRef = useRef<HTMLDivElement>(null);
-  const headerColPopoverRef = useRef<HTMLDivElement>(null);
 
-  const [ctxSession, setCtxSession] = useState<SessionSummary | null>(null);
   const [resizingCol, setResizingCol] = useState<ColumnId | null>(null);
   const [sortColumn, setSortColumn] = useState<ColumnId | null>(null);
   const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
-  const [ctxHeaderCol, setCtxHeaderCol] = useState<ColumnId | null>(null);
   const [sortAnnouncement, setSortAnnouncement] = useState<string>("");
   const suppressNextHeaderClickRef = useRef<boolean>(false);
   const hasMountedSortRef = useRef<boolean>(false);
@@ -464,63 +393,187 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
     el.style.setProperty("--traffic-min-width", `${totalMinWidth}px`);
   }, [gridTemplate, totalMinWidth, resizingCol, resolvedGridRef]);
 
-  const closeContextMenu = useCallback(() => {
-    closePopoverSafe(ctxPopoverRef.current);
-  }, []);
-
-  const closeHeaderMenu = useCallback(() => {
-    closePopoverSafe(headerColPopoverRef.current);
-  }, []);
-
   const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const diffLeftId = selectedIds.length >= 2 ? selectedIds[0] : null;
   const diffRightId = selectedIds.length >= 2 ? selectedIds[1] : null;
 
   const handleRowContextMenu = useCallback(
     (e: React.MouseEvent<HTMLDivElement>, session: SessionSummary) => {
-      e.preventDefault();
-      closeHeaderMenu();
       if (!selectedSet.has(session.id)) {
         onSelectSession(session.id);
       }
-      setCtxSession(session);
+      const targetIds =
+        selectedSet.has(session.id) && selectedIds.length > 0
+          ? selectedIds
+          : [session.id];
 
-      openFixedContextPopover(
-        ctxPopoverRef.current,
-        e.clientX,
-        e.clientY,
-        288,
-        396
-      );
+      const items = buildTrafficRowContextMenu({
+        session,
+        targetIds,
+        selectedId,
+        onReplaySessions,
+        onSendToComposer,
+        onCompareWithSession,
+        onOpenDiffModal,
+        onOpenStatistics,
+        onCopyUrl,
+        onCopyCurl,
+        onGenerateClientCode,
+        onCopyHeaders,
+        onExportSelectedSessions,
+        onExportOpenApi,
+        onSaveSessionBody,
+        onAnnotateSessions,
+        onUnmarkSessions,
+        onCreateRuleFromSession,
+        onAddBreakpoint,
+        onFilterByHost,
+        onFilterByStatus,
+        onFilterByProcess,
+        onFilterByClientIp,
+        onAddClientIpToAllowlist,
+        onAlwaysInspectHost,
+        onAlwaysPassthroughHost: effectivePassthroughHandler,
+        onDeleteSessions,
+      });
 
-      window.requestAnimationFrame(() => {
-        const firstBtn =
-          ctxFocusGroupRef.current?.querySelector<HTMLButtonElement>(
-            "button:not(:disabled)"
-          );
-        firstBtn?.focus({ preventScroll: true });
+      openContextMenu(e, items, {
+        ariaLabel: `Действия для сессии #${session.id}`,
+        minWidth: 240,
       });
     },
-    [closeHeaderMenu, onSelectSession, selectedSet]
+    [
+      effectivePassthroughHandler,
+      onAddBreakpoint,
+      onAddClientIpToAllowlist,
+      onAlwaysInspectHost,
+      onAnnotateSessions,
+      onCompareWithSession,
+      onCopyCurl,
+      onCopyHeaders,
+      onCopyUrl,
+      onCreateRuleFromSession,
+      onDeleteSessions,
+      onExportOpenApi,
+      onExportSelectedSessions,
+      onFilterByClientIp,
+      onFilterByHost,
+      onFilterByProcess,
+      onFilterByStatus,
+      onGenerateClientCode,
+      onOpenDiffModal,
+      onOpenStatistics,
+      onReplaySessions,
+      onSaveSessionBody,
+      onSelectSession,
+      onSendToComposer,
+      onUnmarkSessions,
+      openContextMenu,
+      selectedId,
+      selectedIds,
+      selectedSet,
+    ]
   );
 
   const handleHeaderContextMenu = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
-      e.preventDefault();
-      closeContextMenu();
       const colEl = (e.target as HTMLElement | null)?.closest<HTMLElement>(
         "[data-col-id]"
       );
-      setCtxHeaderCol((colEl?.dataset.colId as ColumnId | undefined) ?? null);
-      openFixedContextPopover(
-        headerColPopoverRef.current,
-        e.clientX,
-        e.clientY,
-        240,
-        500
-      );
+      const clickedColId = (colEl?.dataset.colId as ColumnId | undefined) ?? null;
+      const clickedColumn = clickedColId
+        ? TRAFFIC_COLUMNS.find((c) => c.id === clickedColId) ?? null
+        : null;
+
+      const items = buildTrafficHeaderContextMenu({
+        clickedColumn,
+        allColumns: TRAFFIC_COLUMNS,
+        visibleColumns,
+        columnWidths,
+        sortColumn,
+        sortDirection,
+        onSort: (colId, dir) => {
+          setSortColumn(colId);
+          setSortDirection(dir);
+        },
+        onClearSort: () => {
+          setSortColumn(null);
+          setSortDirection("asc");
+        },
+        onAutoFitColumn: (col) => {
+          onColumnWidthChange(col.id, computeAutoFitWidth(col, sortedSessions));
+        },
+        onAutoFitAllVisible: () => {
+          for (const col of activeColumns) {
+            onColumnWidthChange(col.id, computeAutoFitWidth(col, sortedSessions));
+          }
+        },
+        onToggleColumnVisibility,
+        onResetColumns,
+      });
+
+      openContextMenu(e, items, {
+        ariaLabel: "Настройки колонок и сортировки TrafficGrid",
+        minWidth: 236,
+      });
     },
-    [closeContextMenu]
+    [
+      activeColumns,
+      columnWidths,
+      onColumnWidthChange,
+      onResetColumns,
+      onToggleColumnVisibility,
+      openContextMenu,
+      sortColumn,
+      sortDirection,
+      sortedSessions,
+      visibleColumns,
+    ]
+  );
+
+  const handleEmptyAreaContextMenu = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (e.defaultPrevented) return;
+      const items = buildTrafficEmptyContextMenu({
+        visibleCount: sortedSessions.length,
+        totalCount: totalSessionsCount ?? sessions.length,
+        proxyRunning,
+        followTail,
+        hasActiveFilters,
+        onSelectAllVisible: onSelectAllSessions
+          ? () => onSelectAllSessions(sortedSessions.map((s) => s.id))
+          : undefined,
+        onToggleCapture,
+        onToggleFollowTail,
+        onImportArchive,
+        onSaveAllSessions,
+        onResetFilters,
+        onResetColumns,
+        onClearAllSessions,
+      });
+
+      openContextMenu(e, items, {
+        ariaLabel: "Действия таблицы Traffic",
+        minWidth: 232,
+      });
+    },
+    [
+      followTail,
+      hasActiveFilters,
+      onClearAllSessions,
+      onImportArchive,
+      onResetColumns,
+      onResetFilters,
+      onSaveAllSessions,
+      onSelectAllSessions,
+      onToggleCapture,
+      onToggleFollowTail,
+      openContextMenu,
+      proxyRunning,
+      sessions.length,
+      sortedSessions,
+      totalSessionsCount,
+    ]
   );
 
   const handleHeaderClick = useCallback(
@@ -544,56 +597,6 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
     },
     [sortColumn, sortDirection]
   );
-
-  // Progressive enhancement fallback for browsers where native `focusgroup` is not yet supported
-  useEffect(() => {
-    const group = ctxFocusGroupRef.current;
-    if (
-      !group ||
-      typeof HTMLElement === "undefined" ||
-      "focusGroup" in HTMLElement.prototype
-    ) {
-      return;
-    }
-
-    group.setAttribute("role", "menu");
-    group.querySelectorAll("button:not([role])").forEach((item) => {
-      item.setAttribute("role", "menuitem");
-    });
-
-    const onGroupKeyDown = (event: KeyboardEvent) => {
-      if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
-      const items = Array.from(group.querySelectorAll<HTMLButtonElement>("button"))
-        .filter((item) => item.closest("[focusgroup]") === group)
-        .filter(
-          (item) =>
-            !item.disabled && item.getAttribute("aria-disabled") !== "true"
-        );
-      if (items.length === 0) return;
-      const current = items.indexOf(
-        document.activeElement as HTMLButtonElement
-      );
-      const next =
-        event.key === "Home"
-          ? 0
-          : event.key === "End"
-            ? items.length - 1
-            : current < 0
-              ? 0
-              : (current +
-                  (event.key === "ArrowUp" ? -1 : 1) +
-                  items.length) %
-                items.length;
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      items[next]?.focus({ preventScroll: true });
-    };
-
-    group.addEventListener("keydown", onGroupKeyDown, true);
-    return () => {
-      group.removeEventListener("keydown", onGroupKeyDown, true);
-    };
-  }, [ctxSession]);
 
   const resizeCleanupRef = useRef<(() => void) | null>(null);
 
@@ -677,23 +680,6 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
     },
     [onColumnWidthChange, sortedSessions]
   );
-
-  const ctxHostClean = useMemo(
-    () => (ctxSession ? ctxSession.host.split(":")[0].trim() : ""),
-    [ctxSession]
-  );
-  const ctxWildcardDomain = useMemo(
-    () => (ctxHostClean ? extractParentWildcardDomain(ctxHostClean) : null),
-    [ctxHostClean]
-  );
-
-  const ctxTargetIds = useMemo(() => {
-    if (!ctxSession) return [];
-    if (selectedSet.has(ctxSession.id) && selectedIds.length > 0) {
-      return selectedIds;
-    }
-    return [ctxSession.id];
-  }, [ctxSession, selectedIds, selectedSet]);
 
   const rowVirtualizer = useVirtualizer({
     count: sortedSessions.length,
@@ -935,8 +921,6 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
     }
   };
 
-  const visibleColCount = activeColumns.length;
-
   return (
     <div
       ref={resolvedGridRef}
@@ -1024,7 +1008,11 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
       )}
 
       {/* Scrollable Viewport containing both Sticky Resizable Header & Virtualized Rows */}
-      <div ref={scrollParentRef} className="flex-1 overflow-auto">
+      <div
+        ref={scrollParentRef}
+        onContextMenu={handleEmptyAreaContextMenu}
+        className="flex-1 overflow-auto"
+      >
         {/* Sticky Resizable Column Header */}
         <div
           role="row"
@@ -1592,571 +1580,6 @@ export const TrafficGrid: React.FC<TrafficGridProps> = ({
             })}
           </div>
         )}
-      </div>
-
-      {/* Column Header Right-Click Column Picker & Sort Popover (plain disclosure, not role="menu") */}
-      <div
-        ref={headerColPopoverRef}
-        {...({ popover: "auto" } as Record<string, string>)}
-        className="session-context-menu z-50 hidden w-60 rounded-lg border border-strong bg-surface p-2 text-fg shadow-popover"
-      >
-        {(() => {
-          const targetCol =
-            TRAFFIC_COLUMNS.find(
-              (c) => c.id === (ctxHeaderCol ?? sortColumn)
-            ) ?? TRAFFIC_COLUMNS[0];
-          const isAsc =
-            sortColumn === targetCol.id && sortDirection === "asc";
-          const isDesc =
-            sortColumn === targetCol.id && sortDirection === "desc";
-          return (
-            <>
-              <div className="mb-1 flex items-center justify-between px-1">
-                <span className="truncate text-[11px] font-semibold text-fg">
-                  Сортировка: {targetCol.label}
-                </span>
-                <button
-                  type="button"
-                  disabled={sortColumn === null}
-                  onClick={() => {
-                    setSortColumn(null);
-                    setSortDirection("asc");
-                    closeHeaderMenu();
-                  }}
-                  className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-muted hover:bg-hover hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  <RotateCcw className="h-2.5 w-2.5" />
-                  <span>Сбросить</span>
-                </button>
-              </div>
-              <div className="mb-1.5 grid grid-cols-1 gap-0.5">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSortColumn(targetCol.id);
-                    setSortDirection("asc");
-                    closeHeaderMenu();
-                  }}
-                  className={`flex items-center justify-between rounded px-1.5 py-1 text-left text-xs hover:bg-hover ${
-                    isAsc ? "bg-selected font-semibold text-accent" : "text-fg"
-                  }`}
-                >
-                  <span>▲ По возрастанию (ASC)</span>
-                  {isAsc && (
-                    <span className="text-[10px]" aria-hidden="true">
-                      ✓
-                    </span>
-                  )}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSortColumn(targetCol.id);
-                    setSortDirection("desc");
-                    closeHeaderMenu();
-                  }}
-                  className={`flex items-center justify-between rounded px-1.5 py-1 text-left text-xs hover:bg-hover ${
-                    isDesc ? "bg-selected font-semibold text-accent" : "text-fg"
-                  }`}
-                >
-                  <span>▼ По убыванию (DESC)</span>
-                  {isDesc && (
-                    <span className="text-[10px]" aria-hidden="true">
-                      ✓
-                    </span>
-                  )}
-                </button>
-              </div>
-              <hr className="my-1.5 border-hairline" />
-            </>
-          );
-        })()}
-        {(() => {
-          const clickedCol = ctxHeaderCol
-            ? (TRAFFIC_COLUMNS.find((c) => c.id === ctxHeaderCol) ?? null)
-            : null;
-          return (
-            <div className="mb-1.5 grid grid-cols-1 gap-0.5">
-              {clickedCol && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    onColumnWidthChange(
-                      clickedCol.id,
-                      computeAutoFitWidth(clickedCol, sortedSessions)
-                    );
-                    closeHeaderMenu();
-                  }}
-                  className="flex items-center justify-between rounded px-1.5 py-1 text-left text-xs text-fg hover:bg-hover"
-                >
-                  <span className="truncate">
-                    {`Auto-fit "${clickedCol.label}"`}
-                  </span>
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={() => {
-                  for (const col of activeColumns) {
-                    onColumnWidthChange(
-                      col.id,
-                      computeAutoFitWidth(col, sortedSessions)
-                    );
-                  }
-                  closeHeaderMenu();
-                }}
-                className="flex items-center justify-between rounded px-1.5 py-1 text-left text-xs text-fg hover:bg-hover"
-              >
-                <span className="truncate">Auto-fit All Visible Columns</span>
-              </button>
-            </div>
-          );
-        })()}
-        <hr className="my-1.5 border-hairline" />
-        <div className="mb-1.5 flex items-center justify-between px-1">
-          <span className="text-[11px] font-semibold text-fg">
-            Видимость колонок
-          </span>
-          <button
-            type="button"
-            onClick={() => {
-              onResetColumns();
-              closeHeaderMenu();
-            }}
-            className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-muted hover:bg-hover hover:text-fg"
-          >
-            <RotateCcw className="h-2.5 w-2.5" />
-            <span>Reset</span>
-          </button>
-        </div>
-        <div className="grid grid-cols-1 gap-0.5">
-          {TRAFFIC_COLUMNS.map((col) => {
-            const checked = visibleColumns[col.id];
-            const disableUncheck = checked && visibleColCount <= 1;
-            return (
-              <label
-                key={col.id}
-                className="flex cursor-pointer items-center justify-between rounded px-1.5 py-1 text-xs text-fg hover:bg-hover"
-              >
-                <span className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    disabled={disableUncheck}
-                    onChange={() => onToggleColumnVisibility(col.id)}
-                    className="checkbox-native"
-                  />
-                  <span>{col.label}</span>
-                </span>
-                <span className="font-mono text-[10px] text-subtle">
-                  {columnWidths[col.id]}px
-                </span>
-              </label>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* Session Row Right-Click Context Menu (`popover="auto"` + nested `focusgroup="menu nomemory"`) */}
-      <div
-        ref={ctxPopoverRef}
-        {...({ popover: "auto" } as Record<string, string>)}
-        className="session-context-menu z-50 hidden w-72 rounded-lg border border-strong bg-surface text-fg shadow-popover"
-      >
-        <div
-          ref={ctxFocusGroupRef}
-          {...({ focusgroup: "menu nomemory" } as Record<string, string>)}
-          aria-label={
-            ctxSession
-              ? `Действия для сессии #${ctxSession.id} (${ctxHostClean})`
-              : "Действия для сессии"
-          }
-          onPointerMove={(e) => {
-            const btn = (e.target as HTMLElement).closest("button");
-            if (btn && !btn.disabled) {
-              btn.focus({ preventScroll: true });
-            }
-          }}
-        >
-          {ctxSession && (
-            <button
-              type="button"
-              onClick={() => {
-                closeContextMenu();
-                onReplaySessions(ctxTargetIds);
-              }}
-            >
-              <RotateCw className="h-3.5 w-3.5 shrink-0 text-accent" />
-              <span className="truncate">
-                Replay запрос{ctxTargetIds.length > 1 ? ` (${ctxTargetIds.length})` : ""}
-              </span>
-              <span className="hint font-mono text-[10px] text-subtle" aria-hidden="true">
-                R
-              </span>
-            </button>
-          )}
-
-          {ctxSession && (
-            <button
-              type="button"
-              onClick={() => {
-                closeContextMenu();
-                onSendToComposer(ctxSession.id);
-              }}
-            >
-              <Send className="h-3.5 w-3.5 shrink-0 text-muted" />
-              <span className="truncate">Открыть в Composer</span>
-              <span className="hint font-mono text-[10px] text-subtle" aria-hidden="true">
-                E
-              </span>
-            </button>
-          )}
-
-          {ctxSession && (
-            <button
-              type="button"
-              onClick={() => {
-                closeContextMenu();
-                if (selectedId !== null && selectedId !== ctxSession.id && ctxTargetIds.length === 1) {
-                  onCompareWithSession(ctxSession.id);
-                } else {
-                  onOpenDiffModal();
-                }
-              }}
-            >
-              <GitCompareArrows className="h-3.5 w-3.5 shrink-0 text-muted" />
-              <span className="truncate">Сравнить в Session Diff</span>
-              <span className="hint font-mono text-[10px] text-subtle" aria-hidden="true">
-                Ctrl+D
-              </span>
-            </button>
-          )}
-
-          <hr />
-
-          {ctxSession && (
-            <button
-              type="button"
-              onClick={() => {
-                closeContextMenu();
-                onCopyUrl(ctxTargetIds);
-              }}
-            >
-              <Copy className="h-3.5 w-3.5 shrink-0 text-muted" />
-              <span className="truncate">
-                Copy URL{ctxTargetIds.length > 1 ? ` (${ctxTargetIds.length})` : ""}
-              </span>
-              <span className="hint font-mono text-[10px] text-subtle" aria-hidden="true">
-                Ctrl+C
-              </span>
-            </button>
-          )}
-
-          {ctxSession && (
-            <button
-              type="button"
-              onClick={() => {
-                closeContextMenu();
-                onCopyCurl(ctxSession.id);
-              }}
-            >
-              <Terminal className="h-3.5 w-3.5 shrink-0 text-muted" />
-              <span className="truncate">Copy as cURL</span>
-            </button>
-          )}
-
-          {ctxSession && onGenerateClientCode && (
-            <button
-              type="button"
-              onClick={() => {
-                closeContextMenu();
-                onGenerateClientCode(ctxSession.id);
-              }}
-            >
-              <Code2 className="h-3.5 w-3.5 shrink-0 text-accent" />
-              <span className="truncate">{getSectionMeta("codeGenerator").title}</span>
-            </button>
-          )}
-
-          {ctxSession && (
-            <button
-              type="button"
-              onClick={() => {
-                closeContextMenu();
-                onCopyHeaders(ctxSession.id, "request");
-              }}
-            >
-              <FileCode2 className="h-3.5 w-3.5 shrink-0 text-muted" />
-              <span className="truncate">Copy Request Headers</span>
-            </button>
-          )}
-
-          {ctxSession && (
-            <button
-              type="button"
-              onClick={() => {
-                closeContextMenu();
-                onCopyHeaders(ctxSession.id, "response");
-              }}
-            >
-              <FileCode2 className="h-3.5 w-3.5 shrink-0 text-muted" />
-              <span className="truncate">Copy Response Headers</span>
-            </button>
-          )}
-
-          {ctxSession && (onExportSelectedSessions || onExportOpenApi || onSaveSessionBody) && (
-            <>
-              <hr />
-
-              {onExportSelectedSessions && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    closeContextMenu();
-                    onExportSelectedSessions(ctxTargetIds, "har");
-                  }}
-                >
-                  <Archive className="h-3.5 w-3.5 shrink-0 text-accent" />
-                  <span className="truncate">
-                    Save Selected as HAR (.har)
-                    {ctxTargetIds.length > 1 ? ` (${ctxTargetIds.length})` : ""}
-                  </span>
-                </button>
-              )}
-
-              {onExportSelectedSessions && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    closeContextMenu();
-                    onExportSelectedSessions(ctxTargetIds, "saz");
-                  }}
-                >
-                  <Archive className="h-3.5 w-3.5 shrink-0 text-status3xx-fg" />
-                  <span className="truncate">
-                    Save Selected as Fiddler SAZ (.saz)
-                    {ctxTargetIds.length > 1 ? ` (${ctxTargetIds.length})` : ""}
-                  </span>
-                </button>
-              )}
-
-              {onExportOpenApi && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    closeContextMenu();
-                    onExportOpenApi(ctxTargetIds);
-                  }}
-                >
-                  <FileJson className="h-3.5 w-3.5 shrink-0 text-accent" />
-                  <span className="truncate">
-                    {getSectionMeta("openApiExport").title}
-                    {ctxTargetIds.length > 1 ? ` (${ctxTargetIds.length})` : ""}
-                  </span>
-                </button>
-              )}
-
-              {onSaveSessionBody && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    closeContextMenu();
-                    onSaveSessionBody(ctxSession.id, false);
-                  }}
-                >
-                  <Download className="h-3.5 w-3.5 shrink-0 text-muted" />
-                  <span className="truncate">Save Request Body As...</span>
-                </button>
-              )}
-
-              {onSaveSessionBody && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    closeContextMenu();
-                    onSaveSessionBody(ctxSession.id, true);
-                  }}
-                >
-                  <Download className="h-3.5 w-3.5 shrink-0 text-status2xx-fg" />
-                  <span className="truncate">Save Response Body As...</span>
-                </button>
-              )}
-
-              {onExportSelectedSessions && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    closeContextMenu();
-                    onExportSelectedSessions([ctxSession.id], "raw");
-                  }}
-                >
-                  <FileText className="h-3.5 w-3.5 shrink-0 text-muted" />
-                  <span className="truncate">
-                    Save Full Raw HTTP Message (.txt)
-                  </span>
-                </button>
-              )}
-            </>
-          )}
-
-          <hr />
-
-          {ctxSession && (
-            <button
-              type="button"
-              onClick={() => {
-                closeContextMenu();
-                onAnnotateSessions(ctxTargetIds);
-              }}
-            >
-              <MessageSquarePlus className="h-3.5 w-3.5 shrink-0 text-status4xx-fg" />
-              <span className="truncate">{getSectionMeta("commentMark").title}</span>
-              <span className="hint font-mono text-[10px] text-subtle" aria-hidden="true">
-                M
-              </span>
-            </button>
-          )}
-
-          {ctxSession && (
-            <button
-              type="button"
-              onClick={() => {
-                closeContextMenu();
-                onUnmarkSessions(ctxTargetIds);
-              }}
-            >
-              <Eraser className="h-3.5 w-3.5 shrink-0 text-muted" />
-              <span className="truncate">Снять цветовую метку (Unmark)</span>
-              <span className="hint font-mono text-[10px] text-subtle" aria-hidden="true">
-                U
-              </span>
-            </button>
-          )}
-
-          {ctxSession && (
-            <button
-              type="button"
-              onClick={() => {
-                closeContextMenu();
-                onCreateRuleFromSession(ctxSession);
-              }}
-            >
-              <Sparkles className="h-3.5 w-3.5 shrink-0 text-status4xx-fg" />
-              <span className="truncate">Создать правило AutoResponder</span>
-            </button>
-          )}
-
-          <hr />
-
-          {ctxSession &&
-            isRemoteClientIp(ctxSession.clientIp) &&
-            onFilterByClientIp && (
-              <button
-                type="button"
-                onClick={() => {
-                  closeContextMenu();
-                  onFilterByClientIp(ctxSession.clientIp!);
-                }}
-              >
-                <Smartphone
-                  className="h-3.5 w-3.5 shrink-0 text-status2xx-fg"
-                  aria-hidden="true"
-                />
-                <span className="truncate">
-                  Фильтровать по IP устройства ({ctxSession.clientIp})
-                </span>
-              </button>
-            )}
-
-          {ctxSession &&
-            isRemoteClientIp(ctxSession.clientIp) &&
-            onAddClientIpToAllowlist && (
-              <button
-                type="button"
-                onClick={() => {
-                  closeContextMenu();
-                  onAddClientIpToAllowlist(ctxSession.clientIp!);
-                }}
-              >
-                <ShieldCheck
-                  className="h-3.5 w-3.5 shrink-0 text-emerald-400"
-                  aria-hidden="true"
-                />
-                <span className="truncate">
-                  Разрешить IP в LAN Allowlist ({ctxSession.clientIp})
-                </span>
-              </button>
-            )}
-
-          {ctxSession && onAlwaysInspectHost && (
-            <button
-              type="button"
-              onClick={() => {
-                closeContextMenu();
-                onAlwaysInspectHost(ctxHostClean);
-              }}
-            >
-              <Target className="h-3.5 w-3.5 shrink-0 text-status2xx-fg" />
-              <span className="truncate">
-                Always inspect ({ctxHostClean})
-              </span>
-            </button>
-          )}
-
-          {ctxSession &&
-            onAlwaysInspectHost &&
-            ctxWildcardDomain &&
-            ctxWildcardDomain !== `*.${ctxHostClean}` && (
-              <button
-                type="button"
-                onClick={() => {
-                  closeContextMenu();
-                  onAlwaysInspectHost(ctxWildcardDomain);
-                }}
-              >
-                <Target className="h-3.5 w-3.5 shrink-0 text-status2xx-fg/80" />
-                <span className="truncate">
-                  Always inspect {ctxWildcardDomain}
-                </span>
-              </button>
-            )}
-
-          {ctxSession && effectivePassthroughHandler && (
-            <button
-              type="button"
-              onClick={() => {
-                closeContextMenu();
-                effectivePassthroughHandler(ctxHostClean);
-              }}
-            >
-              <ShieldOff className="h-3.5 w-3.5 shrink-0 text-muted" />
-              <span className="truncate">
-                Always passthrough ({ctxHostClean})
-              </span>
-            </button>
-          )}
-
-          {ctxSession && (
-            <>
-              <hr />
-              <button
-                type="button"
-                onClick={() => {
-                  closeContextMenu();
-                  onDeleteSessions(ctxTargetIds);
-                }}
-              >
-                <Trash2 className="h-3.5 w-3.5 shrink-0 text-status5xx-fg" />
-                <span className="truncate text-status5xx-fg">
-                  Удалить{ctxTargetIds.length > 1 ? ` выбранные (${ctxTargetIds.length})` : " сессию"}
-                </span>
-                <span className="hint font-mono text-[10px] text-subtle" aria-hidden="true">
-                  Del
-                </span>
-              </button>
-            </>
-          )}
-        </div>
       </div>
     </div>
   );

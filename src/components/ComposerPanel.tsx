@@ -32,6 +32,17 @@ import {
   FLUX_PANEL_LAYOUT_RESET_EVENT,
   SAFE_PANEL_STORAGE,
 } from "../hooks/useUiPreferences";
+import { useContextMenu } from "../hooks/useContextMenu";
+import {
+  generateCodeSnippet,
+  requestFromComposedRequest,
+} from "../lib/codeGenerators";
+import {
+  buildComposerHeaderRowContextMenu,
+  buildComposerUrlContextMenu,
+  captureEditableSelection,
+  copyTextToClipboard,
+} from "../lib/contextMenuBuilders";
 import {
   isCurlCommand,
   parseCurlCommand,
@@ -81,6 +92,7 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
   onGenerateCode,
   onNotify,
 }) => {
+  const { openContextMenu } = useContextMenu();
   const curlDialogRef = useRef<HTMLDialogElement>(null);
   const curlTextareaRef = useRef<HTMLTextAreaElement>(null);
   const activeRequestIdRef = useRef<string | null>(null);
@@ -280,6 +292,141 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
     applyParsedCurlResult(outcome.result);
     setCurlModalOpen(false);
     setCurlInput("");
+  };
+
+  const handleCopyAsCurl = async () => {
+    const cleanUrl = url.trim();
+    if (!cleanUrl) return;
+    const req = requestFromComposedRequest({
+      method,
+      url: cleanUrl,
+      headers: headers.filter((h) => h.name.trim().length > 0),
+      body,
+      followRedirects,
+    });
+    const snippet = generateCodeSnippet(req, "curl-bash");
+    await copyTextToClipboard(
+      snippet,
+      onNotify,
+      "Скопирована команда cURL из Composer"
+    );
+  };
+
+  const handlePasteAndImportCurl = async () => {
+    let text = "";
+    try {
+      text = (await navigator.clipboard?.readText()) ?? "";
+    } catch {
+      setErrorMessage(
+        "Нет доступа к буферу обмена — откройте Import cURL или используйте Ctrl+V."
+      );
+      return;
+    }
+    if (!text.trim()) {
+      setErrorMessage("Буфер обмена пуст.");
+      return;
+    }
+    const outcome = parseCurlCommand(text);
+    if (!outcome.ok) {
+      setErrorMessage(`Не удалось разобрать cURL: ${outcome.error}`);
+      return;
+    }
+    applyParsedCurlResult(outcome.result, "ПКМ Paste & Import cURL");
+  };
+
+  const handleUrlContextMenu = (e: React.MouseEvent<HTMLInputElement>) => {
+    const inputEl = e.currentTarget;
+    const snapshot = captureEditableSelection(inputEl);
+    openContextMenu(
+      e,
+      buildComposerUrlContextMenu({
+        input: inputEl,
+        snapshot,
+        hasUrl: url.trim().length > 0,
+        onPasteAndImportCurl: () => void handlePasteAndImportCurl(),
+        onCopyAsCurl: () => void handleCopyAsCurl(),
+        onClearUrl: () => setUrl(""),
+        onNotify,
+      }),
+      { ariaLabel: "Composer URL Context Menu", restoreFocusTo: inputEl }
+    );
+  };
+
+  const handleHeaderRowContextMenu = (
+    e: React.MouseEvent<HTMLDivElement>,
+    index: number
+  ) => {
+    const h = headers[index];
+    if (!h) return;
+    const inputEl =
+      e.target instanceof HTMLInputElement ? e.target : null;
+    const snapshot = inputEl ? captureEditableSelection(inputEl) : undefined;
+
+    openContextMenu(
+      e,
+      buildComposerHeaderRowContextMenu({
+        header: h,
+        index,
+        totalCount: headers.length,
+        inputTarget: inputEl,
+        snapshot,
+        onCopyHeader: () =>
+          void copyTextToClipboard(
+            `${h.name}: ${h.value}`,
+            onNotify,
+            `Скопирован заголовок ${h.name}`
+          ),
+        onDuplicateHeader: () => {
+          const copy = headers.slice();
+          copy.splice(index + 1, 0, { ...h });
+          setHeaders(copy);
+        },
+        onMoveUp: () => {
+          if (index <= 0) return;
+          const copy = headers.slice();
+          [copy[index - 1], copy[index]] = [copy[index], copy[index - 1]];
+          setHeaders(copy);
+        },
+        onMoveDown: () => {
+          if (index >= headers.length - 1) return;
+          const copy = headers.slice();
+          [copy[index + 1], copy[index]] = [copy[index], copy[index + 1]];
+          setHeaders(copy);
+        },
+        onAddHeader: () =>
+          setHeaders([...headers, { name: "", value: "" }]),
+        onRemoveHeader: () =>
+          setHeaders(headers.filter((_, idx) => idx !== index)),
+        onNotify,
+      }),
+      {
+        ariaLabel: `Composer Header ${h.name || index + 1} Context Menu`,
+        restoreFocusTo: inputEl ?? undefined,
+      }
+    );
+  };
+
+  const handleHeadersAreaContextMenu = (
+    e: React.MouseEvent<HTMLDivElement>
+  ) => {
+    if (e.defaultPrevented) return;
+    openContextMenu(
+      e,
+      [
+        {
+          type: "header",
+          id: "cmp-hdrs-empty-header",
+          label: `Request Headers (${headers.length})`,
+        },
+        {
+          id: "cmp-hdrs-empty-add",
+          label: "Add New Header",
+          icon: <Plus className="h-3.5 w-3.5 text-accent" />,
+          onSelect: () => setHeaders([...headers, { name: "", value: "" }]),
+        },
+      ],
+      { ariaLabel: "Composer Headers Context Menu" }
+    );
   };
 
   const handleGenerateCodeClick = () => {
@@ -547,6 +694,7 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           onPaste={handleUrlPaste}
+          onContextMenu={handleUrlContextMenu}
           placeholder="https://api.example.com/v1/resource (или вставьте curl ...)"
           aria-label="Target Request URL"
           className="h-8 flex-1 rounded-md border border-strong bg-canvas px-2.5 font-mono text-xs text-fg focus:border-sky-500 focus:outline-none"
@@ -660,11 +808,15 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
             {/* Editable Request Content */}
             <div className="min-h-0 flex-1 overflow-hidden bg-canvas">
               {activeTab === "headers" ? (
-                <div className="h-full overflow-auto p-3">
+                <div
+                  onContextMenu={handleHeadersAreaContextMenu}
+                  className="h-full overflow-auto p-3"
+                >
                   <div className="space-y-1.5">
                     {headers.map((h, i) => (
                       <div
                         key={i}
+                        onContextMenu={(e) => handleHeaderRowContextMenu(e, i)}
                         className="grid grid-cols-[minmax(180px,28%)_minmax(0,1fr)_auto] items-center gap-1.5"
                       >
                         <input

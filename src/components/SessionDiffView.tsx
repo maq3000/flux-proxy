@@ -18,6 +18,11 @@ import {
   WrapText,
   X,
 } from "lucide-react";
+import { useContextMenu } from "../hooks/useContextMenu";
+import {
+  buildSessionDiffHeaderContextMenu,
+  copyTextToClipboard,
+} from "../lib/contextMenuBuilders";
 import { formatBytes, formatDuration } from "../lib/formatters";
 import { getMonacoThemeName } from "../lib/monaco";
 import {
@@ -74,6 +79,7 @@ interface SessionDiffViewProps {
   onOpenStatistics?: () => void;
   onCloseDiff?: () => void;
   closeLabel?: string;
+  onNotify?: (msg: string) => void;
 }
 
 export const SessionDiffView: React.FC<SessionDiffViewProps> = ({
@@ -91,7 +97,9 @@ export const SessionDiffView: React.FC<SessionDiffViewProps> = ({
   onOpenStatistics,
   onCloseDiff,
   closeLabel = "К инспектору",
+  onNotify,
 }) => {
+  const { openContextMenu } = useContextMenu();
   const instanceUid = useId().replace(/[^a-zA-Z0-9_-]/g, "");
   const origModelPath = `inmemory://fluxproxy-diff/${instanceUid}/original`;
   const modModelPath = `inmemory://fluxproxy-diff/${instanceUid}/modified`;
@@ -206,12 +214,45 @@ export const SessionDiffView: React.FC<SessionDiffViewProps> = ({
   const deltaDuration = rightSum.durationMs - leftSum.durationMs;
   const deltaSize = rightSum.bodySize - leftSum.bodySize;
 
+  const handleDiffHeaderContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    const diffHeaderText = `A: #${leftSum.id} [${leftSum.status}] ${leftSum.method} ${leftSum.url}\nB: #${rightSum.id} [${rightSum.status}] ${rightSum.method} ${rightSum.url}`;
+    openContextMenu(
+      e,
+      buildSessionDiffHeaderContextMenu({
+        leftSummary: leftSum,
+        rightSummary: rightSum,
+        sortKeys: sortKeysAndHeaders,
+        ignoreNoise: ignoreVolatileHeaders,
+        sideBySide,
+        wordWrap: wordWrap === "on",
+        onSwapPair,
+        onCopyDiffHeader: () =>
+          void copyTextToClipboard(
+            diffHeaderText,
+            onNotify,
+            "Скопирована сводка Session Diff"
+          ),
+        onCopyLeft: () => void handleCopyContent("left"),
+        onCopyRight: () => void handleCopyContent("right"),
+        onToggleSortKeys: () => setSortKeysAndHeaders((v) => !v),
+        onToggleIgnoreNoise: () => setIgnoreVolatileHeaders((v) => !v),
+        onToggleSideBySide: () => setSideBySide((v) => !v),
+        onToggleWordWrap: () =>
+          setWordWrap((w) => (w === "on" ? "off" : "on")),
+      }),
+      { ariaLabel: "Session Diff Header Context Menu" }
+    );
+  };
+
   return (
     <div className="pane-contain flex h-full flex-col overflow-hidden bg-surface">
       {renderTabHeader()}
 
       {/* Top Comparison Header: Session A vs Session B */}
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-elevated/60 px-3 py-2">
+      <div
+        onContextMenu={handleDiffHeaderContextMenu}
+        className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline bg-elevated/60 px-3 py-2"
+      >
         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5 text-xs">
           {/* Left Session A */}
           <SessionEndpointPill

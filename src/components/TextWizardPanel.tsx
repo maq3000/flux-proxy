@@ -12,9 +12,16 @@ import {
   KeyRound,
   Link2,
   Sparkles,
+  Trash2,
   Wand2,
   XCircle,
 } from "lucide-react";
+import { useContextMenu } from "../hooks/useContextMenu";
+import {
+  buildEditableInputMenuItems,
+  buildTextWizardOutputContextMenu,
+  captureEditableSelection,
+} from "../lib/contextMenuBuilders";
 import { proxyBridge } from "../lib/tauriBridge";
 import {
   convertTimestampInput,
@@ -93,6 +100,7 @@ export const TextWizardPanel: React.FC<TextWizardPanelProps> = ({
   onBackToTraffic,
   onNotify,
 }) => {
+  const { openContextMenu } = useContextMenu();
   const [activeTab, setActiveTab] = useState<TextWizardTab>(requestedTab);
   const [input, setInput] = useState<string>(() =>
     requestedInput !== undefined && requestedInput.trim()
@@ -323,6 +331,32 @@ export const TextWizardPanel: React.FC<TextWizardPanelProps> = ({
     }
   };
 
+  const handleInputContextMenu = (
+    e: React.MouseEvent<HTMLTextAreaElement>
+  ) => {
+    const ta = e.currentTarget;
+    const snapshot = captureEditableSelection(ta);
+    openContextMenu(
+      e,
+      buildEditableInputMenuItems({
+        target: ta,
+        snapshot,
+        extraItems: [
+          {
+            id: "tw-clear-input",
+            label: "Clear Input",
+            icon: <Trash2 className="h-3.5 w-3.5" />,
+            danger: true,
+            disabled: input.length === 0,
+            onSelect: () => setInput(""),
+          },
+        ],
+        onNotify,
+      }),
+      { ariaLabel: "TextWizard Input Context Menu", restoreFocusTo: ta }
+    );
+  };
+
   return (
     <div className="pane-contain flex h-full w-full flex-col overflow-hidden bg-surface text-fg">
       <SectionHeader
@@ -434,6 +468,7 @@ export const TextWizardPanel: React.FC<TextWizardPanelProps> = ({
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
+              onContextMenu={handleInputContextMenu}
               aria-label="Входные данные TextWizard"
               rows={activeTab === "timestamp" ? 2 : 5}
               placeholder={
@@ -547,21 +582,41 @@ export const TextWizardPanel: React.FC<TextWizardPanelProps> = ({
                       title="JOSE Header (JSON)"
                       value={jwtResult.headerJson}
                       copied={copiedTag === "jwt-hdr"}
+                      hasInput={input.length > 0}
                       onCopy={() =>
                         void copyValue("jwt-hdr", jwtResult.headerJson)
                       }
+                      onClearInput={() => setInput("")}
                     />
                     <OutputCodeBox
                       title="JWT Claims Payload (JSON)"
                       value={jwtResult.claimsJson}
                       copied={copiedTag === "jwt-claims"}
+                      hasInput={input.length > 0}
                       onCopy={() =>
                         void copyValue("jwt-claims", jwtResult.claimsJson)
                       }
+                      onClearInput={() => setInput("")}
                     />
                   </div>
 
-                  <div className="rounded-lg border border-hairline bg-canvas p-2.5 font-mono text-[11px]">
+                  <div
+                    onContextMenu={(e) =>
+                      openContextMenu(
+                        e,
+                        buildTextWizardOutputContextMenu({
+                          title: "JWT Signature (Hex)",
+                          value: jwtResult.signatureHex,
+                          hasInput: input.length > 0,
+                          onCopyOutput: () =>
+                            void copyValue("jwt-sig", jwtResult.signatureHex),
+                          onClearInput: () => setInput(""),
+                        }),
+                        { ariaLabel: "JWT Signature Context Menu" }
+                      )
+                    }
+                    className="rounded-lg border border-hairline bg-canvas p-2.5 font-mono text-[11px]"
+                  >
                     <div className="flex items-center justify-between text-subtle">
                       <span>
                         Signature ({jwtResult.signatureBytes} байт • Base64URL +
@@ -651,7 +706,15 @@ export const TextWizardPanel: React.FC<TextWizardPanelProps> = ({
                   title={`Результат (${b64Output.info})`}
                   value={b64Output.text}
                   copied={copiedTag === "b64"}
+                  hasInput={input.length > 0}
                   onCopy={() => void copyValue("b64", b64Output.text)}
+                  onUseAsInput={() => {
+                    setInput(b64Output.text);
+                    setB64Direction((d) =>
+                      d === "encode" ? "decode" : "encode"
+                    );
+                  }}
+                  onClearInput={() => setInput("")}
                 />
               )}
             </div>
@@ -723,7 +786,15 @@ export const TextWizardPanel: React.FC<TextWizardPanelProps> = ({
                     title="Преобразованная строка"
                     value={urlOutput.text}
                     copied={copiedTag === "url"}
+                    hasInput={input.length > 0}
                     onCopy={() => void copyValue("url", urlOutput.text)}
+                    onUseAsInput={() => {
+                      setInput(urlOutput.text);
+                      setUrlDirection((d) =>
+                        d === "encode" ? "decode" : "encode"
+                      );
+                    }}
+                    onClearInput={() => setInput("")}
                   />
                   {urlOutput.params.length > 0 && (
                     <div className="rounded-lg border border-hairline bg-canvas p-2.5">
@@ -882,12 +953,14 @@ export const TextWizardPanel: React.FC<TextWizardPanelProps> = ({
                         title="Распакованный UTF-8 текст"
                         value={codecResult.outputText}
                         copied={copiedTag === "codec-txt"}
+                        hasInput={input.length > 0}
                         onCopy={() =>
                           void copyValue(
                             "codec-txt",
                             codecResult.outputText ?? ""
                           )
                         }
+                        onClearInput={() => setInput("")}
                       />
                     )}
 
@@ -895,18 +968,22 @@ export const TextWizardPanel: React.FC<TextWizardPanelProps> = ({
                     title="Base64 представление потока"
                     value={codecResult.outputBase64}
                     copied={copiedTag === "codec-b64"}
+                    hasInput={input.length > 0}
                     onCopy={() =>
                       void copyValue("codec-b64", codecResult.outputBase64)
                     }
+                    onClearInput={() => setInput("")}
                   />
 
                   <OutputCodeBox
                     title="Hex дамп"
                     value={codecResult.outputHex}
                     copied={copiedTag === "codec-hex"}
+                    hasInput={input.length > 0}
                     onCopy={() =>
                       void copyValue("codec-hex", codecResult.outputHex)
                     }
+                    onClearInput={() => setInput("")}
                   />
                 </div>
               )}
@@ -993,7 +1070,15 @@ export const TextWizardPanel: React.FC<TextWizardPanelProps> = ({
                   title={`Результат (${hexOutput.info})`}
                   value={hexOutput.text}
                   copied={copiedTag === "hex"}
+                  hasInput={input.length > 0}
                   onCopy={() => void copyValue("hex", hexOutput.text)}
+                  onUseAsInput={() => {
+                    setInput(hexOutput.text);
+                    setHexDirection((d) =>
+                      d === "toHex" ? "fromHex" : "toHex"
+                    );
+                  }}
+                  onClearInput={() => setInput("")}
                 />
               )}
             </div>
@@ -1042,6 +1127,19 @@ export const TextWizardPanel: React.FC<TextWizardPanelProps> = ({
                   ].map((row) => (
                     <div
                       key={row.id}
+                      onContextMenu={(e) =>
+                        openContextMenu(
+                          e,
+                          buildTextWizardOutputContextMenu({
+                            title: row.label,
+                            value: row.val,
+                            hasInput: input.length > 0,
+                            onCopyOutput: () => void copyValue(row.id, row.val),
+                            onClearInput: () => setInput(""),
+                          }),
+                          { ariaLabel: `${row.label} Context Menu` }
+                        )
+                      }
                       className="flex items-center justify-between gap-2 rounded-lg border border-hairline bg-canvas px-3 py-2 font-mono text-xs"
                     >
                       <div className="min-w-0">
@@ -1081,34 +1179,76 @@ const OutputCodeBox: React.FC<{
   title: string;
   value: string;
   copied: boolean;
+  hasInput?: boolean;
   onCopy: () => void;
-}> = ({ title, value, copied, onCopy }) => (
-  <div className="rounded-lg border border-hairline bg-canvas p-2.5">
-    <div className="mb-1.5 flex items-center justify-between">
-      <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-subtle">
-        {title}
-      </span>
-      <button
-        type="button"
-        onClick={onCopy}
-        disabled={!value}
-        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[11px] text-sky-400 hover:bg-hover disabled:opacity-40"
-      >
-        {copied ? (
-          <>
-            <Check className="h-3 w-3 text-emerald-400" aria-hidden="true" />
-            <span>Copied</span>
-          </>
-        ) : (
-          <>
-            <Copy className="h-3 w-3" aria-hidden="true" />
-            <span>Copy</span>
-          </>
-        )}
-      </button>
+  onUseAsInput?: () => void;
+  onClearInput?: () => void;
+}> = ({
+  title,
+  value,
+  copied,
+  hasInput = false,
+  onCopy,
+  onUseAsInput,
+  onClearInput,
+}) => {
+  const { openContextMenu } = useContextMenu();
+
+  const handleOutputContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    const sel = typeof window !== "undefined" ? window.getSelection() : null;
+    if (
+      sel &&
+      !sel.isCollapsed &&
+      sel.toString().trim().length > 0 &&
+      e.currentTarget.contains(sel.anchorNode)
+    ) {
+      return;
+    }
+    openContextMenu(
+      e,
+      buildTextWizardOutputContextMenu({
+        title,
+        value,
+        hasInput,
+        onCopyOutput: onCopy,
+        onUseAsInput,
+        onClearInput: onClearInput ?? (() => {}),
+      }),
+      { ariaLabel: `${title} Context Menu` }
+    );
+  };
+
+  return (
+    <div
+      onContextMenu={handleOutputContextMenu}
+      className="rounded-lg border border-hairline bg-canvas p-2.5"
+    >
+      <div className="mb-1.5 flex items-center justify-between">
+        <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-subtle">
+          {title}
+        </span>
+        <button
+          type="button"
+          onClick={onCopy}
+          disabled={!value}
+          className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[11px] text-sky-400 hover:bg-hover disabled:opacity-40"
+        >
+          {copied ? (
+            <>
+              <Check className="h-3 w-3 text-emerald-400" aria-hidden="true" />
+              <span>Copied</span>
+            </>
+          ) : (
+            <>
+              <Copy className="h-3 w-3" aria-hidden="true" />
+              <span>Copy</span>
+            </>
+          )}
+        </button>
+      </div>
+      <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-all font-mono text-xs text-fg">
+        {value || "—"}
+      </pre>
     </div>
-    <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-all font-mono text-xs text-fg">
-      {value || "—"}
-    </pre>
-  </div>
-);
+  );
+};

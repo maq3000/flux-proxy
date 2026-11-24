@@ -10,6 +10,8 @@ import {
   Sliders,
   Wand2,
 } from "lucide-react";
+import { useContextMenu } from "../hooks/useContextMenu";
+import { buildSidebarContextMenu } from "../lib/contextMenuBuilders";
 import {
   formatSectionTooltip,
   getSectionMeta,
@@ -50,6 +52,40 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onCollapseSidebar,
 }) => {
   const [composerDragOver, setComposerDragOver] = useState(false);
+  const { openContextMenu } = useContextMenu();
+
+  const openSectionById = (section: ActiveNavSection) => {
+    if (section === "breakpoints" && onOpenBreakpoints) {
+      onOpenBreakpoints();
+    } else if (section === "diff" && onOpenSessionDiff) {
+      onOpenSessionDiff();
+    } else if (section === "wizard" && onOpenTextWizard) {
+      onOpenTextWizard();
+    } else {
+      onSelectSection(section);
+    }
+  };
+
+  const handleSidebarContextMenu = (
+    e: React.MouseEvent,
+    targetSection: ActiveNavSection | null
+  ) => {
+    openContextMenu(
+      e,
+      buildSidebarContextMenu({
+        targetSection,
+        activeSection,
+        onOpenSection: openSectionById,
+        onOpenSettings,
+        onCollapseSidebar,
+      }),
+      {
+        ariaLabel: targetSection
+          ? `${getSectionMeta(targetSection).title} Context Menu`
+          : "Sidebar Context Menu",
+      }
+    );
+  };
 
   const handleDragOver = (e: React.DragEvent) => {
     if (e.dataTransfer.types.includes("application/x-fluxproxy-session-id")) {
@@ -83,6 +119,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   return (
     <aside
       aria-label="Primary Navigation"
+      onContextMenu={(e) => handleSidebarContextMenu(e, null)}
       className="flex h-full w-11 shrink-0 flex-col items-center justify-between border-r border-hairline bg-surface py-2"
     >
       <nav
@@ -103,6 +140,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <button
           type="button"
           onClick={() => onSelectSection("traffic")}
+          onContextMenu={(e) => handleSidebarContextMenu(e, "traffic")}
           aria-label={trafficMeta.title}
           aria-current={activeSection === "traffic" ? "page" : undefined}
           title={formatSectionTooltip("traffic")}
@@ -119,6 +157,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <button
           type="button"
           onClick={() => onSelectSection("composer")}
+          onContextMenu={(e) => handleSidebarContextMenu(e, "composer")}
           onDragOver={handleDragOver}
           onDragLeave={() => setComposerDragOver(false)}
           onDrop={handleDrop}
@@ -140,6 +179,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <button
           type="button"
           onClick={() => onSelectSection("rules")}
+          onContextMenu={(e) => handleSidebarContextMenu(e, "rules")}
           aria-label={rulesMeta.title}
           aria-current={activeSection === "rules" ? "page" : undefined}
           title={formatSectionTooltip("rules")}
@@ -165,6 +205,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               ? onOpenBreakpoints()
               : onSelectSection("breakpoints")
           }
+          onContextMenu={(e) => handleSidebarContextMenu(e, "breakpoints")}
           aria-label={breakpointsMeta.title}
           aria-current={activeSection === "breakpoints" ? "page" : undefined}
           title={formatSectionTooltip("breakpoints")}
@@ -190,6 +231,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <button
           type="button"
           onClick={() => onSelectSection("scripts")}
+          onContextMenu={(e) => handleSidebarContextMenu(e, "scripts")}
           aria-label={scriptsMeta.title}
           aria-current={activeSection === "scripts" ? "page" : undefined}
           title={formatSectionTooltip("scripts")}
@@ -214,6 +256,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           onClick={() =>
             onOpenSessionDiff ? onOpenSessionDiff() : onSelectSection("diff")
           }
+          onContextMenu={(e) => handleSidebarContextMenu(e, "diff")}
           aria-label={diffMeta.title}
           aria-current={activeSection === "diff" ? "page" : undefined}
           title={formatSectionTooltip("diff")}
@@ -232,6 +275,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           onClick={() =>
             onOpenTextWizard ? onOpenTextWizard() : onSelectSection("wizard")
           }
+          onContextMenu={(e) => handleSidebarContextMenu(e, "wizard")}
           aria-label={wizardMeta.title}
           aria-current={activeSection === "wizard" ? "page" : undefined}
           title={formatSectionTooltip("wizard")}

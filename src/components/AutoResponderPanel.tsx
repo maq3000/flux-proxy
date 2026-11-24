@@ -1,6 +1,12 @@
 import React, { useEffect, useId, useState } from "react";
 import Editor from "@monaco-editor/react";
 import { Clock, Plus, Save, Sliders, Trash2 } from "lucide-react";
+import { useContextMenu } from "../hooks/useContextMenu";
+import {
+  buildAutoResponderEmptyContextMenu,
+  buildAutoResponderRuleContextMenu,
+  copyTextToClipboard,
+} from "../lib/contextMenuBuilders";
 import { getMonacoThemeName } from "../lib/monaco";
 import type {
   AutoResponderRule,
@@ -16,6 +22,7 @@ interface AutoResponderPanelProps {
   resolvedTheme: "dark" | "light";
   onUpsertRule: (rule: AutoResponderRule) => Promise<void>;
   onDeleteRule: (id: string) => Promise<void>;
+  onNotify?: (msg: string) => void;
 }
 
 export const AutoResponderPanel: React.FC<AutoResponderPanelProps> = ({
@@ -25,7 +32,9 @@ export const AutoResponderPanel: React.FC<AutoResponderPanelProps> = ({
   resolvedTheme,
   onUpsertRule,
   onDeleteRule,
+  onNotify,
 }) => {
+  const { openContextMenu } = useContextMenu();
   const masterToggleId = useId();
   const [selectedRuleId, setSelectedRuleId] = useState<string | null>(
     rules[0]?.id ?? null
@@ -58,6 +67,64 @@ export const AutoResponderPanel: React.FC<AutoResponderPanelProps> = ({
     };
     await onUpsertRule(newRule);
     setSelectedRuleId(newRule.id);
+  };
+
+  const handleDuplicateRule = async (rule: AutoResponderRule) => {
+    const duplicate: AutoResponderRule = {
+      ...rule,
+      id: `rule-${Date.now()}`,
+      name: `${rule.name} (Copy)`,
+      responseHeaders: rule.responseHeaders.map((h) => ({ ...h })),
+    };
+    await onUpsertRule(duplicate);
+    setSelectedRuleId(duplicate.id);
+  };
+
+  const handleRuleContextMenu = (
+    e: React.MouseEvent<HTMLDivElement>,
+    rule: AutoResponderRule
+  ) => {
+    setSelectedRuleId(rule.id);
+    openContextMenu(
+      e,
+      buildAutoResponderRuleContextMenu({
+        rule,
+        onToggleEnabled: () =>
+          void onUpsertRule({ ...rule, enabled: !rule.enabled }),
+        onDuplicate: () => void handleDuplicateRule(rule),
+        onCopyPattern: () =>
+          void copyTextToClipboard(
+            rule.pattern,
+            onNotify,
+            `Скопирован шаблон правила: ${rule.pattern}`
+          ),
+        onDelete: () => {
+          void onDeleteRule(rule.id).then(() => {
+            setSelectedRuleId((cur) =>
+              cur === rule.id
+                ? rules.find((x) => x.id !== rule.id)?.id ?? null
+                : cur
+            );
+          });
+        },
+      }),
+      { ariaLabel: `AutoResponder Rule ${rule.name} Context Menu` }
+    );
+  };
+
+  const handleEmptyListContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.defaultPrevented) return;
+    openContextMenu(
+      e,
+      buildAutoResponderEmptyContextMenu({
+        enabled,
+        onAddRule: () => void handleCreateRule(),
+        onToggleGlobal: onToggleEnabled
+          ? () => void onToggleEnabled(!enabled)
+          : undefined,
+      }),
+      { ariaLabel: "AutoResponder Rules Context Menu" }
+    );
   };
 
   return (
@@ -116,7 +183,10 @@ export const AutoResponderPanel: React.FC<AutoResponderPanelProps> = ({
 
       <div className="flex min-h-0 flex-1 overflow-hidden">
         {/* Left List of Rules */}
-        <div className="flex w-80 shrink-0 flex-col border-r border-hairline bg-surface">
+        <div
+          onContextMenu={handleEmptyListContextMenu}
+          className="flex w-80 shrink-0 flex-col border-r border-hairline bg-surface"
+        >
           <div className="flex-1 space-y-1 overflow-y-auto p-2">
           {rules.length === 0 ? (
             <p className="p-4 text-center text-xs text-subtle">
@@ -127,6 +197,7 @@ export const AutoResponderPanel: React.FC<AutoResponderPanelProps> = ({
               <div
                 key={r.id}
                 onClick={() => setSelectedRuleId(r.id)}
+                onContextMenu={(e) => handleRuleContextMenu(e, r)}
                 className={`flex cursor-pointer flex-col gap-1 rounded-md border p-2.5 transition-colors ${
                   r.id === selectedRuleId
                     ? "border-sky-500/50 bg-selected"

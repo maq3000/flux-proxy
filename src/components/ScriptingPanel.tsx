@@ -14,6 +14,12 @@ import {
 } from "lucide-react";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { SAFE_PANEL_STORAGE } from "../hooks/useUiPreferences";
+import { useContextMenu } from "../hooks/useContextMenu";
+import {
+  buildScriptConsoleContextMenu,
+  copyTextToClipboard,
+  formatScriptConsoleLogLine,
+} from "../lib/contextMenuBuilders";
 import { PYTHON_SCRIPT_PRESETS } from "../lib/mockTraffic";
 import { getMonacoThemeName } from "../lib/monaco";
 import type {
@@ -37,6 +43,7 @@ interface ScriptingPanelProps {
   onToggleEnabled: (enabled: boolean) => Promise<void> | void;
   onRefreshStatus: () => Promise<void> | void;
   onClearLogs: () => void;
+  onNotify?: (msg: string) => void;
 }
 
 type LogFilterKind = "all" | "stdout" | "errors";
@@ -70,7 +77,9 @@ export const ScriptingPanel: React.FC<ScriptingPanelProps> = ({
   onToggleEnabled,
   onRefreshStatus,
   onClearLogs,
+  onNotify,
 }) => {
+  const { openContextMenu } = useContextMenu();
   const toggleId = useId();
   const [logFilter, setLogFilter] = useState<LogFilterKind>("all");
   const [autoScrollLogs, setAutoScrollLogs] = useState(true);
@@ -116,9 +125,53 @@ export const ScriptingPanel: React.FC<ScriptingPanelProps> = ({
 
   useEffect(() => {
     if (autoScrollLogs) {
-      consoleEndRef.current?.scrollIntoView({ block: "end" });
+      consoleEndRef.current?.scrollIntoView?.({ block: "end" });
     }
   }, [autoScrollLogs, filteredLogs.length]);
+
+  const handleConsoleContextMenu = (
+    e: React.MouseEvent,
+    entry?: ScriptConsoleLogEvent | null
+  ) => {
+    const sel = typeof window !== "undefined" ? window.getSelection() : null;
+    if (
+      sel &&
+      !sel.isCollapsed &&
+      sel.toString().trim().length > 0 &&
+      e.currentTarget.contains(sel.anchorNode)
+    ) {
+      return;
+    }
+
+    openContextMenu(
+      e,
+      buildScriptConsoleContextMenu({
+        entry: entry ?? null,
+        visibleCount: filteredLogs.length,
+        totalCount: logs.length,
+        logFilter,
+        autoScroll: autoScrollLogs,
+        onCopyLine: entry
+          ? () =>
+              void copyTextToClipboard(
+                formatScriptConsoleLogLine(entry),
+                onNotify,
+                "Строка лога скопирована"
+              )
+          : undefined,
+        onCopyAllVisible: () =>
+          void copyTextToClipboard(
+            filteredLogs.map(formatScriptConsoleLogLine).join("\n"),
+            onNotify,
+            `Скопировано строк консоли: ${filteredLogs.length}`
+          ),
+        onChangeFilter: setLogFilter,
+        onToggleAutoScroll: () => setAutoScrollLogs((v) => !v),
+        onClearConsole: onClearLogs,
+      }),
+      { ariaLabel: "Script Console Context Menu" }
+    );
+  };
 
   const statusBadge = useMemo(() => {
     if (!status) {
@@ -527,7 +580,10 @@ export const ScriptingPanel: React.FC<ScriptingPanelProps> = ({
                   </div>
                 </div>
 
-                <div className="flex-1 overflow-y-auto bg-canvas p-2 font-mono text-[11px] leading-relaxed">
+                <div
+                  onContextMenu={(e) => handleConsoleContextMenu(e, null)}
+                  className="flex-1 overflow-y-auto bg-canvas p-2 font-mono text-[11px] leading-relaxed select-text"
+                >
                   {filteredLogs.length === 0 ? (
                     <div className="flex h-full items-center justify-center text-center text-xs text-subtle">
                       Вывод <code className="mx-1 text-muted">print(...)</code>{" "}
@@ -553,6 +609,9 @@ export const ScriptingPanel: React.FC<ScriptingPanelProps> = ({
                         return (
                           <div
                             key={entry.id}
+                            onContextMenu={(e) =>
+                              handleConsoleContextMenu(e, entry)
+                            }
                             className="flex items-start gap-2 rounded px-2 py-1 hover:bg-hover/60"
                           >
                             <span className="shrink-0 text-[10px] text-subtle tabular-nums">
