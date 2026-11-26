@@ -53,6 +53,7 @@ pub(super) const FLUXPROXY_ERR_UPSTREAM_CONNECT_TIMEOUT: &str = "upstream-connec
 pub(super) const FLUXPROXY_ERR_UPSTREAM_CONNECT_ERROR: &str = "upstream-connect-error";
 pub(super) const FLUXPROXY_ERR_CLIENT_CLOSED_REQUEST: &str = "client-closed-request";
 pub(super) const FLUXPROXY_ERR_COMPOSER_CANCELLED: &str = "composer-cancelled";
+pub(super) const FLUXPROXY_ERR_FORBIDDEN_REMOTE_TARGET: &str = "forbidden-remote-target";
 const MAX_CONTENT_ENCODING_LAYERS: usize = 4;
 type ProxyBoxBody = BoxBody<Bytes, Infallible>;
 
@@ -446,6 +447,7 @@ pub struct SharedProxyContext {
     pub throttle: Arc<ThrottleEngine>,
     pub store: Arc<TrafficStore>,
     pub upstream_http_client: std::sync::RwLock<Arc<UpstreamHttpClient>>,
+    pub remote_upstream_http_client: std::sync::RwLock<Arc<UpstreamHttpClient>>,
     pub client_certs: Arc<ClientCertificateStore>,
     pub script_runner: Arc<PythonScriptRunner>,
     pub active_ws_channels: Arc<DashMap<u64, mpsc::UnboundedSender<WsInjectCommand>>>,
@@ -599,14 +601,30 @@ impl SharedProxyContext {
             .clone()
     }
 
+    pub fn remote_upstream_http_client(&self) -> Arc<UpstreamHttpClient> {
+        self.remote_upstream_http_client
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn upstream_http_client_for_peer(&self, peer_is_remote: bool) -> Arc<UpstreamHttpClient> {
+        if peer_is_remote {
+            self.remote_upstream_http_client()
+        } else {
+            self.upstream_http_client()
+        }
+    }
+
     pub fn rebuild_upstream_clients(&self) {
         let resolver = Arc::clone(&self.host_remap);
         let upstream_proxy = Arc::clone(&self.upstream_proxy);
         match UpstreamHttpClient::build(
-            Some(resolver),
-            Some(upstream_proxy),
+            Some(Arc::clone(&resolver)),
+            Some(Arc::clone(&upstream_proxy)),
             None,
             Arc::clone(&self.connect_timeout_sec),
+            false,
         ) {
             Ok(client) => {
                 *self
@@ -616,6 +634,23 @@ impl SharedProxyContext {
             }
             Err(err) => {
                 tracing::warn!("Failed rebuilding upstream_http_client: {err}");
+            }
+        }
+        match UpstreamHttpClient::build(
+            Some(resolver),
+            Some(upstream_proxy),
+            None,
+            Arc::clone(&self.connect_timeout_sec),
+            true,
+        ) {
+            Ok(remote_client) => {
+                *self
+                    .remote_upstream_http_client
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = Arc::new(remote_client);
+            }
+            Err(err) => {
+                tracing::warn!("Failed rebuilding remote_upstream_http_client: {err}");
             }
         }
         self.client_certs.invalidate_client_cache();
@@ -1090,10 +1125,21 @@ impl ProxyEngineController {
         let dns_resolver = Arc::clone(&host_remap);
         let upstream_http_client = Arc::new(
             UpstreamHttpClient::build(
+                Some(Arc::clone(&dns_resolver)),
+                Some(Arc::clone(&upstream_proxy)),
+                None,
+                Arc::clone(&connect_timeout_sec),
+                false,
+            )
+            .map_err(ProxyError::Custom)?,
+        );
+        let remote_upstream_http_client = Arc::new(
+            UpstreamHttpClient::build(
                 Some(dns_resolver),
                 Some(Arc::clone(&upstream_proxy)),
                 None,
                 Arc::clone(&connect_timeout_sec),
+                true,
             )
             .map_err(ProxyError::Custom)?,
         );
@@ -1113,6 +1159,7 @@ impl ProxyEngineController {
             throttle,
             store,
             upstream_http_client: std::sync::RwLock::new(upstream_http_client),
+            remote_upstream_http_client: std::sync::RwLock::new(remote_upstream_http_client),
             client_certs,
             script_runner,
             active_ws_channels,
@@ -2197,7 +2244,7 @@ fn extract_mapped_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
     None
 }
 
-fn is_loopback_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_loopback_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_loopback(),
         IpAddr::V6(v6) => {
@@ -2206,13 +2253,37 @@ fn is_loopback_ip(ip: IpAddr) -> bool {
     }
 }
 
-fn is_unspecified_ip(ip: IpAddr) -> bool {
+pub(crate) fn is_unspecified_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_unspecified(),
         IpAddr::V6(v6) => {
             v6.is_unspecified() || extract_mapped_ipv4(v6).is_some_and(|v4| v4.is_unspecified())
         }
     }
+}
+
+pub(crate) fn is_forbidden_remote_target_ip(ip: IpAddr) -> bool {
+    is_loopback_ip(ip) || is_unspecified_ip(ip)
+}
+
+pub(crate) fn validate_resolved_addrs_for_peer(
+    addrs: &[SocketAddr],
+    peer_is_remote: bool,
+    target_label: &str,
+) -> Result<(), String> {
+    if !peer_is_remote {
+        return Ok(());
+    }
+    if let Some(blocked) = addrs
+        .iter()
+        .find(|addr| is_forbidden_remote_target_ip(addr.ip()))
+    {
+        return Err(format!(
+            "Forbidden: remote LAN clients cannot connect to loopback or unspecified IP {} (resolved from {target_label})",
+            blocked.ip()
+        ));
+    }
+    Ok(())
 }
 
 
@@ -2230,7 +2301,7 @@ fn parse_ip_including_mapped_and_shorthand(host_clean: &str) -> Option<IpAddr> {
     h.parse::<IpAddr>().ok()
 }
 
-fn is_loopback_or_unspecified_host(raw_host: &str) -> bool {
+pub(crate) fn is_loopback_or_unspecified_host(raw_host: &str) -> bool {
     let (host_only, _) = parse_host_and_optional_port(raw_host);
     let clean = host_only.trim_end_matches('.');
     if clean.is_empty() {
@@ -2298,6 +2369,24 @@ mod tests {
                 Arc::new(std::sync::atomic::AtomicU64::new(
                     crate::models::DEFAULT_CONNECT_TIMEOUT_SEC,
                 )),
+                false,
+            )
+            .unwrap(),
+        ))
+    }
+
+    fn test_remote_upstream_http_client(
+        host_remap: Option<Arc<HostRemapRegistry>>,
+    ) -> std::sync::RwLock<Arc<UpstreamHttpClient>> {
+        std::sync::RwLock::new(Arc::new(
+            UpstreamHttpClient::build(
+                host_remap,
+                None,
+                None,
+                Arc::new(std::sync::atomic::AtomicU64::new(
+                    crate::models::DEFAULT_CONNECT_TIMEOUT_SEC,
+                )),
+                true,
             )
             .unwrap(),
         ))
@@ -2356,6 +2445,7 @@ mod tests {
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -2481,6 +2571,7 @@ mod tests {
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -2740,6 +2831,7 @@ mod tests {
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -2894,6 +2986,7 @@ mod tests {
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -3040,6 +3133,7 @@ mod tests {
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -3253,6 +3347,7 @@ mod tests {
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -3427,6 +3522,7 @@ mod tests {
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -3661,6 +3757,7 @@ mod tests {
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -3954,6 +4051,7 @@ mod tests {
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -4460,6 +4558,7 @@ mod tests {
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -4828,6 +4927,7 @@ def on_response(response, request):
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: script_runner.clone(),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -5052,6 +5152,7 @@ def on_response(response, request):
             throttle: Arc::new(ThrottleEngine::new()),
             store,
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -5226,6 +5327,7 @@ def on_response(response, request):
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -5441,6 +5543,7 @@ def on_response(response, request):
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -5645,6 +5748,7 @@ def on_response(response, request):
             throttle: Arc::new(ThrottleEngine::new()),
             store,
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -5899,6 +6003,7 @@ def on_response(response, request):
             throttle,
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(Some(resolver)),
+            remote_upstream_http_client: test_remote_upstream_http_client(Some(Arc::clone(&host_remap))),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -6035,6 +6140,7 @@ def on_response(response, request):
             None,
             None,
             Arc::new(std::sync::atomic::AtomicU64::new(DEFAULT_UPSTREAM_TIMEOUT_SEC)),
+            false,
         )
         .unwrap();
 
@@ -6135,6 +6241,7 @@ def on_response(response, request):
             throttle: throttle.clone(),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -6283,6 +6390,7 @@ def on_response(response, request):
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -6437,6 +6545,7 @@ def on_response(response, request):
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -6584,6 +6693,7 @@ def on_response(response, request):
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -6758,6 +6868,7 @@ def on_response(response, request):
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -7165,6 +7276,7 @@ def on_response(response, request):
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -7547,7 +7659,8 @@ def on_response(response, request):
             upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
-            upstream_http_client: test_upstream_http_client(Some(host_remap)),
+            upstream_http_client: test_upstream_http_client(Some(Arc::clone(&host_remap))),
+            remote_upstream_http_client: test_remote_upstream_http_client(Some(host_remap)),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -8028,6 +8141,7 @@ def on_response(response, request):
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -8151,7 +8265,8 @@ def on_response(response, request):
             upstream_proxy: Arc::new(UpstreamProxyManager::new()),
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
-            upstream_http_client: test_upstream_http_client(Some(host_remap)),
+            upstream_http_client: test_upstream_http_client(Some(Arc::clone(&host_remap))),
+            remote_upstream_http_client: test_remote_upstream_http_client(Some(host_remap)),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -8274,6 +8389,7 @@ def on_response(response, request):
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -8396,6 +8512,7 @@ def on_response(response, request):
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -8735,6 +8852,7 @@ def on_response(response, request):
             throttle: Arc::new(ThrottleEngine::new()),
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -8863,6 +8981,428 @@ def on_response(response, request):
             assert!(
                 resp.starts_with("HTTP/1.1 200"),
                 "expected 200 for loopback peer, got: {resp}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn sec01_validates_resolved_ips_isolates_pools_and_blocks_remote_hosts_remap() {
+        assert!(validate_resolved_addrs_for_peer(
+            &["127.0.0.1:8080".parse().unwrap()],
+            true,
+            "evil.nip.io:8080"
+        )
+        .is_err());
+        assert!(validate_resolved_addrs_for_peer(
+            &["[::1]:8080".parse().unwrap()],
+            true,
+            "evil.nip.io:8080"
+        )
+        .is_err());
+        assert!(validate_resolved_addrs_for_peer(
+            &["[::ffff:127.0.0.1]:8080".parse().unwrap()],
+            true,
+            "evil.nip.io:8080"
+        )
+        .is_err());
+        assert!(validate_resolved_addrs_for_peer(
+            &["0.0.0.0:80".parse().unwrap()],
+            true,
+            "evil.zero.test:80"
+        )
+        .is_err());
+        assert!(validate_resolved_addrs_for_peer(
+            &["[::]:80".parse().unwrap()],
+            true,
+            "evil.zero.test:80"
+        )
+        .is_err());
+        assert!(validate_resolved_addrs_for_peer(
+            &["[::ffff:0.0.0.0]:80".parse().unwrap()],
+            true,
+            "evil.zero.test:80"
+        )
+        .is_err());
+        assert!(validate_resolved_addrs_for_peer(
+            &[
+                "93.184.216.34:443".parse().unwrap(),
+                "127.0.0.1:443".parse().unwrap(),
+            ],
+            true,
+            "rebind.example:443"
+        )
+        .is_err());
+        assert!(validate_resolved_addrs_for_peer(
+            &["93.184.216.34:443".parse().unwrap()],
+            true,
+            "example.com:443"
+        )
+        .is_ok());
+        assert!(validate_resolved_addrs_for_peer(
+            &["127.0.0.1:8080".parse().unwrap()],
+            false,
+            "localhost:8080"
+        )
+        .is_ok());
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-sec01-pools-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let upstream_hits_srv = Arc::clone(&upstream_hits);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = upstream_listener.accept().await {
+                upstream_hits_srv.fetch_add(1, Ordering::Relaxed);
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(|_req: Request<Incoming>| async move {
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
+                            b"loopback-only-ok",
+                        ))))
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let mut cfg = crate::proxy::filters::default_backend_config();
+        cfg.tls_bypass_enabled = true;
+        cfg.tls_bypass_rules = vec![TlsBypassRule {
+            id: "bypass-remapped".into(),
+            enabled: true,
+            pattern: "remapped-internal.test".into(),
+            category: "Test".into(),
+            description: "Passthrough test".into(),
+        }];
+        filters.update_config(cfg);
+
+        let host_remap = Arc::new(HostRemapRegistry::new());
+        host_remap
+            .set_rules(vec![crate::models::HostRemapRule {
+                id: "remap-to-loopback".into(),
+                enabled: true,
+                source_pattern: "remapped-internal.test".into(),
+                target_host: "127.0.0.1".into(),
+                target_port: Some(upstream_addr.port()),
+                preserve_host_header: true,
+                comment: String::new(),
+            }])
+            .unwrap();
+
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("sec01.sqlite")).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        let ctx = Arc::new(SharedProxyContext {
+            ca,
+            rules,
+            filters,
+            breakpoints: Arc::new(BreakpointEngine::new(None)),
+            host_remap: Arc::clone(&host_remap),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
+            store,
+            upstream_http_client: test_upstream_http_client(Some(Arc::clone(&host_remap))),
+            remote_upstream_http_client: test_remote_upstream_http_client(Some(host_remap)),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(proxy_addr.port()),
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            )),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let local_before = ctx.upstream_http_client_for_peer(false);
+        let remote_before = ctx.upstream_http_client_for_peer(true);
+        assert!(!Arc::ptr_eq(&local_before, &remote_before));
+        assert!(!local_before.peer_is_remote());
+        assert!(remote_before.peer_is_remote());
+
+        ctx.rebuild_upstream_clients();
+        let local_after = ctx.upstream_http_client_for_peer(false);
+        let remote_after = ctx.upstream_http_client_for_peer(true);
+        assert!(!Arc::ptr_eq(&local_before, &local_after));
+        assert!(!Arc::ptr_eq(&remote_before, &remote_after));
+        assert!(!Arc::ptr_eq(&local_after, &remote_after));
+        assert!(!local_after.peer_is_remote());
+        assert!(remote_after.peer_is_remote());
+
+        let scripted_peers: Vec<SocketAddr> = vec![
+            "192.168.1.50:55001".parse().unwrap(),
+            "192.168.1.50:55002".parse().unwrap(),
+            "127.0.0.1:55003".parse().unwrap(),
+        ];
+        let proxy_ctx = ctx.clone();
+        tokio::spawn(async move {
+            for peer_addr in scripted_peers {
+                if let Ok((tcp_stream, _)) = proxy_listener.accept().await {
+                    let io = TokioIo::new(tcp_stream);
+                    let c = proxy_ctx.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req: Request<Incoming>| {
+                            let inner_c = c.clone();
+                            async move {
+                                Ok::<_, Infallible>(
+                                    handle_outer_proxy_request(
+                                        req,
+                                        peer_addr,
+                                        None,
+                                        ClientConnContext::new(),
+                                        inner_c,
+                                    )
+                                    .await,
+                                )
+                            }
+                        });
+                        let _ = AutoConnBuilder::new(TokioExecutor::new())
+                            .serve_connection_with_upgrades(io, service)
+                            .await;
+                    });
+                }
+            }
+        });
+
+        // Remote LAN peer -> plain HTTP via HOSTS Remapping to 127.0.0.1 must fail with 403
+        {
+            let mut sock = TcpStream::connect(proxy_addr).await.unwrap();
+            sock.write_all(
+                b"GET http://remapped-internal.test/api HTTP/1.1\r\nHost: remapped-internal.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut buf = Vec::new();
+            let _ = sock.read_to_end(&mut buf).await;
+            let resp = String::from_utf8_lossy(&buf);
+            assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        }
+
+        // Remote LAN peer -> CONNECT passthrough via HOSTS Remapping to 127.0.0.1 must fail with 403
+        {
+            let mut sock = TcpStream::connect(proxy_addr).await.unwrap();
+            sock.write_all(
+                b"CONNECT remapped-internal.test:443 HTTP/1.1\r\nHost: remapped-internal.test:443\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut buf = [0u8; 512];
+            let n = sock.read(&mut buf).await.unwrap();
+            let resp = String::from_utf8_lossy(&buf[..n]);
+            assert!(resp.starts_with("HTTP/1.1 403"), "got: {resp}");
+        }
+        assert_eq!(upstream_hits.load(Ordering::Relaxed), 0);
+
+        // Local loopback peer -> plain HTTP via HOSTS Remapping succeeds with 200
+        {
+            let mut sock = TcpStream::connect(proxy_addr).await.unwrap();
+            sock.write_all(
+                b"GET http://remapped-internal.test/api HTTP/1.1\r\nHost: remapped-internal.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut buf = Vec::new();
+            let _ = sock.read_to_end(&mut buf).await;
+            let resp = String::from_utf8_lossy(&buf);
+            assert!(resp.starts_with("HTTP/1.1 200"), "got: {resp}");
+            assert!(resp.contains("loopback-only-ok"), "got: {resp}");
+        }
+        assert_eq!(upstream_hits.load(Ordering::Relaxed), 1);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn sec03_blocks_domain_fronting_and_h2_authority_coalescing_in_intercept_all() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy-test-sec03-intercept-all-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        filters.update_config(ProxyFilterBackendConfig {
+            tls_intercept_mode: TlsInterceptMode::InterceptAll,
+            tls_bypass_enabled: true,
+            tls_bypass_rules: vec![TlsBypassRule {
+                id: "bypass-pinned-bank".into(),
+                enabled: true,
+                pattern: "pinned-bank.test".into(),
+                category: "Banking".into(),
+                description: "Bypass pinned-bank.test".into(),
+            }],
+            tls_target_rules: Vec::new(),
+            ..crate::proxy::filters::default_backend_config()
+        });
+
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("sec03_ia.sqlite")).unwrap());
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        let ctx = Arc::new(SharedProxyContext {
+            ca: ca.clone(),
+            rules,
+            filters,
+            breakpoints: Arc::new(BreakpointEngine::new(None)),
+            host_remap: Arc::new(HostRemapRegistry::new()),
+            upstream_proxy: Arc::new(UpstreamProxyManager::new()),
+            throttle: Arc::new(ThrottleEngine::new()),
+            store,
+            upstream_http_client: test_upstream_http_client(None),
+            remote_upstream_http_client: test_remote_upstream_http_client(None),
+            client_certs: Arc::new(ClientCertificateStore::in_memory()),
+            script_runner: Arc::new(PythonScriptRunner::new(None)),
+            active_ws_channels: Arc::new(DashMap::new()),
+            event_tx,
+            removed_tx,
+            active_port: AtomicU16::new(proxy_addr.port()),
+            connect_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                DEFAULT_UPSTREAM_TIMEOUT_SEC,
+            )),
+            response_header_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_RESPONSE_HEADER_TIMEOUT_SEC,
+            )),
+            composer_timeout_sec: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::models::DEFAULT_COMPOSER_TIMEOUT_SEC,
+            )),
+            app_handle: None,
+            stats_dirty: Arc::new(AtomicBool::new(false)),
+        });
+
+        let proxy_ctx = ctx.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                if let Ok((tcp_stream, client_addr)) = proxy_listener.accept().await {
+                    let io = TokioIo::new(tcp_stream);
+                    let c = proxy_ctx.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req: Request<Incoming>| {
+                            let inner_c = c.clone();
+                            async move {
+                                Ok::<_, Infallible>(
+                                    handle_outer_proxy_request(
+                                        req,
+                                        client_addr,
+                                        None,
+                                        ClientConnContext::new(),
+                                        inner_c,
+                                    )
+                                    .await,
+                                )
+                            }
+                        });
+                        let _ = AutoConnBuilder::new(TokioExecutor::new())
+                            .serve_connection_with_upgrades(io, service)
+                            .await;
+                    });
+                }
+            }
+        });
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store
+            .add(rustls::pki_types::CertificateDer::from(
+                ca.root_ca_der().to_vec(),
+            ))
+            .unwrap();
+
+        // 1. HTTP/1.1 Host mismatch to bypassed domain inside InterceptAll CONNECT tunnel -> 421 Misdirected Request
+        {
+            let mut sock = TcpStream::connect(proxy_addr).await.unwrap();
+            sock.write_all(b"CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\n\r\n")
+                .await
+                .unwrap();
+            let mut connect_buf = [0u8; 256];
+            let n = sock.read(&mut connect_buf).await.unwrap();
+            assert!(String::from_utf8_lossy(&connect_buf[..n]).starts_with("HTTP/1.1 200"));
+
+            let tls_cfg = Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(root_store.clone())
+                    .with_no_client_auth(),
+            );
+            let connector = tokio_rustls::TlsConnector::from(tls_cfg);
+            let server_name = rustls::pki_types::ServerName::try_from("allowed.test").unwrap();
+            let mut tls_stream = connector.connect(server_name, sock).await.unwrap();
+
+            tls_stream
+                .write_all(
+                    b"GET /secret HTTP/1.1\r\nHost: pinned-bank.test\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut resp_bytes = Vec::new();
+            let _ = tls_stream.read_to_end(&mut resp_bytes).await;
+            let inner_resp = String::from_utf8_lossy(&resp_bytes);
+            assert!(
+                inner_resp.starts_with("HTTP/1.1 421"),
+                "expected 421 Misdirected Request for HTTP/1.1 Host mismatch in InterceptAll, got: {inner_resp}"
+            );
+        }
+
+        // 2. HTTP/2 :authority mismatch to bypassed domain inside InterceptAll CONNECT tunnel -> 421 Misdirected Request
+        {
+            let mut sock = TcpStream::connect(proxy_addr).await.unwrap();
+            sock.write_all(b"CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\n\r\n")
+                .await
+                .unwrap();
+            let mut connect_buf = [0u8; 256];
+            let n = sock.read(&mut connect_buf).await.unwrap();
+            assert!(String::from_utf8_lossy(&connect_buf[..n]).starts_with("HTTP/1.1 200"));
+
+            let mut tls_cfg = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            tls_cfg.alpn_protocols = vec![b"h2".to_vec()];
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_cfg));
+            let server_name = rustls::pki_types::ServerName::try_from("allowed.test").unwrap();
+            let tls_stream = connector.connect(server_name, sock).await.unwrap();
+
+            let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+                .handshake::<_, http_body_util::Empty<Bytes>>(TokioIo::new(tls_stream))
+                .await
+                .unwrap();
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+
+            let h2_req = Request::builder()
+                .method(hyper::Method::GET)
+                .uri("https://pinned-bank.test/secret")
+                .body(http_body_util::Empty::<Bytes>::new())
+                .unwrap();
+            let h2_resp = sender.send_request(h2_req).await.unwrap();
+            assert_eq!(
+                h2_resp.status(),
+                StatusCode::MISDIRECTED_REQUEST,
+                "expected 421 Misdirected Request for HTTP/2 :authority mismatch in InterceptAll"
             );
         }
 

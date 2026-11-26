@@ -350,6 +350,7 @@ fn validate_identity_pem(pem_bytes: &[u8]) -> Result<(), ProxyError> {
         Arc::new(std::sync::atomic::AtomicU64::new(
             crate::models::DEFAULT_CONNECT_TIMEOUT_SEC,
         )),
+        false,
     )
     .map_err(|e| {
         ProxyError::Custom(format!(
@@ -357,6 +358,17 @@ fn validate_identity_pem(pem_bytes: &[u8]) -> Result<(), ProxyError> {
         ))
     })?;
     Ok(())
+}
+
+fn is_valid_identity_pem_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let _ = enforce_secure_file_permissions(path);
+    let Ok(pem_bytes) = crate::proxy::dpapi::read_protected_key_bytes(path) else {
+        return false;
+    };
+    parse_rustls_client_auth_from_pem(&pem_bytes).is_ok()
 }
 
 /// Parses and validates a PKCS#12 (`.p12` / `.pfx`) archive in pure Rust,
@@ -584,7 +596,7 @@ fn validate_cert_source_path(
     allowed_exts: &[&str],
     field_label: &str,
 ) -> Result<(PathBuf, String), ProxyError> {
-    let path = crate::commands::validate_user_file_path(raw_path, Some(allowed_exts), true)
+    let path = crate::commands::validate_user_file_path(raw_path, Some(allowed_exts), true, false)
         .map_err(|e| ProxyError::Custom(format!("Некорректный путь ({field_label}): {e}")))?;
     let metadata = fs::metadata(&path)?;
     if metadata.len() > MAX_CERT_FILE_BYTES {
@@ -634,32 +646,73 @@ impl ClientCertificateStore {
                     ))
                 })?;
             parsed.retain(|entry| !entry.ephemeral);
-            for entry in &parsed {
+            let mut registry_migrated = false;
+            for entry in &mut parsed {
                 let stored = Path::new(&entry.stored_cert_path);
-                match resolve_path_strictly_inside_dir(&dir, stored) {
+                let stored_inside_vault = match resolve_path_strictly_inside_dir(&dir, stored) {
                     Ok(safe_stored) => {
                         let _ = enforce_secure_file_permissions(&safe_stored);
                         if entry.format == ClientCertificateFormat::Pem && safe_stored.is_file() {
                             let _ = crate::proxy::dpapi::read_protected_key_bytes(&safe_stored);
                         }
+                        true
                     }
                     Err(err) => {
                         tracing::warn!(
                             "Client certificate '{}' has stored_cert_path outside vault: {err}",
                             entry.id
                         );
+                        false
                     }
-                }
+                };
                 if entry.format == ClientCertificateFormat::Pkcs12 {
                     if is_safe_cert_entry_id(&entry.id) {
                         let identity_path = dir.join(format!("{}.identity.pem", entry.id));
                         if let Ok(safe_identity) =
                             resolve_path_strictly_inside_dir(&dir, &identity_path)
                         {
-                            let _ = enforce_secure_file_permissions(&safe_identity);
-                            if safe_identity.is_file() {
-                                let _ =
-                                    crate::proxy::dpapi::read_protected_key_bytes(&safe_identity);
+                            if is_valid_identity_pem_file(&safe_identity) {
+                                // Remove legacy unencrypted `.p12`/`.pfx` duplicates when a valid protected identity exists
+                                for ext in ["p12", "pfx"] {
+                                    let legacy_archive = dir.join(format!("{}.{ext}", entry.id));
+                                    if let Ok(safe_legacy) =
+                                        resolve_path_strictly_inside_dir(&dir, &legacy_archive)
+                                    {
+                                        if safe_legacy.is_file()
+                                            && fs::remove_file(&safe_legacy).is_ok()
+                                        {
+                                            tracing::info!(
+                                                "Removed legacy unencrypted PKCS#12 duplicate: {}",
+                                                safe_legacy.display()
+                                            );
+                                        }
+                                    }
+                                }
+                                if stored_inside_vault {
+                                    if let Ok(safe_stored) = resolve_path_strictly_inside_dir(
+                                        &dir,
+                                        Path::new(&entry.stored_cert_path),
+                                    ) {
+                                        let is_legacy_p12 = safe_stored
+                                            .extension()
+                                            .and_then(|e| e.to_str())
+                                            .is_some_and(|e| {
+                                                e.eq_ignore_ascii_case("p12")
+                                                    || e.eq_ignore_ascii_case("pfx")
+                                            });
+                                        if is_legacy_p12
+                                            && safe_stored != safe_identity
+                                            && safe_stored.is_file()
+                                        {
+                                            let _ = fs::remove_file(&safe_stored);
+                                        }
+                                        let next_stored = identity_path.display().to_string();
+                                        if entry.stored_cert_path != next_stored {
+                                            entry.stored_cert_path = next_stored;
+                                            registry_migrated = true;
+                                        }
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -670,10 +723,54 @@ impl ClientCertificateStore {
                     }
                 }
             }
+            if registry_migrated {
+                let updated_json = serde_json::to_vec_pretty(&parsed).map_err(|e| {
+                    ProxyError::Custom(format!(
+                        "Не удалось обновить реестр клиентских сертификатов: {e}"
+                    ))
+                })?;
+                write_bytes_securely(&registry_path, &updated_json)?;
+            }
             parsed
         } else {
             Vec::new()
         };
+
+        // Clean up any leftover unencrypted `.p12`/`.pfx` files inside vault that have a valid `{id}.identity.pem`
+        if let Ok(read_dir) = fs::read_dir(&dir) {
+            for dir_entry in read_dir.flatten() {
+                let path = dir_entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let is_p12 = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                    e.eq_ignore_ascii_case("p12") || e.eq_ignore_ascii_case("pfx")
+                });
+                if !is_p12 {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if !is_safe_cert_entry_id(stem) {
+                    continue;
+                }
+                let sibling_identity = dir.join(format!("{stem}.identity.pem"));
+                if let (Ok(safe_archive), Ok(safe_identity)) = (
+                    resolve_path_strictly_inside_dir(&dir, &path),
+                    resolve_path_strictly_inside_dir(&dir, &sibling_identity),
+                ) {
+                    if is_valid_identity_pem_file(&safe_identity)
+                        && fs::remove_file(&safe_archive).is_ok()
+                    {
+                        tracing::info!(
+                            "Removed orphaned unencrypted PKCS#12 duplicate: {}",
+                            safe_archive.display()
+                        );
+                    }
+                }
+            }
+        }
 
         Ok(Self {
             storage_dir: Some(dir),
@@ -824,14 +921,12 @@ impl ClientCertificateStore {
             ensure_secure_dir(dir)?;
             match format {
                 ClientCertificateFormat::Pkcs12 => {
-                    let archive_path = dir.join(format!("{id}.{cert_ext}"));
-                    write_bytes_securely(&archive_path, &cert_bytes)?;
                     let identity_path = dir.join(format!("{id}.identity.pem"));
                     crate::proxy::dpapi::write_protected_key_bytes(
                         &identity_path,
                         &parsed.identity_pem_bytes,
                     )?;
-                    archive_path.display().to_string()
+                    identity_path.display().to_string()
                 }
                 ClientCertificateFormat::Pem => {
                     let pem_path = dir.join(format!("{id}.pem"));
@@ -985,6 +1080,14 @@ impl ClientCertificateStore {
                             );
                         }
                     }
+                    for ext in ["p12", "pfx"] {
+                        let legacy_archive = dir.join(format!("{}.{ext}", removed.id));
+                        if let Ok(safe_legacy) =
+                            resolve_path_strictly_inside_dir(dir, &legacy_archive)
+                        {
+                            let _ = fs::remove_file(&safe_legacy);
+                        }
+                    }
                 } else {
                     tracing::warn!(
                         "Refusing to remove mTLS identity for unsafe entry ID '{}'",
@@ -1098,6 +1201,7 @@ impl ClientCertificateStore {
             upstream_proxy,
             Some((certs, key, entry.common_name.clone())),
             connect_timeout_sec,
+            false,
         )
         .map_err(|e| {
             ProxyError::Custom(format!(
@@ -1725,6 +1829,100 @@ mod tests {
         let migrated_disk = fs::read_to_string(&pem_stored_path).unwrap();
         assert!(migrated_disk.starts_with(crate::proxy::dpapi::DPAPI_PREFIX));
         assert!(!migrated_disk.contains("-----BEGIN"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sec02_write_only_pkcs12_omits_raw_archive_and_cleans_legacy_duplicates() {
+        let tmp = unique_test_dir("sec02_write_only_pkcs12");
+        let app_data = tmp.join("app_data");
+        let import_dir = tmp.join("imports");
+        fs::create_dir_all(&import_dir).unwrap();
+
+        let (cert_der, _cert_pem, key_der, _key_pem) =
+            mint_self_signed_client_cert("write-only.corp.local", 120);
+        let p12_bytes = build_pkcs12_bytes(&cert_der, &key_der, "p12-pass");
+        let source_p12 = import_dir.join("corp.p12");
+        fs::write(&source_p12, &p12_bytes).unwrap();
+
+        let store = ClientCertificateStore::init_or_load(&app_data).unwrap();
+        let entry = store
+            .add_certificate(AddClientCertificateRequest {
+                domain_pattern: "api.write-only.local".into(),
+                label: Some("WriteOnly".into()),
+                cert_path: source_p12.display().to_string(),
+                key_path: None,
+                password: Some("p12-pass".into()),
+                enabled: Some(true),
+                ephemeral: false,
+            })
+            .unwrap();
+
+        let vault_dir = app_data.join(CLIENT_CERTS_DIR_NAME);
+        let expected_identity_pem = vault_dir.join(format!("{}.identity.pem", entry.id));
+        assert_eq!(
+            PathBuf::from(&entry.stored_cert_path),
+            expected_identity_pem
+        );
+        assert!(expected_identity_pem.is_file());
+
+        // Ensure ZERO .p12 or .pfx files exist in client_certs/
+        for item in fs::read_dir(&vault_dir).unwrap() {
+            let p = item.unwrap().path();
+            let ext = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            assert!(
+                ext != "p12" && ext != "pfx",
+                "raw PKCS#12 file must not exist on disk in vault: {}",
+                p.display()
+            );
+        }
+
+        // Simulate legacy installation that left {id}.p12 + {id}.pfx and legacy stored_cert_path in registry.json
+        let legacy_p12 = vault_dir.join(format!("{}.p12", entry.id));
+        let legacy_pfx = vault_dir.join(format!("{}.pfx", entry.id));
+        fs::write(&legacy_p12, &p12_bytes).unwrap();
+        fs::write(&legacy_pfx, &p12_bytes).unwrap();
+
+        let mut legacy_entry = entry.clone();
+        legacy_entry.stored_cert_path = legacy_p12.display().to_string();
+        let registry_path = vault_dir.join(REGISTRY_FILE_NAME);
+        fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&vec![legacy_entry]).unwrap(),
+        )
+        .unwrap();
+
+        let reloaded = ClientCertificateStore::init_or_load(&app_data).unwrap();
+        assert!(
+            !legacy_p12.exists(),
+            "legacy .p12 duplicate must be deleted on init_or_load"
+        );
+        assert!(
+            !legacy_pfx.exists(),
+            "legacy .pfx duplicate must be deleted on init_or_load"
+        );
+        assert!(expected_identity_pem.is_file());
+
+        let entries_after = reloaded.list();
+        assert_eq!(entries_after.len(), 1);
+        assert_eq!(
+            PathBuf::from(&entries_after[0].stored_cert_path),
+            expected_identity_pem
+        );
+        let registry_disk = fs::read_to_string(&registry_path).unwrap();
+        assert!(!registry_disk.contains(".p12"));
+        assert!(registry_disk.contains(".identity.pem"));
+
+        let timeout_sec = Arc::new(AtomicU64::new(crate::models::DEFAULT_CONNECT_TIMEOUT_SEC));
+        assert!(reloaded
+            .get_or_build_upstream_client("api.write-only.local", None, None, timeout_sec)
+            .unwrap()
+            .is_some());
 
         let _ = fs::remove_dir_all(&tmp);
     }

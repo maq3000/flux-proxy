@@ -41,9 +41,12 @@ use crate::proxy::upstream_proxy::{connect_tunnel_via_upstream, format_via_proxy
 use super::http_handler::format_error_chain;
 use super::{
     boxed_full, extract_hyper_headers, format_mitm_tls_display, format_raw_http_version,
-    is_hop_by_hop_header, parse_host_and_optional_port, plain_response, record_and_return_error,
-    record_and_return_error_with_opts, record_completed_session, should_use_host_mtls_for_peer,
-    ClientConnContext, ProxyBoxBody, SharedProxyContext, MAX_CAPTURED_BODY_BYTES,
+    is_hop_by_hop_header, is_loopback_ip, is_loopback_or_unspecified_host,
+    parse_host_and_optional_port, plain_response, record_and_return_error,
+    record_and_return_error_with_opts, record_and_return_error_with_opts_and_code,
+    record_completed_session, should_use_host_mtls_for_peer, validate_resolved_addrs_for_peer,
+    ClientConnContext, ProxyBoxBody, SharedProxyContext, FLUXPROXY_ERR_FORBIDDEN_REMOTE_TARGET,
+    MAX_CAPTURED_BODY_BYTES,
 };
 
 pub const MAX_WS_INJECT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024; // 16 MiB safety cap
@@ -119,11 +122,18 @@ struct WsTcpConnectResult {
     tcp_connect_ms: f64,
 }
 
+#[derive(Debug)]
+enum WsTcpConnectError {
+    Forbidden(String),
+    Connect(String),
+}
+
 async fn measure_ws_tcp_connect(
     connect_host: &str,
     connect_port: u16,
     timeout: Duration,
-) -> Result<WsTcpConnectResult, String> {
+    peer_is_remote: bool,
+) -> Result<WsTcpConnectResult, WsTcpConnectError> {
     let deadline = Instant::now() + timeout;
     let clean_host = connect_host.trim().trim_matches(['[', ']']);
     let (addrs, dns_ms): (Vec<SocketAddr>, f64) = if let Ok(ip) = clean_host.parse::<IpAddr>() {
@@ -131,9 +141,9 @@ async fn measure_ws_tcp_connect(
     } else {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(format!(
+            return Err(WsTcpConnectError::Connect(format!(
                 "WebSocket DNS lookup timed out for {connect_host}:{connect_port}"
-            ));
+            )));
         }
         let dns_start = Instant::now();
         let resolved_iter = tokio::time::timeout(
@@ -142,19 +152,30 @@ async fn measure_ws_tcp_connect(
         )
         .await
         .map_err(|_| {
-            format!("WebSocket DNS lookup timed out for {connect_host}:{connect_port}")
+            WsTcpConnectError::Connect(format!(
+                "WebSocket DNS lookup timed out for {connect_host}:{connect_port}"
+            ))
         })?
         .map_err(|e| {
-            format!("WebSocket DNS lookup failed for {connect_host}:{connect_port}: {e}")
+            WsTcpConnectError::Connect(format!(
+                "WebSocket DNS lookup failed for {connect_host}:{connect_port}: {e}"
+            ))
         })?;
         let collected: Vec<SocketAddr> = resolved_iter.collect();
         if collected.is_empty() {
-            return Err(format!(
+            return Err(WsTcpConnectError::Connect(format!(
                 "WebSocket DNS lookup returned no addresses for {connect_host}:{connect_port}"
-            ));
+            )));
         }
         (collected, elapsed_ms(dns_start))
     };
+
+    validate_resolved_addrs_for_peer(
+        &addrs,
+        peer_is_remote,
+        &format!("{connect_host}:{connect_port}"),
+    )
+    .map_err(WsTcpConnectError::Forbidden)?;
 
     let tcp_start = Instant::now();
     let mut tcp_opt = None;
@@ -177,10 +198,10 @@ async fn measure_ws_tcp_connect(
     }
 
     let stream = tcp_opt.ok_or_else(|| {
-        format!(
+        WsTcpConnectError::Connect(format!(
             "WebSocket TCP connect failed for {connect_host}:{connect_port}: {}",
             last_err.unwrap_or_else(|| "no reachable address".to_string())
-        )
+        ))
     })?;
     let tcp_connect_ms = elapsed_ms(tcp_start);
     let peer_addr = stream
@@ -1034,6 +1055,7 @@ pub(super) async fn handle_websocket_intercept(
         }
     };
 
+    let peer_is_remote = !is_loopback_ip(client_addr.ip());
     let (target_host, opt_port) = parse_host_and_optional_port(&host_header);
     let target_port = opt_port.unwrap_or(if ws_scheme == "wss" { 443 } else { 80 });
     let remapped = ctx
@@ -1041,6 +1063,31 @@ pub(super) async fn handle_websocket_intercept(
         .resolve_connect_target(&target_host, target_port);
     let (connect_host, connect_port, remapped_to) = match &remapped {
         Some((h, p, rule)) => {
+            if peer_is_remote && is_loopback_or_unspecified_host(h) {
+                return record_and_return_error_with_opts_and_code(
+                    &ctx,
+                    session_id,
+                    ws_scheme,
+                    "GET",
+                    &host_header,
+                    &path_and_query,
+                    &full_url,
+                    req_headers,
+                    Bytes::new(),
+                    start,
+                    timestamp,
+                    client_addr,
+                    client_proc.as_ref(),
+                    false,
+                    req_mutated,
+                    StatusCode::FORBIDDEN,
+                    None,
+                    format!(
+                        "Forbidden: remote LAN clients cannot open WebSocket connections via HOSTS Remapping to loopback or unspecified host '{h}'"
+                    ),
+                    Some(FLUXPROXY_ERR_FORBIDDEN_REMOTE_TARGET),
+                );
+            }
             if !rule.preserve_host_header {
                 let default_ws_port = if ws_scheme == "wss" { 443 } else { 80 };
                 let h_fmt = HostRemapRegistry::format_host_for_authority(h);
@@ -1498,29 +1545,55 @@ pub(super) async fn handle_websocket_intercept(
 
     // Direct WebSocket connection (honoring HOSTS Remapping, Bandwidth Throttling, and mTLS)
     let deadline = Instant::now() + connect_timeout;
-    let tcp_res = match measure_ws_tcp_connect(&connect_host, connect_port, connect_timeout).await {
-        Ok(res) => res,
-        Err(err_msg) => {
-            return record_and_return_error(
-                &ctx,
-                session_id,
-                ws_scheme,
-                "GET",
-                &host_header,
-                &path_and_query,
-                &full_url,
-                req_headers,
-                Bytes::new(),
-                start,
-                timestamp,
-                client_addr,
-                client_proc.as_ref(),
-                false,
-                req_mutated,
-                err_msg,
-            );
-        }
-    };
+    let tcp_res =
+        match measure_ws_tcp_connect(&connect_host, connect_port, connect_timeout, peer_is_remote)
+            .await
+        {
+            Ok(res) => res,
+            Err(WsTcpConnectError::Forbidden(err_msg)) => {
+                return record_and_return_error_with_opts_and_code(
+                    &ctx,
+                    session_id,
+                    ws_scheme,
+                    "GET",
+                    &host_header,
+                    &path_and_query,
+                    &full_url,
+                    req_headers,
+                    Bytes::new(),
+                    start,
+                    timestamp,
+                    client_addr,
+                    client_proc.as_ref(),
+                    false,
+                    req_mutated,
+                    StatusCode::FORBIDDEN,
+                    hs.remapped_to,
+                    err_msg,
+                    Some(FLUXPROXY_ERR_FORBIDDEN_REMOTE_TARGET),
+                );
+            }
+            Err(WsTcpConnectError::Connect(err_msg)) => {
+                return record_and_return_error(
+                    &ctx,
+                    session_id,
+                    ws_scheme,
+                    "GET",
+                    &host_header,
+                    &path_and_query,
+                    &full_url,
+                    req_headers,
+                    Bytes::new(),
+                    start,
+                    timestamp,
+                    client_addr,
+                    client_proc.as_ref(),
+                    false,
+                    req_mutated,
+                    err_msg,
+                );
+            }
+        };
     let throttled_tcp =
         ThrottledStream::new_without_initial_delay(tcp_res.stream, Arc::clone(&ctx.throttle));
 
@@ -2040,5 +2113,49 @@ pub(super) fn record_ws_frame(
         byte_length: msg.len(),
         timestamp: Utc::now().to_rfc3339(),
         injected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn sec01_ws_tcp_connect_blocks_remote_peer_dns_to_loopback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let remote_res = measure_ws_tcp_connect(
+            "localhost",
+            addr.port(),
+            Duration::from_secs(3),
+            true,
+        )
+        .await;
+        match remote_res {
+            Err(WsTcpConnectError::Forbidden(msg)) => {
+                assert!(msg.contains("Forbidden"));
+            }
+            Ok(_) => panic!("remote peer must be blocked from resolving WS target to loopback"),
+            Err(WsTcpConnectError::Connect(err)) => {
+                panic!("expected Forbidden error, got Connect({err})")
+            }
+        }
+
+        let local_res = measure_ws_tcp_connect(
+            "127.0.0.1",
+            addr.port(),
+            Duration::from_secs(3),
+            false,
+        )
+        .await;
+        assert!(
+            local_res.is_ok(),
+            "local loopback peer must connect cleanly"
+        );
     }
 }

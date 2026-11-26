@@ -81,15 +81,18 @@ pub fn run() {
             app.manage(AppState { controller });
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if matches!(
-                event,
-                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
-            ) {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed => {
                 if let Some(state) = window.try_state::<AppState>() {
                     state.controller.shutdown_sync();
                 }
             }
+            tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
+                for path in paths {
+                    commands::register_authorized_dialog_path(path);
+                }
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_proxy_status,
@@ -150,6 +153,7 @@ pub fn run() {
             commands::import_sessions_bytes,
             commands::save_session_body_file,
             commands::export_settings_file,
+            commands::export_text_file,
             commands::import_settings_file,
             commands::pick_save_file_dialog,
             commands::pick_open_file_dialog,

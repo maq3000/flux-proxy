@@ -18,7 +18,7 @@ use crate::models::{
     PausedBreakpointItem, RuleActionType, SessionDetail, SessionSummary, SessionTimings,
     SessionTransferStats, SseEventRecord,
 };
-use crate::proxy::filters::is_alt_svc_header;
+use crate::proxy::filters::{is_alt_svc_header, ConnectTunnelDecision, PassthroughReason};
 use crate::proxy::hosts::HostRemapRegistry;
 use crate::proxy::network::normalize_client_ip;
 use crate::proxy::process::ClientProcessInfo;
@@ -37,8 +37,8 @@ use super::websocket_relay::handle_websocket_intercept;
 use super::{
     boxed_full, encode_inline_or_offload, extract_hyper_headers, format_http_version,
     format_mitm_tls_display, format_raw_http_version, is_hop_by_hop_header, is_loopback_ip,
-    make_breakpoint_guard, parse_host_and_optional_port, plain_response,
-    record_completed_session, record_in_flight_session_with_remap,
+    is_loopback_or_unspecified_host, make_breakpoint_guard, parse_host_and_optional_port,
+    plain_response, record_completed_session, record_in_flight_session_with_remap,
     request_targets_loopback_or_unspecified, resolve_protocol_label,
     should_use_host_mtls_for_peer, ClientConnContext, ProxyBoxBody, SharedProxyContext,
     MAX_BUFFERED_RESPONSE_BODY_BYTES, MAX_CAPTURED_BODY_BYTES,
@@ -767,35 +767,48 @@ pub(super) async fn handle_intercepted_request(
         );
     }
 
-    // 0b. Enforce TargetedOnly allowlist against inner Host / HTTP/2 :authority when inside CONNECT MITM
+    // 0b. Enforce TLS policy against inner Host / HTTP/2 :authority in ALL MITM modes (InterceptAll & TargetedOnly)
     if let Some(tunnel_auth) = default_authority {
-        if ctx.filters.is_targeted_only_mode() {
-            let normalize_auth = |raw: &str| -> (String, u16) {
-                let (h, maybe_p) = parse_host_and_optional_port(raw);
-                (h.trim_end_matches('.').to_string(), maybe_p.unwrap_or(443))
-            };
-            let tunnel_norm = normalize_auth(tunnel_auth);
-            let host_hdr_raw = req
-                .headers()
-                .get(HOST)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or(tunnel_auth);
-            let uri_auth_raw = req.uri().authority().map(|a| a.as_str());
+        let normalize_auth = |raw: &str| -> (String, u16) {
+            let (h, maybe_p) = parse_host_and_optional_port(raw);
+            (h.trim_end_matches('.').to_string(), maybe_p.unwrap_or(443))
+        };
+        let tunnel_norm = normalize_auth(tunnel_auth);
+        let host_hdr_raw = req
+            .headers()
+            .get(HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(tunnel_auth);
+        let uri_auth_raw = req.uri().authority().map(|a| a.as_str());
 
-            let differs_from_tunnel = normalize_auth(host_hdr_raw) != tunnel_norm
-                || uri_auth_raw.is_some_and(|ua| normalize_auth(ua) != tunnel_norm);
+        let mut mismatched_targets: Vec<(String, u16)> = Vec::new();
+        let host_norm = normalize_auth(host_hdr_raw);
+        if host_norm != tunnel_norm {
+            mismatched_targets.push(host_norm);
+        }
+        if let Some(ua) = uri_auth_raw {
+            let uri_norm = normalize_auth(ua);
+            if uri_norm != tunnel_norm && !mismatched_targets.contains(&uri_norm) {
+                mismatched_targets.push(uri_norm);
+            }
+        }
 
-            if differs_from_tunnel {
-                let host_allowed = ctx.filters.should_intercept_tls(host_hdr_raw);
-                let uri_allowed = uri_auth_raw
-                    .map(|ua| ctx.filters.should_intercept_tls(ua))
-                    .unwrap_or(true);
-                if !host_allowed || !uri_allowed {
-                    return plain_response(
+        for (cand_host, cand_port) in mismatched_targets {
+            if let ConnectTunnelDecision::Passthrough(reason) =
+                ctx.filters.evaluate_connect_tunnel(&cand_host, cand_port)
+            {
+                return match reason {
+                    PassthroughReason::NotInTargetAllowlist => plain_response(
                         StatusCode::FORBIDDEN,
-                        "Forbidden: Host header differs from CONNECT authority and is outside TargetedOnly TLS allowlist",
-                    );
-                }
+                        "Forbidden: Host header or :authority differs from CONNECT authority and is outside TargetedOnly TLS allowlist",
+                    ),
+                    PassthroughReason::BypassRule(_) | PassthroughReason::NotInHostsWhitelist => {
+                        plain_response(
+                            StatusCode::MISDIRECTED_REQUEST,
+                            "Misdirected Request: Host header or :authority differs from CONNECT authority and requires TLS Passthrough",
+                        )
+                    }
+                };
             }
         }
     }
@@ -1397,6 +1410,17 @@ pub(super) async fn handle_intercepted_request(
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned))
         .unwrap_or_else(|| host_header.clone());
+    if is_remote_peer
+        && ctx
+            .host_remap
+            .match_host(&target_host)
+            .is_some_and(|rule| is_loopback_or_unspecified_host(&rule.target_host))
+    {
+        return plain_response(
+            StatusCode::FORBIDDEN,
+            "Forbidden: remote LAN clients cannot use HOSTS Remapping targeting loopback or unspecified hosts",
+        );
+    }
     let upstream_target = prepare_remapped_upstream_target(&ctx, &full_url, &host_header, &scheme_str);
 
     let (upstream_client, mtls_cn) = if should_use_host_mtls_for_peer(client_addr, &scheme_str) {
@@ -1410,7 +1434,7 @@ pub(super) async fn handle_intercepted_request(
             )
         {
             Ok(Some((mtls_client, entry))) => (mtls_client, Some(entry.common_name)),
-            Ok(None) => (ctx.upstream_http_client(), None),
+            Ok(None) => (ctx.upstream_http_client_for_peer(is_remote_peer), None),
             Err(err) => {
                 let msg = format!("Client certificate (mTLS) error for '{target_host}': {err}");
                 tracing::warn!("{msg}");
@@ -1454,7 +1478,7 @@ pub(super) async fn handle_intercepted_request(
             }
         }
     } else {
-        (ctx.upstream_http_client(), None)
+        (ctx.upstream_http_client_for_peer(is_remote_peer), None)
     };
 
     record_in_flight_session_with_remap(
@@ -1608,6 +1632,9 @@ pub(super) async fn handle_intercepted_request(
             let msg = match &err {
                 crate::proxy::upstream_client::UpstreamClientError::Timeout(_) => {
                     format!("Upstream response timeout: {chain}")
+                }
+                crate::proxy::upstream_client::UpstreamClientError::Forbidden(reason) => {
+                    reason.clone()
                 }
                 _ => format!("Upstream connection error: {chain}"),
             };

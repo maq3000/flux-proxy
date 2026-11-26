@@ -37,7 +37,8 @@ use super::mobile_portal::{is_builtin_portal_target, is_virtual_portal_domain};
 use super::{
     boxed_full, extract_hyper_headers, format_raw_http_version, is_loopback_ip,
     is_loopback_or_unspecified_host, plain_response, record_and_return_error_with_opts,
-    record_completed_session, split_authority, ClientConnContext, ProxyBoxBody, SharedProxyContext,
+    record_completed_session, split_authority, validate_resolved_addrs_for_peer, ClientConnContext,
+    ProxyBoxBody, SharedProxyContext, FLUXPROXY_ERR_FORBIDDEN_REMOTE_TARGET,
 };
 
 /// Entry handler for outer proxy TCP connections:
@@ -139,11 +140,38 @@ pub(super) async fn handle_outer_proxy_request(
 
             let remapped_connect = ctx.host_remap.resolve_connect_target(&host, port);
             let (connect_host, connect_port, remapped_to) = match &remapped_connect {
-                Some((target_host, target_port, rule)) => (
-                    target_host.clone(),
-                    *target_port,
-                    Some(HostRemapRegistry::format_remap_target(rule, rule.target_port)),
-                ),
+                Some((target_host, target_port, rule)) => {
+                    if is_remote_peer && is_loopback_or_unspecified_host(target_host) {
+                        return super::record_and_return_error_with_opts_and_code(
+                            &ctx,
+                            session_id,
+                            "https",
+                            "CONNECT",
+                            &host,
+                            &tunnel_path,
+                            &target_url,
+                            connect_headers,
+                            Bytes::new(),
+                            start,
+                            timestamp,
+                            client_addr,
+                            client_proc.as_ref(),
+                            true,
+                            false,
+                            StatusCode::FORBIDDEN,
+                            None,
+                            format!(
+                                "Forbidden: remote LAN clients cannot open CONNECT tunnels via HOSTS Remapping to loopback or unspecified host '{target_host}'"
+                            ),
+                            Some(FLUXPROXY_ERR_FORBIDDEN_REMOTE_TARGET),
+                        );
+                    }
+                    (
+                        target_host.clone(),
+                        *target_port,
+                        Some(HostRemapRegistry::format_remap_target(rule, rule.target_port)),
+                    )
+                }
                 None => (host.clone(), port, None),
             };
 
@@ -342,6 +370,34 @@ pub(super) async fn handle_outer_proxy_request(
                             }
                         }
                     };
+
+                if let Err(err_msg) = validate_resolved_addrs_for_peer(
+                    &resolved_addrs,
+                    is_remote_peer,
+                    &format!("{connect_host}:{connect_port}"),
+                ) {
+                    return super::record_and_return_error_with_opts_and_code(
+                        &ctx,
+                        session_id,
+                        "https",
+                        "CONNECT",
+                        &host,
+                        &tunnel_path,
+                        &target_url,
+                        connect_headers,
+                        Bytes::new(),
+                        start,
+                        timestamp,
+                        client_addr,
+                        client_proc.as_ref(),
+                        true,
+                        false,
+                        StatusCode::FORBIDDEN,
+                        remapped_to,
+                        err_msg,
+                        Some(FLUXPROXY_ERR_FORBIDDEN_REMOTE_TARGET),
+                    );
+                }
 
                 let tcp_start = Instant::now();
                 let mut upstream_tcp_opt = None;

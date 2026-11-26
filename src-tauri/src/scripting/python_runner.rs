@@ -7,7 +7,7 @@ use base64::Engine as _;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
@@ -17,6 +17,7 @@ use crate::models::{HeaderPair, ProxyError, PythonRunnerStatus, ScriptConsoleLog
 pub const DEFAULT_SCRIPT_TIMEOUT: Duration = Duration::from_millis(1500);
 pub const DEFAULT_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(5000);
 pub const MAX_SCRIPT_BODY_BYTES: usize = 4 * 1024 * 1024; // 4 MiB safety cap per hook payload
+pub const MAX_IPC_RESPONSE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB safety cap per stdout JSONL line
 const SCRIPT_CONSOLE_LOG_EVENT: &str = "proxy://script-console-log";
 
 const PYTHON_BOOTSTRAP_SCRIPT: &str = r#"
@@ -1028,15 +1029,7 @@ impl PythonScriptRunner {
                 .await
                 .map_err(|e| RpcFailure::Io(e.to_string()))?;
 
-            let mut line = String::new();
-            let n = worker
-                .stdout
-                .read_line(&mut line)
-                .await
-                .map_err(|e| RpcFailure::Io(e.to_string()))?;
-            if n == 0 {
-                return Err(RpcFailure::Closed);
-            }
+            let line = read_bounded_ipc_line(&mut worker.stdout, MAX_IPC_RESPONSE_BYTES).await?;
             serde_json::from_str::<Resp>(line.trim())
                 .map_err(|e| RpcFailure::Protocol(format!("Invalid worker JSON response: {e}")))
         };
@@ -1631,6 +1624,31 @@ impl PythonScriptRunner {
     }
 }
 
+async fn read_bounded_ipc_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<String, RpcFailure> {
+    let mut buf = Vec::new();
+    let limit = (max_bytes as u64).saturating_add(1);
+    let n = reader
+        .take(limit)
+        .read_until(b'\n', &mut buf)
+        .await
+        .map_err(|e| RpcFailure::Io(e.to_string()))?;
+    if n == 0 {
+        return Err(RpcFailure::Closed);
+    }
+    if buf.len() > max_bytes {
+        return Err(RpcFailure::Protocol(format!(
+            "Python worker stdout response exceeded limit of {max_bytes} bytes"
+        )));
+    }
+    String::from_utf8(buf).map_err(|e| {
+        RpcFailure::Protocol(format!("Invalid UTF-8 in Python worker response: {e}"))
+    })
+}
+
+#[derive(Debug)]
 enum RpcFailure {
     Timeout,
     Closed,
@@ -2114,6 +2132,97 @@ def on_request(request):
         let after = runner.get_status().await;
         assert_eq!(after.restart_count, 0);
         assert_eq!(after.worker_pid, pid_before);
+
+        runner.shutdown_sync();
+    }
+
+    #[tokio::test]
+    async fn sec06_read_bounded_ipc_line_rejects_oversized_or_invalid_utf8_and_accepts_within_cap() {
+        use std::io::Cursor;
+
+        // 1. Empty stream -> Closed
+        let mut eof_reader = BufReader::new(Cursor::new(Vec::<u8>::new()));
+        assert!(matches!(
+            read_bounded_ipc_line(&mut eof_reader, 64).await,
+            Err(RpcFailure::Closed)
+        ));
+
+        // 2. Exact cap including newline -> Ok
+        let mut ok_payload = vec![b'x'; 63];
+        ok_payload.push(b'\n');
+        let mut ok_reader = BufReader::new(Cursor::new(ok_payload));
+        let ok_line = read_bounded_ipc_line(&mut ok_reader, 64)
+            .await
+            .expect("64 bytes including newline must fit within limit=64");
+        assert_eq!(ok_line.len(), 64);
+
+        // 3. Exceeding limit without newline -> Protocol error
+        let oversized = vec![b'A'; 65];
+        let mut over_reader = BufReader::new(Cursor::new(oversized));
+        match read_bounded_ipc_line(&mut over_reader, 64).await {
+            Err(RpcFailure::Protocol(msg)) => {
+                assert!(msg.contains("exceeded limit"));
+            }
+            other => panic!("expected Protocol overflow error, got {other:?}"),
+        }
+
+        // 4. Truncating inside multibyte UTF-8 sequence or raw invalid UTF-8 -> Protocol error
+        let mut invalid_utf8 = vec![0xFF, 0xFE, b'\n'];
+        let mut utf8_reader = BufReader::new(Cursor::new(std::mem::take(&mut invalid_utf8)));
+        assert!(matches!(
+            read_bounded_ipc_line(&mut utf8_reader, 64).await,
+            Err(RpcFailure::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn sec06_live_worker_oversized_stdout_fails_open_and_restarts() {
+        let runner = PythonScriptRunner::new_with_options(Duration::from_millis(5000), None);
+        if !runner.get_status().await.available {
+            return;
+        }
+
+        // Trigger oversized (> 16 MiB) JSONL stdout line via print() inside hook
+        let script = r#"
+def on_request(request):
+    if "/flood" in request["url"]:
+        print("A" * (17 * 1024 * 1024))
+        return
+    request["headers"]["X-Safe"] = "1"
+"#;
+        let initial = runner.set_script(script.to_string(), true).await.unwrap();
+        let pid_before = initial.worker_pid;
+        assert!(pid_before.is_some());
+
+        let flood_res = runner
+            .run_on_request(301, "GET", "https://test/flood", &[], b"")
+            .await;
+        assert!(
+            matches!(flood_res, ScriptRequestOutcome::Unchanged),
+            "oversized worker response must fail open as Unchanged"
+        );
+
+        let mid = runner.get_status().await;
+        assert_eq!(mid.restart_count, 1);
+        assert!(mid.running);
+        assert_ne!(mid.worker_pid, pid_before);
+        assert!(mid
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("exceeded limit") || e.contains("protocol error")));
+
+        let recovered = runner
+            .run_on_request(302, "GET", "https://test/ok", &[], b"")
+            .await;
+        match recovered {
+            ScriptRequestOutcome::Modified(edits) => {
+                assert!(edits
+                    .headers_set
+                    .iter()
+                    .any(|(k, v)| k == "X-Safe" && v == "1"));
+            }
+            other => panic!("expected restarted worker to handle next request, got {other:?}"),
+        }
 
         runner.shutdown_sync();
     }

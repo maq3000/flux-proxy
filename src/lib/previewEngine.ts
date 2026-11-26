@@ -3523,6 +3523,16 @@ export class BrowserPreviewEngine {
     return frame;
   }
 
+  exportPreviewTextFile(
+    filePath: string,
+    contents: string,
+    mimeType = "text/plain;charset=utf-8"
+  ): number {
+    const bytes = new TextEncoder().encode(contents);
+    triggerBrowserDownload(bytes, filePath, mimeType);
+    return bytes.byteLength;
+  }
+
   getNetworkInterfaces(includeVirtual = false): NetworkInterfaceInfo[] {
     const baseInterfaces: NetworkInterfaceInfo[] = [
       {

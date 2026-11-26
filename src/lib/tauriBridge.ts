@@ -40,7 +40,6 @@ import {
   encodeUint8ArrayToBase64,
   getPreviewEngine,
   previewPickedFiles,
-  triggerBrowserDownload,
 } from "./previewEngine";
 
 export { DEFAULT_BREAKPOINT_CONFIG, getPreviewEngine };
@@ -771,19 +770,15 @@ export const proxyBridge = {
     jsonContent: string
   ): Promise<void> {
     if (isTauriRuntime()) {
-      try {
-        await invoke<number>("export_settings_file", {
-          filePath,
-          contents: jsonContent,
-        });
-        return;
-      } catch {
-        // Fallback to browser download if native command unavailable
-      }
+      await invoke<number>("export_settings_file", {
+        filePath,
+        contents: jsonContent,
+      });
+      return;
     }
-    triggerBrowserDownload(
-      new TextEncoder().encode(jsonContent),
+    getPreviewEngine().exportPreviewTextFile(
       filePath,
+      jsonContent,
       "application/json;charset=utf-8"
     );
   },
@@ -794,21 +789,13 @@ export const proxyBridge = {
     mimeType = "text/plain;charset=utf-8"
   ): Promise<void> {
     if (isTauriRuntime()) {
-      try {
-        await invoke<number>("export_settings_file", {
-          filePath,
-          contents,
-        });
-        return;
-      } catch {
-        // Fallback to browser download if native command unavailable or rejects extension
-      }
+      await invoke<number>("export_text_file", {
+        filePath,
+        contents,
+      });
+      return;
     }
-    triggerBrowserDownload(
-      new TextEncoder().encode(contents),
-      filePath,
-      mimeType
-    );
+    getPreviewEngine().exportPreviewTextFile(filePath, contents, mimeType);
   },
 
   async readSettingsJsonFile(filePath: string): Promise<string> {

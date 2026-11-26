@@ -1,5 +1,6 @@
+use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf, Prefix};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -537,9 +538,10 @@ pub async fn pick_save_file_dialog(
                 dialog = dialog.add_filter(&f.name, &ext_refs);
             }
         }
-        Ok(dialog
-            .save_file()
-            .map(|p| p.to_string_lossy().into_owned()))
+        Ok(dialog.save_file().map(|p| {
+            register_authorized_dialog_path(&p);
+            p.to_string_lossy().into_owned()
+        }))
     })
     .await
     .map_err(|e| ProxyError::Custom(format!("Native save dialog join error: {e}")))?
@@ -563,15 +565,109 @@ pub async fn pick_open_file_dialog(
                 dialog = dialog.add_filter(&f.name, &ext_refs);
             }
         }
-        Ok(dialog
-            .pick_file()
-            .map(|p| p.to_string_lossy().into_owned()))
+        Ok(dialog.pick_file().map(|p| {
+            register_authorized_dialog_path(&p);
+            p.to_string_lossy().into_owned()
+        }))
     })
     .await
     .map_err(|e| ProxyError::Custom(format!("Native open dialog join error: {e}")))?
 }
 
 pub const MAX_SETTINGS_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_AUTHORIZED_DIALOG_PATHS: usize = 128;
+pub const ALLOWED_TEXT_EXPORT_EXTENSIONS: &[&str] = &["txt", "md", "json", "yaml", "yml"];
+
+struct AuthorizedDialogPathRegistry {
+    max_entries: usize,
+    paths: VecDeque<String>,
+}
+
+impl AuthorizedDialogPathRegistry {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries: max_entries.max(1),
+            paths: VecDeque::with_capacity(max_entries.min(256)),
+        }
+    }
+
+    fn register(&mut self, key: String) {
+        if key.is_empty() {
+            return;
+        }
+        if let Some(pos) = self.paths.iter().position(|existing| existing == &key) {
+            self.paths.remove(pos);
+        }
+        while self.paths.len() >= self.max_entries {
+            self.paths.pop_front();
+        }
+        self.paths.push_back(key);
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        !key.is_empty() && self.paths.iter().any(|existing| existing == key)
+    }
+}
+
+static AUTHORIZED_DIALOG_PATHS: OnceLock<StdMutex<AuthorizedDialogPathRegistry>> = OnceLock::new();
+
+fn authorized_dialog_registry() -> &'static StdMutex<AuthorizedDialogPathRegistry> {
+    AUTHORIZED_DIALOG_PATHS
+        .get_or_init(|| StdMutex::new(AuthorizedDialogPathRegistry::new(MAX_AUTHORIZED_DIALOG_PATHS)))
+}
+
+fn normalize_dialog_path_key(path: &Path) -> String {
+    let resolved = if path.exists() {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    } else if let Some(file_name) = path.file_name() {
+        let parent_dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+        if let Ok(canon_parent) = std::fs::canonicalize(&parent_dir) {
+            canon_parent.join(file_name)
+        } else if path.is_relative() {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        } else {
+            path.to_path_buf()
+        }
+    } else {
+        path.to_path_buf()
+    };
+
+    let raw_str = resolved.to_string_lossy().into_owned();
+    #[cfg(target_os = "windows")]
+    {
+        let stripped = if is_windows_verbatim_disk_prefix(&raw_str) {
+            &raw_str[4..]
+        } else {
+            raw_str.as_str()
+        };
+        stripped.replace('/', "\\").to_ascii_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        raw_str
+    }
+}
+
+pub(crate) fn register_authorized_dialog_path(path: &Path) {
+    let key = normalize_dialog_path_key(path);
+    let mut guard = authorized_dialog_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.register(key);
+}
+
+fn is_authorized_dialog_path(path: &Path) -> bool {
+    let key = normalize_dialog_path_key(path);
+    let guard = authorized_dialog_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.contains(&key)
+}
 
 fn is_reserved_dos_device_name(component: &str) -> bool {
     let stem = component
@@ -620,6 +716,7 @@ pub(crate) fn validate_user_file_path(
     raw_path: &str,
     allowed_extensions: Option<&[&str]>,
     must_exist: bool,
+    require_dialog_token: bool,
 ) -> Result<PathBuf, ProxyError> {
     if raw_path.contains('\0') {
         return Err(ProxyError::Custom(
@@ -706,6 +803,12 @@ pub(crate) fn validate_user_file_path(
             "Использование зарезервированного имени устройства ОС '{file_name}' запрещено."
         )));
     }
+    if require_dialog_token && !is_authorized_dialog_path(&path) {
+        return Err(ProxyError::Custom(
+            "Доступ к файлу запрещён: путь должен быть выбран через системный диалог файла."
+                .into(),
+        ));
+    }
     if path.is_dir() {
         return Err(ProxyError::Custom(format!(
             "Указанный путь является каталогом: {}",
@@ -750,8 +853,12 @@ pub async fn export_sessions_file(
     sanitization: Option<SanitizationOptions>,
     state: State<'_, AppState>,
 ) -> Result<usize, ProxyError> {
-    let validated_path =
-        validate_user_file_path(&file_path, Some(&["har", "saz", "json", "txt", "raw"]), false)?;
+    let validated_path = validate_user_file_path(
+        &file_path,
+        Some(&["har", "saz", "json", "txt", "raw"]),
+        false,
+        true,
+    )?;
     let fmt_clean = format.trim().trim_start_matches('.').to_ascii_lowercase();
     if !fmt_clean.is_empty() {
         let ext = validated_path
@@ -794,7 +901,7 @@ pub async fn import_sessions_file(
     state: State<'_, AppState>,
 ) -> Result<Vec<SessionSummary>, ProxyError> {
     let validated_path =
-        validate_user_file_path(&file_path, Some(&["har", "saz", "json", "zip"]), true)?;
+        validate_user_file_path(&file_path, Some(&["har", "saz", "json", "zip"]), true, true)?;
     let store = state.controller.context.store.clone();
     let event_tx = state.controller.context.event_tx.clone();
     let summaries = tokio::task::spawn_blocking(move || {
@@ -844,7 +951,7 @@ pub async fn save_session_body_file(
     file_path: String,
     state: State<'_, AppState>,
 ) -> Result<usize, ProxyError> {
-    let validated_path = validate_user_file_path(&file_path, None, false)?;
+    let validated_path = validate_user_file_path(&file_path, None, false, true)?;
     let store = state.controller.context.store.clone();
     tokio::task::spawn_blocking(move || {
         let bytes = store.extract_raw_body_bytes(session_id, is_response)?;
@@ -860,12 +967,26 @@ pub async fn export_settings_file(
     contents: String,
 ) -> Result<usize, ProxyError> {
     let validated_path =
-        validate_user_file_path(&file_path, Some(&["json", "yaml", "yml"]), false)?;
+        validate_user_file_path(&file_path, Some(&["json", "yaml", "yml"]), false, true)?;
     tokio::task::spawn_blocking(move || {
         write_raw_bytes_to_file(&validated_path, contents.as_bytes())
     })
     .await
     .map_err(|e| ProxyError::Custom(format!("Export settings task join error: {e}")))?
+}
+
+#[tauri::command]
+pub async fn export_text_file(
+    file_path: String,
+    contents: String,
+) -> Result<usize, ProxyError> {
+    let validated_path =
+        validate_user_file_path(&file_path, Some(ALLOWED_TEXT_EXPORT_EXTENSIONS), false, true)?;
+    tokio::task::spawn_blocking(move || {
+        write_raw_bytes_to_file(&validated_path, contents.as_bytes())
+    })
+    .await
+    .map_err(|e| ProxyError::Custom(format!("Export text file task join error: {e}")))?
 }
 
 fn read_bounded_settings_file(path: &Path) -> Result<String, ProxyError> {
@@ -889,7 +1010,7 @@ fn read_bounded_settings_file(path: &Path) -> Result<String, ProxyError> {
 
 #[tauri::command]
 pub async fn import_settings_file(file_path: String) -> Result<String, ProxyError> {
-    let validated_path = validate_user_file_path(&file_path, Some(&["json"]), true)?;
+    let validated_path = validate_user_file_path(&file_path, Some(&["json"]), true, true)?;
     tokio::task::spawn_blocking(move || read_bounded_settings_file(&validated_path))
         .await
         .map_err(|e| ProxyError::Custom(format!("Import settings task join error: {e}")))?
@@ -1022,19 +1143,20 @@ mod tests {
 
     #[test]
     fn validates_user_file_paths_and_extensions() {
-        assert!(validate_user_file_path("", Some(&["har"]), false).is_err());
-        assert!(validate_user_file_path("   ", None, false).is_err());
-        assert!(validate_user_file_path("capture.har\0.exe", Some(&["har"]), false).is_err());
-        assert!(validate_user_file_path("some/dir/", None, false).is_err());
-        assert!(validate_user_file_path("some/dir/..", None, false).is_err());
-        assert!(validate_user_file_path("capture.exe", Some(&["har", "saz"]), false).is_err());
-        assert!(validate_user_file_path("capture", Some(&["har", "saz"]), false).is_err());
+        assert!(validate_user_file_path("", Some(&["har"]), false, false).is_err());
+        assert!(validate_user_file_path("   ", None, false, false).is_err());
+        assert!(validate_user_file_path("capture.har\0.exe", Some(&["har"]), false, false).is_err());
+        assert!(validate_user_file_path("some/dir/", None, false, false).is_err());
+        assert!(validate_user_file_path("some/dir/..", None, false, false).is_err());
+        assert!(validate_user_file_path("capture.exe", Some(&["har", "saz"]), false, false).is_err());
+        assert!(validate_user_file_path("capture", Some(&["har", "saz"]), false, false).is_err());
 
-        let valid_har = validate_user_file_path("exports/trace.HAR", Some(&["har", "saz"]), false)
-            .expect("valid extension case-insensitive");
+        let valid_har =
+            validate_user_file_path("exports/trace.HAR", Some(&["har", "saz"]), false, false)
+                .expect("valid extension case-insensitive");
         assert!(valid_har.ends_with("trace.HAR"));
 
-        let valid_body = validate_user_file_path("payload.bin", None, false)
+        let valid_body = validate_user_file_path("payload.bin", None, false, false)
             .expect("unrestricted save body path");
         assert!(valid_body.ends_with("payload.bin"));
     }
@@ -1042,27 +1164,38 @@ mod tests {
     #[test]
     fn sec02_rejects_parent_traversal_unc_ntfs_ads_and_dos_device_names() {
         // 1. Parent directory traversal
-        assert!(validate_user_file_path("a/../../etc/passwd", None, false).is_err());
-        assert!(validate_user_file_path("../a.json", Some(&["json"]), false).is_err());
-        assert!(validate_user_file_path("a/b/../c.json", Some(&["json"]), false).is_err());
-        assert!(validate_user_file_path(r"a\..\b.json", Some(&["json"]), false).is_err());
+        assert!(validate_user_file_path("a/../../etc/passwd", None, false, false).is_err());
+        assert!(validate_user_file_path("../a.json", Some(&["json"]), false, false).is_err());
+        assert!(validate_user_file_path("a/b/../c.json", Some(&["json"]), false, false).is_err());
+        assert!(validate_user_file_path(r"a\..\b.json", Some(&["json"]), false, false).is_err());
 
         // 2. UNC & device namespaces
         assert!(
-            validate_user_file_path(r"\\attacker\share\a.json", Some(&["json"]), false).is_err()
-        );
-        assert!(
-            validate_user_file_path("//attacker/share/a.json", Some(&["json"]), false).is_err()
-        );
-        assert!(
-            validate_user_file_path(r"\\?\UNC\attacker\share\a.json", Some(&["json"]), false)
+            validate_user_file_path(r"\\attacker\share\a.json", Some(&["json"]), false, false)
                 .is_err()
         );
-        assert!(validate_user_file_path(r"\\.\pipe\a.json", Some(&["json"]), false).is_err());
+        assert!(
+            validate_user_file_path("//attacker/share/a.json", Some(&["json"]), false, false)
+                .is_err()
+        );
+        assert!(
+            validate_user_file_path(
+                r"\\?\UNC\attacker\share\a.json",
+                Some(&["json"]),
+                false,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_user_file_path(r"\\.\pipe\a.json", Some(&["json"]), false, false).is_err()
+        );
 
         // 3. NTFS Alternate Data Streams (:)
-        assert!(validate_user_file_path("file.json:ads", None, false).is_err());
-        assert!(validate_user_file_path("dir:ads/file.json", Some(&["json"]), false).is_err());
+        assert!(validate_user_file_path("file.json:ads", None, false, false).is_err());
+        assert!(
+            validate_user_file_path("dir:ads/file.json", Some(&["json"]), false, false).is_err()
+        );
 
         // 4. Reserved DOS device names
         for reserved in [
@@ -1078,7 +1211,7 @@ mod tests {
             "dir/CON.json",
         ] {
             assert!(
-                validate_user_file_path(reserved, None, false).is_err(),
+                validate_user_file_path(reserved, None, false, false).is_err(),
                 "must reject reserved DOS device path: {reserved}"
             );
         }
@@ -1086,7 +1219,7 @@ mod tests {
         // 5. Legitimate lookalike filenames remain accepted
         for safe in ["config.json", "console.har", "null.json", "com10.json"] {
             assert!(
-                validate_user_file_path(safe, None, false).is_ok(),
+                validate_user_file_path(safe, None, false, false).is_ok(),
                 "must allow safe lookalike path: {safe}"
             );
         }
@@ -1107,6 +1240,7 @@ mod tests {
             &small_path.display().to_string(),
             Some(&["json"]),
             true,
+            false,
         )
         .unwrap();
         let content = read_bounded_settings_file(&validated_small).unwrap();
@@ -1121,11 +1255,112 @@ mod tests {
             &huge_path.display().to_string(),
             Some(&["json"]),
             true,
+            false,
         )
         .unwrap();
         let err = read_bounded_settings_file(&validated_huge)
             .expect_err("must reject settings file exceeding 16 MiB");
         assert!(err.to_string().contains("превышает допустимый лимит"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sec04_authorized_dialog_registry_enforces_fifo_capacity_128() {
+        use super::{AuthorizedDialogPathRegistry, MAX_AUTHORIZED_DIALOG_PATHS};
+
+        assert_eq!(MAX_AUTHORIZED_DIALOG_PATHS, 128);
+        let mut reg = AuthorizedDialogPathRegistry::new(MAX_AUTHORIZED_DIALOG_PATHS);
+
+        for i in 0..130 {
+            reg.register(format!("c:\\tmp\\export_{i}.txt"));
+        }
+
+        assert!(!reg.contains("c:\\tmp\\export_0.txt"));
+        assert!(!reg.contains("c:\\tmp\\export_1.txt"));
+        for i in 2..130 {
+            assert!(
+                reg.contains(&format!("c:\\tmp\\export_{i}.txt")),
+                "expected entry {i} to remain in bounded FIFO registry"
+            );
+        }
+
+        // Re-registering an existing path refreshes its FIFO position without duplicating
+        reg.register("c:\\tmp\\export_2.txt".to_string());
+        reg.register("c:\\tmp\\export_130.txt".to_string());
+        assert!(reg.contains("c:\\tmp\\export_2.txt"));
+        assert!(!reg.contains("c:\\tmp\\export_3.txt"));
+    }
+
+    #[tokio::test]
+    async fn sec04_dialog_tokens_and_export_text_file_enforce_authorization_and_extensions() {
+        use super::{
+            export_text_file, register_authorized_dialog_path, validate_user_file_path,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "fluxproxy_sec04_dialog_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let unauthorized_txt = dir.join("unauthorized.txt");
+        assert!(validate_user_file_path(
+            &unauthorized_txt.display().to_string(),
+            Some(&["txt"]),
+            false,
+            true
+        )
+        .is_err());
+
+        let unauth_export = export_text_file(
+            unauthorized_txt.display().to_string(),
+            "secret".to_string(),
+        )
+        .await;
+        assert!(
+            unauth_export.is_err(),
+            "export_text_file must reject unregistered paths"
+        );
+        assert!(!unauthorized_txt.exists());
+
+        // Authorized text export extensions succeed
+        for (ext, content) in [
+            ("txt", "plain text report"),
+            ("md", "# Markdown Report"),
+            ("json", "{\"openapi\":\"3.0.3\"}"),
+            ("yaml", "openapi: 3.0.3\n"),
+            ("yml", "openapi: 3.0.3\n"),
+        ] {
+            let p = dir.join(format!("authorized.{ext}"));
+            register_authorized_dialog_path(&p);
+            let written = export_text_file(p.display().to_string(), content.to_string())
+                .await
+                .unwrap_or_else(|e| panic!("expected .{ext} export to succeed: {e}"));
+            assert_eq!(written, content.len());
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), content);
+        }
+
+        // Disallowed extensions (.bat, .exe, .ps1) must be rejected even if registered in dialog cache
+        for bad_ext in ["bat", "exe", "ps1"] {
+            let bad_path = dir.join(format!("payload.{bad_ext}"));
+            register_authorized_dialog_path(&bad_path);
+            let err = export_text_file(bad_path.display().to_string(), "echo pwn".to_string())
+                .await
+                .expect_err("disallowed extension must fail");
+            assert!(err.to_string().contains("Недопустимое расширение файла"));
+            assert!(!bad_path.exists());
+        }
+
+        // Case/slash normalization test on Windows (and exact path on Unix)
+        let norm_target = dir.join("mixed_Case_Report.MD");
+        register_authorized_dialog_path(&norm_target);
+        #[cfg(target_os = "windows")]
+        let variant = norm_target.display().to_string().replace('\\', "/").to_uppercase();
+        #[cfg(not(target_os = "windows"))]
+        let variant = norm_target.display().to_string();
+        assert!(validate_user_file_path(&variant, Some(&["md"]), false, true).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

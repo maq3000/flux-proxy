@@ -25,6 +25,7 @@ use tower_service::Service;
 
 use crate::models::{HeaderPair, UpstreamProxyProtocol};
 use crate::proxy::hosts::HostRemapRegistry;
+use crate::proxy::server::{is_loopback_or_unspecified_host, validate_resolved_addrs_for_peer};
 use crate::proxy::upstream_proxy::{
     connect_http_proxy_direct, connect_tunnel_via_upstream, format_via_proxy_telemetry,
     proxy_authorization_header_value, UpstreamProxyManager, UpstreamTransportStream,
@@ -335,11 +336,30 @@ impl Connection for InstrumentedStream {
 }
 
 #[derive(Debug)]
-pub struct UpstreamConnectorError(pub String);
+pub struct UpstreamConnectorError {
+    pub message: String,
+    pub forbidden: bool,
+}
+
+impl UpstreamConnectorError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            forbidden: false,
+        }
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            forbidden: true,
+        }
+    }
+}
 
 impl std::fmt::Display for UpstreamConnectorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -352,6 +372,7 @@ pub struct InstrumentedConnector {
     upstream_proxy: Option<Arc<UpstreamProxyManager>>,
     connect_timeout_sec: Arc<AtomicU64>,
     mtls_cn: Option<String>,
+    peer_is_remote: bool,
 }
 
 impl InstrumentedConnector {
@@ -360,6 +381,7 @@ impl InstrumentedConnector {
         upstream_proxy: Option<Arc<UpstreamProxyManager>>,
         client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, String)>,
         connect_timeout_sec: Arc<AtomicU64>,
+        peer_is_remote: bool,
     ) -> Result<Self, String> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let roots = default_root_store();
@@ -386,6 +408,7 @@ impl InstrumentedConnector {
             upstream_proxy,
             connect_timeout_sec,
             mtls_cn,
+            peer_is_remote,
         })
     }
 }
@@ -420,6 +443,59 @@ fn extract_tls_conn_details(conn_info: &rustls::ClientConnection) -> TlsConnDeta
     }
 }
 
+async fn resolve_and_validate_addrs(
+    connect_host: &str,
+    connect_port: u16,
+    connect_timeout: Duration,
+    dns_timeout: Duration,
+    peer_is_remote: bool,
+) -> Result<(Vec<SocketAddr>, f64), UpstreamConnectorError> {
+    let (addrs, dns_ms): (Vec<SocketAddr>, f64) =
+        if let Ok(ip) = connect_host.parse::<IpAddr>() {
+            (vec![SocketAddr::new(ip, connect_port)], 0.0)
+        } else {
+            if dns_timeout.is_zero() {
+                return Err(UpstreamConnectorError::new(format!(
+                    "DNS lookup timed out after {} s connect deadline for {connect_host}:{connect_port}",
+                    connect_timeout.as_secs()
+                )));
+            }
+            let dns_start = Instant::now();
+            let resolved_iter = tokio::time::timeout(
+                dns_timeout,
+                tokio::net::lookup_host((connect_host, connect_port)),
+            )
+            .await
+            .map_err(|_| {
+                UpstreamConnectorError::new(format!(
+                    "DNS lookup timed out after {} s connect deadline for {connect_host}:{connect_port}",
+                    connect_timeout.as_secs()
+                ))
+            })?
+            .map_err(|e| {
+                UpstreamConnectorError::new(format!(
+                    "DNS lookup failed for {connect_host}:{connect_port}: {e}"
+                ))
+            })?;
+            let collected: Vec<SocketAddr> = resolved_iter.collect();
+            if collected.is_empty() {
+                return Err(UpstreamConnectorError::new(format!(
+                    "DNS lookup returned no addresses for {connect_host}:{connect_port}"
+                )));
+            }
+            (collected, elapsed_ms(dns_start))
+        };
+
+    validate_resolved_addrs_for_peer(
+        &addrs,
+        peer_is_remote,
+        &format!("{connect_host}:{connect_port}"),
+    )
+    .map_err(UpstreamConnectorError::forbidden)?;
+
+    Ok((addrs, dns_ms))
+}
+
 impl Service<Uri> for InstrumentedConnector {
     type Response = InstrumentedStream;
     type Error = UpstreamConnectorError;
@@ -436,6 +512,7 @@ impl Service<Uri> for InstrumentedConnector {
         let connect_timeout_sec = self.connect_timeout_sec.load(Ordering::Relaxed).max(1);
         let connect_timeout = Duration::from_secs(connect_timeout_sec);
         let mtls_cn = self.mtls_cn.clone();
+        let peer_is_remote = self.peer_is_remote;
 
         Box::pin(async move {
             let connect_deadline = Instant::now() + connect_timeout;
@@ -443,7 +520,7 @@ impl Service<Uri> for InstrumentedConnector {
             let is_tls = scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss");
             let orig_host = dst
                 .host()
-                .ok_or_else(|| UpstreamConnectorError(format!("Missing host in URI: {dst}")))?
+                .ok_or_else(|| UpstreamConnectorError::new(format!("Missing host in URI: {dst}")))?
                 .to_string();
             let orig_port = dst
                 .port_u16()
@@ -451,7 +528,7 @@ impl Service<Uri> for InstrumentedConnector {
             let remaining_connect_budget = |phase: &str| -> Result<Duration, UpstreamConnectorError> {
                 let remaining = connect_deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    Err(UpstreamConnectorError(format!(
+                    Err(UpstreamConnectorError::new(format!(
                         "{phase} timed out after {} s connect deadline for {orig_host}:{orig_port}",
                         connect_timeout.as_secs()
                     )))
@@ -461,6 +538,14 @@ impl Service<Uri> for InstrumentedConnector {
             };
 
             let remap_rule = host_remap.as_ref().and_then(|reg| reg.match_host(&orig_host));
+            if let Some(ref rule) = remap_rule {
+                if peer_is_remote && is_loopback_or_unspecified_host(&rule.target_host) {
+                    return Err(UpstreamConnectorError::forbidden(format!(
+                        "Forbidden: remote LAN clients cannot connect via HOSTS Remapping to loopback or unspecified host '{}'",
+                        rule.target_host
+                    )));
+                }
+            }
             let (connect_host, connect_port, remapped_target) = if let Some(ref rule) = remap_rule
             {
                 let target_port = rule.target_port.unwrap_or(orig_port);
@@ -477,6 +562,12 @@ impl Service<Uri> for InstrumentedConnector {
                     None,
                 )
             };
+
+            if peer_is_remote && is_loopback_or_unspecified_host(&connect_host) {
+                return Err(UpstreamConnectorError::forbidden(format!(
+                    "Forbidden: remote LAN clients cannot connect to loopback or unspecified host '{connect_host}'"
+                )));
+            }
 
             let active_proxy = upstream_proxy.as_ref().and_then(|mgr| {
                 mgr.resolve_for_target(
@@ -506,7 +597,7 @@ impl Service<Uri> for InstrumentedConnector {
                         )
                         .await
                     }
-                    .map_err(UpstreamConnectorError)?;
+                    .map_err(UpstreamConnectorError::new)?;
 
                     let (via_proxy_addr, via_server_ip) =
                         format_via_proxy_telemetry(proxy_cfg.protocol, tunnel.proxy_addr);
@@ -547,11 +638,11 @@ impl Service<Uri> for InstrumentedConnector {
                     tunnel_timeout,
                 )
                 .await
-                .map_err(UpstreamConnectorError)?;
+                .map_err(UpstreamConnectorError::new)?;
 
                 let sni_clean = orig_host.trim_matches(['[', ']']).to_string();
                 let server_name = ServerName::try_from(sni_clean.clone()).map_err(|_| {
-                    UpstreamConnectorError(format!("Invalid TLS ServerName for '{sni_clean}'"))
+                    UpstreamConnectorError::new(format!("Invalid TLS ServerName for '{sni_clean}'"))
                 })?;
 
                 let tls_timeout = remaining_connect_budget("TLS handshake via upstream proxy")?;
@@ -563,13 +654,13 @@ impl Service<Uri> for InstrumentedConnector {
                 )
                 .await
                 .map_err(|_| {
-                    UpstreamConnectorError(format!(
+                    UpstreamConnectorError::new(format!(
                         "TLS handshake timed out via upstream proxy after {} s connect deadline for {orig_host}:{orig_port}",
                         connect_timeout.as_secs()
                     ))
                 })?
                 .map_err(|e| {
-                    UpstreamConnectorError(format!(
+                    UpstreamConnectorError::new(format!(
                         "TLS handshake failed via upstream proxy for {orig_host}:{orig_port}: {e}"
                     ))
                 })?;
@@ -614,37 +705,19 @@ impl Service<Uri> for InstrumentedConnector {
             }
 
             // 1. DNS Resolution phase
-            let (addrs, dns_ms): (Vec<SocketAddr>, f64) =
-                if let Ok(ip) = connect_host.parse::<IpAddr>() {
-                    (vec![SocketAddr::new(ip, connect_port)], 0.0)
-                } else {
-                    let dns_timeout = remaining_connect_budget("DNS lookup")?;
-                    let dns_start = Instant::now();
-                    let resolved_iter =
-                        tokio::time::timeout(
-                            dns_timeout,
-                            tokio::net::lookup_host((connect_host.as_str(), connect_port)),
-                        )
-                        .await
-                        .map_err(|_| {
-                            UpstreamConnectorError(format!(
-                                "DNS lookup timed out after {} s connect deadline for {connect_host}:{connect_port}",
-                                connect_timeout.as_secs()
-                            ))
-                        })?
-                        .map_err(|e| {
-                            UpstreamConnectorError(format!(
-                                "DNS lookup failed for {connect_host}:{connect_port}: {e}"
-                            ))
-                        })?;
-                    let collected: Vec<SocketAddr> = resolved_iter.collect();
-                    if collected.is_empty() {
-                        return Err(UpstreamConnectorError(format!(
-                            "DNS lookup returned no addresses for {connect_host}:{connect_port}"
-                        )));
-                    }
-                    (collected, elapsed_ms(dns_start))
-                };
+            let dns_timeout = if connect_host.parse::<IpAddr>().is_ok() {
+                Duration::from_millis(1)
+            } else {
+                remaining_connect_budget("DNS lookup")?
+            };
+            let (addrs, dns_ms) = resolve_and_validate_addrs(
+                &connect_host,
+                connect_port,
+                connect_timeout,
+                dns_timeout,
+                peer_is_remote,
+            )
+            .await?;
 
             // 2. TCP Connect phase
             let tcp_start = Instant::now();
@@ -679,7 +752,7 @@ impl Service<Uri> for InstrumentedConnector {
             }
 
             let tcp_stream = tcp_stream_opt.ok_or_else(|| {
-                UpstreamConnectorError(format!(
+                UpstreamConnectorError::new(format!(
                     "TCP connect failed for {connect_host}:{connect_port}: {}",
                     last_tcp_err.unwrap_or_else(|| "no reachable address".to_string())
                 ))
@@ -724,7 +797,7 @@ impl Service<Uri> for InstrumentedConnector {
             // 3. TLS Handshake phase (preserving original URI hostname for SNI!)
             let sni_clean = orig_host.trim_matches(['[', ']']).to_string();
             let server_name = ServerName::try_from(sni_clean.clone()).map_err(|_| {
-                UpstreamConnectorError(format!("Invalid TLS ServerName for '{sni_clean}'"))
+                UpstreamConnectorError::new(format!("Invalid TLS ServerName for '{sni_clean}'"))
             })?;
 
             let tls_timeout = remaining_connect_budget("TLS handshake")?;
@@ -736,13 +809,15 @@ impl Service<Uri> for InstrumentedConnector {
             )
             .await
             .map_err(|_| {
-                UpstreamConnectorError(format!(
+                UpstreamConnectorError::new(format!(
                     "TLS handshake timed out after {} s connect deadline for {orig_host}:{orig_port}",
                     connect_timeout.as_secs()
                 ))
             })?
             .map_err(|e| {
-                UpstreamConnectorError(format!("TLS handshake failed for {orig_host}:{orig_port}: {e}"))
+                UpstreamConnectorError::new(format!(
+                    "TLS handshake failed for {orig_host}:{orig_port}: {e}"
+                ))
             })?;
             let tls_handshake_ms = Some(elapsed_ms(tls_start));
             let now_instant = Instant::now();
@@ -936,6 +1011,7 @@ impl Drop for TrackedResponseBody {
 #[derive(Debug)]
 pub enum UpstreamClientError {
     InvalidRequest(String),
+    Forbidden(String),
     Connect(String),
     Timeout(String),
     Transport(String),
@@ -945,6 +1021,7 @@ impl std::fmt::Display for UpstreamClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidRequest(msg)
+            | Self::Forbidden(msg)
             | Self::Connect(msg)
             | Self::Timeout(msg)
             | Self::Transport(msg) => f.write_str(msg),
@@ -963,6 +1040,7 @@ impl UpstreamClientError {
         match self {
             Self::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
             Self::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Connect(_) | Self::Transport(_) => StatusCode::BAD_GATEWAY,
         }
     }
@@ -970,6 +1048,7 @@ impl UpstreamClientError {
     pub fn proxy_error_code(&self) -> &'static str {
         match self {
             Self::Timeout(_) => "upstream-response-timeout",
+            Self::Forbidden(_) => "forbidden-remote-target",
             Self::Connect(msg) => {
                 if msg.to_ascii_lowercase().contains("timed out") {
                     "upstream-connect-timeout"
@@ -1005,6 +1084,7 @@ pub struct UpstreamHttpClient {
     mtls_cn: Option<String>,
     host_remap: Option<Arc<HostRemapRegistry>>,
     upstream_proxy: Option<Arc<UpstreamProxyManager>>,
+    peer_is_remote: bool,
 }
 
 impl UpstreamHttpClient {
@@ -1013,6 +1093,7 @@ impl UpstreamHttpClient {
         upstream_proxy: Option<Arc<UpstreamProxyManager>>,
         client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, String)>,
         connect_timeout_sec: Arc<AtomicU64>,
+        peer_is_remote: bool,
     ) -> Result<Self, String> {
         let mtls_cn = client_auth.as_ref().map(|(_, _, cn)| cn.clone());
         let connector = InstrumentedConnector::new(
@@ -1020,6 +1101,7 @@ impl UpstreamHttpClient {
             upstream_proxy.clone(),
             client_auth,
             connect_timeout_sec,
+            peer_is_remote,
         )?;
         let client = Client::builder(TokioExecutor::new())
             .timer(TokioTimer::new())
@@ -1035,6 +1117,7 @@ impl UpstreamHttpClient {
             mtls_cn,
             host_remap,
             upstream_proxy,
+            peer_is_remote,
         })
     }
 
@@ -1044,6 +1127,10 @@ impl UpstreamHttpClient {
 
     pub fn host_remap(&self) -> Option<&Arc<HostRemapRegistry>> {
         self.host_remap.as_ref()
+    }
+
+    pub fn peer_is_remote(&self) -> bool {
+        self.peer_is_remote
     }
 
     pub async fn send_request(
@@ -1097,6 +1184,14 @@ impl UpstreamHttpClient {
                             proxy_auth_header = proxy_authorization_header_value(&proxy_cfg);
                         }
                         if let Some(rule) = remap_rule {
+                            if self.peer_is_remote
+                                && is_loopback_or_unspecified_host(&rule.target_host)
+                            {
+                                return Err(UpstreamClientError::Forbidden(format!(
+                                    "Forbidden: remote LAN clients cannot connect via HOSTS Remapping to loopback or unspecified host '{}'",
+                                    rule.target_host
+                                )));
+                            }
                             let target_port = rule.target_port.unwrap_or(orig_port);
                             let target_host_fmt =
                                 HostRemapRegistry::format_host_for_authority(&rule.target_host);
@@ -1165,6 +1260,9 @@ impl UpstreamHttpClient {
         let response = match req_result {
             Ok(Ok(resp)) => resp,
             Ok(Err(err)) => {
+                if let Some(forbidden_msg) = find_forbidden_connector_error(&err) {
+                    return Err(UpstreamClientError::Forbidden(forbidden_msg));
+                }
                 let chain = format_hyper_client_error(&err);
                 if err.is_connect() {
                     return Err(UpstreamClientError::Connect(chain));
@@ -1388,6 +1486,19 @@ impl UpstreamHttpClient {
     }
 }
 
+fn find_forbidden_connector_error(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(source) = current {
+        if let Some(conn_err) = source.downcast_ref::<UpstreamConnectorError>() {
+            if conn_err.forbidden {
+                return Some(conn_err.message.clone());
+            }
+        }
+        current = source.source();
+    }
+    None
+}
+
 fn format_hyper_client_error(err: &dyn std::error::Error) -> String {
     let mut parts = vec![err.to_string()];
     let mut current = err.source();
@@ -1476,6 +1587,7 @@ mod tests {
             None,
             None,
             Arc::new(AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_SEC)),
+            false,
         )
         .unwrap();
         let url = format!("http://{addr}/hello");
@@ -1581,6 +1693,7 @@ mod tests {
             None,
             None,
             Arc::new(AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_SEC)),
+            false,
         )
         .unwrap();
         let headers = vec![("Host".to_string(), addr_a.to_string())];
@@ -1721,6 +1834,7 @@ mod tests {
             Some(Arc::clone(&upstream_proxy)),
             None,
             Arc::new(AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_SEC)),
+            false,
         )
         .unwrap();
 
@@ -1870,6 +1984,7 @@ mod tests {
             None,
             None,
             Arc::new(AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_SEC)),
+            false,
         )
         .unwrap();
         let url = format!("http://{addr}/slow-500");
@@ -1912,7 +2027,7 @@ mod tests {
             }
         });
 
-        let client = UpstreamHttpClient::build(None, None, None, Arc::new(AtomicU64::new(1))).unwrap();
+        let client = UpstreamHttpClient::build(None, None, None, Arc::new(AtomicU64::new(1)), false).unwrap();
         let url = format!("https://{addr}/tls-stall");
 
         let started = Instant::now();
@@ -1928,5 +2043,139 @@ mod tests {
         assert_eq!(err.status_hint(), StatusCode::BAD_GATEWAY);
         assert_eq!(err.proxy_error_code(), "upstream-connect-timeout");
         assert!(err.to_string().to_ascii_lowercase().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn sec01_remote_connector_blocks_dns_to_loopback_and_hosts_remap_to_loopback() {
+        use crate::models::HostRemapRule;
+        use http_body_util::BodyExt;
+
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_srv = Arc::clone(&accepted);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted_srv.fetch_add(1, Ordering::Relaxed);
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(|_req: Request<Incoming>| async move {
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"local-secret"))))
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        // 1. Post-lookup_host check directly rejects DNS resolving to loopback for remote peers
+        let dns_err = resolve_and_validate_addrs(
+            "localhost",
+            addr.port(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            true,
+        )
+        .await
+        .expect_err("remote peer DNS resolution to loopback must be forbidden");
+        assert!(dns_err.forbidden);
+        assert!(dns_err.to_string().contains("Forbidden"));
+
+        // 2. Remote UpstreamHttpClient rejects http://localhost:<port>/ with Forbidden without touching socket
+        let remote_client = UpstreamHttpClient::build(
+            None,
+            None,
+            None,
+            Arc::new(AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_SEC)),
+            true,
+        )
+        .unwrap();
+        assert!(remote_client.peer_is_remote());
+
+        let remote_err = match remote_client
+            .send_request(
+                Method::GET,
+                &format!("http://localhost:{}/secret", addr.port()),
+                &[],
+                None,
+                Bytes::new(),
+                Some(Duration::from_secs(3)),
+            )
+            .await
+        {
+            Ok(_) => panic!("remote client must not connect to localhost"),
+            Err(e) => e,
+        };
+        assert!(matches!(remote_err, UpstreamClientError::Forbidden(_)));
+        assert_eq!(remote_err.status_hint(), StatusCode::FORBIDDEN);
+        assert_eq!(remote_err.proxy_error_code(), "forbidden-remote-target");
+        assert_eq!(accepted.load(Ordering::Relaxed), 0);
+
+        // 3. Remote client with HOSTS Remapping targeting 127.0.0.1 is rejected with Forbidden, while local client succeeds
+        let host_remap = Arc::new(HostRemapRegistry::new());
+        host_remap
+            .set_rules(vec![HostRemapRule {
+                id: "remap-loopback".into(),
+                enabled: true,
+                source_pattern: "remapped-local.example".into(),
+                target_host: "127.0.0.1".into(),
+                target_port: Some(addr.port()),
+                preserve_host_header: true,
+                comment: String::new(),
+            }])
+            .unwrap();
+
+        let remote_remap_client = UpstreamHttpClient::build(
+            Some(Arc::clone(&host_remap)),
+            None,
+            None,
+            Arc::new(AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_SEC)),
+            true,
+        )
+        .unwrap();
+        let remap_err = match remote_remap_client
+            .send_request(
+                Method::GET,
+                "http://remapped-local.example/secret",
+                &[],
+                None,
+                Bytes::new(),
+                Some(Duration::from_secs(3)),
+            )
+            .await
+        {
+            Ok(_) => panic!("remote client must not connect via HOSTS Remapping to 127.0.0.1"),
+            Err(e) => e,
+        };
+        assert!(matches!(remap_err, UpstreamClientError::Forbidden(_)));
+        assert_eq!(remap_err.status_hint(), StatusCode::FORBIDDEN);
+        assert_eq!(accepted.load(Ordering::Relaxed), 0);
+
+        let local_remap_client = UpstreamHttpClient::build(
+            Some(host_remap),
+            None,
+            None,
+            Arc::new(AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_SEC)),
+            false,
+        )
+        .unwrap();
+        assert!(!local_remap_client.peer_is_remote());
+        let ok_resp = local_remap_client
+            .send_request(
+                Method::GET,
+                "http://remapped-local.example/secret",
+                &[],
+                None,
+                Bytes::new(),
+                Some(Duration::from_secs(3)),
+            )
+            .await
+            .expect("local loopback client must succeed");
+        assert_eq!(ok_resp.response.status(), StatusCode::OK);
+        let body = ok_resp.response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from_static(b"local-secret"));
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
     }
 }
