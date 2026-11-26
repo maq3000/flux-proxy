@@ -365,6 +365,9 @@ impl std::fmt::Display for UpstreamConnectorError {
 
 impl std::error::Error for UpstreamConnectorError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostRemapAlreadyApplied;
+
 #[derive(Clone)]
 pub struct InstrumentedConnector {
     tls_config: Arc<rustls::ClientConfig>,
@@ -373,6 +376,7 @@ pub struct InstrumentedConnector {
     connect_timeout_sec: Arc<AtomicU64>,
     mtls_cn: Option<String>,
     peer_is_remote: bool,
+    skip_host_remap: bool,
 }
 
 impl InstrumentedConnector {
@@ -409,7 +413,13 @@ impl InstrumentedConnector {
             connect_timeout_sec,
             mtls_cn,
             peer_is_remote,
+            skip_host_remap: false,
         })
+    }
+
+    pub(crate) fn with_skip_host_remap(mut self, skip: bool) -> Self {
+        self.skip_host_remap = skip;
+        self
     }
 }
 
@@ -513,6 +523,7 @@ impl Service<Uri> for InstrumentedConnector {
         let connect_timeout = Duration::from_secs(connect_timeout_sec);
         let mtls_cn = self.mtls_cn.clone();
         let peer_is_remote = self.peer_is_remote;
+        let skip_host_remap = self.skip_host_remap;
 
         Box::pin(async move {
             let connect_deadline = Instant::now() + connect_timeout;
@@ -537,7 +548,11 @@ impl Service<Uri> for InstrumentedConnector {
                 }
             };
 
-            let remap_rule = host_remap.as_ref().and_then(|reg| reg.match_host(&orig_host));
+            let remap_rule = if skip_host_remap {
+                None
+            } else {
+                host_remap.as_ref().and_then(|reg| reg.match_host(&orig_host))
+            };
             if let Some(ref rule) = remap_rule {
                 if peer_is_remote && is_loopback_or_unspecified_host(&rule.target_host) {
                     return Err(UpstreamConnectorError::forbidden(format!(
@@ -1081,6 +1096,7 @@ pub struct UpstreamExchange {
 #[derive(Clone)]
 pub struct UpstreamHttpClient {
     client: Client<InstrumentedConnector, TrackedRequestBody>,
+    pre_remapped_client: Client<InstrumentedConnector, TrackedRequestBody>,
     mtls_cn: Option<String>,
     host_remap: Option<Arc<HostRemapRegistry>>,
     upstream_proxy: Option<Arc<UpstreamProxyManager>>,
@@ -1103,6 +1119,7 @@ impl UpstreamHttpClient {
             connect_timeout_sec,
             peer_is_remote,
         )?;
+        let pre_remapped_connector = connector.clone().with_skip_host_remap(true);
         let client = Client::builder(TokioExecutor::new())
             .timer(TokioTimer::new())
             .pool_timer(TokioTimer::new())
@@ -1111,9 +1128,18 @@ impl UpstreamHttpClient {
             .http2_keep_alive_timeout(Duration::from_secs(10))
             .http2_keep_alive_while_idle(true)
             .build(connector);
+        let pre_remapped_client = Client::builder(TokioExecutor::new())
+            .timer(TokioTimer::new())
+            .pool_timer(TokioTimer::new())
+            .pool_idle_timeout(Some(Duration::from_secs(35)))
+            .http2_keep_alive_interval(Some(Duration::from_secs(20)))
+            .http2_keep_alive_timeout(Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
+            .build(pre_remapped_connector);
 
         Ok(Self {
             client,
+            pre_remapped_client,
             mtls_cn,
             host_remap,
             upstream_proxy,
@@ -1137,7 +1163,7 @@ impl UpstreamHttpClient {
         &self,
         method: Method,
         url: &str,
-        headers: &[(String, String)],
+        headers: &[HeaderPair],
         host_header_override: Option<&str>,
         body: Bytes,
         response_timeout: Option<Duration>,
@@ -1153,6 +1179,7 @@ impl UpstreamHttpClient {
         let mut request_uri = uri.clone();
         let mut effective_host_override = host_header_override.map(str::to_owned);
         let mut proxy_auth_header: Option<String> = None;
+        let mut plain_http_remapped = false;
 
         if uri
             .scheme_str()
@@ -1179,7 +1206,7 @@ impl UpstreamHttpClient {
                     ) {
                         if !headers
                             .iter()
-                            .any(|(n, _)| n.eq_ignore_ascii_case(PROXY_AUTHORIZATION.as_str()))
+                            .any(|h| h.name.trim().eq_ignore_ascii_case(PROXY_AUTHORIZATION.as_str()))
                         {
                             proxy_auth_header = proxy_authorization_header_value(&proxy_cfg);
                         }
@@ -1192,6 +1219,7 @@ impl UpstreamHttpClient {
                                     rule.target_host
                                 )));
                             }
+                            plain_http_remapped = true;
                             let target_port = rule.target_port.unwrap_or(orig_port);
                             let target_host_fmt =
                                 HostRemapRegistry::format_host_for_authority(&rule.target_host);
@@ -1210,7 +1238,7 @@ impl UpstreamHttpClient {
                                 if effective_host_override.is_none()
                                     && !headers
                                         .iter()
-                                        .any(|(n, _)| n.eq_ignore_ascii_case(HOST.as_str()))
+                                        .any(|h| h.name.trim().eq_ignore_ascii_case(HOST.as_str()))
                                 {
                                     effective_host_override =
                                         uri.authority().map(|a| a.as_str().to_string());
@@ -1224,22 +1252,40 @@ impl UpstreamHttpClient {
             }
         }
 
+        let body_is_empty = body.is_empty();
+        let method_for_cl = method.clone();
         let (tracked_body, send_tracker) = TrackedRequestBody::new(body);
         let mut builder = Request::builder().method(method).uri(request_uri);
 
-        for (name, value) in headers {
-            if effective_host_override.is_some() && name.eq_ignore_ascii_case(HOST.as_str()) {
+        let mut host_added = false;
+        let mut has_content_length = false;
+        let mut has_transfer_encoding = false;
+        for pair in headers {
+            let trimmed_name = pair.name.trim();
+            if trimmed_name.is_empty() {
+                continue;
+            }
+            if trimmed_name.eq_ignore_ascii_case(HOST.as_str())
+                && (effective_host_override.is_some() || host_added)
+            {
                 continue;
             }
             if let (Ok(hn), Ok(hv)) = (
-                HeaderName::from_bytes(name.as_bytes()),
-                HeaderValue::from_str(value),
+                HeaderName::from_bytes(trimmed_name.as_bytes()),
+                pair.to_hyper_header_value(),
             ) {
+                if hn == HOST {
+                    host_added = true;
+                } else if hn == CONTENT_LENGTH {
+                    has_content_length = true;
+                } else if hn == http::header::TRANSFER_ENCODING {
+                    has_transfer_encoding = true;
+                }
                 builder = builder.header(hn, hv);
             }
         }
         if let Some(host_val) = effective_host_override.as_deref() {
-            if let Ok(hv) = HeaderValue::from_str(host_val) {
+            if let Ok(hv) = HeaderValue::from_bytes(host_val.as_bytes()) {
                 builder = builder.header(HOST, hv);
             }
         }
@@ -1248,14 +1294,30 @@ impl UpstreamHttpClient {
                 builder = builder.header(PROXY_AUTHORIZATION, hv);
             }
         }
+        if body_is_empty
+            && !has_content_length
+            && !has_transfer_encoding
+            && matches!(method_for_cl, Method::POST | Method::PUT | Method::PATCH)
+        {
+            builder = builder.header(CONTENT_LENGTH, HeaderValue::from_static("0"));
+        }
 
-        let req = builder
+        let mut req = builder
             .body(tracked_body)
             .map_err(|e| UpstreamClientError::InvalidRequest(format!("Failed building upstream request: {e}")))?;
 
+        if plain_http_remapped {
+            req.extensions_mut().insert(HostRemapAlreadyApplied);
+        }
+        let target_client = if plain_http_remapped {
+            &self.pre_remapped_client
+        } else {
+            &self.client
+        };
+
         let req_result = match response_timeout {
-            None => Ok(self.client.request(req).await),
-            Some(timeout) => tokio::time::timeout(timeout, self.client.request(req)).await,
+            None => Ok(target_client.request(req).await),
+            Some(timeout) => tokio::time::timeout(timeout, target_client.request(req)).await,
         };
         let response = match req_result {
             Ok(Ok(resp)) => resp,
@@ -1339,7 +1401,7 @@ impl UpstreamHttpClient {
         &self,
         method: Method,
         url: &str,
-        headers: &[(String, String)],
+        headers: &[HeaderPair],
         host_header_override: Option<&str>,
         body: Bytes,
         response_timeout: Option<Duration>,
@@ -1382,7 +1444,7 @@ impl UpstreamHttpClient {
         &self,
         initial_method: Method,
         initial_url: &str,
-        initial_headers: &[(String, String)],
+        initial_headers: &[HeaderPair],
         initial_host_override: Option<&str>,
         initial_body: Bytes,
         response_timeout: Option<Duration>,
@@ -1451,15 +1513,17 @@ impl UpstreamHttpClient {
             let same_authority = base.host_str() == next_parsed.host_str()
                 && base.port_or_known_default() == next_parsed.port_or_known_default();
             if !same_authority {
-                current_headers.retain(|(name, _)| !name.eq_ignore_ascii_case(HOST.as_str()));
+                current_headers.retain(|h| !h.name.trim().eq_ignore_ascii_case(HOST.as_str()));
                 current_host_override = None;
             }
             let same_origin = base.scheme() == next_parsed.scheme() && same_authority;
             if !same_origin {
-                current_headers.retain(|(name, _)| {
-                    !name.eq_ignore_ascii_case(AUTHORIZATION.as_str())
-                        && !name.eq_ignore_ascii_case(COOKIE.as_str())
-                        && !name.eq_ignore_ascii_case(PROXY_AUTHORIZATION.as_str())
+                current_headers.retain(|h| {
+                    !h.name.trim().eq_ignore_ascii_case(AUTHORIZATION.as_str())
+                        && !h.name.trim().eq_ignore_ascii_case(COOKIE.as_str())
+                        && !h.name
+                            .trim()
+                            .eq_ignore_ascii_case(PROXY_AUTHORIZATION.as_str())
                 });
                 current_host_override = None;
             }
@@ -1471,9 +1535,9 @@ impl UpstreamHttpClient {
             {
                 current_method = Method::GET;
                 current_body = Bytes::new();
-                current_headers.retain(|(name, _)| {
-                    !name.eq_ignore_ascii_case(CONTENT_LENGTH.as_str())
-                        && !name.eq_ignore_ascii_case(CONTENT_TYPE.as_str())
+                current_headers.retain(|h| {
+                    !h.name.trim().eq_ignore_ascii_case(CONTENT_LENGTH.as_str())
+                        && !h.name.trim().eq_ignore_ascii_case(CONTENT_TYPE.as_str())
                 });
             }
 
@@ -1696,7 +1760,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let headers = vec![("Host".to_string(), addr_a.to_string())];
+        let headers = vec![HeaderPair::new("Host", addr_a.to_string())];
         let ex = client
             .send_following_redirects(
                 Method::GET,
@@ -2177,5 +2241,115 @@ mod tests {
         let body = ok_resp.response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from_static(b"local-secret"));
         assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn bug06_plain_http_via_http_proxy_with_chained_host_remap_does_not_double_remap() {
+        use crate::models::{HostRemapRule, UpstreamProxyConfig};
+        use std::sync::Mutex;
+
+        type RecordedProxyRequests = Arc<Mutex<Vec<(String, Option<String>)>>>;
+        let recorded_proxy_uris: RecordedProxyRequests = Arc::new(Mutex::new(Vec::new()));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let recorded_srv = Arc::clone(&recorded_proxy_uris);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = proxy_listener.accept().await {
+                let recorded = Arc::clone(&recorded_srv);
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let recorded = Arc::clone(&recorded);
+                        async move {
+                            let uri_str = req.uri().to_string();
+                            let host_hdr = req
+                                .headers()
+                                .get(HOST)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_owned);
+                            recorded.lock().unwrap().push((uri_str, host_hdr));
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
+                                b"single-remap-ok",
+                            ))))
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        let host_remap = Arc::new(HostRemapRegistry::new());
+        host_remap
+            .set_rules(vec![
+                HostRemapRule {
+                    id: "hop-1".into(),
+                    enabled: true,
+                    source_pattern: "a.chain-hop.invalid".into(),
+                    target_host: "b.chain-hop.invalid".into(),
+                    target_port: Some(8081),
+                    preserve_host_header: false,
+                    comment: String::new(),
+                },
+                HostRemapRule {
+                    id: "hop-2".into(),
+                    enabled: true,
+                    source_pattern: "b.chain-hop.invalid".into(),
+                    target_host: "c.chain-hop.invalid".into(),
+                    target_port: Some(9092),
+                    preserve_host_header: false,
+                    comment: String::new(),
+                },
+            ])
+            .unwrap();
+
+        let upstream_proxy = Arc::new(UpstreamProxyManager::new());
+        upstream_proxy
+            .set_config(UpstreamProxyConfig {
+                enabled: true,
+                protocol: UpstreamProxyProtocol::Http,
+                host: "127.0.0.1".into(),
+                port: proxy_addr.port(),
+                username: None,
+                password: None,
+                has_password: false,
+                bypass_list: Vec::new(),
+            })
+            .unwrap();
+
+        let client = UpstreamHttpClient::build(
+            Some(host_remap),
+            Some(upstream_proxy),
+            None,
+            Arc::new(AtomicU64::new(DEFAULT_CONNECT_TIMEOUT_SEC)),
+            false,
+        )
+        .unwrap();
+
+        let ex = client
+            .send_request(
+                Method::GET,
+                "http://a.chain-hop.invalid/step1",
+                &[],
+                None,
+                Bytes::new(),
+                Some(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ex.response.status(), StatusCode::OK);
+        use http_body_util::BodyExt;
+        let body = ex.response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from_static(b"single-remap-ok"));
+
+        let captured = recorded_proxy_uris.lock().unwrap();
+        assert_eq!(
+            captured.as_slice(),
+            &[(
+                "http://b.chain-hop.invalid:8081/step1".to_string(),
+                Some("b.chain-hop.invalid:8081".to_string())
+            )]
+        );
     }
 }

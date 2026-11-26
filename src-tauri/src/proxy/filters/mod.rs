@@ -1044,17 +1044,11 @@ impl ProxyFilterEngine {
                 }
                 CompiledHeaderMutationOp::Set { name, value } => {
                     headers.retain(|h| !h.name.trim().eq_ignore_ascii_case(name));
-                    headers.push(HeaderPair {
-                        name: name.clone(),
-                        value: value.clone(),
-                    });
+                    headers.push(HeaderPair::new(name.clone(), value.clone()));
                     mutated = true;
                 }
                 CompiledHeaderMutationOp::Append { name, value } => {
-                    headers.push(HeaderPair {
-                        name: name.clone(),
-                        value: value.clone(),
-                    });
+                    headers.push(HeaderPair::new(name.clone(), value.clone()));
                     mutated = true;
                 }
             }

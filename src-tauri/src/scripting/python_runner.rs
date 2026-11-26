@@ -643,10 +643,7 @@ pub fn apply_header_diff(
     for (name, value) in set {
         let clean_name = name.trim();
         if !clean_name.is_empty() {
-            headers.push(HeaderPair {
-                name: clean_name.to_string(),
-                value: value.clone(),
-            });
+            headers.push(HeaderPair::new(clean_name, value.clone()));
             added_any = true;
         }
     }
@@ -1415,7 +1412,7 @@ impl PythonScriptRunner {
                         .headers
                         .into_iter()
                         .filter(|(k, _)| !k.trim().is_empty())
-                        .map(|(name, value)| HeaderPair { name, value })
+                        .map(|(name, value)| HeaderPair::new(name, value))
                         .collect();
                     return ScriptRequestOutcome::MockResponse {
                         edits,
@@ -1669,22 +1666,10 @@ mod tests {
     #[test]
     fn apply_header_diff_preserves_unmodified_duplicate_headers() {
         let mut headers = vec![
-            HeaderPair {
-                name: "Set-Cookie".into(),
-                value: "sid=1; Path=/".into(),
-            },
-            HeaderPair {
-                name: "Set-Cookie".into(),
-                value: "csrf=2; Path=/".into(),
-            },
-            HeaderPair {
-                name: "X-Remove".into(),
-                value: "gone".into(),
-            },
-            HeaderPair {
-                name: "X-Replace".into(),
-                value: "old".into(),
-            },
+            HeaderPair::new("Set-Cookie", "sid=1; Path=/"),
+            HeaderPair::new("Set-Cookie", "csrf=2; Path=/"),
+            HeaderPair::new("X-Remove", "gone"),
+            HeaderPair::new("X-Replace", "old"),
         ];
 
         let changed = apply_header_diff(
@@ -1785,10 +1770,7 @@ def on_response(response, request):
         assert!(status.has_on_response);
         assert!(status.last_error.is_none());
 
-        let req_headers = vec![HeaderPair {
-            name: "Host".into(),
-            value: "api.example.com".into(),
-        }];
+        let req_headers = vec![HeaderPair::new("Host", "api.example.com")];
         let req_outcome = runner
             .run_on_request(
                 42,
@@ -1817,14 +1799,8 @@ def on_response(response, request):
         }
 
         let resp_headers = vec![
-            HeaderPair {
-                name: "Set-Cookie".into(),
-                value: "a=1".into(),
-            },
-            HeaderPair {
-                name: "Set-Cookie".into(),
-                value: "b=2".into(),
-            },
+            HeaderPair::new("Set-Cookie", "a=1"),
+            HeaderPair::new("Set-Cookie", "b=2"),
         ];
         let resp_outcome = runner
             .run_on_response(

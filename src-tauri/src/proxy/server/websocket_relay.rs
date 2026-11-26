@@ -475,7 +475,7 @@ fn handle_ws_handshake_http_rejection(
         protocol: hs.ws_scheme.to_ascii_uppercase(),
         scheme: hs.ws_scheme.to_string(),
         method: "GET".to_string(),
-        host: hs.host_header,
+        host: hs.host_header.clone(),
         path: hs.path_and_query,
         url: hs.full_url,
         content_type,
@@ -532,7 +532,9 @@ fn handle_ws_handshake_http_rejection(
         transfer_stats: Some(transfer_stats),
     };
 
-    record_completed_session(ctx, detail, None, None);
+    if !hs.client_conn.is_capture_suppressed() {
+        record_completed_session(ctx, detail, None, None);
+    }
 
     let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
     let mut rej_resp = Response::builder()
@@ -546,7 +548,7 @@ fn handle_ws_handshake_http_rejection(
         {
             if let (Ok(hn), Ok(hv)) = (
                 http::header::HeaderName::from_bytes(h.name.trim().as_bytes()),
-                http::header::HeaderValue::from_str(&h.value),
+                h.to_hyper_header_value(),
             ) {
                 rej_resp.headers_mut().append(hn, hv);
             }
@@ -651,7 +653,7 @@ where
         protocol: hs.ws_scheme.to_ascii_uppercase(),
         scheme: hs.ws_scheme.to_string(),
         method: "GET".to_string(),
-        host: hs.host_header,
+        host: hs.host_header.clone(),
         path: hs.path_and_query,
         url: hs.full_url,
         content_type: "websocket/frames".to_string(),
@@ -707,7 +709,9 @@ where
         transfer_stats: Some(initial_stats),
     };
 
-    record_completed_session(&ctx, initial_detail, None, None);
+    if !hs.client_conn.is_capture_suppressed() {
+        record_completed_session(&ctx, initial_detail, None, None);
+    }
     let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
 
     // Register channel BEFORE returning `101 Switching Protocols` so immediate injection after 101 works.
@@ -721,6 +725,11 @@ where
     let start = hs.start;
     let start_utc = hs.start_utc;
     let relay_ctx = Arc::clone(&ctx);
+    let ws_lifecycle = hs.client_conn.lifecycle.clone();
+    let ws_client_addr = hs.client_addr;
+    let (ws_host, ws_opt_port) = parse_host_and_optional_port(&hs.host_header);
+    let ws_port = ws_opt_port.unwrap_or(if hs.ws_scheme == "wss" { 443 } else { 80 });
+    let ws_is_tls = hs.ws_scheme == "wss";
 
     tokio::spawn(async move {
         let _ws_guard = ws_guard;
@@ -729,7 +738,18 @@ where
         let rx_bytes = Arc::new(AtomicUsize::new(0));
         let last_ipc_emit = Arc::new(std::sync::Mutex::new(None::<Instant>));
 
-        if let Ok(upgraded) = hyper::upgrade::on(req).await {
+        let mut abort_sig = ws_lifecycle.clone();
+        let mut upgrade_drain_sig = ws_lifecycle.clone();
+        let mut drain_expire_sig = ws_lifecycle.clone();
+
+        let upgraded = tokio::select! {
+            biased;
+            _ = abort_sig.wait_abort() => None,
+            _ = upgrade_drain_sig.wait_drain_expired() => None,
+            res = hyper::upgrade::on(req) => res.ok(),
+        };
+
+        if let Some(upgraded) = upgraded {
             let client_ws =
                 WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
 
@@ -785,6 +805,7 @@ where
             let c2u_tx = Arc::clone(&tx_bytes);
             let c2u_ctx = Arc::clone(&relay_ctx);
             let c2u_last_emit = Arc::clone(&last_ipc_emit);
+            let c2u_lifecycle = ws_lifecycle.clone();
             let client_to_upstream = async move {
                 loop {
                     tokio::select! {
@@ -800,19 +821,21 @@ where
                             }
                             c2u_tx.fetch_add(msg_len, Ordering::Relaxed);
                             let new_total = c2u_bytes.fetch_add(msg_len, Ordering::Relaxed) + msg_len;
-                            if let Some((updated_summary, assigned_idx)) =
-                                c2u_ctx.store.append_ws_frame_with_index(
-                                    session_id,
-                                    Some(frame.clone()),
-                                    new_total,
-                                    MAX_WS_FRAMES,
-                                )
-                            {
-                                if let Some(idx) = assigned_idx {
-                                    frame.index = idx;
-                                }
-                                if should_emit_ws_ipc(&c2u_last_emit, true) {
-                                    let _ = c2u_ctx.event_tx.send(updated_summary);
+                            if !c2u_lifecycle.is_capture_suppressed() {
+                                if let Some((updated_summary, assigned_idx)) =
+                                    c2u_ctx.store.append_ws_frame_with_index(
+                                        session_id,
+                                        Some(frame.clone()),
+                                        new_total,
+                                        MAX_WS_FRAMES,
+                                    )
+                                {
+                                    if let Some(idx) = assigned_idx {
+                                        frame.index = idx;
+                                    }
+                                    if should_emit_ws_ipc(&c2u_last_emit, true) {
+                                        let _ = c2u_ctx.event_tx.send(updated_summary);
+                                    }
                                 }
                             }
                             let _ = cmd.ack_tx.send(Ok(frame));
@@ -824,17 +847,19 @@ where
                             let msg_len = msg.len();
                             c2u_tx.fetch_add(msg_len, Ordering::Relaxed);
                             let new_total = c2u_bytes.fetch_add(msg_len, Ordering::Relaxed) + msg_len;
-                            let frame = record_ws_frame(0, "outbound", &msg, false);
-                            if let Some((updated_summary, _)) =
-                                c2u_ctx.store.append_ws_frame_with_index(
-                                    session_id,
-                                    Some(frame),
-                                    new_total,
-                                    MAX_WS_FRAMES,
-                                )
-                            {
-                                if should_emit_ws_ipc(&c2u_last_emit, false) {
-                                    let _ = c2u_ctx.event_tx.send(updated_summary);
+                            if !c2u_lifecycle.is_capture_suppressed() {
+                                let frame = record_ws_frame(0, "outbound", &msg, false);
+                                if let Some((updated_summary, _)) =
+                                    c2u_ctx.store.append_ws_frame_with_index(
+                                        session_id,
+                                        Some(frame),
+                                        new_total,
+                                        MAX_WS_FRAMES,
+                                    )
+                                {
+                                    if should_emit_ws_ipc(&c2u_last_emit, false) {
+                                        let _ = c2u_ctx.event_tx.send(updated_summary);
+                                    }
                                 }
                             }
                             if upstream_sink.send(msg).await.is_err() {
@@ -854,6 +879,7 @@ where
             let u2c_rx = Arc::clone(&rx_bytes);
             let u2c_ctx = Arc::clone(&relay_ctx);
             let u2c_last_emit = Arc::clone(&last_ipc_emit);
+            let u2c_lifecycle = ws_lifecycle.clone();
             let upstream_to_client = async move {
                 loop {
                     tokio::select! {
@@ -869,19 +895,21 @@ where
                             }
                             u2c_rx.fetch_add(msg_len, Ordering::Relaxed);
                             let new_total = u2c_bytes.fetch_add(msg_len, Ordering::Relaxed) + msg_len;
-                            if let Some((updated_summary, assigned_idx)) =
-                                u2c_ctx.store.append_ws_frame_with_index(
-                                    session_id,
-                                    Some(frame.clone()),
-                                    new_total,
-                                    MAX_WS_FRAMES,
-                                )
-                            {
-                                if let Some(idx) = assigned_idx {
-                                    frame.index = idx;
-                                }
-                                if should_emit_ws_ipc(&u2c_last_emit, true) {
-                                    let _ = u2c_ctx.event_tx.send(updated_summary);
+                            if !u2c_lifecycle.is_capture_suppressed() {
+                                if let Some((updated_summary, assigned_idx)) =
+                                    u2c_ctx.store.append_ws_frame_with_index(
+                                        session_id,
+                                        Some(frame.clone()),
+                                        new_total,
+                                        MAX_WS_FRAMES,
+                                    )
+                                {
+                                    if let Some(idx) = assigned_idx {
+                                        frame.index = idx;
+                                    }
+                                    if should_emit_ws_ipc(&u2c_last_emit, true) {
+                                        let _ = u2c_ctx.event_tx.send(updated_summary);
+                                    }
                                 }
                             }
                             let _ = cmd.ack_tx.send(Ok(frame));
@@ -893,17 +921,19 @@ where
                             let msg_len = msg.len();
                             u2c_rx.fetch_add(msg_len, Ordering::Relaxed);
                             let new_total = u2c_bytes.fetch_add(msg_len, Ordering::Relaxed) + msg_len;
-                            let frame = record_ws_frame(0, "inbound", &msg, false);
-                            if let Some((updated_summary, _)) =
-                                u2c_ctx.store.append_ws_frame_with_index(
-                                    session_id,
-                                    Some(frame),
-                                    new_total,
-                                    MAX_WS_FRAMES,
-                                )
-                            {
-                                if should_emit_ws_ipc(&u2c_last_emit, false) {
-                                    let _ = u2c_ctx.event_tx.send(updated_summary);
+                            if !u2c_lifecycle.is_capture_suppressed() {
+                                let frame = record_ws_frame(0, "inbound", &msg, false);
+                                if let Some((updated_summary, _)) =
+                                    u2c_ctx.store.append_ws_frame_with_index(
+                                        session_id,
+                                        Some(frame),
+                                        new_total,
+                                        MAX_WS_FRAMES,
+                                    )
+                                {
+                                    if should_emit_ws_ipc(&u2c_last_emit, false) {
+                                        let _ = u2c_ctx.event_tx.send(updated_summary);
+                                    }
                                 }
                             }
                             if client_sink.send(msg).await.is_err() {
@@ -919,47 +949,91 @@ where
                 .await;
             };
 
+            let mut config_rx = relay_ctx.filters.subscribe_config_updates();
+            let mut config_closed = false;
+            let monitor_ctx = Arc::clone(&relay_ctx);
+            let lifecycle_monitor = async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = abort_sig.wait_abort() => break,
+                        _ = drain_expire_sig.wait_drain_expired() => break,
+                        changed = config_rx.changed(), if !config_closed => {
+                            if changed.is_err() {
+                                config_closed = true;
+                            } else {
+                                if !monitor_ctx.filters.is_lan_client_allowed(ws_client_addr.ip()) {
+                                    tracing::info!(
+                                        "Hard-aborting active WebSocket {}:{} after LAN Client Allowlist excluded {}",
+                                        ws_host,
+                                        ws_port,
+                                        ws_client_addr.ip()
+                                    );
+                                    break;
+                                }
+                                if ws_is_tls
+                                    && matches!(
+                                        monitor_ctx.filters.evaluate_connect_tunnel(&ws_host, ws_port),
+                                        crate::proxy::filters::ConnectTunnelDecision::Passthrough(_)
+                                    )
+                                {
+                                    tracing::info!(
+                                        "Hard-aborting active WSS {}:{} after filter switch to Passthrough",
+                                        ws_host,
+                                        ws_port
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
             tokio::select! {
                 _ = client_to_upstream => {}
                 _ = upstream_to_client => {}
                 _ = inject_router => {}
+                _ = lifecycle_monitor => {}
             }
         }
 
         // Guarantee channel removal BEFORE emitting closed state so UI/API never sees a stale open handle.
         drop(_ws_guard);
 
-        let _ = relay_ctx.store.finalize_ws_stream(session_id);
-        let end_instant = Instant::now();
-        let done_at = timestamp_at_instant(start, start_utc, end_instant);
-        let overall_ms = elapsed_ms(start);
-        let relay_ms = duration_ms_f64(end_instant.saturating_duration_since(got_resp_instant));
-        let final_tx = tx_bytes.load(Ordering::Relaxed);
-        let final_rx = rx_bytes.load(Ordering::Relaxed);
+        if !ws_lifecycle.is_capture_suppressed() {
+            let _ = relay_ctx.store.finalize_ws_stream(session_id);
+            let end_instant = Instant::now();
+            let done_at = timestamp_at_instant(start, start_utc, end_instant);
+            let overall_ms = elapsed_ms(start);
+            let relay_ms = duration_ms_f64(end_instant.saturating_duration_since(got_resp_instant));
+            let final_tx = tx_bytes.load(Ordering::Relaxed);
+            let final_rx = rx_bytes.load(Ordering::Relaxed);
 
-        if let Some(final_summary) = relay_ctx.store.update_session_telemetry(session_id, |detail| {
-            detail.summary.ws_open = Some(false);
-            detail.summary.duration_ms = start.elapsed().as_millis() as u64;
-            let timings = detail.timings.get_or_insert_with(Default::default);
-            timings.server_done_response = Some(done_at.clone());
-            timings.client_done_response = Some(done_at);
-            timings.content_download_ms = Some(relay_ms);
-            timings.overall_elapsed_ms = Some(overall_ms);
-            timings.net_elapsed_ms = Some(overall_ms);
+            if let Some(final_summary) = relay_ctx.store.update_session_telemetry(session_id, |detail| {
+                detail.summary.ws_open = Some(false);
+                detail.summary.duration_ms = start.elapsed().as_millis() as u64;
+                let timings = detail.timings.get_or_insert_with(Default::default);
+                timings.server_done_response = Some(done_at.clone());
+                timings.client_done_response = Some(done_at);
+                timings.content_download_ms = Some(relay_ms);
+                timings.overall_elapsed_ms = Some(overall_ms);
+                timings.net_elapsed_ms = Some(overall_ms);
 
-            let stats = detail.transfer_stats.get_or_insert_with(Default::default);
-            stats.is_streaming = Some(false);
-            stats.request_wire_body_bytes = Some(final_tx);
-            stats.request_body_bytes = Some(final_tx);
-            stats.response_wire_body_bytes = Some(final_rx);
-            stats.response_body_bytes = Some(final_rx);
-            let timings_clone = detail.timings.clone();
-            let stats_clone = detail.transfer_stats.clone();
-            detail
-                .summary
-                .apply_telemetry(timings_clone.as_ref(), stats_clone.as_ref());
-        }) {
-            let _ = relay_ctx.event_tx.send(final_summary);
+                let stats = detail.transfer_stats.get_or_insert_with(Default::default);
+                stats.is_streaming = Some(false);
+                stats.request_wire_body_bytes = Some(final_tx);
+                stats.request_body_bytes = Some(final_tx);
+                stats.response_wire_body_bytes = Some(final_rx);
+                stats.response_body_bytes = Some(final_rx);
+                let timings_clone = detail.timings.clone();
+                let stats_clone = detail.transfer_stats.clone();
+                detail
+                    .summary
+                    .apply_telemetry(timings_clone.as_ref(), stats_clone.as_ref());
+            }) {
+                let _ = relay_ctx.event_tx.send(final_summary);
+            }
         }
     });
 
@@ -982,7 +1056,7 @@ where
         }
         if let (Ok(hn), Ok(hv)) = (
             http::header::HeaderName::from_bytes(h.name.trim().as_bytes()),
-            http::header::HeaderValue::from_str(&h.value),
+            h.to_hyper_header_value(),
         ) {
             client_resp.headers_mut().append(hn, hv);
         }
@@ -1008,6 +1082,13 @@ pub(super) async fn handle_websocket_intercept(
     client_conn: ClientConnContext,
     ctx: Arc<SharedProxyContext>,
 ) -> Response<ProxyBoxBody> {
+    if client_conn.is_draining_or_aborted() {
+        return plain_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable: FluxProxy is stopping",
+        );
+    }
+
     let start = Instant::now();
     let start_utc = Utc::now();
     let req_begin_at = format_rfc3339_micros(start_utc);
@@ -1023,11 +1104,20 @@ pub(super) async fn handle_websocket_intercept(
     let accept_key = derive_accept_key(sec_ws_key.as_bytes());
 
     let mut req_headers = extract_hyper_headers(req.headers());
+    let orig_host_hdr = req_headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("host"))
+        .map(|h| h.value.clone());
     let req_mutated = ctx.filters.apply_header_mutations(
         HeaderMutationDirection::Request,
         &full_url,
         &mut req_headers,
     );
+    let current_host_hdr = req_headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("host"))
+        .map(|h| h.value.clone());
+    let custom_ws_host = current_host_hdr.is_some() && current_host_hdr != orig_host_hdr;
     let req_headers_bytes =
         estimate_request_headers_bytes("GET", &path_and_query, &client_http_ver, &req_headers);
 
@@ -1088,7 +1178,7 @@ pub(super) async fn handle_websocket_intercept(
                     Some(FLUXPROXY_ERR_FORBIDDEN_REMOTE_TARGET),
                 );
             }
-            if !rule.preserve_host_header {
+            if !rule.preserve_host_header && !custom_ws_host {
                 let default_ws_port = if ws_scheme == "wss" { 443 } else { 80 };
                 let h_fmt = HostRemapRegistry::format_host_for_authority(h);
                 let new_host_val = if *p != default_ws_port {
@@ -1981,9 +2071,18 @@ pub(super) fn build_upstream_websocket_request(
             continue;
         }
 
+        if lower == "host" {
+            if let Ok(hv) = h.to_hyper_header_value() {
+                if hv.to_str().is_ok() {
+                    ws_req.headers_mut().insert(http::header::HOST, hv);
+                }
+            }
+            continue;
+        }
+
         if let (Ok(hn), Ok(hv)) = (
             http::header::HeaderName::from_bytes(raw_name.as_bytes()),
-            http::header::HeaderValue::from_str(&h.value),
+            h.to_hyper_header_value(),
         ) {
             if hv.to_str().is_ok() {
                 ws_req.headers_mut().append(hn, hv);
@@ -2054,8 +2153,7 @@ pub(super) fn filter_supported_ws_extensions(raw_value: &str) -> Option<String> 
 pub(super) fn is_ws_excluded_request_header(lower_name: &str) -> bool {
     matches!(
         lower_name,
-        "host"
-            | "connection"
+        "connection"
             | "upgrade"
             | "sec-websocket-key"
             | "sec-websocket-version"

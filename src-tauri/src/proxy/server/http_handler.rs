@@ -79,50 +79,29 @@ pub(super) enum ResponseBodyReadError {
     Transport { message: String, bytes_read: usize },
 }
 
-pub(super) async fn collect_response_body_limited<B>(
+pub(super) enum ResponseBodyCollectOutcome<B> {
+    Complete(Bytes),
+    Spilled {
+        prefix: Vec<Bytes>,
+        remaining: B,
+    },
+}
+
+pub(super) async fn collect_response_body_or_spill<B>(
     mut body: B,
     throttle: &crate::proxy::throttle::ThrottleEngine,
     max_bytes: usize,
-) -> Result<Bytes, ResponseBodyReadError>
+    spill_threshold: Option<usize>,
+) -> Result<ResponseBodyCollectOutcome<B>, ResponseBodyReadError>
 where
     B: hyper::body::Body<Data = Bytes> + Unpin,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    if throttle.get_config().download_bytes_per_sec().is_some() || throttle.is_offline() {
-        let mut collected = Vec::new();
-        let mut pacer = BandwidthPacer::new();
-        loop {
-            match body.frame().await {
-                Some(Ok(frame)) => {
-                    let Some(chunk) = frame.into_data().ok().filter(|c| !c.is_empty()) else {
-                        continue;
-                    };
-                    if collected.len().saturating_add(chunk.len()) > max_bytes {
-                        return Err(ResponseBodyReadError::PayloadTooLarge {
-                            limit: max_bytes,
-                            bytes_read: collected.len(),
-                        });
-                    }
-                    if let Err(err) = pacer.pace(throttle, chunk.len(), true).await {
-                        return Err(ResponseBodyReadError::Throttle {
-                            message: err.to_string(),
-                            bytes_read: collected.len(),
-                        });
-                    }
-                    collected.extend_from_slice(&chunk);
-                }
-                None => return Ok(Bytes::from(collected)),
-                Some(Err(err)) => {
-                    return Err(ResponseBodyReadError::Transport {
-                        message: format_error_chain(&err),
-                        bytes_read: collected.len(),
-                    });
-                }
-            }
-        }
-    } else {
-        match Limited::new(body, max_bytes).collect().await {
-            Ok(collected) => Ok(collected.to_bytes()),
+    let use_throttle = throttle.get_config().download_bytes_per_sec().is_some()
+        || throttle.is_offline();
+    if spill_threshold.is_none() && !use_throttle {
+        return match Limited::new(body, max_bytes).collect().await {
+            Ok(collected) => Ok(ResponseBodyCollectOutcome::Complete(collected.to_bytes())),
             Err(err) => {
                 if err.is::<LengthLimitError>() {
                     Err(ResponseBodyReadError::PayloadTooLarge {
@@ -135,6 +114,223 @@ where
                         bytes_read: 0,
                     })
                 }
+            }
+        };
+    }
+
+    let mut collected: Vec<u8> = Vec::new();
+    let mut prefix_chunks: Vec<Bytes> = Vec::new();
+    let mut bytes_read: usize = 0;
+    let mut pacer = BandwidthPacer::new();
+
+    loop {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                let Some(chunk) = frame.into_data().ok().filter(|c| !c.is_empty()) else {
+                    continue;
+                };
+                if spill_threshold.is_none() && bytes_read.saturating_add(chunk.len()) > max_bytes {
+                    return Err(ResponseBodyReadError::PayloadTooLarge {
+                        limit: max_bytes,
+                        bytes_read,
+                    });
+                }
+                if use_throttle {
+                    if let Err(err) = pacer.pace(throttle, chunk.len(), true).await {
+                        return Err(ResponseBodyReadError::Throttle {
+                            message: err.to_string(),
+                            bytes_read,
+                        });
+                    }
+                }
+                bytes_read = bytes_read.saturating_add(chunk.len());
+                if let Some(threshold) = spill_threshold {
+                    prefix_chunks.push(chunk);
+                    if bytes_read > threshold {
+                        return Ok(ResponseBodyCollectOutcome::Spilled {
+                            prefix: prefix_chunks,
+                            remaining: body,
+                        });
+                    }
+                } else {
+                    collected.extend_from_slice(&chunk);
+                }
+            }
+            None => {
+                if spill_threshold.is_some() {
+                    if prefix_chunks.len() == 1 {
+                        return Ok(ResponseBodyCollectOutcome::Complete(
+                            prefix_chunks.into_iter().next().unwrap_or_default(),
+                        ));
+                    }
+                    let mut flat = Vec::with_capacity(bytes_read);
+                    for c in prefix_chunks {
+                        flat.extend_from_slice(&c);
+                    }
+                    return Ok(ResponseBodyCollectOutcome::Complete(Bytes::from(flat)));
+                }
+                return Ok(ResponseBodyCollectOutcome::Complete(Bytes::from(collected)));
+            }
+            Some(Err(err)) => {
+                return Err(ResponseBodyReadError::Transport {
+                    message: format_error_chain(&err),
+                    bytes_read,
+                });
+            }
+        }
+    }
+}
+
+pub(super) async fn collect_response_body_limited<B>(
+    body: B,
+    throttle: &crate::proxy::throttle::ThrottleEngine,
+    max_bytes: usize,
+) -> Result<Bytes, ResponseBodyReadError>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    match collect_response_body_or_spill(body, throttle, max_bytes, None).await? {
+        ResponseBodyCollectOutcome::Complete(bytes) => Ok(bytes),
+        ResponseBodyCollectOutcome::Spilled { .. } => unreachable!(),
+    }
+}
+
+pub(super) struct BoundedSseSink {
+    pub(super) buf: Vec<u8>,
+    pub(super) total_written: usize,
+    pub(super) max_total: usize,
+}
+
+impl BoundedSseSink {
+    pub(super) fn new(max_total: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            total_written: 0,
+            max_total,
+        }
+    }
+
+    pub(super) fn take_bytes(&mut self) -> Vec<u8> {
+        self.total_written = 0;
+        std::mem::take(&mut self.buf)
+    }
+}
+
+impl std::io::Write for BoundedSseSink {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.total_written.saturating_add(data.len()) > self.max_total {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "SSE decompressed output exceeds limit of {} bytes",
+                    self.max_total
+                ),
+            ));
+        }
+        self.total_written = self.total_written.saturating_add(data.len());
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn read_prefix_best_effort<R: std::io::Read>(mut reader: R, max_bytes: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while out.len() < max_bytes {
+        let need = (max_bytes - out.len()).min(chunk.len());
+        match reader.read(&mut chunk[..need]) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&chunk[..n]),
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+pub(super) fn decode_stream_preview_best_effort(
+    encodings: &[String],
+    raw_prefix: &[u8],
+    max_bytes: usize,
+) -> Vec<u8> {
+    if raw_prefix.is_empty() || encodings.is_empty() || max_bytes == 0 {
+        return raw_prefix.to_vec();
+    }
+    let mut current = raw_prefix.to_vec();
+    let mut decoded_any = false;
+    let mut peeled_layers = 0usize;
+
+    for enc in encodings.iter().rev() {
+        if peeled_layers >= MAX_CONTENT_ENCODING_LAYERS {
+            break;
+        }
+        let enc_lower = enc.trim().to_ascii_lowercase();
+        if enc_lower.is_empty() || enc_lower == "identity" {
+            continue;
+        }
+        let next = match enc_lower.as_str() {
+            "zstd" | "x-zstd" => match zstd::stream::read::Decoder::new(current.as_slice()) {
+                Ok(dec) => read_prefix_best_effort(dec, max_bytes),
+                Err(_) => break,
+            },
+            "gzip" | "x-gzip" => read_prefix_best_effort(
+                flate2::read::GzDecoder::new(current.as_slice()),
+                max_bytes,
+            ),
+            "deflate" => {
+                let zlib = read_prefix_best_effort(
+                    flate2::read::ZlibDecoder::new(current.as_slice()),
+                    max_bytes,
+                );
+                if zlib.is_empty() {
+                    read_prefix_best_effort(
+                        flate2::read::DeflateDecoder::new(current.as_slice()),
+                        max_bytes,
+                    )
+                } else {
+                    zlib
+                }
+            }
+            "br" => read_prefix_best_effort(
+                brotli::Decompressor::new(current.as_slice(), 4096),
+                max_bytes,
+            ),
+            _ => break,
+        };
+        if next.is_empty() {
+            break;
+        }
+        current = next;
+        decoded_any = true;
+        peeled_layers += 1;
+    }
+
+    if decoded_any {
+        current
+    } else {
+        raw_prefix.to_vec()
+    }
+}
+
+pub(super) fn utf8_prefix_lossless(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(s) => Some(s.to_owned()),
+        Err(err) => {
+            let valid_up_to = err.valid_up_to();
+            if valid_up_to > 0 && err.error_len().is_none() {
+                std::str::from_utf8(&bytes[..valid_up_to])
+                    .ok()
+                    .map(str::to_owned)
+            } else {
+                None
             }
         }
     }
@@ -651,6 +847,13 @@ pub(super) async fn handle_intercepted_request(
         );
     }
 
+    if client_conn.is_draining_or_aborted() {
+        return plain_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable: FluxProxy is stopping",
+        );
+    }
+
     let start = Instant::now();
     let start_utc = Utc::now();
     let timestamp = start_utc.to_rfc3339();
@@ -717,6 +920,10 @@ pub(super) async fn handle_intercepted_request(
 
     // 0a. Bandwidth Throttling: Offline mode blocks outbound HTTP/HTTPS/WS traffic immediately
     if ctx.throttle.is_offline() {
+        let msg = "Network Offline (Bandwidth Throttling: Offline)".to_string();
+        if client_conn.is_capture_suppressed() {
+            return plain_response(StatusCode::SERVICE_UNAVAILABLE, &msg);
+        }
         let (client_reused, client_tls_ms) = client_conn.claim_request_seq();
         let client_http_ver = format_raw_http_version(req.version()).to_string();
         let method_preview = req.method().as_str().to_string();
@@ -727,7 +934,6 @@ pub(super) async fn handle_intercepted_request(
             &client_http_ver,
             &req_headers,
         );
-        let msg = "Network Offline (Bandwidth Throttling: Offline)".to_string();
         let (err_timings, err_stats) = build_error_timings_and_stats(
             start,
             start_utc,
@@ -843,6 +1049,10 @@ pub(super) async fn handle_intercepted_request(
     let req_version = req.version();
     let client_http_ver = format_raw_http_version(req_version).to_string();
     let mut req_headers = extract_hyper_headers(req.headers());
+    let initial_req_host_hdr = req_headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("host"))
+        .map(|h| h.value.clone());
     let mut req_mutated = ctx.filters.apply_header_mutations(
         HeaderMutationDirection::Request,
         &full_url,
@@ -860,18 +1070,18 @@ pub(super) async fn handle_intercepted_request(
     {
         Ok(bytes) => bytes,
         Err(RequestBodyReadError::PayloadTooLarge(limit)) => {
+            let msg = format!(
+                "Request body exceeds maximum captured payload limit ({limit} bytes)"
+            );
+            if client_conn.is_capture_suppressed() {
+                return plain_response(StatusCode::PAYLOAD_TOO_LARGE, &msg);
+            }
             let client_done_req_instant = Instant::now();
             let client_read_ms = duration_ms_f64(
                 client_done_req_instant.saturating_duration_since(req_body_read_start),
             );
-            let msg = format!(
-                "Request body exceeds maximum captured payload limit ({limit} bytes)"
-            );
             let protocol = resolve_protocol_label(&scheme_str, alpn, req_version);
-            let resp_headers = vec![HeaderPair {
-                name: "Content-Type".into(),
-                value: "text/plain; charset=utf-8".into(),
-            }];
+            let resp_headers = vec![HeaderPair::new("Content-Type", "text/plain; charset=utf-8")];
             let (mut err_timings, mut err_stats) = build_error_timings_and_stats(
                 start,
                 start_utc,
@@ -954,8 +1164,11 @@ pub(super) async fn handle_intercepted_request(
             return plain_response(StatusCode::PAYLOAD_TOO_LARGE, &msg);
         }
         Err(RequestBodyReadError::Transport(err)) => {
-            let client_read_ms = elapsed_ms(req_body_read_start);
             let msg = format!("Failed reading client request body: {err}");
+            if client_conn.is_capture_suppressed() {
+                return plain_response(StatusCode::BAD_GATEWAY, &msg);
+            }
+            let client_read_ms = elapsed_ms(req_body_read_start);
             let (err_timings, err_stats) = build_error_timings_and_stats(
                 start,
                 start_utc,
@@ -1047,6 +1260,9 @@ pub(super) async fn handle_intercepted_request(
         total_bp_pause_ms += elapsed_ms(bp_start);
         if bp_res.is_err() {
             let msg = "Aborted at Live Breakpoint (Before Request)".to_string();
+            if client_conn.is_capture_suppressed() {
+                return plain_response(StatusCode::BAD_GATEWAY, &msg);
+            }
             let (err_timings, err_stats) = build_error_timings_and_stats(
                 start,
                 start_utc,
@@ -1262,7 +1478,9 @@ pub(super) async fn handle_intercepted_request(
                     transfer_stats: Some(mock_stats),
                 };
 
-                record_completed_session(&ctx, detail, Some(capped_req), Some(capped_mock));
+                if !client_conn.is_capture_suppressed() {
+                    record_completed_session(&ctx, detail, Some(capped_req), Some(capped_mock));
+                }
 
                 let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
                 let mut resp_builder = Response::builder()
@@ -1275,7 +1493,7 @@ pub(super) async fn handle_intercepted_request(
                     {
                         if let (Ok(hn), Ok(hv)) = (
                             http::HeaderName::from_bytes(h.name.trim().as_bytes()),
-                            http::HeaderValue::from_str(&h.value),
+                            h.to_hyper_header_value(),
                         ) {
                             resp_builder = resp_builder.header(hn, hv);
                         }
@@ -1379,19 +1597,35 @@ pub(super) async fn handle_intercepted_request(
 
             let capped_req = &body_bytes[..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
             let capped_mock = &mock_out.2[..mock_out.2.len().min(MAX_CAPTURED_BODY_BYTES)];
-            record_completed_session(&ctx, mock_out.0, Some(capped_req), Some(capped_mock));
+            if !client_conn.is_capture_suppressed() {
+                record_completed_session(&ctx, mock_out.0, Some(capped_req), Some(capped_mock));
+            }
 
             let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
+            let mock_body_bytes = Bytes::from(mock_out.2);
+            let mock_cl = mock_body_bytes.len().to_string();
             let mut resp_builder = Response::builder().status(
                 StatusCode::from_u16(rule.status_code).unwrap_or(StatusCode::OK),
             );
             for h in &mock_out.1 {
-                if !h.name.trim().is_empty() && !(strip_alt_svc && is_alt_svc_header(&h.name)) {
-                    resp_builder = resp_builder.header(&h.name, &h.value);
+                let trimmed = h.name.trim();
+                if !trimmed.is_empty()
+                    && !is_hop_by_hop_header(trimmed)
+                    && !trimmed.eq_ignore_ascii_case("content-length")
+                    && !trimmed.eq_ignore_ascii_case("content-encoding")
+                    && !(strip_alt_svc && is_alt_svc_header(trimmed))
+                {
+                    if let (Ok(hn), Ok(hv)) = (
+                        http::HeaderName::from_bytes(trimmed.as_bytes()),
+                        h.to_hyper_header_value(),
+                    ) {
+                        resp_builder = resp_builder.header(hn, hv);
+                    }
                 }
             }
+            resp_builder = resp_builder.header(http::header::CONTENT_LENGTH, mock_cl);
             return resp_builder
-                .body(boxed_full(Bytes::from(mock_out.2)))
+                .body(boxed_full(mock_body_bytes))
                 .unwrap_or_else(|_| {
                     plain_response(StatusCode::INTERNAL_SERVER_ERROR, "Mock build error")
                 });
@@ -1421,7 +1655,22 @@ pub(super) async fn handle_intercepted_request(
             "Forbidden: remote LAN clients cannot use HOSTS Remapping targeting loopback or unspecified hosts",
         );
     }
-    let upstream_target = prepare_remapped_upstream_target(&ctx, &full_url, &host_header, &scheme_str);
+    let current_req_host_hdr = req_headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("host"))
+        .map(|h| h.value.clone());
+    let host_explicitly_modified = current_req_host_hdr.is_some()
+        && current_req_host_hdr != initial_req_host_hdr;
+    let host_for_remap = current_req_host_hdr
+        .as_deref()
+        .unwrap_or(host_header.as_str());
+    let upstream_target =
+        prepare_remapped_upstream_target(&ctx, &full_url, host_for_remap, &scheme_str);
+    let effective_host_override = if host_explicitly_modified {
+        current_req_host_hdr.clone()
+    } else {
+        upstream_target.host_header_override.clone()
+    };
 
     let (upstream_client, mtls_cn) = if should_use_host_mtls_for_peer(client_addr, &scheme_str) {
         match ctx
@@ -1438,6 +1687,9 @@ pub(super) async fn handle_intercepted_request(
             Err(err) => {
                 let msg = format!("Client certificate (mTLS) error for '{target_host}': {err}");
                 tracing::warn!("{msg}");
+                if client_conn.is_capture_suppressed() {
+                    return plain_response(StatusCode::BAD_GATEWAY, &msg);
+                }
                 let (err_timings, err_stats) = build_error_timings_and_stats(
                     start,
                     start_utc,
@@ -1481,38 +1733,48 @@ pub(super) async fn handle_intercepted_request(
         (ctx.upstream_http_client_for_peer(is_remote_peer), None)
     };
 
-    record_in_flight_session_with_remap(
-        &ctx,
+    if !client_conn.is_capture_suppressed() {
+        record_in_flight_session_with_remap(
+            &ctx,
+            session_id,
+            timestamp.clone(),
+            resolve_protocol_label(&scheme_str, alpn, req_version),
+            scheme_str.clone(),
+            method_str.clone(),
+            host_header.clone(),
+            path_and_query.clone(),
+            full_url.clone(),
+            client_proc.as_ref().map(|p| p.name.clone()),
+            client_proc.as_ref().map(|p| p.pid),
+            req_mutated,
+            bp_modified,
+            Some(normalize_client_ip(client_addr)),
+            client_addr.to_string(),
+            format_mitm_tls_display(
+                &scheme_str,
+                client_conn.client_tls_version.as_deref(),
+                None,
+                mtls_cn.as_deref(),
+            ),
+            req_headers.clone(),
+            &body_bytes,
+            upstream_target.remapped_to.clone(),
+        );
+    }
+    let mut in_flight_guard = super::InFlightSessionGuard::new_with_lifecycle(
+        Arc::clone(&ctx),
         session_id,
-        timestamp.clone(),
-        resolve_protocol_label(&scheme_str, alpn, req_version),
-        scheme_str.clone(),
-        method_str.clone(),
-        host_header.clone(),
-        path_and_query.clone(),
-        full_url.clone(),
-        client_proc.as_ref().map(|p| p.name.clone()),
-        client_proc.as_ref().map(|p| p.pid),
-        req_mutated,
-        bp_modified,
-        Some(normalize_client_ip(client_addr)),
-        client_addr.to_string(),
-        format_mitm_tls_display(
-            &scheme_str,
-            client_conn.client_tls_version.as_deref(),
-            None,
-            mtls_cn.as_deref(),
-        ),
-        req_headers.clone(),
-        &body_bytes,
-        upstream_target.remapped_to.clone(),
+        start,
+        client_conn.lifecycle.clone(),
     );
-    let mut in_flight_guard = super::InFlightSessionGuard::new(Arc::clone(&ctx), session_id, start);
 
     // Apply Bandwidth Throttling RTT latency & upload bandwidth pacing before upstream send
     if let Err(err) = ctx.throttle.apply_latency().await {
         in_flight_guard.disarm();
         let msg = err.to_string();
+        if client_conn.is_capture_suppressed() {
+            return plain_response(StatusCode::SERVICE_UNAVAILABLE, &msg);
+        }
         let (err_timings, err_stats) = build_error_timings_and_stats(
             start,
             start_utc,
@@ -1555,6 +1817,9 @@ pub(super) async fn handle_intercepted_request(
         if let Err(err) = ctx.throttle.throttle_bytes(body_bytes.len(), false).await {
             in_flight_guard.disarm();
             let msg = err.to_string();
+            if client_conn.is_capture_suppressed() {
+                return plain_response(StatusCode::SERVICE_UNAVAILABLE, &msg);
+            }
             let (err_timings, err_stats) = build_error_timings_and_stats(
                 start,
                 start_utc,
@@ -1595,14 +1860,16 @@ pub(super) async fn handle_intercepted_request(
         }
     }
 
-    let outbound_headers: Vec<(String, String)> = req_headers
+    let outbound_headers: Vec<HeaderPair> = req_headers
         .iter()
         .filter(|h| {
-            !is_hop_by_hop_header(&h.name)
-                && !h.name.eq_ignore_ascii_case("host")
-                && !h.name.eq_ignore_ascii_case("content-length")
+            let trimmed = h.name.trim();
+            !trimmed.is_empty()
+                && !is_hop_by_hop_header(trimmed)
+                && !trimmed.eq_ignore_ascii_case("content-length")
+                && !(effective_host_override.is_some() && trimmed.eq_ignore_ascii_case("host"))
         })
-        .map(|h| (h.name.clone(), h.value.clone()))
+        .cloned()
         .collect();
     let response_timeout = ctx.response_header_timeout();
 
@@ -1611,7 +1878,7 @@ pub(super) async fn handle_intercepted_request(
             http_method,
             &upstream_target.upstream_url,
             &outbound_headers,
-            upstream_target.host_header_override.as_deref(),
+            effective_host_override.as_deref(),
             body_bytes.clone(),
             response_timeout,
         )
@@ -1638,6 +1905,9 @@ pub(super) async fn handle_intercepted_request(
                 }
                 _ => format!("Upstream connection error: {chain}"),
             };
+            if client_conn.is_capture_suppressed() {
+                return plain_response(err.status_hint(), &msg);
+            }
             let (err_timings, err_stats) = build_error_timings_and_stats(
                 start,
                 start_utc,
@@ -1836,7 +2106,7 @@ pub(super) async fn handle_intercepted_request(
             protocol: protocol_label,
             scheme: scheme_str.clone(),
             method: method_str,
-            host: host_header,
+            host: host_header.clone(),
             path: path_and_query,
             url: full_url,
             content_type: content_type.clone(),
@@ -1894,41 +2164,18 @@ pub(super) async fn handle_intercepted_request(
         };
 
         in_flight_guard.disarm();
-        record_completed_session(&ctx, initial_detail, Some(capped_req), None);
+        if !client_conn.is_capture_suppressed() {
+            record_completed_session(&ctx, initial_detail, Some(capped_req), None);
+        }
 
         let (chunk_tx, chunk_rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(64);
         let sse_ctx = ctx.clone();
+        let sse_lifecycle = client_conn.lifecycle.clone();
+        let (sse_host, sse_opt_port) = parse_host_and_optional_port(&host_header);
+        let sse_port = sse_opt_port.unwrap_or_else(|| default_port_for_scheme(&scheme_str));
+        let sse_is_https = scheme_str.eq_ignore_ascii_case("https");
 
         tokio::spawn(async move {
-            use std::io::Write;
-
-            struct BoundedSseSink {
-                buf: Vec<u8>,
-                total_written: usize,
-                max_total: usize,
-            }
-
-            impl Write for BoundedSseSink {
-                fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                    if self.total_written.saturating_add(data.len()) > self.max_total {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "SSE decompressed output exceeds limit of {} bytes",
-                                self.max_total
-                            ),
-                        ));
-                    }
-                    self.total_written = self.total_written.saturating_add(data.len());
-                    self.buf.extend_from_slice(data);
-                    Ok(data.len())
-                }
-
-                fn flush(&mut self) -> std::io::Result<()> {
-                    Ok(())
-                }
-            }
-
             enum SseStreamDecoder {
                 Zstd(zstd::stream::write::Decoder<'static, BoundedSseSink>),
                 Gzip(flate2::write::GzDecoder<BoundedSseSink>),
@@ -1938,61 +2185,59 @@ pub(super) async fn handle_intercepted_request(
 
             impl SseStreamDecoder {
                 fn write_and_take(&mut self, input: &[u8]) -> Result<Vec<u8>, String> {
+                    use std::io::Write;
                     match self {
                         Self::Zstd(d) => {
                             d.write_all(input)
                                 .and_then(|()| d.flush())
                                 .map_err(|e| e.to_string())?;
-                            Ok(std::mem::take(&mut d.get_mut().buf))
+                            Ok(d.get_mut().take_bytes())
                         }
                         Self::Gzip(d) => {
                             d.write_all(input)
                                 .and_then(|()| d.flush())
                                 .map_err(|e| e.to_string())?;
-                            Ok(std::mem::take(&mut d.get_mut().buf))
+                            Ok(d.get_mut().take_bytes())
                         }
                         Self::Deflate(d) => {
                             d.write_all(input)
                                 .and_then(|()| d.flush())
                                 .map_err(|e| e.to_string())?;
-                            Ok(std::mem::take(&mut d.get_mut().buf))
+                            Ok(d.get_mut().take_bytes())
                         }
                         Self::Brotli(d) => {
                             d.write_all(input)
                                 .and_then(|()| d.flush())
                                 .map_err(|e| e.to_string())?;
-                            Ok(std::mem::take(&mut d.get_mut().buf))
+                            Ok(d.get_mut().take_bytes())
                         }
                     }
                 }
 
                 fn flush_tail(mut self) -> Vec<u8> {
+                    use std::io::Write;
                     match &mut self {
                         Self::Zstd(d) => {
                             let _ = d.flush();
-                            std::mem::take(&mut d.get_mut().buf)
+                            d.get_mut().take_bytes()
                         }
                         Self::Gzip(d) => {
                             let _ = d.flush();
-                            std::mem::take(&mut d.get_mut().buf)
+                            d.get_mut().take_bytes()
                         }
                         Self::Deflate(d) => {
                             let _ = d.flush();
-                            std::mem::take(&mut d.get_mut().buf)
+                            d.get_mut().take_bytes()
                         }
                         Self::Brotli(d) => {
                             let _ = d.flush();
-                            std::mem::take(&mut d.get_mut().buf)
+                            d.get_mut().take_bytes()
                         }
                     }
                 }
             }
 
-            let make_sink = || BoundedSseSink {
-                buf: Vec::new(),
-                total_written: 0,
-                max_total: MAX_CAPTURED_BODY_BYTES,
-            };
+            let make_sink = || BoundedSseSink::new(MAX_CAPTURED_BODY_BYTES);
 
             let mut decoder = match outer_sse_encoding.as_deref() {
                 Some("zstd" | "x-zstd") => {
@@ -2023,8 +2268,37 @@ pub(super) async fn handle_intercepted_request(
             let mut total_wire_bytes = 0usize;
             let mut last_sse_emit: Option<Instant> = None;
             let mut download_pacer = BandwidthPacer::new();
+            let mut abort_sig = sse_lifecycle.clone();
+            let mut drain_expire_sig = sse_lifecycle.clone();
+            let mut config_rx = sse_ctx.filters.subscribe_config_updates();
+            let mut config_closed = false;
 
-            while let Some(Ok(frame)) = upstream_resp_body.frame().await {
+            loop {
+                let maybe_frame = tokio::select! {
+                    biased;
+                    _ = abort_sig.wait_abort() => break,
+                    _ = drain_expire_sig.wait_drain_expired() => break,
+                    changed = config_rx.changed(), if !config_closed => {
+                        if changed.is_err() {
+                            config_closed = true;
+                            continue;
+                        }
+                        if !sse_ctx.filters.is_lan_client_allowed(client_addr.ip())
+                            || (sse_is_https
+                                && matches!(
+                                    sse_ctx.filters.evaluate_connect_tunnel(&sse_host, sse_port),
+                                    ConnectTunnelDecision::Passthrough(_)
+                                ))
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    res = upstream_resp_body.frame() => res,
+                };
+                let Some(Ok(frame)) = maybe_frame else {
+                    break;
+                };
                 let Some(chunk) = frame.into_data().ok().filter(|c| !c.is_empty()) else {
                     continue;
                 };
@@ -2047,17 +2321,19 @@ pub(super) async fn handle_intercepted_request(
 
                 let chunk_offset_ms = start.elapsed().as_millis() as u64;
                 total_bytes = total_bytes.saturating_add(effective_chunk.len());
-                record_sse_chunk(
-                    &sse_ctx,
-                    session_id,
-                    &effective_chunk,
-                    &mut pending_parse_buf,
-                    &mut total_parsed_events,
-                    total_bytes,
-                    chunk_offset_ms,
-                    MAX_SSE_EVENTS,
-                    &mut last_sse_emit,
-                );
+                if !sse_lifecycle.is_capture_suppressed() {
+                    record_sse_chunk(
+                        &sse_ctx,
+                        session_id,
+                        &effective_chunk,
+                        &mut pending_parse_buf,
+                        &mut total_parsed_events,
+                        total_bytes,
+                        chunk_offset_ms,
+                        MAX_SSE_EVENTS,
+                        &mut last_sse_emit,
+                    );
+                }
 
                 if chunk_tx.send(Ok(Frame::data(effective_chunk))).await.is_err() {
                     break;
@@ -2069,55 +2345,65 @@ pub(super) async fn handle_intercepted_request(
                 if !tail_decoded.is_empty() {
                     let chunk_offset_ms = start.elapsed().as_millis() as u64;
                     total_bytes = total_bytes.saturating_add(tail_decoded.len());
-                    record_sse_chunk(
-                        &sse_ctx,
-                        session_id,
-                        &tail_decoded,
-                        &mut pending_parse_buf,
-                        &mut total_parsed_events,
-                        total_bytes,
-                        chunk_offset_ms,
-                        MAX_SSE_EVENTS,
-                        &mut last_sse_emit,
-                    );
+                    if !sse_lifecycle.is_capture_suppressed() {
+                        record_sse_chunk(
+                            &sse_ctx,
+                            session_id,
+                            &tail_decoded,
+                            &mut pending_parse_buf,
+                            &mut total_parsed_events,
+                            total_bytes,
+                            chunk_offset_ms,
+                            MAX_SSE_EVENTS,
+                            &mut last_sse_emit,
+                        );
+                    }
                     let _ = chunk_tx.send(Ok(Frame::data(Bytes::from(tail_decoded)))).await;
                 }
             }
 
-            // Flush any trailing partial SSE block and finalize Base64/text/SQLite offload once
-            let end_ms = start.elapsed().as_millis() as u64;
-            let trailing_event = if !pending_parse_buf.is_empty() && total_parsed_events < MAX_SSE_EVENTS {
-                parse_single_sse_block(&pending_parse_buf, total_parsed_events + 1, end_ms)
-            } else {
-                None
-            };
-            let _ = sse_ctx
-                .store
-                .finalize_sse_stream(session_id, end_ms, trailing_event, MAX_SSE_EVENTS);
-            let done_instant = Instant::now();
-            let done_at = timestamp_at_instant(start, start_utc, done_instant);
-            let download_ms = duration_ms_f64(
-                done_instant.saturating_duration_since(got_response_headers_instant),
-            );
-            let overall_ms = duration_ms_f64(done_instant.saturating_duration_since(start));
-            if let Some(updated_summary) =
-                sse_ctx.store.update_session_telemetry(session_id, |detail| {
-                    let timings = detail.timings.get_or_insert_with(Default::default);
-                    timings.server_done_response = Some(done_at.clone());
-                    timings.client_done_response = Some(done_at);
-                    timings.content_download_ms = Some(download_ms);
-                    compute_timings_summary(timings, overall_ms);
+            if !sse_lifecycle.is_capture_suppressed() {
+                // Flush any trailing partial SSE block and finalize Base64/text/SQLite offload once
+                let end_ms = start.elapsed().as_millis() as u64;
+                let trailing_event =
+                    if !pending_parse_buf.is_empty() && total_parsed_events < MAX_SSE_EVENTS {
+                        parse_single_sse_block(&pending_parse_buf, total_parsed_events + 1, end_ms)
+                    } else {
+                        None
+                    };
+                let _ = sse_ctx.store.finalize_sse_stream(
+                    session_id,
+                    end_ms,
+                    trailing_event,
+                    MAX_SSE_EVENTS,
+                );
+                let done_instant = Instant::now();
+                let done_at = timestamp_at_instant(start, start_utc, done_instant);
+                let download_ms = duration_ms_f64(
+                    done_instant.saturating_duration_since(got_response_headers_instant),
+                );
+                let overall_ms = duration_ms_f64(done_instant.saturating_duration_since(start));
+                if let Some(updated_summary) =
+                    sse_ctx.store.update_session_telemetry(session_id, |detail| {
+                        let timings = detail.timings.get_or_insert_with(Default::default);
+                        timings.server_done_response = Some(done_at.clone());
+                        timings.client_done_response = Some(done_at);
+                        timings.content_download_ms = Some(download_ms);
+                        compute_timings_summary(timings, overall_ms);
 
-                    let stats = detail.transfer_stats.get_or_insert_with(Default::default);
-                    stats.response_body_bytes = Some(total_bytes);
-                    stats.response_wire_body_bytes = Some(total_wire_bytes);
+                        let stats = detail.transfer_stats.get_or_insert_with(Default::default);
+                        stats.response_body_bytes = Some(total_bytes);
+                        stats.response_wire_body_bytes = Some(total_wire_bytes);
 
-                    let t_clone = detail.timings.clone();
-                    let s_clone = detail.transfer_stats.clone();
-                    detail.summary.apply_telemetry(t_clone.as_ref(), s_clone.as_ref());
-                })
-            {
-                let _ = sse_ctx.event_tx.send(updated_summary);
+                        let t_clone = detail.timings.clone();
+                        let s_clone = detail.transfer_stats.clone();
+                        detail
+                            .summary
+                            .apply_telemetry(t_clone.as_ref(), s_clone.as_ref());
+                    })
+                {
+                    let _ = sse_ctx.event_tx.send(updated_summary);
+                }
             }
         });
 
@@ -2128,12 +2414,19 @@ pub(super) async fn handle_intercepted_request(
         let mut builder =
             Response::builder().status(StatusCode::from_u16(final_status).unwrap_or(StatusCode::OK));
         for h in &resp_headers {
-            if !is_hop_by_hop_header(&h.name)
-                && !h.name.eq_ignore_ascii_case("content-encoding")
-                && !h.name.eq_ignore_ascii_case("content-length")
-                && !(strip_alt_svc && is_alt_svc_header(&h.name))
+            let trimmed = h.name.trim();
+            if !trimmed.is_empty()
+                && !is_hop_by_hop_header(trimmed)
+                && !trimmed.eq_ignore_ascii_case("content-encoding")
+                && !trimmed.eq_ignore_ascii_case("content-length")
+                && !(strip_alt_svc && is_alt_svc_header(trimmed))
             {
-                builder = builder.header(&h.name, &h.value);
+                if let (Ok(hn), Ok(hv)) = (
+                    http::HeaderName::from_bytes(trimmed.as_bytes()),
+                    h.to_hyper_header_value(),
+                ) {
+                    builder = builder.header(hn, hv);
+                }
             }
         }
         if !sse_remaining_encodings.is_empty() {
@@ -2159,6 +2452,8 @@ pub(super) async fn handle_intercepted_request(
     let is_large_stream_body = resp_content_length
         .map(|len| len > BODY_OFFLOAD_THRESHOLD_BYTES)
         .unwrap_or(false);
+    let capture_text_preview = !is_media_or_partial
+        && (ct_lower.starts_with("text/") || ct_lower.starts_with("application/"));
 
     if !is_head_request
         && !should_break_resp
@@ -2166,230 +2461,109 @@ pub(super) async fn handle_intercepted_request(
         && !resp_has_zstd
         && (is_media_or_partial || is_large_stream_body)
     {
-        let capture_text_preview = !is_media_or_partial
-            && (ct_lower.starts_with("text/") || ct_lower.starts_with("application/"));
-
-        base_stats.is_streaming = Some(true);
-        base_stats.response_body_bytes = Some(0);
-        base_stats.response_wire_body_bytes = Some(0);
-        base_timings.client_begin_response = Some(got_response_headers_at.clone());
-        compute_timings_summary(&mut base_timings, elapsed_ms(start));
-
-        let capped_req = &body_bytes[..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
-        let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
-        let mut initial_summary = SessionSummary {
-            id: session_id,
-            status: final_status,
-            protocol: protocol_label,
-            scheme: scheme_str.clone(),
-            method: method_str,
-            host: host_header,
-            path: path_and_query,
-            url: full_url,
+        in_flight_guard.disarm();
+        return build_and_spawn_raw_stream_response(RawBodyStreamParams {
+            ctx,
+            session_id,
+            final_status,
+            protocol_label,
+            scheme_str,
+            method_str,
+            host_header,
+            path_and_query,
+            full_url,
             content_type,
-            body_size: 0,
-            duration_ms: start.elapsed().as_millis() as u64,
             timestamp,
+            start,
+            start_utc,
+            got_response_headers_at,
+            got_response_headers_instant,
+            client_addr,
+            client_proc,
+            client_conn,
+            mtls_cn,
+            req_headers,
+            req_body_bytes: body_bytes,
+            req_mutated,
+            resp_mutated,
+            bp_modified,
             is_mocked,
             matched_rule_id,
-            error: None,
-            process_name: client_proc.as_ref().map(|p| p.name.clone()),
-            process_pid: client_proc.as_ref().map(|p| p.pid),
-            tls_bypassed: false,
-            headers_mutated: req_mutated || resp_mutated,
-            breakpoint_paused: None,
-            breakpoint_modified: bp_modified,
-            comment: None,
-            marked_color: None,
-            client_ip: Some(normalize_client_ip(client_addr)),
-            remapped_to: upstream_target.remapped_to.clone(),
-            ttfb_ms: None,
-            dns_ms: None,
-            connect_ms: None,
-            tls_ms: None,
-            receive_ms: None,
-            request_size: None,
-            wire_body_size: None,
-            server_ip: None,
-            server_conn_reused: None,
-            ws_open: None,
-        };
-        initial_summary.apply_telemetry(Some(&base_timings), Some(&base_stats));
-
-        let initial_detail = SessionDetail {
-            summary: initial_summary,
-            request_headers: req_headers,
-            response_headers: resp_headers.clone(),
-            request_body_base64: req_b64,
-            response_body_base64: String::new(),
-            request_body_text: req_txt,
-            response_body_text: None,
-            tls_version: format_mitm_tls_display(
-                &scheme_str,
-                client_conn.client_tls_version.as_deref(),
-                Some("Stream"),
-                mtls_cn.as_deref(),
-            ),
-            client_addr: client_addr.to_string(),
-            websocket_frames: Vec::new(),
-            sse_events: Vec::new(),
-            body_offloaded: false,
-            request_body_offloaded: req_offloaded,
-            timings: Some(base_timings),
-            transfer_stats: Some(base_stats),
-        };
-
-        // Stage 21 Phase 1: publish final response headers & status immediately before streaming chunks
-        in_flight_guard.disarm();
-        let initial_recorded =
-            record_completed_session(&ctx, initial_detail.clone(), Some(capped_req), None);
-        let req_body_for_deferred_end = if initial_recorded {
-            None
-        } else {
-            Some(body_bytes.slice(..body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)))
-        };
-
-        let (chunk_tx, chunk_rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(32);
-        let stream_ctx = ctx.clone();
-
-        tokio::spawn(async move {
-            let mut total_bytes: usize = 0;
-            let mut preview_accum: Vec<u8> = Vec::new();
-            let mut stream_error: Option<String> = None;
-            let mut last_emit = Instant::now() - Duration::from_secs(1);
-            let mut download_pacer = BandwidthPacer::new();
-
-            loop {
-                match upstream_resp_body.frame().await {
-                    Some(Ok(frame)) => {
-                        let Some(chunk) = frame.into_data().ok().filter(|c| !c.is_empty()) else {
-                            continue;
-                        };
-                        if let Err(err) = download_pacer.pace(&stream_ctx.throttle, chunk.len(), true).await {
-                            stream_error = Some(err.to_string());
-                            break;
-                        }
-                        total_bytes = total_bytes.saturating_add(chunk.len());
-
-                        if capture_text_preview
-                            && preview_accum.len() < STREAM_TEXT_PREVIEW_MAX_BYTES
-                        {
-                            let room = STREAM_TEXT_PREVIEW_MAX_BYTES - preview_accum.len();
-                            preview_accum.extend_from_slice(&chunk[..chunk.len().min(room)]);
-                        }
-
-                        if chunk_tx.send(Ok(Frame::data(chunk))).await.is_err() {
-                            break;
-                        }
-
-                        if last_emit.elapsed() >= Duration::from_millis(150) {
-                            last_emit = Instant::now();
-                            let cur_elapsed = start.elapsed().as_millis() as u64;
-                            if let Some(mut detail) = stream_ctx.store.get(session_id) {
-                                detail.summary.body_size = total_bytes;
-                                detail.summary.duration_ms = cur_elapsed;
-                                detail.summary.wire_body_size = Some(total_bytes);
-                                let updated_summary = detail.summary.clone();
-                                stream_ctx.store.insert(detail);
-                                let _ = stream_ctx.event_tx.send(updated_summary);
-                            }
-                        }
-                    }
-                    None => break,
-                    Some(Err(err)) => {
-                        let chain = format_error_chain(&err);
-                        tracing::warn!(
-                            "Upstream stream chunk error for session #{session_id} after {total_bytes} bytes: {chain}"
-                        );
-                        stream_error = Some(format!("Upstream response stream error: {chain}"));
-                        break;
-                    }
-                }
-            }
-
-            drop(chunk_tx);
-
-            let done_instant = Instant::now();
-            let done_at = timestamp_at_instant(start, start_utc, done_instant);
-            let final_duration_ms = start.elapsed().as_millis() as u64;
-            let download_ms = duration_ms_f64(
-                done_instant.saturating_duration_since(got_response_headers_instant),
-            );
-            let overall_ms = duration_ms_f64(done_instant.saturating_duration_since(start));
-
-            let mut final_detail = stream_ctx.store.get(session_id).unwrap_or(initial_detail);
-            final_detail.summary.body_size = total_bytes;
-            final_detail.summary.duration_ms = final_duration_ms;
-            if let Some(ref err_msg) = stream_error {
-                final_detail.summary.error = Some(err_msg.clone());
-            }
-            if capture_text_preview && !preview_accum.is_empty() {
-                final_detail.response_body_base64 =
-                    base64::engine::general_purpose::STANDARD.encode(&preview_accum);
-                final_detail.response_body_text =
-                    std::str::from_utf8(&preview_accum).ok().map(str::to_owned);
-            } else {
-                final_detail.response_body_base64.clear();
-                final_detail.response_body_text = None;
-            }
-            {
-                let timings = final_detail.timings.get_or_insert_with(Default::default);
-                timings.server_done_response = Some(done_at.clone());
-                timings.client_done_response = Some(done_at);
-                timings.content_download_ms = Some(download_ms);
-                compute_timings_summary(timings, overall_ms);
-
-                let stats = final_detail
-                    .transfer_stats
-                    .get_or_insert_with(Default::default);
-                stats.response_body_bytes = Some(total_bytes);
-                stats.response_wire_body_bytes = Some(total_bytes);
-
-                let t_clone = final_detail.timings.clone();
-                let s_clone = final_detail.transfer_stats.clone();
-                final_detail
-                    .summary
-                    .apply_telemetry(t_clone.as_ref(), s_clone.as_ref());
-            }
-
-            if initial_recorded || stream_error.is_some() || total_bytes > 0 {
-                let _ = record_completed_session(
-                    &stream_ctx,
-                    final_detail,
-                    req_body_for_deferred_end.as_deref(),
-                    None,
-                );
-            }
+            remapped_to: upstream_target.remapped_to,
+            base_timings,
+            base_stats,
+            resp_headers,
+            capture_text_preview,
+            prefix_chunks: Vec::new(),
+            upstream_resp_body,
         });
-
-        let stream = futures_util::stream::unfold(chunk_rx, |mut rx| async move {
-            rx.recv().await.map(|frame| (frame, rx))
-        });
-        let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
-        let mut builder =
-            Response::builder().status(StatusCode::from_u16(final_status).unwrap_or(StatusCode::OK));
-        for h in &resp_headers {
-            // Raw wire bytes stream directly to the client untouched, so preserve Content-Encoding & Content-Length.
-            if !is_hop_by_hop_header(&h.name) && !(strip_alt_svc && is_alt_svc_header(&h.name)) {
-                builder = builder.header(&h.name, &h.value);
-            }
-        }
-        return builder
-            .body(http_body_util::BodyExt::boxed(StreamBody::new(stream)))
-            .unwrap_or_else(|_| {
-                plain_response(StatusCode::BAD_GATEWAY, "Failed building streamed response")
-            });
     }
 
-    // 4c. Standard Buffered Upstream Response (+ Optional Live Breakpoint After Response)
-    let raw_resp_bytes = match collect_response_body_limited(
+    // 4c. Standard Buffered Upstream Response (+ Seamless Stream Spill at >2 MiB for Chunked + Live Breakpoint After Response)
+    let is_streaming_response = is_sse_stream
+        || final_status == 206
+        || ct_lower.starts_with("video/")
+        || ct_lower.starts_with("audio/");
+    let has_response_script = !is_streaming_response && ctx.script_runner.should_run_response();
+    let has_override_status = matched_rule
+        .as_ref()
+        .is_some_and(|r| matches!(r.action, RuleActionType::OverrideStatus));
+    let can_spill_to_stream = !is_head_request
+        && !should_break_resp
+        && !has_response_script
+        && !has_override_status
+        && resp_content_length.is_none();
+    let spill_threshold = can_spill_to_stream.then_some(BODY_OFFLOAD_THRESHOLD_BYTES);
+
+    let raw_resp_bytes = match collect_response_body_or_spill(
         upstream_resp_body,
         &ctx.throttle,
         MAX_BUFFERED_RESPONSE_BODY_BYTES,
+        spill_threshold,
     )
     .await
     {
-        Ok(bytes) => bytes,
+        Ok(ResponseBodyCollectOutcome::Complete(bytes)) => bytes,
+        Ok(ResponseBodyCollectOutcome::Spilled {
+            prefix, remaining, ..
+        }) => {
+            in_flight_guard.disarm();
+            return build_and_spawn_raw_stream_response(RawBodyStreamParams {
+                ctx,
+                session_id,
+                final_status,
+                protocol_label,
+                scheme_str,
+                method_str,
+                host_header,
+                path_and_query,
+                full_url,
+                content_type,
+                timestamp,
+                start,
+                start_utc,
+                got_response_headers_at,
+                got_response_headers_instant,
+                client_addr,
+                client_proc,
+                client_conn,
+                mtls_cn,
+                req_headers,
+                req_body_bytes: body_bytes,
+                req_mutated,
+                resp_mutated,
+                bp_modified,
+                is_mocked,
+                matched_rule_id,
+                remapped_to: upstream_target.remapped_to,
+                base_timings,
+                base_stats,
+                resp_headers,
+                capture_text_preview,
+                prefix_chunks: prefix,
+                upstream_resp_body: remaining,
+            });
+        }
         Err(err) => {
             let (err_status, bytes_read, err_msg) = match err {
                 ResponseBodyReadError::PayloadTooLarge { limit, bytes_read } => (
@@ -2410,6 +2584,10 @@ pub(super) async fn handle_intercepted_request(
                     format!("Failed reading upstream response body: {message}"),
                 ),
             };
+            in_flight_guard.disarm();
+            if client_conn.is_capture_suppressed() {
+                return plain_response(err_status, &err_msg);
+            }
             let now = Instant::now();
             let now_at = timestamp_at_instant(start, start_utc, now);
             base_timings.server_done_response = Some(now_at.clone());
@@ -2424,7 +2602,6 @@ pub(super) async fn handle_intercepted_request(
             );
             base_stats.response_wire_body_bytes = Some(bytes_read);
             base_stats.response_body_bytes = Some(err_msg.len());
-            in_flight_guard.disarm();
             return record_and_return_error_with_telemetry(
                 &ctx,
                 session_id,
@@ -2481,11 +2658,7 @@ pub(super) async fn handle_intercepted_request(
     // 4c-script. Python Scripting Engine: on_response(response)
     // Explicitly skipped for SSE (`text/event-stream`), media (`video/*`, `audio/*`),
     // and `206 Partial Content` streams so zero-buffering paths remain untouched.
-    let is_streaming_response = is_sse_stream
-        || final_status == 206
-        || ct_lower.starts_with("video/")
-        || ct_lower.starts_with("audio/");
-    if !is_streaming_response && ctx.script_runner.should_run_response() {
+    if has_response_script {
         let py_resp_start = Instant::now();
         let outcome = ctx
             .script_runner
@@ -2579,6 +2752,10 @@ pub(super) async fn handle_intercepted_request(
         total_bp_pause_ms += elapsed_ms(bp_resp_start);
         if bp_outcome.aborted {
             let msg = "Aborted at Live Breakpoint (After Response)".to_string();
+            in_flight_guard.disarm();
+            if client_conn.is_capture_suppressed() {
+                return plain_response(StatusCode::BAD_GATEWAY, &msg);
+            }
             base_timings.breakpoint_pause_ms =
                 (total_bp_pause_ms > 0.0).then(|| round_ms(total_bp_pause_ms));
             base_timings.script_hook_ms =
@@ -2592,7 +2769,6 @@ pub(super) async fn handle_intercepted_request(
                 duration_ms_f64(now.saturating_duration_since(start)),
             );
             base_stats.response_body_bytes = Some(msg.len());
-            in_flight_guard.disarm();
             return record_and_return_error_with_telemetry(
                 &ctx,
                 session_id,
@@ -2729,7 +2905,9 @@ pub(super) async fn handle_intercepted_request(
     };
 
     in_flight_guard.disarm();
-    record_completed_session(&ctx, detail, Some(capped_req), Some(capped_resp));
+    if !client_conn.is_capture_suppressed() {
+        record_completed_session(&ctx, detail, Some(capped_req), Some(capped_resp));
+    }
 
     let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
     let preserve_head_content_length =
@@ -2742,20 +2920,29 @@ pub(super) async fn handle_intercepted_request(
     let mut builder =
         Response::builder().status(StatusCode::from_u16(final_status).unwrap_or(StatusCode::OK));
     for h in &resp_headers {
+        let trimmed = h.name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
         // `maybe_decompress_content_encodings` peels supported encodings (`zstd`, `br`, `gzip`, `deflate`).
         // Re-emit only encodings that were not decoded, and preserve upstream `Content-Length` for
         // empty `HEAD` responses (and unmodified undecoded responses).
         // Also strip HTTP/3 QUIC discovery headers (`alt-svc`, `alternate-protocol`) when enabled.
-        let keep_cl = h.name.eq_ignore_ascii_case("content-length")
+        let keep_cl = trimmed.eq_ignore_ascii_case("content-length")
             && (preserve_head_content_length
                 || (preserve_original_content_length
                     && h.value.trim().parse::<usize>().ok() == Some(resp_bytes.len())));
-        if !is_hop_by_hop_header(&h.name)
-            && !h.name.eq_ignore_ascii_case("content-encoding")
-            && (!h.name.eq_ignore_ascii_case("content-length") || keep_cl)
-            && !(strip_alt_svc && is_alt_svc_header(&h.name))
+        if !is_hop_by_hop_header(trimmed)
+            && !trimmed.eq_ignore_ascii_case("content-encoding")
+            && (!trimmed.eq_ignore_ascii_case("content-length") || keep_cl)
+            && !(strip_alt_svc && is_alt_svc_header(trimmed))
         {
-            builder = builder.header(&h.name, &h.value);
+            if let (Ok(hn), Ok(hv)) = (
+                http::HeaderName::from_bytes(trimmed.as_bytes()),
+                h.to_hyper_header_value(),
+            ) {
+                builder = builder.header(hn, hv);
+            }
         }
     }
     if !remaining_content_encodings.is_empty() {
@@ -2763,7 +2950,11 @@ pub(super) async fn handle_intercepted_request(
     }
 
     let ctx_for_send = Arc::clone(&ctx);
+    let send_lifecycle = client_conn.lifecycle.clone();
     let tracked_body = TrackedResponseBody::new(boxed_full(resp_bytes), move |_bytes_sent, done_instant| {
+        if send_lifecycle.is_capture_suppressed() {
+            return;
+        }
         let done_at = timestamp_at_instant(start, start_utc, done_instant);
         let client_send_ms = duration_ms_f64(
             done_instant.saturating_duration_since(client_begin_resp_instant),
@@ -2786,6 +2977,374 @@ pub(super) async fn handle_intercepted_request(
     builder
         .body(http_body_util::BodyExt::boxed(tracked_body))
         .unwrap_or_else(|_| plain_response(StatusCode::BAD_GATEWAY, "Failed building proxy response"))
+}
+
+struct RawBodyStreamParams {
+    ctx: Arc<SharedProxyContext>,
+    session_id: u64,
+    final_status: u16,
+    protocol_label: String,
+    scheme_str: String,
+    method_str: String,
+    host_header: String,
+    path_and_query: String,
+    full_url: String,
+    content_type: String,
+    timestamp: String,
+    start: Instant,
+    start_utc: DateTime<Utc>,
+    got_response_headers_at: String,
+    got_response_headers_instant: Instant,
+    client_addr: SocketAddr,
+    client_proc: Option<ClientProcessInfo>,
+    client_conn: ClientConnContext,
+    mtls_cn: Option<String>,
+    req_headers: Vec<HeaderPair>,
+    req_body_bytes: Bytes,
+    req_mutated: bool,
+    resp_mutated: bool,
+    bp_modified: bool,
+    is_mocked: bool,
+    matched_rule_id: Option<String>,
+    remapped_to: Option<String>,
+    base_timings: SessionTimings,
+    base_stats: SessionTransferStats,
+    resp_headers: Vec<HeaderPair>,
+    capture_text_preview: bool,
+    prefix_chunks: Vec<Bytes>,
+    upstream_resp_body: Incoming,
+}
+
+fn build_and_spawn_raw_stream_response(params: RawBodyStreamParams) -> Response<ProxyBoxBody> {
+    let RawBodyStreamParams {
+        ctx,
+        session_id,
+        final_status,
+        protocol_label,
+        scheme_str,
+        method_str,
+        host_header,
+        path_and_query,
+        full_url,
+        content_type,
+        timestamp,
+        start,
+        start_utc,
+        got_response_headers_at,
+        got_response_headers_instant,
+        client_addr,
+        client_proc,
+        client_conn,
+        mtls_cn,
+        req_headers,
+        req_body_bytes,
+        req_mutated,
+        resp_mutated,
+        bp_modified,
+        is_mocked,
+        matched_rule_id,
+        remapped_to,
+        mut base_timings,
+        mut base_stats,
+        resp_headers,
+        capture_text_preview,
+        prefix_chunks,
+        mut upstream_resp_body,
+    } = params;
+
+    base_stats.is_streaming = Some(true);
+    base_stats.response_body_bytes = Some(0);
+    base_stats.response_wire_body_bytes = Some(0);
+    base_timings.client_begin_response = Some(got_response_headers_at);
+    compute_timings_summary(&mut base_timings, elapsed_ms(start));
+
+    let capped_req = &req_body_bytes[..req_body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
+    let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
+    let mut initial_summary = SessionSummary {
+        id: session_id,
+        status: final_status,
+        protocol: protocol_label,
+        scheme: scheme_str.clone(),
+        method: method_str,
+        host: host_header.clone(),
+        path: path_and_query,
+        url: full_url,
+        content_type,
+        body_size: 0,
+        duration_ms: start.elapsed().as_millis() as u64,
+        timestamp,
+        is_mocked,
+        matched_rule_id,
+        error: None,
+        process_name: client_proc.as_ref().map(|p| p.name.clone()),
+        process_pid: client_proc.as_ref().map(|p| p.pid),
+        tls_bypassed: false,
+        headers_mutated: req_mutated || resp_mutated,
+        breakpoint_paused: None,
+        breakpoint_modified: bp_modified,
+        comment: None,
+        marked_color: None,
+        client_ip: Some(normalize_client_ip(client_addr)),
+        remapped_to,
+        ttfb_ms: None,
+        dns_ms: None,
+        connect_ms: None,
+        tls_ms: None,
+        receive_ms: None,
+        request_size: None,
+        wire_body_size: None,
+        server_ip: None,
+        server_conn_reused: None,
+        ws_open: None,
+    };
+    initial_summary.apply_telemetry(Some(&base_timings), Some(&base_stats));
+
+    let initial_detail = SessionDetail {
+        summary: initial_summary,
+        request_headers: req_headers,
+        response_headers: resp_headers.clone(),
+        request_body_base64: req_b64,
+        response_body_base64: String::new(),
+        request_body_text: req_txt,
+        response_body_text: None,
+        tls_version: format_mitm_tls_display(
+            &scheme_str,
+            client_conn.client_tls_version.as_deref(),
+            Some("Stream"),
+            mtls_cn.as_deref(),
+        ),
+        client_addr: client_addr.to_string(),
+        websocket_frames: Vec::new(),
+        sse_events: Vec::new(),
+        body_offloaded: false,
+        request_body_offloaded: req_offloaded,
+        timings: Some(base_timings),
+        transfer_stats: Some(base_stats),
+    };
+
+    let initial_recorded = if !client_conn.is_capture_suppressed() {
+        record_completed_session(&ctx, initial_detail.clone(), Some(capped_req), None)
+    } else {
+        false
+    };
+    let req_body_for_deferred_end = if initial_recorded {
+        None
+    } else {
+        Some(req_body_bytes.slice(..req_body_bytes.len().min(MAX_CAPTURED_BODY_BYTES)))
+    };
+
+    let stream_content_encodings = extract_content_encoding_tokens(&resp_headers);
+    let stream_lifecycle = client_conn.lifecycle.clone();
+    let (stream_host, stream_opt_port) = parse_host_and_optional_port(&host_header);
+    let stream_port = stream_opt_port.unwrap_or_else(|| default_port_for_scheme(&scheme_str));
+    let stream_is_https = scheme_str.eq_ignore_ascii_case("https");
+    let (chunk_tx, chunk_rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(32);
+    let stream_ctx = ctx.clone();
+
+    tokio::spawn(async move {
+        let mut total_bytes: usize = 0;
+        let mut preview_accum: Vec<u8> = Vec::new();
+        let mut stream_error: Option<String> = None;
+        let mut last_emit = Instant::now() - Duration::from_secs(1);
+        let mut download_pacer = BandwidthPacer::new();
+        let mut abort_sig = stream_lifecycle.clone();
+        let mut drain_expire_sig = stream_lifecycle.clone();
+        let mut config_rx = stream_ctx.filters.subscribe_config_updates();
+        let mut config_closed = false;
+        let mut aborted_early = false;
+
+        for chunk in prefix_chunks {
+            if abort_sig.is_aborted() {
+                aborted_early = true;
+                break;
+            }
+            total_bytes = total_bytes.saturating_add(chunk.len());
+            if capture_text_preview && preview_accum.len() < STREAM_TEXT_PREVIEW_MAX_BYTES {
+                let room = STREAM_TEXT_PREVIEW_MAX_BYTES - preview_accum.len();
+                preview_accum.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
+            tokio::select! {
+                biased;
+                _ = abort_sig.wait_abort() => {
+                    aborted_early = true;
+                    break;
+                }
+                _ = drain_expire_sig.wait_drain_expired() => {
+                    aborted_early = true;
+                    break;
+                }
+                res = chunk_tx.send(Ok(Frame::data(chunk))) => {
+                    if res.is_err() {
+                        aborted_early = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !aborted_early {
+            loop {
+                let next_frame = tokio::select! {
+                    biased;
+                    _ = abort_sig.wait_abort() => break,
+                    _ = drain_expire_sig.wait_drain_expired() => break,
+                    changed = config_rx.changed(), if !config_closed => {
+                        if changed.is_err() {
+                            config_closed = true;
+                            continue;
+                        }
+                        if !stream_ctx.filters.is_lan_client_allowed(client_addr.ip())
+                            || (stream_is_https
+                                && matches!(
+                                    stream_ctx.filters.evaluate_connect_tunnel(&stream_host, stream_port),
+                                    ConnectTunnelDecision::Passthrough(_)
+                                ))
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    res = upstream_resp_body.frame() => res,
+                };
+                match next_frame {
+                    Some(Ok(frame)) => {
+                        let Some(chunk) = frame.into_data().ok().filter(|c| !c.is_empty()) else {
+                            continue;
+                        };
+                        if let Err(err) = download_pacer.pace(&stream_ctx.throttle, chunk.len(), true).await {
+                            stream_error = Some(err.to_string());
+                            break;
+                        }
+                        total_bytes = total_bytes.saturating_add(chunk.len());
+
+                        if capture_text_preview
+                            && preview_accum.len() < STREAM_TEXT_PREVIEW_MAX_BYTES
+                        {
+                            let room = STREAM_TEXT_PREVIEW_MAX_BYTES - preview_accum.len();
+                            preview_accum.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                        }
+
+                        if chunk_tx.send(Ok(Frame::data(chunk))).await.is_err() {
+                            break;
+                        }
+
+                        if !stream_lifecycle.is_capture_suppressed()
+                            && last_emit.elapsed() >= Duration::from_millis(150)
+                        {
+                            last_emit = Instant::now();
+                            let cur_elapsed = start.elapsed().as_millis() as u64;
+                            if let Some(mut detail) = stream_ctx.store.get(session_id) {
+                                detail.summary.body_size = total_bytes;
+                                detail.summary.duration_ms = cur_elapsed;
+                                detail.summary.wire_body_size = Some(total_bytes);
+                                let updated_summary = detail.summary.clone();
+                                stream_ctx.store.insert(detail);
+                                let _ = stream_ctx.event_tx.send(updated_summary);
+                            }
+                        }
+                    }
+                    None => break,
+                    Some(Err(err)) => {
+                        let chain = format_error_chain(&err);
+                        tracing::warn!(
+                            "Upstream stream chunk error for session #{session_id} after {total_bytes} bytes: {chain}"
+                        );
+                        stream_error = Some(format!("Upstream response stream error: {chain}"));
+                        break;
+                    }
+                }
+            }
+        }
+
+        drop(chunk_tx);
+
+        if stream_lifecycle.is_capture_suppressed() {
+            return;
+        }
+
+        let done_instant = Instant::now();
+        let done_at = timestamp_at_instant(start, start_utc, done_instant);
+        let final_duration_ms = start.elapsed().as_millis() as u64;
+        let download_ms = duration_ms_f64(
+            done_instant.saturating_duration_since(got_response_headers_instant),
+        );
+        let overall_ms = duration_ms_f64(done_instant.saturating_duration_since(start));
+
+        let mut final_detail = stream_ctx.store.get(session_id).unwrap_or(initial_detail);
+        final_detail.summary.body_size = total_bytes;
+        final_detail.summary.duration_ms = final_duration_ms;
+        if let Some(ref err_msg) = stream_error {
+            final_detail.summary.error = Some(err_msg.clone());
+        }
+        if capture_text_preview && !preview_accum.is_empty() {
+            let preview_bytes = decode_stream_preview_best_effort(
+                &stream_content_encodings,
+                &preview_accum,
+                STREAM_TEXT_PREVIEW_MAX_BYTES,
+            );
+            final_detail.response_body_base64 =
+                base64::engine::general_purpose::STANDARD.encode(&preview_bytes);
+            final_detail.response_body_text = utf8_prefix_lossless(&preview_bytes);
+        } else {
+            final_detail.response_body_base64.clear();
+            final_detail.response_body_text = None;
+        }
+        {
+            let timings = final_detail.timings.get_or_insert_with(Default::default);
+            timings.server_done_response = Some(done_at.clone());
+            timings.client_done_response = Some(done_at);
+            timings.content_download_ms = Some(download_ms);
+            compute_timings_summary(timings, overall_ms);
+
+            let stats = final_detail
+                .transfer_stats
+                .get_or_insert_with(Default::default);
+            stats.response_body_bytes = Some(total_bytes);
+            stats.response_wire_body_bytes = Some(total_bytes);
+
+            let t_clone = final_detail.timings.clone();
+            let s_clone = final_detail.transfer_stats.clone();
+            final_detail
+                .summary
+                .apply_telemetry(t_clone.as_ref(), s_clone.as_ref());
+        }
+
+        if initial_recorded || stream_error.is_some() || total_bytes > 0 {
+            let _ = record_completed_session(
+                &stream_ctx,
+                final_detail,
+                req_body_for_deferred_end.as_deref(),
+                None,
+            );
+        }
+    });
+
+    let stream = futures_util::stream::unfold(chunk_rx, |mut rx| async move {
+        rx.recv().await.map(|frame| (frame, rx))
+    });
+    let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
+    let mut builder =
+        Response::builder().status(StatusCode::from_u16(final_status).unwrap_or(StatusCode::OK));
+    for h in &resp_headers {
+        let trimmed = h.name.trim();
+        // Raw wire bytes stream directly to the client untouched, so preserve Content-Encoding & Content-Length.
+        if !trimmed.is_empty()
+            && !is_hop_by_hop_header(trimmed)
+            && !(strip_alt_svc && is_alt_svc_header(trimmed))
+        {
+            if let (Ok(hn), Ok(hv)) = (
+                http::HeaderName::from_bytes(trimmed.as_bytes()),
+                h.to_hyper_header_value(),
+            ) {
+                builder = builder.header(hn, hv);
+            }
+        }
+    }
+    builder
+        .body(http_body_util::BodyExt::boxed(StreamBody::new(stream)))
+        .unwrap_or_else(|_| {
+            plain_response(StatusCode::BAD_GATEWAY, "Failed building streamed response")
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2817,13 +3376,7 @@ pub(super) fn rewrite_request_url_fields(
     *full_url = parsed.to_string();
     // Keep Host header synchronized with the rewritten URL
     req_headers.retain(|h| !h.name.eq_ignore_ascii_case("host"));
-    req_headers.insert(
-        0,
-        HeaderPair {
-            name: "Host".into(),
-            value: host_header.clone(),
-        },
-    );
+    req_headers.insert(0, HeaderPair::new("Host", host_header.clone()));
     true
 }
 
@@ -3466,12 +4019,32 @@ pub(super) fn build_autoresponder_mock_detail(
     input: AutoResponderMockInput<'_>,
 ) -> (SessionDetail, Vec<HeaderPair>, Vec<u8>) {
     let mock_bytes = input.rule.response_body.clone().into_bytes();
-    let mut mock_resp_headers = input.rule.response_headers.clone();
+    let strip_alt_svc = ctx.filters.is_strip_alt_svc_enabled();
+    let is_disallowed_mock_header = |name: &str| -> bool {
+        let trimmed = name.trim();
+        trimmed.is_empty()
+            || is_hop_by_hop_header(trimmed)
+            || trimmed.eq_ignore_ascii_case("content-length")
+            || trimmed.eq_ignore_ascii_case("content-encoding")
+            || (strip_alt_svc && is_alt_svc_header(trimmed))
+    };
+    let mut mock_resp_headers: Vec<HeaderPair> = input
+        .rule
+        .response_headers
+        .iter()
+        .filter(|h| !is_disallowed_mock_header(&h.name))
+        .cloned()
+        .collect();
     let resp_mutated = ctx.filters.apply_header_mutations(
         HeaderMutationDirection::Response,
         &input.full_url,
         &mut mock_resp_headers,
     );
+    mock_resp_headers.retain(|h| !is_disallowed_mock_header(&h.name));
+    mock_resp_headers.push(HeaderPair::new(
+        "Content-Length",
+        mock_bytes.len().to_string(),
+    ));
     let content_type = mock_resp_headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case("content-type"))

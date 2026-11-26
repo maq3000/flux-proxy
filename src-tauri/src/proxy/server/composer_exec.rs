@@ -195,19 +195,45 @@ impl ProxyEngineController {
                 req_mutated,
             };
             let bp_start = Instant::now();
-            let bp_res = run_request_breakpoint_stage(
-                &self.context,
-                bp_input,
-                &mut method_str,
-                &mut full_url,
-                &mut scheme,
-                &mut host,
-                &mut path,
-                &mut req_headers,
-                &mut req_bytes,
-                &mut bp_modified,
-            )
-            .await;
+            let bp_res = tokio::select! {
+                biased;
+                _ = &mut cancel_fut => {
+                    return Err(record_composer_cancelled(
+                        &self.context,
+                        session_id,
+                        if scheme == "https" {
+                            "HTTPS/2".to_string()
+                        } else {
+                            "HTTP/1.1".to_string()
+                        },
+                        &scheme,
+                        &method_str,
+                        &host,
+                        &path,
+                        &full_url,
+                        req_headers,
+                        &req_bytes,
+                        start,
+                        timestamp,
+                        self_pid,
+                        req_mutated,
+                        bp_modified,
+                        None,
+                    ));
+                }
+                res = run_request_breakpoint_stage(
+                    &self.context,
+                    bp_input,
+                    &mut method_str,
+                    &mut full_url,
+                    &mut scheme,
+                    &mut host,
+                    &mut path,
+                    &mut req_headers,
+                    &mut req_bytes,
+                    &mut bp_modified,
+                ) => res,
+            };
             total_bp_pause_ms += elapsed_ms(bp_start);
             if bp_res.is_err() {
                 let proto = if scheme == "https" {
@@ -268,11 +294,37 @@ impl ProxyEngineController {
         // Python Scripting Engine: on_request(request)
         if !skip_python_scripts && self.context.script_runner.should_run_request() {
             let py_req_start = Instant::now();
-            let outcome = self
-                .context
-                .script_runner
-                .run_on_request(session_id, &method_str, &full_url, &req_headers, &req_bytes)
-                .await;
+            let outcome = tokio::select! {
+                biased;
+                _ = &mut cancel_fut => {
+                    return Err(record_composer_cancelled(
+                        &self.context,
+                        session_id,
+                        if scheme == "https" {
+                            "HTTPS/2".to_string()
+                        } else {
+                            "HTTP/1.1".to_string()
+                        },
+                        &scheme,
+                        &method_str,
+                        &host,
+                        &path,
+                        &full_url,
+                        req_headers,
+                        &req_bytes,
+                        start,
+                        timestamp,
+                        self_pid,
+                        req_mutated,
+                        bp_modified,
+                        None,
+                    ));
+                }
+                res = self
+                    .context
+                    .script_runner
+                    .run_on_request(session_id, &method_str, &full_url, &req_headers, &req_bytes) => res,
+            };
             total_script_hook_ms += elapsed_ms(py_req_start);
             match outcome {
                 ScriptRequestOutcome::Unchanged => {}
@@ -468,7 +520,34 @@ impl ProxyEngineController {
         if let Some(ref rule) = matched_rule {
             if rule.latency_ms > 0 {
                 let delay_t = Instant::now();
-                tokio::time::sleep(Duration::from_millis(rule.latency_ms)).await;
+                tokio::select! {
+                    biased;
+                    _ = &mut cancel_fut => {
+                        return Err(record_composer_cancelled(
+                            &self.context,
+                            session_id,
+                            if scheme == "https" {
+                                "HTTPS/2".to_string()
+                            } else {
+                                "HTTP/1.1".to_string()
+                            },
+                            &scheme,
+                            &method_str,
+                            &host,
+                            &path,
+                            &full_url,
+                            req_headers,
+                            &req_bytes,
+                            start,
+                            timestamp,
+                            self_pid,
+                            req_mutated,
+                            bp_modified,
+                            None,
+                        ));
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(rule.latency_ms)) => {}
+                }
                 autoresponder_delay_ms = elapsed_ms(delay_t);
             }
             if matches!(rule.action, RuleActionType::MockResponse) {
@@ -542,16 +621,15 @@ impl ProxyEngineController {
                 detail.timings = Some(mock_timings);
                 detail.transfer_stats = Some(mock_stats);
 
-                let summary = detail.summary.clone();
                 let capped_req = &req_bytes[..req_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
                 let capped_mock = &mock_bytes[..mock_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
-                self.context.store.insert_with_bodies(
+                let _ = record_completed_session(
+                    &self.context,
                     detail.clone(),
                     Some(capped_req),
                     Some(capped_mock),
                 );
                 let stored = self.context.store.get(session_id).unwrap_or(detail);
-                let _ = self.context.event_tx.send(summary);
                 return Ok(stored);
             }
         }
@@ -794,7 +872,7 @@ impl ProxyEngineController {
             }
         }
 
-        let outbound_headers: Vec<(String, String)> = req_headers
+        let outbound_headers: Vec<crate::models::HeaderPair> = req_headers
             .iter()
             .filter(|h| {
                 let name = h.name.trim();
@@ -804,7 +882,7 @@ impl ProxyEngineController {
                     && !(upstream_target.host_header_override.is_some()
                         && name.eq_ignore_ascii_case("host"))
             })
-            .map(|h| (h.name.clone(), h.value.clone()))
+            .cloned()
             .collect();
         let req_timeout = self.context.composer_timeout(timeout_override);
         let req_body_bytes = Bytes::from(req_bytes.clone());
@@ -903,6 +981,20 @@ impl ProxyEngineController {
                 return Err(ProxyError::Custom(msg));
             }
         };
+
+        if !exchange.final_url.is_empty() && exchange.final_url != full_url {
+            full_url = exchange.final_url.clone();
+            if let Ok(parsed_final) = url::Url::parse(&full_url) {
+                scheme = parsed_final.scheme().to_string();
+                if let Some(final_host) = parsed_final.host_str() {
+                    host = final_host.to_string();
+                }
+                path = match parsed_final.query() {
+                    Some(q) => format!("{}?{}", parsed_final.path(), q),
+                    None => parsed_final.path().to_string(),
+                };
+            }
+        }
 
         let conn_meta = exchange.conn_meta.clone();
         let claimed = exchange.claimed.clone();
@@ -1051,18 +1143,38 @@ impl ProxyEngineController {
             && self.context.script_runner.should_run_response()
         {
             let py_resp_start = Instant::now();
-            let outcome = self
-                .context
-                .script_runner
-                .run_on_response(
+            let outcome = tokio::select! {
+                biased;
+                _ = &mut cancel_fut => {
+                    in_flight_guard.disarm();
+                    return Err(record_composer_cancelled(
+                        &self.context,
+                        session_id,
+                        version_str,
+                        &scheme,
+                        &method_str,
+                        &host,
+                        &path,
+                        &full_url,
+                        req_headers,
+                        &req_bytes,
+                        start,
+                        timestamp,
+                        self_pid,
+                        req_mutated || resp_mutated,
+                        bp_modified,
+                        upstream_target.remapped_to.clone(),
+                    ));
+                }
+                res = self.context.script_runner.run_on_response(
                     session_id,
                     &method_str,
                     &full_url,
                     status,
                     &resp_headers,
                     &resp_bytes,
-                )
-                .await;
+                ) => res,
+            };
             total_script_hook_ms += elapsed_ms(py_resp_start);
             if let ScriptResponseOutcome::Modified(edits) = outcome {
                 if let Some(next_status) = edits.status {
@@ -1101,38 +1213,61 @@ impl ProxyEngineController {
             .should_break(BreakpointStage::Response, &method_str, &full_url)
         {
             let bp_resp_start = Instant::now();
-            let bp_outcome = run_response_breakpoint_stage(
-                &self.context,
-                ResponseBreakpointStageInput {
-                    session_id,
-                    protocol: version_str.clone(),
-                    scheme: scheme.clone(),
-                    method: method_str.clone(),
-                    host: host.clone(),
-                    path: path.clone(),
-                    url: full_url.clone(),
-                    content_type: content_type.clone(),
-                    timestamp: timestamp.clone(),
-                    start,
-                    process_name: Some("flux-proxy (Composer)".into()),
-                    process_pid: Some(self_pid),
-                    client_ip: Some("127.0.0.1".into()),
-                    client_addr: "Composer (Local)".into(),
-                    tls_version: None,
-                    is_mocked,
-                    matched_rule_id: matched_rule_id.clone(),
-                    req_headers: req_headers.clone(),
-                    req_bytes: req_bytes.clone(),
-                    req_mutated,
-                    insert_paused_summary: false,
-                },
-                &mut status,
-                &mut resp_headers,
-                &mut resp_bytes,
-                &mut resp_mutated,
-                &mut bp_modified,
-            )
-            .await;
+            let bp_outcome = tokio::select! {
+                biased;
+                _ = &mut cancel_fut => {
+                    in_flight_guard.disarm();
+                    return Err(record_composer_cancelled(
+                        &self.context,
+                        session_id,
+                        version_str,
+                        &scheme,
+                        &method_str,
+                        &host,
+                        &path,
+                        &full_url,
+                        req_headers,
+                        &req_bytes,
+                        start,
+                        timestamp,
+                        self_pid,
+                        req_mutated || resp_mutated,
+                        bp_modified,
+                        upstream_target.remapped_to.clone(),
+                    ));
+                }
+                res = run_response_breakpoint_stage(
+                    &self.context,
+                    ResponseBreakpointStageInput {
+                        session_id,
+                        protocol: version_str.clone(),
+                        scheme: scheme.clone(),
+                        method: method_str.clone(),
+                        host: host.clone(),
+                        path: path.clone(),
+                        url: full_url.clone(),
+                        content_type: content_type.clone(),
+                        timestamp: timestamp.clone(),
+                        start,
+                        process_name: Some("flux-proxy (Composer)".into()),
+                        process_pid: Some(self_pid),
+                        client_ip: Some("127.0.0.1".into()),
+                        client_addr: "Composer (Local)".into(),
+                        tls_version: None,
+                        is_mocked,
+                        matched_rule_id: matched_rule_id.clone(),
+                        req_headers: req_headers.clone(),
+                        req_bytes: req_bytes.clone(),
+                        req_mutated,
+                        insert_paused_summary: false,
+                    },
+                    &mut status,
+                    &mut resp_headers,
+                    &mut resp_bytes,
+                    &mut resp_mutated,
+                    &mut bp_modified,
+                ) => res,
+            };
             total_bp_pause_ms += elapsed_ms(bp_resp_start);
             if bp_outcome.aborted {
                 in_flight_guard.disarm();
@@ -1298,6 +1433,8 @@ impl ProxyEngineController {
         let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
         let (resp_b64, resp_txt, resp_offloaded) = encode_inline_or_offload(capped_resp);
         let server_tls_ver = conn_meta.as_ref().and_then(|m| m.tls_version.as_deref());
+        let is_tls = scheme.eq_ignore_ascii_case("https")
+            || conn_meta.as_ref().is_some_and(|m| m.is_tls);
         let detail = SessionDetail {
             summary,
             request_headers: req_headers,
@@ -1306,7 +1443,7 @@ impl ProxyEngineController {
             response_body_base64: resp_b64,
             request_body_text: req_txt,
             response_body_text: resp_txt,
-            tls_version: if scheme == "https" {
+            tls_version: if is_tls {
                 let tls_label = server_tls_ver.unwrap_or("TLS");
                 Some(match &mtls_cn {
                     Some(cn) => format!("{tls_label} (Composer · mTLS: {cn})"),

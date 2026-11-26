@@ -524,14 +524,8 @@ mod tests {
                 server_conn_reused: None,
                 ws_open: None,
             },
-            request_headers: vec![HeaderPair {
-                name: "Authorization".into(),
-                value: "Bearer expired_jwt".into(),
-            }],
-            response_headers: vec![HeaderPair {
-                name: "Content-Type".into(),
-                value: "application/json".into(),
-            }],
+            request_headers: vec![HeaderPair::new("Authorization", "Bearer expired_jwt")],
+            response_headers: vec![HeaderPair::new("Content-Type", "application/json")],
             request_body_base64: String::new(),
             response_body_base64: String::new(),
             request_body_text: None,

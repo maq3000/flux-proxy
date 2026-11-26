@@ -60,6 +60,132 @@ type ProxyBoxBody = BoxBody<Bytes, Infallible>;
 static NEXT_CLIENT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Tracks client TCP / MITM-TLS connection identity, keep-alive sequence, and negotiated TLS info.
+pub(super) const GRACEFUL_DRAIN_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Tracks two-tier proxy connection lifecycle (`CONC-01`, `ADR-02`):
+/// - `drain_rx`: Graceful Drain deadline (stop accepting new requests, suppress TrafficStore capture,
+///   send HTTP/2 GOAWAY / close keep-alive, let live tunnels/WS run up to deadline).
+/// - `abort_rx`: Hard Abort `0 ms` (immediately break out of active tunnels, TLS, WS, and HTTP servers).
+#[derive(Debug, Clone)]
+pub(super) struct ConnectionLifecycle {
+    drain_rx: watch::Receiver<Option<tokio::time::Instant>>,
+    abort_rx: watch::Receiver<bool>,
+    capture_suppressed: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+pub(super) struct ConnectionLifecycleHandle {
+    drain_tx: watch::Sender<Option<tokio::time::Instant>>,
+    abort_tx: watch::Sender<bool>,
+    capture_suppressed: Arc<AtomicBool>,
+    lifecycle: ConnectionLifecycle,
+}
+
+impl ConnectionLifecycleHandle {
+    pub fn new() -> Self {
+        let (drain_tx, drain_rx) = watch::channel(None);
+        let (abort_tx, abort_rx) = watch::channel(false);
+        let capture_suppressed = Arc::new(AtomicBool::new(false));
+        let lifecycle = ConnectionLifecycle {
+            drain_rx,
+            abort_rx,
+            capture_suppressed: Arc::clone(&capture_suppressed),
+        };
+        Self {
+            drain_tx,
+            abort_tx,
+            capture_suppressed,
+            lifecycle,
+        }
+    }
+
+    pub fn lifecycle(&self) -> ConnectionLifecycle {
+        self.lifecycle.clone()
+    }
+
+    pub fn begin_drain(&self, deadline: Duration) {
+        self.capture_suppressed.store(true, Ordering::Release);
+        let target = tokio::time::Instant::now() + deadline;
+        self.drain_tx.send_if_modified(|current| {
+            if current.is_none() {
+                *current = Some(target);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    pub fn abort_now(&self) {
+        self.capture_suppressed.store(true, Ordering::Release);
+        let _ = self.abort_tx.send(true);
+    }
+
+    pub fn is_finished(&self) -> bool {
+        *self.abort_tx.borrow()
+            || self
+                .drain_tx
+                .borrow()
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    }
+}
+
+impl ConnectionLifecycle {
+    pub fn detached() -> Self {
+        let (_drain_tx, drain_rx) = watch::channel(None);
+        let (_abort_tx, abort_rx) = watch::channel(false);
+        Self {
+            drain_rx,
+            abort_rx,
+            capture_suppressed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn is_aborted(&self) -> bool {
+        *self.abort_rx.borrow()
+    }
+
+    pub fn drain_deadline(&self) -> Option<tokio::time::Instant> {
+        *self.drain_rx.borrow()
+    }
+
+    pub fn is_draining_or_aborted(&self) -> bool {
+        self.is_aborted() || self.drain_deadline().is_some()
+    }
+
+    pub fn is_capture_suppressed(&self) -> bool {
+        self.capture_suppressed.load(Ordering::Acquire) || self.is_aborted()
+    }
+
+    pub async fn wait_abort(&mut self) {
+        loop {
+            if *self.abort_rx.borrow_and_update() {
+                return;
+            }
+            if self.abort_rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    pub async fn wait_drain_started(&mut self) -> tokio::time::Instant {
+        loop {
+            if let Some(deadline) = *self.drain_rx.borrow_and_update() {
+                return deadline;
+            }
+            if self.drain_rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    pub async fn wait_drain_expired(&mut self) {
+        let deadline = self.wait_drain_started().await;
+        tokio::time::sleep_until(deadline).await;
+    }
+}
+
+/// Tracks client TCP / MITM-TLS connection identity, keep-alive sequence, and negotiated TLS info.
 #[derive(Debug, Clone)]
 pub(super) struct ClientConnContext {
     pub conn_id: u64,
@@ -70,10 +196,16 @@ pub(super) struct ClientConnContext {
     pub client_tls_version: Option<String>,
     pub client_tls_cipher: Option<String>,
     pub client_alpn: Option<String>,
+    pub lifecycle: ConnectionLifecycle,
 }
 
 impl ClientConnContext {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::new_with_lifecycle(ConnectionLifecycle::detached())
+    }
+
+    pub fn new_with_lifecycle(lifecycle: ConnectionLifecycle) -> Self {
         let connected_instant = Instant::now();
         let connected_at = format_rfc3339_micros(Utc::now());
         Self {
@@ -85,7 +217,16 @@ impl ClientConnContext {
             client_tls_version: None,
             client_tls_cipher: None,
             client_alpn: None,
+            lifecycle,
         }
+    }
+
+    pub fn is_draining_or_aborted(&self) -> bool {
+        self.lifecycle.is_draining_or_aborted()
+    }
+
+    pub fn is_capture_suppressed(&self) -> bool {
+        self.lifecycle.is_capture_suppressed()
     }
 
     pub fn with_mitm_tls(
@@ -104,6 +245,7 @@ impl ClientConnContext {
             client_tls_version: tls_version,
             client_tls_cipher: tls_cipher,
             client_alpn: alpn,
+            lifecycle: self.lifecycle.clone(),
         }
     }
 
@@ -406,15 +548,9 @@ pub(super) fn record_error_session_with_telemetry_and_code(
 
     let capped_req = &req_body[..req_body.len().min(MAX_CAPTURED_BODY_BYTES)];
     let (req_b64, req_txt, req_offloaded) = encode_inline_or_offload(capped_req);
-    let mut response_headers = vec![HeaderPair {
-        name: "Content-Type".into(),
-        value: "text/plain; charset=utf-8".into(),
-    }];
+    let mut response_headers = vec![HeaderPair::new("Content-Type", "text/plain; charset=utf-8")];
     if let Some(code) = proxy_error_code {
-        response_headers.push(HeaderPair {
-            name: FLUXPROXY_ERROR_HEADER.into(),
-            value: code.to_string(),
-        });
+        response_headers.push(HeaderPair::new(FLUXPROXY_ERROR_HEADER, code));
     }
     let detail = SessionDetail {
         summary,
@@ -468,10 +604,16 @@ pub(super) struct InFlightSessionGuard {
     armed: bool,
     error_message: &'static str,
     proxy_error_code: &'static str,
+    lifecycle: ConnectionLifecycle,
 }
 
 impl InFlightSessionGuard {
-    pub(super) fn new(ctx: Arc<SharedProxyContext>, session_id: u64, start: Instant) -> Self {
+    pub(super) fn new_with_lifecycle(
+        ctx: Arc<SharedProxyContext>,
+        session_id: u64,
+        start: Instant,
+        lifecycle: ConnectionLifecycle,
+    ) -> Self {
         Self {
             ctx,
             session_id,
@@ -479,6 +621,7 @@ impl InFlightSessionGuard {
             armed: true,
             error_message: "Client closed connection while waiting for upstream response",
             proxy_error_code: FLUXPROXY_ERR_CLIENT_CLOSED_REQUEST,
+            lifecycle,
         }
     }
 
@@ -494,6 +637,7 @@ impl InFlightSessionGuard {
             armed: true,
             error_message: "Composer request aborted before completion",
             proxy_error_code: FLUXPROXY_ERR_COMPOSER_CANCELLED,
+            lifecycle: ConnectionLifecycle::detached(),
         }
     }
 
@@ -504,7 +648,7 @@ impl InFlightSessionGuard {
 
 impl Drop for InFlightSessionGuard {
     fn drop(&mut self) {
-        if !self.armed {
+        if !self.armed || self.lifecycle.is_capture_suppressed() {
             return;
         }
         let duration_ms = self.start.elapsed().as_millis() as u64;
@@ -741,6 +885,9 @@ struct ControllerRuntimeState {
     bound_ips: Vec<String>,
     shutdown_tx: Option<watch::Sender<bool>>,
     listener_handles: Vec<tokio::task::JoinHandle<()>>,
+    active_lifecycle: Option<ConnectionLifecycleHandle>,
+    draining_lifecycles: Vec<ConnectionLifecycleHandle>,
+    drain_deadline: Duration,
     auto_system_proxy: bool,
     allow_remote: bool,
 }
@@ -908,6 +1055,192 @@ pub(crate) async fn bind_listeners_with_cleanup(
     }
 
     Ok((listeners, actual_port))
+}
+
+fn collect_local_host_ips() -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    for info in crate::proxy::network::list_network_interfaces_with_options(true) {
+        if let Ok(parsed) = info.ip.trim().parse::<IpAddr>() {
+            if !ips.contains(&parsed) {
+                ips.push(parsed);
+            }
+        }
+    }
+    ips
+}
+
+fn host_matches_local_self_loop(host: &str, bound_ips: &[String], local_host_ips: &[IpAddr]) -> bool {
+    let clean = host
+        .trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.');
+    let clean_no_zone = clean.split('%').next().unwrap_or(clean).to_ascii_lowercase();
+    if clean_no_zone.is_empty() {
+        return false;
+    }
+    if clean_no_zone == "localhost" {
+        return true;
+    }
+    if bound_ips.iter().any(|ip| ip.eq_ignore_ascii_case(&clean_no_zone)) {
+        return true;
+    }
+    if let Ok(parsed) = clean_no_zone.parse::<IpAddr>() {
+        let canonical = match parsed {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(v6),
+            },
+            other => other,
+        };
+        if canonical.is_loopback() || canonical.is_unspecified() {
+            return true;
+        }
+        if bound_ips.iter().any(|b| {
+            b.parse::<IpAddr>().is_ok_and(|bp| match bp {
+                IpAddr::V6(v6) => v6
+                    .to_ipv4_mapped()
+                    .map_or(IpAddr::V6(v6) == canonical, |v4| IpAddr::V4(v4) == canonical),
+                other => other == canonical,
+            })
+        }) {
+            return true;
+        }
+        if local_host_ips.iter().any(|local| match local {
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map_or(IpAddr::V6(*v6) == canonical, |v4| IpAddr::V4(v4) == canonical),
+            other => *other == canonical,
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn validate_no_upstream_proxy_self_loop(
+    config: &UpstreamProxyConfig,
+    proxy_port: u16,
+    bound_ips: &[String],
+) -> Result<(), ProxyError> {
+    if !config.enabled || proxy_port == 0 {
+        return Ok(());
+    }
+    let local_host_ips = collect_local_host_ips();
+    if config.port == proxy_port
+        && host_matches_local_self_loop(&config.host, bound_ips, &local_host_ips)
+    {
+        let clean_host = config
+            .host
+            .trim()
+            .trim_matches(['[', ']'])
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        return Err(ProxyError::Custom(format!(
+            "Защита от петли трафика: вышестоящий прокси не может указывать на собственный порт FluxProxy ({clean_host}:{proxy_port})."
+        )));
+    }
+    Ok(())
+}
+
+fn is_bind_narrowing(
+    prev_mode: BindHostMode,
+    prev_bound_ips: &[String],
+    next_mode: BindHostMode,
+    next_bound_ips: &[String],
+) -> bool {
+    if next_mode == BindHostMode::AllInterfaces {
+        return false;
+    }
+    if prev_mode == BindHostMode::AllInterfaces {
+        return true;
+    }
+    prev_bound_ips
+        .iter()
+        .any(|old_ip| !next_bound_ips.iter().any(|new_ip| new_ip == old_ip))
+}
+
+async fn serve_connection(
+    tcp_stream: tokio::net::TcpStream,
+    client_addr: SocketAddr,
+    local_proxy_port: Option<u16>,
+    lifecycle: ConnectionLifecycle,
+    ctx: Arc<SharedProxyContext>,
+) {
+    if lifecycle.is_aborted() || !ctx.filters.is_lan_client_allowed(client_addr.ip()) {
+        return;
+    }
+    let mut abort_sig = lifecycle.clone();
+    let mut proc_drain_sig = lifecycle.clone();
+    let client_proc = tokio::select! {
+        biased;
+        _ = abort_sig.wait_abort() => return,
+        _ = proc_drain_sig.wait_drain_expired() => return,
+        proc_info = resolve_client_process_async(client_addr, local_proxy_port) => proc_info,
+    };
+    if abort_sig.is_aborted() || !ctx.filters.is_lan_client_allowed(client_addr.ip()) {
+        return;
+    }
+
+    let mut drain_sig = lifecycle.clone();
+    let mut drain_notified = false;
+    let mut drain_deadline: Option<tokio::time::Instant> = None;
+    let mut config_rx = ctx.filters.subscribe_config_updates();
+    let mut config_closed = false;
+
+    let client_conn = ClientConnContext::new_with_lifecycle(lifecycle);
+    let conn_ctx = Arc::clone(&ctx);
+    let io = TokioIo::new(tcp_stream);
+    let service = service_fn(move |req: Request<Incoming>| {
+        let req_ctx = conn_ctx.clone();
+        let proc_info = client_proc.clone();
+        let conn_info = client_conn.clone();
+        async move {
+            Ok::<_, Infallible>(
+                handle_outer_proxy_request(req, client_addr, proc_info, conn_info, req_ctx).await,
+            )
+        }
+    });
+
+    let auto_builder = AutoConnBuilder::new(TokioExecutor::new());
+    let conn = auto_builder.serve_connection_with_upgrades(io, service);
+    tokio::pin!(conn);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = abort_sig.wait_abort() => {
+                break;
+            }
+            res = conn.as_mut() => {
+                let _ = res;
+                break;
+            }
+            deadline = drain_sig.wait_drain_started(), if !drain_notified => {
+                drain_notified = true;
+                drain_deadline = Some(deadline);
+                conn.as_mut().graceful_shutdown();
+            }
+            _ = async {
+                match drain_deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                break;
+            }
+            changed = config_rx.changed(), if !config_closed => {
+                if changed.is_err() {
+                    config_closed = true;
+                } else if !ctx.filters.is_lan_client_allowed(client_addr.ip()) {
+                    tracing::info!(
+                        "Hard-aborting active client connection from {} after LAN Client Allowlist update",
+                        client_addr.ip()
+                    );
+                    break;
+                }
+            }
+        }
+    }
 }
 
 async fn shutdown_listeners(
@@ -1207,6 +1540,9 @@ impl ProxyEngineController {
                 bound_ips: initial_bound_ips,
                 shutdown_tx: None,
                 listener_handles: Vec::new(),
+                active_lifecycle: None,
+                draining_lifecycles: Vec::new(),
+                drain_deadline: GRACEFUL_DRAIN_DEADLINE,
                 auto_system_proxy: initial_auto,
                 allow_remote: initial_allow_remote,
             }),
@@ -1219,6 +1555,11 @@ impl ProxyEngineController {
 
     pub fn preferred_port(&self) -> u16 {
         self.lock_runtime().bind_addr.1
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_drain_deadline_for_test(&self, deadline: Duration) {
+        self.lock_runtime().drain_deadline = deadline;
     }
 
     fn lock_runtime(&self) -> std::sync::MutexGuard<'_, ControllerRuntimeState> {
@@ -1290,6 +1631,7 @@ impl ProxyEngineController {
         addr_str: String,
         actual_port: u16,
         mut rx: watch::Receiver<bool>,
+        lifecycle: ConnectionLifecycle,
     ) -> tokio::task::JoinHandle<()> {
         self.context.active_port.store(actual_port, Ordering::Relaxed);
         let ctx = self.context.clone();
@@ -1307,27 +1649,15 @@ impl ProxyEngineController {
                         match accept_res {
                             Ok((tcp_stream, client_addr)) => {
                                 let conn_ctx = ctx.clone();
+                                let conn_lifecycle = lifecycle.clone();
                                 let local_proxy_port = tcp_stream.local_addr().ok().map(|a| a.port()).or(Some(actual_port));
-                                tokio::spawn(async move {
-                                    // Resolve owning local OS process (PID + executable name) off Tokio worker threads
-                                    let client_proc = resolve_client_process_async(client_addr, local_proxy_port).await;
-                                    let client_conn = ClientConnContext::new();
-                                    let io = TokioIo::new(tcp_stream);
-                                    let service = service_fn(move |req: Request<Incoming>| {
-                                        let req_ctx = conn_ctx.clone();
-                                        let proc_info = client_proc.clone();
-                                        let conn_info = client_conn.clone();
-                                        async move {
-                                            Ok::<_, Infallible>(
-                                                handle_outer_proxy_request(req, client_addr, proc_info, conn_info, req_ctx).await
-                                            )
-                                        }
-                                    });
-
-                                    let _ = AutoConnBuilder::new(TokioExecutor::new())
-                                        .serve_connection_with_upgrades(io, service)
-                                        .await;
-                                });
+                                tokio::spawn(serve_connection(
+                                    tcp_stream,
+                                    client_addr,
+                                    local_proxy_port,
+                                    conn_lifecycle,
+                                    conn_ctx,
+                                ));
                             }
                             Err(err) => {
                                 tracing::warn!("TCP accept error on {addr_str}: {err}");
@@ -1343,15 +1673,26 @@ impl ProxyEngineController {
         &self,
         listeners: Vec<(TcpListener, String)>,
         actual_port: u16,
-    ) -> (watch::Sender<bool>, Vec<tokio::task::JoinHandle<()>>) {
+    ) -> (
+        watch::Sender<bool>,
+        Vec<tokio::task::JoinHandle<()>>,
+        ConnectionLifecycleHandle,
+    ) {
         let (tx, rx) = watch::channel(false);
+        let lifecycle_handle = ConnectionLifecycleHandle::new();
         let mut handles = Vec::with_capacity(listeners.len());
         for (listener, ip) in listeners {
             let addr_str = format_bind_sock_addr(&ip, actual_port);
-            let handle = self.spawn_accept_loop(listener, addr_str, actual_port, rx.clone());
+            let handle = self.spawn_accept_loop(
+                listener,
+                addr_str,
+                actual_port,
+                rx.clone(),
+                lifecycle_handle.lifecycle(),
+            );
             handles.push(handle);
         }
-        (tx, handles)
+        (tx, handles, lifecycle_handle)
     }
 
     pub async fn start_with_config(&self, port: u16) -> Result<ProxyStatus, ProxyError> {
@@ -1404,6 +1745,11 @@ impl ProxyEngineController {
         let (eff_mode, primary_host, norm_specific_ip, target_ips, allow_remote) =
             resolve_bind_plan(bind_mode, specific_bind_ip.as_deref(), also_bind_loopback)?;
 
+        let upstream_cfg = self.context.upstream_proxy.get_public_config();
+        if port > 0 {
+            validate_no_upstream_proxy_self_loop(&upstream_cfg, port, &target_ips)?;
+        }
+
         let (listeners, actual_port) =
             match bind_listeners_with_cleanup(&target_ips, port, 1).await {
                 Ok(bound) => bound,
@@ -1413,11 +1759,21 @@ impl ProxyEngineController {
                 }
             };
 
+        if port == 0 {
+            if let Err(err) =
+                validate_no_upstream_proxy_self_loop(&upstream_cfg, actual_port, &target_ips)
+            {
+                drop(listeners);
+                self.sysproxy.rollback_if_dirty();
+                return Err(err);
+            }
+        }
+
         if port > 0 {
             self.sysproxy.save_proxy_port_pref(actual_port);
         }
 
-        let (tx, handles) = self.spawn_listeners_for_bind(listeners, actual_port);
+        let (tx, handles, lifecycle_handle) = self.spawn_listeners_for_bind(listeners, actual_port);
 
         {
             let mut guard = self.lock_runtime();
@@ -1429,6 +1785,7 @@ impl ProxyEngineController {
             guard.allow_remote = allow_remote;
             guard.shutdown_tx = Some(tx);
             guard.listener_handles = handles;
+            guard.active_lifecycle = Some(lifecycle_handle);
         }
 
         let sysproxy_host = resolve_sysproxy_host_for_bind(
@@ -1464,6 +1821,25 @@ impl ProxyEngineController {
 
         let (eff_mode, primary_host, norm_specific_ip, target_ips, allow_remote) =
             resolve_bind_plan(bind_mode, specific_bind_ip.as_deref(), also_bind_loopback)?;
+
+        let check_port = {
+            let guard = self.lock_runtime();
+            if guard.shutdown_tx.is_some() {
+                guard.bind_addr.1
+            } else {
+                let ap = self.context.active_port.load(Ordering::Relaxed);
+                if ap > 0 {
+                    ap
+                } else {
+                    guard.bind_addr.1
+                }
+            }
+        };
+        validate_no_upstream_proxy_self_loop(
+            &self.context.upstream_proxy.get_public_config(),
+            check_port,
+            &target_ips,
+        )?;
 
         let (
             was_running,
@@ -1503,6 +1879,25 @@ impl ProxyEngineController {
             } else {
                 Vec::new()
             };
+            if running && !same {
+                let narrowing = is_bind_narrowing(p_mode, &p_bound, eff_mode, &target_ips);
+                let drain_deadline = guard.drain_deadline;
+                if let Some(old_lc) = guard.active_lifecycle.take() {
+                    if narrowing {
+                        old_lc.abort_now();
+                    } else {
+                        old_lc.begin_drain(drain_deadline);
+                        guard.draining_lifecycles.push(old_lc);
+                    }
+                }
+                if narrowing {
+                    for lc in std::mem::take(&mut guard.draining_lifecycles) {
+                        lc.abort_now();
+                    }
+                } else {
+                    guard.draining_lifecycles.retain(|h| !h.is_finished());
+                }
+            }
             if !running {
                 guard.bind_addr.0 = primary_host.clone();
                 guard.bind_mode = eff_mode;
@@ -1546,7 +1941,8 @@ impl ProxyEngineController {
 
         match bind_listeners_with_cleanup(&target_ips, port, 8).await {
             Ok((listeners, actual_port)) => {
-                let (tx, handles) = self.spawn_listeners_for_bind(listeners, actual_port);
+                let (tx, handles, lifecycle_handle) =
+                    self.spawn_listeners_for_bind(listeners, actual_port);
                 {
                     let mut guard = self.lock_runtime();
                     guard.bind_addr = (primary_host, actual_port);
@@ -1557,6 +1953,7 @@ impl ProxyEngineController {
                     guard.allow_remote = allow_remote;
                     guard.shutdown_tx = Some(tx);
                     guard.listener_handles = handles;
+                    guard.active_lifecycle = Some(lifecycle_handle);
                 }
 
                 let sysproxy_enabled_before = self.sysproxy.is_desired_enabled();
@@ -1587,7 +1984,7 @@ impl ProxyEngineController {
                 if let Ok((fallback_listeners, actual_port)) =
                     bind_listeners_with_cleanup(&prev_bound_ips, port, 3).await
                 {
-                    let (tx, handles) =
+                    let (tx, handles, lifecycle_handle) =
                         self.spawn_listeners_for_bind(fallback_listeners, actual_port);
                     let mut guard = self.lock_runtime();
                     guard.bind_addr = (prev_primary, actual_port);
@@ -1598,6 +1995,7 @@ impl ProxyEngineController {
                     guard.allow_remote = prev_allow_remote;
                     guard.shutdown_tx = Some(tx);
                     guard.listener_handles = handles;
+                    guard.active_lifecycle = Some(lifecycle_handle);
                 } else {
                     {
                         let mut guard = self.lock_runtime();
@@ -1641,6 +2039,13 @@ impl ProxyEngineController {
         }
 
         let _op = self.op_lock.lock().await;
+        let bound_ips_for_check = self.lock_runtime().bound_ips.clone();
+        validate_no_upstream_proxy_self_loop(
+            &self.context.upstream_proxy.get_public_config(),
+            port,
+            &bound_ips_for_check,
+        )?;
+
         let (
             was_running,
             prev_port,
@@ -1670,6 +2075,12 @@ impl ProxyEngineController {
                 self.emit_status_changed(&status);
                 return Ok(status);
             }
+            if let Some(old_lc) = guard.active_lifecycle.take() {
+                old_lc.abort_now();
+            }
+            for lc in std::mem::take(&mut guard.draining_lifecycles) {
+                lc.abort_now();
+            }
             (
                 running,
                 current_port,
@@ -1688,12 +2099,14 @@ impl ProxyEngineController {
 
         match bind_listeners_with_cleanup(&bound_ips, port, 8).await {
             Ok((listeners, actual_port)) => {
-                let (tx, handles) = self.spawn_listeners_for_bind(listeners, actual_port);
+                let (tx, handles, lifecycle_handle) =
+                    self.spawn_listeners_for_bind(listeners, actual_port);
                 {
                     let mut guard = self.lock_runtime();
                     guard.bind_addr.1 = actual_port;
                     guard.shutdown_tx = Some(tx);
                     guard.listener_handles = handles;
+                    guard.active_lifecycle = Some(lifecycle_handle);
                 }
                 self.sysproxy.save_proxy_port_pref(actual_port);
 
@@ -1719,13 +2132,14 @@ impl ProxyEngineController {
                 if let Ok((fallback_listeners, fallback_port)) =
                     bind_listeners_with_cleanup(&bound_ips, prev_port, 3).await
                 {
-                    let (tx, handles) =
+                    let (tx, handles, lifecycle_handle) =
                         self.spawn_listeners_for_bind(fallback_listeners, fallback_port);
                     {
                         let mut guard = self.lock_runtime();
                         guard.bind_addr.1 = fallback_port;
                         guard.shutdown_tx = Some(tx);
                         guard.listener_handles = handles;
+                        guard.active_lifecycle = Some(lifecycle_handle);
                     }
                     let sysproxy_enabled_before = self.sysproxy.is_desired_enabled();
                     if auto_system_proxy || sysproxy_enabled_before {
@@ -1759,6 +2173,12 @@ impl ProxyEngineController {
             .resume_all(BreakpointAction::Continue);
         let (tx, handles) = {
             let mut guard = self.lock_runtime();
+            let drain_deadline = guard.drain_deadline;
+            guard.draining_lifecycles.retain(|h| !h.is_finished());
+            if let Some(old_lc) = guard.active_lifecycle.take() {
+                old_lc.begin_drain(drain_deadline);
+                guard.draining_lifecycles.push(old_lc);
+            }
             (
                 guard.shutdown_tx.take(),
                 std::mem::take(&mut guard.listener_handles),
@@ -1852,6 +2272,12 @@ impl ProxyEngineController {
         self.context.script_runner.shutdown_sync();
         {
             let mut guard = self.lock_runtime();
+            if let Some(lc) = guard.active_lifecycle.take() {
+                lc.abort_now();
+            }
+            for lc in std::mem::take(&mut guard.draining_lifecycles) {
+                lc.abort_now();
+            }
             if let Some(tx) = guard.shutdown_tx.take() {
                 let _ = tx.send(true);
             }
@@ -1901,29 +2327,13 @@ impl ProxyEngineController {
         config: UpstreamProxyConfig,
     ) -> Result<UpstreamProxyConfig, ProxyError> {
         if config.enabled {
-            let (active_port, bound_ips) = {
+            let (effective_port, bound_ips) = {
                 let guard = self.lock_runtime();
                 let port = self.context.active_port.load(Ordering::Relaxed);
                 let effective_port = if port > 0 { port } else { guard.bind_addr.1 };
                 (effective_port, guard.bound_ips.clone())
             };
-            let clean_host = config
-                .host
-                .trim()
-                .trim_matches(['[', ']'])
-                .trim_end_matches('.')
-                .to_ascii_lowercase();
-            let targets_local_listener = clean_host == "localhost"
-                || clean_host == "127.0.0.1"
-                || clean_host == "::1"
-                || clean_host == "0.0.0.0"
-                || clean_host == "::"
-                || bound_ips.iter().any(|ip| ip.eq_ignore_ascii_case(&clean_host));
-            if targets_local_listener && config.port == active_port {
-                return Err(ProxyError::Custom(format!(
-                    "Защита от петли трафика: вышестоящий прокси не может указывать на собственный порт FluxProxy ({clean_host}:{active_port})."
-                )));
-            }
+            validate_no_upstream_proxy_self_loop(&config, effective_port, &bound_ips)?;
         }
 
         let saved = self.context.upstream_proxy.set_config(config)?;
@@ -2125,9 +2535,16 @@ fn split_authority(authority: &str) -> (String, u16) {
 
 fn extract_hyper_headers(map: &http::HeaderMap) -> Vec<HeaderPair> {
     map.iter()
-        .map(|(k, v)| HeaderPair {
-            name: k.as_str().to_string(),
-            value: v.to_str().unwrap_or("<binary>").to_string(),
+        .map(|(k, v)| match v.to_str() {
+            Ok(s) => HeaderPair::new(k.as_str(), s),
+            Err(_) => {
+                let raw = v.as_bytes();
+                HeaderPair {
+                    name: k.as_str().to_string(),
+                    value: HeaderPair::display_value_for_raw_bytes(raw),
+                    raw_bytes_b64: Some(base64::engine::general_purpose::STANDARD.encode(raw)),
+                }
+            }
         })
         .collect()
 }
@@ -3016,10 +3433,7 @@ mod tests {
             action: RuleActionType::MockResponse,
             status_code: 200,
             latency_ms: 0,
-            response_headers: vec![HeaderPair {
-                name: "Content-Type".into(),
-                value: "application/json".into(),
-            }],
+            response_headers: vec![HeaderPair::new("Content-Type", "application/json")],
             response_body: "{\"decrypted\":true}".into(),
         });
 
@@ -3319,18 +3733,9 @@ mod tests {
             status_code: 200,
             latency_ms: 0,
             response_headers: vec![
-                HeaderPair {
-                    name: "Content-Type".into(),
-                    value: "application/json".into(),
-                },
-                HeaderPair {
-                    name: "alt-svc".into(),
-                    value: "h3=\":443\"; ma=2592000".into(),
-                },
-                HeaderPair {
-                    name: "alternate-protocol".into(),
-                    value: "443:quic".into(),
-                },
+                HeaderPair::new("Content-Type", "application/json"),
+                HeaderPair::new("alt-svc", "h3=\":443\"; ma=2592000"),
+                HeaderPair::new("alternate-protocol", "443:quic"),
             ],
             response_body: "{\"protocol\":\"h2\"}".into(),
         });
@@ -3552,10 +3957,7 @@ mod tests {
             action: RuleActionType::MockResponse,
             status_code: 200,
             latency_ms: 0,
-            response_headers: vec![HeaderPair {
-                name: "Content-Type".into(),
-                value: "application/json".into(),
-            }],
+            response_headers: vec![HeaderPair::new("Content-Type", "application/json")],
             response_body: "{\"acc\":1}".into(),
         });
 
@@ -6676,10 +7078,7 @@ def on_response(response, request):
             action: RuleActionType::MockResponse,
             status_code: 200,
             latency_ms: 40,
-            response_headers: vec![HeaderPair {
-                name: "Content-Type".into(),
-                value: "application/json".into(),
-            }],
+            response_headers: vec![HeaderPair::new("Content-Type", "application/json")],
             response_body: "{\"mock\":true}".into(),
         });
 
@@ -7974,18 +8373,9 @@ def on_response(response, request):
                 method: "GET".into(),
                 url: format!("http://{addr}/composer-parity"),
                 headers: vec![
-                    HeaderPair {
-                        name: "Keep-Alive".into(),
-                        value: "timeout=5".into(),
-                    },
-                    HeaderPair {
-                        name: "Proxy-Connection".into(),
-                        value: "keep-alive".into(),
-                    },
-                    HeaderPair {
-                        name: "X-Custom".into(),
-                        value: "1".into(),
-                    },
+                    HeaderPair::new("Keep-Alive", "timeout=5"),
+                    HeaderPair::new("Proxy-Connection", "keep-alive"),
+                    HeaderPair::new("X-Custom", "1"),
                 ],
                 body: String::new(),
                 body_base64: None,
@@ -8009,10 +8399,7 @@ def on_response(response, request):
             .execute_composed(ComposedRequest {
                 method: "GET".into(),
                 url: format!("http://{addr}/composer-parity"),
-                headers: vec![HeaderPair {
-                    name: "Proxy-Connection".into(),
-                    value: "keep-alive".into(),
-                }],
+                headers: vec![HeaderPair::new("Proxy-Connection", "keep-alive")],
                 body: String::new(),
                 body_base64: None,
                 follow_redirects: false,
@@ -8125,6 +8512,22 @@ def on_response(response, request):
 
         let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
         let rules = Arc::new(RuleEngine::new());
+        // Stage 44 BUG-05 spills unhooked chunked responses >2 MiB to streaming; attach an
+        // OverrideStatus rule so this test exercises the 64 MiB buffered OOM cap path.
+        rules.set_rules(vec![crate::models::AutoResponderRule {
+            id: "oom-cap-buffered".into(),
+            enabled: true,
+            name: "Require Buffered Mode for 64 MiB Cap".into(),
+            match_target: crate::models::RuleMatchTarget::UrlContains,
+            pattern: "/huge-chunked".into(),
+            method_filter: None,
+            header_name: None,
+            action: RuleActionType::OverrideStatus,
+            status_code: 201,
+            latency_ms: 0,
+            response_headers: Vec::new(),
+            response_body: String::new(),
+        }]);
         let filters = Arc::new(ProxyFilterEngine::new());
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("oom-cap.sqlite")).unwrap());
@@ -9406,6 +9809,1372 @@ def on_response(response, request):
             );
         }
 
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    async fn read_raw_http_head_and_body(stream: &mut TcpStream) -> (Vec<u8>, Vec<u8>) {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let split_pos = loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos;
+            }
+            let n = stream.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "unexpected EOF while reading HTTP response headers");
+            buf.extend_from_slice(&tmp[..n]);
+        };
+        let head = buf[..split_pos].to_vec();
+        let mut body = buf[split_pos + 4..].to_vec();
+        let head_str = String::from_utf8_lossy(&head);
+        let content_len = head_str
+            .lines()
+            .skip(1)
+            .find_map(|line| {
+                let (k, v) = line.split_once(':')?;
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    v.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            });
+        if let Some(cl) = content_len {
+            while body.len() < cl {
+                let n = stream.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&tmp[..n]);
+            }
+            body.truncate(cl);
+        } else {
+            let _ = stream.read_to_end(&mut body).await;
+        }
+        (head, body)
+    }
+
+    async fn open_proxied_ws(
+        proxy_port: u16,
+        ws_url: &str,
+    ) -> WebSocketStream<TcpStream> {
+        let mut tcp = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+        let rest = ws_url
+            .strip_prefix("ws://")
+            .expect("open_proxied_ws expects ws:// URL");
+        let (host_port, path_q) = match rest.find('/') {
+            Some(idx) => (&rest[..idx], &rest[idx..]),
+            None => (rest, "/"),
+        };
+        let req = format!(
+            "GET http://{host_port}{path_q} HTTP/1.1\r\n\
+             Host: {host_port}\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        tcp.write_all(req.as_bytes()).await.unwrap();
+        let mut resp_buf = Vec::with_capacity(512);
+        let mut byte = [0u8; 1];
+        while !resp_buf.ends_with(b"\r\n\r\n") {
+            let n = tcp.read(&mut byte).await.unwrap();
+            assert!(n > 0, "unexpected EOF waiting for WS 101 response");
+            resp_buf.push(byte[0]);
+        }
+        let resp_str = String::from_utf8_lossy(&resp_buf);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 101"),
+            "expected 101 Switching Protocols, got: {resp_str}"
+        );
+        WebSocketStream::from_raw_socket(
+            tcp,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await
+    }
+
+    fn make_stage44_controller(
+        label: &str,
+    ) -> (
+        ProxyEngineController,
+        Arc<RuleEngine>,
+        Arc<ProxyFilterEngine>,
+        Arc<TrafficStore>,
+        std::path::PathBuf,
+    ) {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy_stage44_{}_{}_{}",
+            label,
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let rules = Arc::new(RuleEngine::new());
+        let filters = Arc::new(ProxyFilterEngine::new());
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("sessions.sqlite")).unwrap());
+        let os_backend = RecordingOsProxyBackend::new();
+        let sysproxy = Arc::new(SystemProxyManager::with_backend(&tmp_dir, os_backend));
+        let controller = ProxyEngineController::new_for_test(
+            ca,
+            rules.clone(),
+            filters.clone(),
+            store.clone(),
+            sysproxy,
+        )
+        .unwrap();
+        (controller, rules, filters, store, tmp_dir)
+    }
+
+    #[tokio::test]
+    async fn bug01_preserves_raw_utf8_and_obs_text_headers_end_to_end_and_on_edit() {
+        let raw_utf8 = b"attachment; filename=\"\xd0\xbe\xd1\x82\xd1\x87\xd0\xb5\xd1\x82.pdf\"";
+        let raw_obs = b"val\xff!";
+        let mut hmap = http::HeaderMap::new();
+        hmap.insert(
+            http::HeaderName::from_static("content-disposition"),
+            http::HeaderValue::from_bytes(raw_utf8).unwrap(),
+        );
+        hmap.insert(
+            http::HeaderName::from_static("x-raw-obs"),
+            http::HeaderValue::from_bytes(raw_obs).unwrap(),
+        );
+
+        let extracted = extract_hyper_headers(&hmap);
+        let cd = extracted
+            .iter()
+            .find(|h| h.name == "content-disposition")
+            .unwrap();
+        assert!(cd.raw_bytes_b64.is_some());
+        assert_eq!(cd.to_hyper_header_value().unwrap().as_bytes(), raw_utf8);
+
+        let obs = extracted.iter().find(|h| h.name == "x-raw-obs").unwrap();
+        assert!(obs.raw_bytes_b64.is_some());
+        assert_eq!(obs.to_hyper_header_value().unwrap().as_bytes(), raw_obs);
+
+        let mut edited = obs.clone();
+        edited.value = "edited-ascii".into();
+        assert_eq!(
+            edited.to_hyper_header_value().unwrap().as_bytes(),
+            b"edited-ascii"
+        );
+
+        // End-to-end raw TCP proxy verification
+        let upstream_seen_req = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let upstream_seen_srv = Arc::clone(&upstream_seen_req);
+        let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = up_listener.accept().await {
+                let mut raw = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = sock.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..n]);
+                }
+                *upstream_seen_srv.lock().unwrap() = raw;
+                let mut resp = Vec::new();
+                resp.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Disposition: ");
+                resp.extend_from_slice(b"attachment; filename=\"\xd0\xbe\xd1\x82\xd1\x87\xd0\xb5\xd1\x82.pdf\"");
+                resp.extend_from_slice(b"\r\nX-Raw-Obs: ");
+                resp.extend_from_slice(b"val\xff!");
+                resp.extend_from_slice(b"\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+                sock.write_all(&resp).await.unwrap();
+            }
+        });
+
+        let (controller, _rules, _filters, store, tmp_dir) = make_stage44_controller("bug01");
+        let status = controller.start("127.0.0.1".into(), 0).await.unwrap();
+
+        let mut client = TcpStream::connect(("127.0.0.1", status.port))
+            .await
+            .unwrap();
+        let client_raw_hdr = b"\xd0\xbf\xd1\x80\xd0\xb8";
+        let mut req_wire = format!(
+            "GET http://{up_addr}/raw-hdr HTTP/1.1\r\nHost: {up_addr}\r\nX-Client-Raw: "
+        )
+        .into_bytes();
+        req_wire.extend_from_slice(client_raw_hdr);
+        req_wire.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+        client.write_all(&req_wire).await.unwrap();
+
+        let (resp_head, resp_body) = read_raw_http_head_and_body(&mut client).await;
+        assert_eq!(resp_body, b"ok");
+        assert!(resp_head.windows(raw_utf8.len()).any(|w| w == raw_utf8));
+        assert!(resp_head.windows(raw_obs.len()).any(|w| w == raw_obs));
+
+        let upstream_wire = upstream_seen_req.lock().unwrap().clone();
+        assert!(
+            upstream_wire
+                .windows(client_raw_hdr.len())
+                .any(|w| w == client_raw_hdr),
+            "upstream did not receive raw non-ASCII client header"
+        );
+
+        let sessions = store.list_summaries();
+        let detail = store.get(sessions[0].id).unwrap();
+        assert!(detail
+            .response_headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case("x-raw-obs") && h.raw_bytes_b64.is_some()));
+
+        controller.stop().await;
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn bug02_autoresponder_mock_strips_stale_headers_and_sets_exact_cl() {
+        use crate::models::{AutoResponderRule, RuleMatchTarget};
+
+        let (controller, rules, _filters, _store, tmp_dir) = make_stage44_controller("bug02");
+        rules.set_rules(vec![AutoResponderRule {
+            id: "mock-clean".into(),
+            enabled: true,
+            name: "Mock Clean".into(),
+            match_target: RuleMatchTarget::UrlContains,
+            pattern: "/mock-cl".into(),
+            method_filter: None,
+            header_name: None,
+            action: RuleActionType::MockResponse,
+            status_code: 200,
+            latency_ms: 0,
+            response_headers: vec![
+                HeaderPair::new("Content-Type", "application/json"),
+                HeaderPair::new("Content-Length", "99999"),
+                HeaderPair::new("Content-Encoding", "gzip"),
+                HeaderPair::new("Transfer-Encoding", "chunked"),
+                HeaderPair::new("Connection", "keep-alive"),
+                HeaderPair::new("Keep-Alive", "timeout=9"),
+                HeaderPair::new("Proxy-Connection", "keep-alive"),
+            ],
+            response_body: "{\"ok\":1}".into(),
+        }]);
+        let status = controller.start("127.0.0.1".into(), 0).await.unwrap();
+
+        let mut client = TcpStream::connect(("127.0.0.1", status.port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"GET http://mock.example/mock-cl HTTP/1.1\r\nHost: mock.example\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, body) = read_raw_http_head_and_body(&mut client).await;
+        assert_eq!(body, br#"{"ok":1}"#);
+        let head_lower = String::from_utf8_lossy(&head).to_ascii_lowercase();
+        assert!(head_lower.contains("content-length: 8"), "head={head_lower}");
+        assert!(!head_lower.contains("content-encoding"), "head={head_lower}");
+        assert!(!head_lower.contains("transfer-encoding"), "head={head_lower}");
+        assert!(!head_lower.contains("proxy-connection"), "head={head_lower}");
+        assert!(!head_lower.contains("keep-alive:"), "head={head_lower}");
+
+        let comp = controller
+            .execute_composed(ComposedRequest {
+                method: "GET".into(),
+                url: "http://mock.example/mock-cl".into(),
+                headers: vec![],
+                body: String::new(),
+                body_base64: None,
+                follow_redirects: false,
+                skip_python_scripts: Some(true),
+                request_id: None,
+                timeout_sec: None,
+            })
+            .await
+            .unwrap();
+        assert!(comp
+            .response_headers
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case("content-length") && h.value == "8"));
+        assert!(!comp.response_headers.iter().any(|h| {
+            h.name.eq_ignore_ascii_case("content-encoding")
+                || h.name.eq_ignore_ascii_case("transfer-encoding")
+                || h.name.eq_ignore_ascii_case("proxy-connection")
+        }));
+
+        controller.stop().await;
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn bug03_custom_host_header_after_mutation_bpu_and_ws_reaches_upstream() {
+        use crate::models::{
+            BreakpointRule, HeaderMutationDirection, HeaderMutationOp, HeaderMutationRule,
+        };
+
+        let recorded_http_hosts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded_ws_hosts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let http_hosts_srv = Arc::clone(&recorded_http_hosts);
+        let ws_hosts_srv = Arc::clone(&recorded_ws_hosts);
+
+        let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = up_listener.accept().await {
+                let http_hosts = Arc::clone(&http_hosts_srv);
+                let ws_hosts = Arc::clone(&ws_hosts_srv);
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let http_hosts = Arc::clone(&http_hosts);
+                        let ws_hosts = Arc::clone(&ws_hosts);
+                        async move {
+                            let host_val = req
+                                .headers()
+                                .get(http::header::HOST)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let is_ws = req
+                                .headers()
+                                .get(http::header::UPGRADE)
+                                .and_then(|v| v.to_str().ok())
+                                .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+                            if is_ws {
+                                ws_hosts.lock().unwrap().push(host_val);
+                                let key = req
+                                    .headers()
+                                    .get("sec-websocket-key")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("");
+                                let accept =
+                                    tokio_tungstenite::tungstenite::handshake::derive_accept_key(
+                                        key.as_bytes(),
+                                    );
+                                tokio::spawn(async move {
+                                    if let Ok(up) = hyper::upgrade::on(req).await {
+                                        let mut ws = WebSocketStream::from_raw_socket(
+                                            TokioIo::new(up),
+                                            Role::Server,
+                                            None,
+                                        )
+                                        .await;
+                                        let _ = ws.close(None).await;
+                                    }
+                                });
+                                return Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(StatusCode::SWITCHING_PROTOCOLS)
+                                        .header(http::header::CONNECTION, "Upgrade")
+                                        .header(http::header::UPGRADE, "websocket")
+                                        .header("Sec-WebSocket-Accept", accept)
+                                        .body(Full::new(Bytes::new()))
+                                        .unwrap(),
+                                );
+                            }
+                            http_hosts.lock().unwrap().push(host_val);
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        let (controller, _rules, filters, _store, tmp_dir) = make_stage44_controller("bug03");
+        filters.update_config(ProxyFilterBackendConfig {
+            header_mutations_enabled: true,
+            header_mutations: vec![
+                HeaderMutationRule {
+                    id: "mut-http-host".into(),
+                    enabled: true,
+                    name: "Mutate HTTP Host".into(),
+                    direction: HeaderMutationDirection::Request,
+                    operation: HeaderMutationOp::Set,
+                    header_name: "Host".into(),
+                    header_value: "mutated-http.example".into(),
+                    url_pattern: "/mut-host".into(),
+                },
+                HeaderMutationRule {
+                    id: "mut-ws-host".into(),
+                    enabled: true,
+                    name: "Mutate WS Host".into(),
+                    direction: HeaderMutationDirection::Request,
+                    operation: HeaderMutationOp::Set,
+                    header_name: "Host".into(),
+                    header_value: "ws-mutated.example".into(),
+                    url_pattern: "/ws-host".into(),
+                },
+            ],
+            ..crate::proxy::filters::default_backend_config()
+        });
+        let status = controller.start("127.0.0.1".into(), 0).await.unwrap();
+
+        // 1. Header Mutation custom Host
+        let mut c1 = TcpStream::connect(("127.0.0.1", status.port))
+            .await
+            .unwrap();
+        c1.write_all(
+            format!("GET http://{up_addr}/mut-host HTTP/1.1\r\nHost: {up_addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let _ = read_raw_http_head_and_body(&mut c1).await;
+
+        // 2. Breakpoint (bpu) custom Host
+        controller.context.breakpoints.update_config(BreakpointConfig {
+            break_before_request: false,
+            break_after_response: false,
+            timeout_secs: 5,
+            rules: vec![BreakpointRule {
+                id: "bp-host".into(),
+                enabled: true,
+                name: "BPU Host".into(),
+                stage: BreakpointStage::Request,
+                url_pattern: "/bpu-host".into(),
+                method_filter: None,
+            }],
+        });
+        let bp_ctx = controller.context.clone();
+        let bp_task = tokio::spawn(async move {
+            for _ in 0..100 {
+                let paused = bp_ctx.breakpoints.list_paused();
+                if let Some(item) = paused.into_iter().next() {
+                    let resolved = bp_ctx.breakpoints.resolve(BreakpointResolution {
+                        breakpoint_id: item.breakpoint_id,
+                        action: BreakpointAction::Continue,
+                        method: None,
+                        url: None,
+                        request_headers: Some(vec![HeaderPair::new("Host", "bpu-host.example")]),
+                        request_body_base64: None,
+                        request_body_text: None,
+                        status_code: None,
+                        response_headers: None,
+                        response_body_base64: None,
+                        response_body_text: None,
+                    });
+                    assert!(resolved);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+            panic!("breakpoint never paused");
+        });
+        let mut c2 = TcpStream::connect(("127.0.0.1", status.port))
+            .await
+            .unwrap();
+        c2.write_all(
+            format!("GET http://{up_addr}/bpu-host HTTP/1.1\r\nHost: {up_addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let _ = read_raw_http_head_and_body(&mut c2).await;
+        bp_task.await.unwrap();
+
+        // 3. WebSocket custom Host
+        let _ws = open_proxied_ws(status.port, &format!("ws://{up_addr}/ws-host")).await;
+
+        assert_eq!(
+            recorded_http_hosts.lock().unwrap().as_slice(),
+            &[
+                "mutated-http.example".to_string(),
+                "bpu-host.example".to_string()
+            ]
+        );
+        assert_eq!(
+            recorded_ws_hosts.lock().unwrap().as_slice(),
+            &["ws-mutated.example".to_string()]
+        );
+
+        controller.stop().await;
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn bug04_empty_post_put_patch_emits_explicit_content_length_zero() {
+        let raw_heads = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let heads_srv = Arc::clone(&raw_heads);
+        let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = up_listener.accept().await {
+                let heads = Arc::clone(&heads_srv);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 2048];
+                    while let Ok(n) = sock.read(&mut tmp).await {
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head_str = String::from_utf8_lossy(&buf[..pos + 4]).to_string();
+                            heads.lock().unwrap().push(head_str);
+                            let _ = sock
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                                )
+                                .await;
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let (controller, _rules, _filters, _store, tmp_dir) = make_stage44_controller("bug04");
+        let status = controller.start("127.0.0.1".into(), 0).await.unwrap();
+
+        for method in ["POST", "PUT", "PATCH"] {
+            let mut client = TcpStream::connect(("127.0.0.1", status.port))
+                .await
+                .unwrap();
+            client
+                .write_all(
+                    format!(
+                        "{method} http://{up_addr}/empty HTTP/1.1\r\nHost: {up_addr}\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let (_h, body) = read_raw_http_head_and_body(&mut client).await;
+            assert_eq!(body, b"ok");
+        }
+
+        let captured = raw_heads.lock().unwrap();
+        assert_eq!(captured.len(), 3);
+        for head in captured.iter() {
+            let lower = head.to_ascii_lowercase();
+            assert!(
+                lower.contains("\r\ncontent-length: 0\r\n"),
+                "missing explicit Content-Length: 0 in raw request head:\n{head}"
+            );
+            assert!(
+                !lower.contains("transfer-encoding: chunked"),
+                "unexpected Transfer-Encoding: chunked in:\n{head}"
+            );
+        }
+
+        controller.stop().await;
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn bug05_sse_sink_reset_4b_gzip_preview_and_4c_chunked_spill() {
+        use std::io::Write;
+
+        // 4a. BoundedSseSink resets total_written inside take_bytes()
+        let mut sink = BoundedSseSink::new(1024);
+        sink.write_all(&vec![b'a'; 900]).unwrap();
+        assert_eq!(sink.take_bytes().len(), 900);
+        sink.write_all(&vec![b'b'; 900]).unwrap();
+        assert_eq!(sink.take_bytes().len(), 900);
+        assert!(sink.write_all(&vec![b'c'; 1025]).is_err());
+
+        // Prepare >2 MiB valid gzip JSON payload (compressible 4KiB prefix + incompressible ASCII tail)
+        let mut plain_payload = Vec::with_capacity(4_020_000);
+        plain_payload.extend_from_slice(br#"{"preview":"fluxproxy-gzip-ok","pad":"#);
+        plain_payload.extend(std::iter::repeat_n(b'A', 4096));
+        plain_payload.extend_from_slice(br#"","noise":""#);
+        let mut rng: u64 = 0x1234_5678_9abc_def0;
+        for _ in 0..4_000_000 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let ch = b'a' + ((rng >> 32) as u8 % 26);
+            plain_payload.push(ch);
+        }
+        plain_payload.extend_from_slice(br#""}"#);
+
+        let mut gz_encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz_encoder.write_all(&plain_payload).unwrap();
+        let gz_bytes = Arc::new(gz_encoder.finish().unwrap());
+        assert!(
+            gz_bytes.len() > BODY_OFFLOAD_THRESHOLD_BYTES,
+            "compressed payload must exceed 2 MiB to trigger branch 4b"
+        );
+
+        let chunked_piece = Arc::new(vec![b'J'; 65_536]);
+        let gz_srv = Arc::clone(&gz_bytes);
+        let chunk_srv = Arc::clone(&chunked_piece);
+        let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = up_listener.accept().await {
+                let gz = Arc::clone(&gz_srv);
+                let cp = Arc::clone(&chunk_srv);
+                tokio::spawn(async move {
+                    let mut req_buf = Vec::new();
+                    let mut tmp = [0u8; 2048];
+                    while let Ok(n) = sock.read(&mut tmp).await {
+                        if n == 0 {
+                            break;
+                        }
+                        req_buf.extend_from_slice(&tmp[..n]);
+                        if req_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let req_head = String::from_utf8_lossy(&req_buf);
+                    if req_head.contains("/gzip-4b") {
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            gz.len()
+                        );
+                        let _ = sock.write_all(hdr.as_bytes()).await;
+                        let _ = sock.write_all(&gz).await;
+                    } else {
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                        let chunk_hdr = format!("{:x}\r\n", cp.len());
+                        for _ in 0..40 {
+                            if sock.write_all(chunk_hdr.as_bytes()).await.is_err()
+                                || sock.write_all(&cp).await.is_err()
+                                || sock.write_all(b"\r\n").await.is_err()
+                            {
+                                return;
+                            }
+                        }
+                        let _ = sock.write_all(b"0\r\n\r\n").await;
+                    }
+                });
+            }
+        });
+
+        let (controller, _rules, _filters, store, tmp_dir) = make_stage44_controller("bug05");
+        let status = controller.start("127.0.0.1".into(), 0).await.unwrap();
+
+        // 4b. Gzipped >2 MiB response decodes 64 KiB preview into TrafficStore
+        {
+            let tcp = TcpStream::connect(("127.0.0.1", status.port))
+                .await
+                .unwrap();
+            let (mut sender, conn) =
+                hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+                    .await
+                    .unwrap();
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let req = Request::builder()
+                .method(hyper::Method::GET)
+                .uri(format!("http://{up_addr}/gzip-4b"))
+                .header(http::header::HOST, up_addr.to_string())
+                .body(http_body_util::Empty::<Bytes>::new())
+                .unwrap();
+            let resp = sender.send_request(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let received = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(received.len(), gz_bytes.len());
+
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let s4b = store
+                .list_summaries()
+                .into_iter()
+                .find(|s| s.path.contains("/gzip-4b"))
+                .unwrap();
+            let d4b = store.get(s4b.id).unwrap();
+            let preview_txt = d4b.response_body_text.expect("expected decoded 4b text preview");
+            assert!(
+                preview_txt.contains("fluxproxy-gzip-ok"),
+                "decoded preview missing marker: {}",
+                &preview_txt[..preview_txt.len().min(120)]
+            );
+        }
+
+        // 4c. Chunked >2 MiB response spills to streaming seamlessly instead of 502 / 499
+        {
+            let tcp = TcpStream::connect(("127.0.0.1", status.port))
+                .await
+                .unwrap();
+            let (mut sender, conn) =
+                hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+                    .await
+                    .unwrap();
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            let req = Request::builder()
+                .method(hyper::Method::GET)
+                .uri(format!("http://{up_addr}/chunked-4c"))
+                .header(http::header::HOST, up_addr.to_string())
+                .body(http_body_util::Empty::<Bytes>::new())
+                .unwrap();
+            let resp = sender.send_request(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let received = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(received.len(), 40 * chunked_piece.len());
+
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let s4c = store
+                .list_summaries()
+                .into_iter()
+                .find(|s| s.path.contains("/chunked-4c"))
+                .unwrap();
+            assert_eq!(s4c.status, 200);
+            let d4c = store.get(s4c.id).unwrap();
+            assert_eq!(
+                d4c.transfer_stats.as_ref().and_then(|st| st.is_streaming),
+                Some(true)
+            );
+        }
+
+        controller.stop().await;
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn bug06_self_loop_rejects_loopback_ranges_v6_and_local_interfaces() {
+        use crate::models::UpstreamProxyProtocol;
+
+        let (controller, _rules, _filters, _store, tmp_dir) = make_stage44_controller("bug06");
+        let status = controller.start("127.0.0.1".into(), 0).await.unwrap();
+        let active_port = status.port;
+
+        let make_cfg = |host: &str, port: u16| UpstreamProxyConfig {
+            enabled: true,
+            protocol: UpstreamProxyProtocol::Http,
+            host: host.into(),
+            port,
+            username: None,
+            password: None,
+            has_password: false,
+            bypass_list: Vec::new(),
+        };
+
+        for loopback_host in [
+            "127.0.0.2",
+            "localhost",
+            "::1",
+            "::ffff:127.0.0.1",
+            "0.0.0.0",
+        ] {
+            let err = controller
+                .set_upstream_proxy_config(make_cfg(loopback_host, active_port))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("Защита от петли трафика"),
+                "expected self-loop error for {loopback_host}:{active_port}, got {err}"
+            );
+        }
+
+        let local_ifs = crate::proxy::network::list_network_interfaces_with_options(true);
+        if let Some(iface) = local_ifs.first() {
+            let err = controller
+                .set_upstream_proxy_config(make_cfg(&iface.ip, active_port))
+                .unwrap_err();
+            assert!(err.to_string().contains("Защита от петли трафика"));
+        }
+
+        // Bind a spare port to guarantee Q != active_port and Q is free
+        let probe_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let alt_port = probe_listener.local_addr().unwrap().port();
+        drop(probe_listener);
+
+        // Verify set_bind_configuration also enforces self-loop protection against active port
+        controller
+            .context
+            .upstream_proxy
+            .set_config(make_cfg("127.0.0.2", active_port))
+            .unwrap();
+        let bind_loop_err = controller
+            .set_bind_configuration(BindHostMode::AllInterfaces, None, false)
+            .await
+            .unwrap_err();
+        assert!(bind_loop_err.to_string().contains("Защита от петли трафика"));
+
+        controller
+            .set_upstream_proxy_config(make_cfg("127.0.0.2", alt_port))
+            .expect("different port must be accepted");
+
+        let set_port_err = controller.set_port(alt_port).await.unwrap_err();
+        assert!(set_port_err.to_string().contains("Защита от петли трафика"));
+        assert_eq!(controller.status().await.port, active_port);
+
+        controller.stop().await;
+        controller.set_port(alt_port).await.unwrap_err();
+        let start_err = controller.start("0.0.0.0".into(), alt_port).await.unwrap_err();
+        assert!(start_err.to_string().contains("Защита от петли трафика"));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn bug07_composer_cancel_latency_and_bpu_redirect_url_and_mock_filter() {
+        use crate::models::{
+            AutoResponderRule, BreakpointRule, HostListBackendSyncConfig, HostListFilterMode,
+            RuleMatchTarget,
+        };
+
+        let (controller, rules, filters, store, tmp_dir) = make_stage44_controller("bug07");
+
+        // Redirect + Target servers
+        let dest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dest_addr = dest_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = dest_listener.accept().await {
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(|_req: Request<Incoming>| async move {
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"landed"))))
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+        let redir_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redir_addr = redir_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = redir_listener.accept().await {
+                let target_url = format!("http://localhost:{}/landed?foo=bar", dest_addr.port());
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |_req: Request<Incoming>| {
+                        let loc = target_url.clone();
+                        async move {
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::FOUND)
+                                    .header(http::header::LOCATION, loc)
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        // 1. Follow redirects updates final summary url/host/path
+        let redir_detail = controller
+            .execute_composed(ComposedRequest {
+                method: "GET".into(),
+                url: format!("http://{redir_addr}/bounce"),
+                headers: vec![],
+                body: String::new(),
+                body_base64: None,
+                follow_redirects: true,
+                skip_python_scripts: Some(true),
+                request_id: None,
+                timeout_sec: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(redir_detail.summary.status, 200);
+        assert_eq!(redir_detail.summary.host, "localhost");
+        assert_eq!(redir_detail.summary.path, "/landed?foo=bar");
+        assert_eq!(
+            redir_detail.summary.url,
+            format!("http://localhost:{}/landed?foo=bar", dest_addr.port())
+        );
+
+        // 2. Cancel during DelayOnly latency simulation
+        rules.set_rules(vec![
+            AutoResponderRule {
+                id: "slow-rule".into(),
+                enabled: true,
+                name: "Slow Latency".into(),
+                match_target: RuleMatchTarget::UrlContains,
+                pattern: "/slow-cancel".into(),
+                method_filter: None,
+                header_name: None,
+                action: RuleActionType::DelayOnly,
+                status_code: 200,
+                latency_ms: 5_000,
+                response_headers: vec![],
+                response_body: String::new(),
+            },
+            AutoResponderRule {
+                id: "mock-dropped".into(),
+                enabled: true,
+                name: "Mock Dropped".into(),
+                match_target: RuleMatchTarget::UrlContains,
+                pattern: "/dropped-mock".into(),
+                method_filter: None,
+                header_name: None,
+                action: RuleActionType::MockResponse,
+                status_code: 200,
+                latency_ms: 0,
+                response_headers: vec![HeaderPair::new("Content-Type", "application/json")],
+                response_body: "{\"m\":1}".into(),
+            },
+        ]);
+
+        let c_lat = Arc::new(controller);
+        let c_lat_exec = Arc::clone(&c_lat);
+        let lat_start = Instant::now();
+        let lat_handle = tokio::spawn(async move {
+            c_lat_exec
+                .execute_composed(ComposedRequest {
+                    method: "GET".into(),
+                    url: "http://example.invalid/slow-cancel".into(),
+                    headers: vec![],
+                    body: String::new(),
+                    body_base64: None,
+                    follow_redirects: false,
+                    skip_python_scripts: Some(true),
+                    request_id: Some("cancel-lat-1".into()),
+                    timeout_sec: Some(10),
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(c_lat.cancel_composed_request("cancel-lat-1"));
+        let lat_res = lat_handle.await.unwrap();
+        assert!(lat_res.is_err());
+        assert!(lat_start.elapsed() < Duration::from_millis(500));
+
+        // 3. Cancel during bpu cleans up paused breakpoint
+        c_lat.context.breakpoints.update_config(BreakpointConfig {
+            break_before_request: false,
+            break_after_response: false,
+            timeout_secs: 10,
+            rules: vec![BreakpointRule {
+                id: "bp-comp-cancel".into(),
+                enabled: true,
+                name: "Composer BPU Cancel".into(),
+                stage: BreakpointStage::Request,
+                url_pattern: "/comp-bpu-cancel".into(),
+                method_filter: None,
+            }],
+        });
+        let c_bpu_exec = Arc::clone(&c_lat);
+        let bpu_handle = tokio::spawn(async move {
+            c_bpu_exec
+                .execute_composed(ComposedRequest {
+                    method: "GET".into(),
+                    url: "http://example.invalid/comp-bpu-cancel".into(),
+                    headers: vec![],
+                    body: String::new(),
+                    body_base64: None,
+                    follow_redirects: false,
+                    skip_python_scripts: Some(true),
+                    request_id: Some("cancel-bpu-1".into()),
+                    timeout_sec: Some(10),
+                })
+                .await
+        });
+        let mut paused_seen = false;
+        for _ in 0..100 {
+            if !c_lat.context.breakpoints.list_paused().is_empty() {
+                paused_seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(paused_seen, "Composer bpu should have paused");
+        assert!(c_lat.cancel_composed_request("cancel-bpu-1"));
+        assert!(bpu_handle.await.unwrap().is_err());
+        assert!(
+            c_lat.context.breakpoints.list_paused().is_empty(),
+            "paused breakpoint must be cleaned up on Composer cancel"
+        );
+
+        // 4. MockResponse respects drop_non_matching_on_capture
+        filters.update_config(ProxyFilterBackendConfig {
+            drop_non_matching_on_capture: true,
+            capture_host_list: HostListBackendSyncConfig {
+                enabled: true,
+                mode: HostListFilterMode::Whitelist,
+                raw_text: "only-keep.invalid".into(),
+            },
+            ..crate::proxy::filters::default_backend_config()
+        });
+        let dropped_before = store.storage_stats(true).dropped_sessions_count;
+        let mock_res = c_lat
+            .execute_composed(ComposedRequest {
+                method: "GET".into(),
+                url: "http://dropped-host.invalid/dropped-mock".into(),
+                headers: vec![],
+                body: String::new(),
+                body_base64: None,
+                follow_redirects: false,
+                skip_python_scripts: Some(true),
+                request_id: None,
+                timeout_sec: None,
+            })
+            .await
+            .unwrap();
+        assert!(store.get(mock_res.summary.id).is_none());
+        assert!(store.storage_stats(true).dropped_sessions_count > dropped_before);
+
+        c_lat.stop().await;
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn conc01_conc02_graceful_drain_hard_abort_and_live_policy_reactivity() {
+        use std::sync::atomic::AtomicUsize;
+
+        // Upstream HTTP + WebSocket echo server
+        let up_http_ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_http_ws.local_addr().unwrap();
+        let up_hits = Arc::new(AtomicUsize::new(0));
+        let up_hits_srv = Arc::clone(&up_hits);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = up_http_ws.accept().await {
+                let hits = Arc::clone(&up_hits_srv);
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let hits = Arc::clone(&hits);
+                        async move {
+                            let is_ws = req
+                                .headers()
+                                .get(http::header::UPGRADE)
+                                .and_then(|v| v.to_str().ok())
+                                .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+                            if is_ws {
+                                let key = req
+                                    .headers()
+                                    .get("sec-websocket-key")
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("");
+                                let accept =
+                                    tokio_tungstenite::tungstenite::handshake::derive_accept_key(
+                                        key.as_bytes(),
+                                    );
+                                tokio::spawn(async move {
+                                    if let Ok(up) = hyper::upgrade::on(req).await {
+                                        let mut ws = WebSocketStream::from_raw_socket(
+                                            TokioIo::new(up),
+                                            Role::Server,
+                                            None,
+                                        )
+                                        .await;
+                                        while let Some(Ok(msg)) = ws.next().await {
+                                            if msg.is_close() {
+                                                break;
+                                            }
+                                            if ws.send(msg).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+                                return Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(StatusCode::SWITCHING_PROTOCOLS)
+                                        .header(http::header::CONNECTION, "Upgrade")
+                                        .header(http::header::UPGRADE, "websocket")
+                                        .header("Sec-WebSocket-Accept", accept)
+                                        .body(Full::new(Bytes::new()))
+                                        .unwrap(),
+                                );
+                            }
+                            hits.fetch_add(1, Ordering::Relaxed);
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                        }
+                    });
+                    let _ = AutoConnBuilder::new(TokioExecutor::new())
+                        .serve_connection_with_upgrades(io, svc)
+                        .await;
+                });
+            }
+        });
+
+        let (controller, _rules, filters, store, tmp_dir) = make_stage44_controller("conc01");
+        controller.set_drain_deadline_for_test(Duration::from_millis(450));
+
+        // 1. CONC-01 Graceful Drain via stop()
+        let status = controller.start("127.0.0.1".into(), 0).await.unwrap();
+        let port1 = status.port;
+
+        let mut ws = open_proxied_ws(port1, &format!("ws://{up_addr}/ws-drain")).await;
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            "before-drain".into(),
+        ))
+        .await
+        .unwrap();
+        let reply1 = ws.next().await.unwrap().unwrap();
+        assert_eq!(reply1.to_text().unwrap(), "before-drain");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let ws_session_id = store
+            .list_summaries()
+            .into_iter()
+            .find(|s| s.path.contains("/ws-drain"))
+            .unwrap()
+            .id;
+        let frames_before_drain = store.get(ws_session_id).unwrap().websocket_frames.len();
+        assert!(frames_before_drain >= 2);
+
+        // Open HTTP/1.1 keep-alive connection and finish one request before stop()
+        let mut keepalive_sock = TcpStream::connect(("127.0.0.1", port1)).await.unwrap();
+        keepalive_sock
+            .write_all(
+                format!("GET http://{up_addr}/ka1 HTTP/1.1\r\nHost: {up_addr}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (_h1, b1) = read_raw_http_head_and_body(&mut keepalive_sock).await;
+        assert_eq!(b1, b"ok");
+        let hits_before_stop = up_hits.load(Ordering::Relaxed);
+
+        controller.stop().await;
+
+        // Listener socket must be released immediately after stop() (avoids Windows ~2s connect SYN-retry eating the 450ms drain window)
+        let probe_listener = TcpListener::bind(("127.0.0.1", port1))
+            .await
+            .expect("listener must be closed after stop()");
+        drop(probe_listener);
+
+        // Keep-alive follow-up request during drain receives 503 (or closes) and never reaches upstream
+        if keepalive_sock
+            .write_all(
+                format!("GET http://{up_addr}/ka2 HTTP/1.1\r\nHost: {up_addr}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .is_ok()
+        {
+            let mut ka2_buf = [0u8; 512];
+            if let Ok(n_ka2) = keepalive_sock.read(&mut ka2_buf).await {
+                if n_ka2 > 0 {
+                    let ka2_str = String::from_utf8_lossy(&ka2_buf[..n_ka2]);
+                    assert!(
+                        ka2_str.starts_with("HTTP/1.1 503"),
+                        "expected 503 during drain, got: {ka2_str}"
+                    );
+                }
+            }
+        }
+        assert_eq!(up_hits.load(Ordering::Relaxed), hits_before_stop);
+
+        // Live WebSocket keeps relaying frames during drain window WITHOUT recording into TrafficStore
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            "during-drain".into(),
+        ))
+        .await
+        .unwrap();
+        let reply2 = ws.next().await.unwrap().unwrap();
+        assert_eq!(reply2.to_text().unwrap(), "during-drain");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            store.get(ws_session_id).unwrap().websocket_frames.len(),
+            frames_before_drain,
+            "TrafficStore capture must be suppressed during graceful drain"
+        );
+
+        // Wait for 450 ms drain deadline -> WS must close
+        let ws_closed_on_deadline = tokio::time::timeout(Duration::from_millis(1000), async {
+            loop {
+                match ws.next().await {
+                    None | Some(Err(_)) => break,
+                    Some(Ok(_)) => continue,
+                }
+            }
+        })
+        .await;
+        assert!(
+            ws_closed_on_deadline.is_ok(),
+            "live WebSocket should close after drain deadline expires"
+        );
+
+        // 2. CONC-01 Hard Abort (0 ms) on narrowing AllInterfaces -> Loopback, set_port, shutdown_sync
+        let st_all = controller.start("0.0.0.0".into(), 0).await.unwrap();
+        let mut ws_narrow = open_proxied_ws(st_all.port, &format!("ws://{up_addr}/ws-narrow")).await;
+        let t_narrow = Instant::now();
+        controller
+            .set_bind_configuration(BindHostMode::Loopback, None, false)
+            .await
+            .unwrap();
+        let closed_narrow = tokio::time::timeout(Duration::from_millis(250), async {
+            while let Some(Ok(_)) = ws_narrow.next().await {}
+        })
+        .await;
+        assert!(
+            closed_narrow.is_ok() && t_narrow.elapsed() < Duration::from_millis(250),
+            "narrowing bind change must hard-abort live WS in <250ms"
+        );
+
+        let spare_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let next_port = spare_listener.local_addr().unwrap().port();
+        drop(spare_listener);
+
+        let mut ws_setport = open_proxied_ws(st_all.port, &format!("ws://{up_addr}/ws-setport")).await;
+        let t_setport = Instant::now();
+        controller.set_port(next_port).await.unwrap();
+        let closed_setport = tokio::time::timeout(Duration::from_millis(250), async {
+            while let Some(Ok(_)) = ws_setport.next().await {}
+        })
+        .await;
+        assert!(
+            closed_setport.is_ok() && t_setport.elapsed() < Duration::from_millis(250),
+            "set_port must hard-abort live WS in <250ms"
+        );
+
+        let mut ws_shutdown =
+            open_proxied_ws(next_port, &format!("ws://{up_addr}/ws-shutdown")).await;
+        let t_shutdown = Instant::now();
+        controller.shutdown_sync();
+        let closed_shutdown = tokio::time::timeout(Duration::from_millis(250), async {
+            while let Some(Ok(_)) = ws_shutdown.next().await {}
+        })
+        .await;
+        assert!(
+            closed_shutdown.is_ok() && t_shutdown.elapsed() < Duration::from_millis(250),
+            "shutdown_sync must hard-abort live WS in <250ms"
+        );
+
+        // 3. CONC-02 Live Policy Switch: Passthrough <-> MITM & LAN Client Allowlist removal (<250 ms)
+        // 3a. Active Passthrough CONNECT tunnel aborts in <250 ms when filter flips TargetedOnly -> InterceptAll
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        filters.update_config(ProxyFilterBackendConfig {
+            tls_intercept_mode: TlsInterceptMode::TargetedOnly,
+            tls_target_rules: Vec::new(),
+            ..crate::proxy::filters::default_backend_config()
+        });
+        let st_pt = controller.start("127.0.0.1".into(), 0).await.unwrap();
+        let mut pt_sock = TcpStream::connect(("127.0.0.1", st_pt.port))
+            .await
+            .unwrap();
+        pt_sock
+            .write_all(
+                format!("CONNECT {echo_addr} HTTP/1.1\r\nHost: {echo_addr}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut conn_ack = [0u8; 256];
+        let n_ack = pt_sock.read(&mut conn_ack).await.unwrap();
+        assert!(String::from_utf8_lossy(&conn_ack[..n_ack]).starts_with("HTTP/1.1 200"));
+        pt_sock.write_all(b"ping").await.unwrap();
+        let mut ping_buf = [0u8; 16];
+        assert_eq!(pt_sock.read(&mut ping_buf).await.unwrap(), 4);
+
+        let t_pt_flip = Instant::now();
+        filters.update_config(ProxyFilterBackendConfig {
+            tls_intercept_mode: TlsInterceptMode::InterceptAll,
+            tls_bypass_enabled: false,
+            tls_bypass_rules: Vec::new(),
+            ..crate::proxy::filters::default_backend_config()
+        });
+        let closed_pt = tokio::time::timeout(Duration::from_millis(250), async {
+            let mut sink = [0u8; 64];
+            loop {
+                match pt_sock.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed_pt.is_ok() && t_pt_flip.elapsed() < Duration::from_millis(250),
+            "active passthrough tunnel must abort <250ms when switching to InterceptAll"
+        );
+
+        // 3b. Active MITM TLS tunnel aborts in <250 ms when filter flips InterceptAll -> Passthrough
+        let mut mitm_sock = TcpStream::connect(("127.0.0.1", st_pt.port))
+            .await
+            .unwrap();
+        mitm_sock
+            .write_all(b"CONNECT mitm-flip.test:443 HTTP/1.1\r\nHost: mitm-flip.test:443\r\n\r\n")
+            .await
+            .unwrap();
+        let n_m_ack = mitm_sock.read(&mut conn_ack).await.unwrap();
+        assert!(String::from_utf8_lossy(&conn_ack[..n_m_ack]).starts_with("HTTP/1.1 200"));
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store
+            .add(rustls::pki_types::CertificateDer::from(
+                controller.context.ca.root_ca_der().to_vec(),
+            ))
+            .unwrap();
+        let client_tls_cfg = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+        let tls_conn = tokio_rustls::TlsConnector::from(client_tls_cfg);
+        let mut mitm_tls = tls_conn
+            .connect(
+                rustls::pki_types::ServerName::try_from("mitm-flip.test").unwrap(),
+                mitm_sock,
+            )
+            .await
+            .unwrap();
+        let t_mitm_flip = Instant::now();
+        filters.update_config(ProxyFilterBackendConfig {
+            tls_intercept_mode: TlsInterceptMode::InterceptAll,
+            tls_bypass_enabled: true,
+            tls_bypass_rules: vec![TlsBypassRule {
+                id: "bypass-mitm-flip".into(),
+                enabled: true,
+                pattern: "mitm-flip.test".into(),
+                category: "Test".into(),
+                description: "Flip to Passthrough".into(),
+            }],
+            ..crate::proxy::filters::default_backend_config()
+        });
+        let closed_mitm = tokio::time::timeout(Duration::from_millis(250), async {
+            let mut sink = [0u8; 64];
+            loop {
+                match mitm_tls.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed_mitm.is_ok() && t_mitm_flip.elapsed() < Duration::from_millis(250),
+            "active MITM TLS connection must abort <250ms when switching to Passthrough"
+        );
+
+        // 3c. LAN Client Allowlist removal aborts active non-loopback connection in <250 ms
+        let remote_peer: SocketAddr = "192.168.50.77:55555".parse().unwrap();
+        filters.update_config(ProxyFilterBackendConfig {
+            lan_client_allowlist: vec!["192.168.50.77".into()],
+            ..crate::proxy::filters::default_backend_config()
+        });
+        let srv_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = srv_listener.local_addr().unwrap();
+        let sc_ctx = controller.context.clone();
+        let lc_handle = ConnectionLifecycleHandle::new();
+        let lc_child = lc_handle.lifecycle();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = srv_listener.accept().await {
+                serve_connection(stream, remote_peer, Some(srv_addr.port()), lc_child, sc_ctx).await;
+            }
+        });
+        let mut remote_client = TcpStream::connect(srv_addr).await.unwrap();
+        let t_allow = Instant::now();
+        filters.update_config(ProxyFilterBackendConfig {
+            lan_client_allowlist: vec!["192.168.50.99".into()],
+            ..crate::proxy::filters::default_backend_config()
+        });
+        let closed_allow = tokio::time::timeout(Duration::from_millis(250), async {
+            let mut sink = [0u8; 64];
+            loop {
+                match remote_client.read(&mut sink).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed_allow.is_ok() && t_allow.elapsed() < Duration::from_millis(250),
+            "removing peer IP from lan_client_allowlist must hard-abort connection <250ms"
+        );
+
+        controller.shutdown_sync();
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

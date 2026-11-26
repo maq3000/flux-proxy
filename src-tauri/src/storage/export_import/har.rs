@@ -1080,20 +1080,14 @@ pub(super) fn har_entry_to_session(entry: &HarEntry, fallback_id: u64) -> Sessio
         .request
         .headers
         .iter()
-        .map(|h| HeaderPair {
-            name: h.name.clone(),
-            value: h.value.clone(),
-        })
+        .map(|h| HeaderPair::new(h.name.clone(), h.value.clone()))
         .collect();
 
     let response_headers: Vec<HeaderPair> = entry
         .response
         .headers
         .iter()
-        .map(|h| HeaderPair {
-            name: h.name.clone(),
-            value: h.value.clone(),
-        })
+        .map(|h| HeaderPair::new(h.name.clone(), h.value.clone()))
         .collect();
 
     let (parsed_scheme, parsed_host, parsed_path) =

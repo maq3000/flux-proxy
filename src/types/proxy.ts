@@ -1,6 +1,7 @@
 export interface HeaderPair {
   name: string;
   value: string;
+  rawBytesB64?: string;
 }
 
 export interface WebSocketFrameRecord {

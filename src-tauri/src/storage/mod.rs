@@ -809,10 +809,10 @@ impl TrafficStore {
                 detail_mut
                     .response_headers
                     .retain(|h| !h.name.eq_ignore_ascii_case("x-fluxproxy-error"));
-                detail_mut.response_headers.push(crate::models::HeaderPair {
-                    name: "X-FluxProxy-Error".to_string(),
-                    value: code.to_string(),
-                });
+                detail_mut.response_headers.push(crate::models::HeaderPair::new(
+                    "X-FluxProxy-Error",
+                    code.to_string(),
+                ));
             }
             if let Some(ref mut timings) = detail_mut.timings {
                 timings.overall_elapsed_ms = Some(duration_ms as f64);
@@ -1215,23 +1215,17 @@ impl TrafficStore {
             let detail = SessionDetail {
                 summary: summary.clone(),
                 request_headers: vec![
-                    HeaderPair {
-                        name: "Host".to_string(),
-                        value: host.to_string(),
-                    },
-                    HeaderPair {
-                        name: "User-Agent".to_string(),
-                        value: "FluxProxy-StressBench/1.0".to_string(),
-                    },
+                    HeaderPair::new("Host", host.to_string()),
+                    HeaderPair::new("User-Agent", "FluxProxy-StressBench/1.0"),
                 ],
-                response_headers: vec![HeaderPair {
-                    name: "Content-Type".to_string(),
-                    value: if content_type.is_empty() {
+                response_headers: vec![HeaderPair::new(
+                    "Content-Type",
+                    if content_type.is_empty() {
                         "text/plain".to_string()
                     } else {
                         content_type.to_string()
                     },
-                }],
+                )],
                 request_body_base64: String::new(),
                 response_body_base64: resp_b64,
                 request_body_text: None,
@@ -1378,14 +1372,8 @@ mod tests {
                 server_conn_reused: None,
                 ws_open: None,
             },
-            request_headers: vec![HeaderPair {
-                name: "Host".into(),
-                value: "api.fluxproxy.dev".into(),
-            }],
-            response_headers: vec![HeaderPair {
-                name: "Content-Type".into(),
-                value: "application/json".into(),
-            }],
+            request_headers: vec![HeaderPair::new("Host", "api.fluxproxy.dev")],
+            response_headers: vec![HeaderPair::new("Content-Type", "application/json")],
             request_body_base64: String::new(),
             response_body_base64: base64::engine::general_purpose::STANDARD.encode(resp_bytes),
             request_body_text: std::str::from_utf8(resp_bytes).ok().map(str::to_owned),
@@ -1567,10 +1555,7 @@ mod tests {
         let initial_len = BODY_OFFLOAD_THRESHOLD_BYTES + 1024;
         let first_payload = "data: a\n\n".repeat(initial_len / 9 + 1);
         let mut s = make_session(id, first_payload.as_bytes());
-        s.response_headers = vec![HeaderPair {
-            name: "Content-Type".into(),
-            value: "text/event-stream".into(),
-        }];
+        s.response_headers = vec![HeaderPair::new("Content-Type", "text/event-stream")];
         store.insert(s);
 
         let mid = store.get(id).expect("session present");

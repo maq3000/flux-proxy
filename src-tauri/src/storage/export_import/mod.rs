@@ -243,28 +243,16 @@ mod tests {
                     ws_open: None,
                 },
                 request_headers: vec![
-                    HeaderPair {
-                        name: "Host".into(),
-                        value: "auth.fluxproxy.dev".into(),
-                    },
-                    HeaderPair {
-                        name: "Content-Type".into(),
-                        value: "application/json".into(),
-                    },
-                    HeaderPair {
-                        name: "Cookie".into(),
-                        value: "device_id=dev-77; theme=dark".into(),
-                    },
+                    HeaderPair::new("Host", "auth.fluxproxy.dev"),
+                    HeaderPair::new("Content-Type", "application/json"),
+                    HeaderPair::new("Cookie", "device_id=dev-77; theme=dark"),
                 ],
                 response_headers: vec![
-                    HeaderPair {
-                        name: "Content-Type".into(),
-                        value: "application/json; charset=utf-8".into(),
-                    },
-                    HeaderPair {
-                        name: "Set-Cookie".into(),
-                        value: "sid=abc123; Path=/; Domain=fluxproxy.dev; Secure; HttpOnly".into(),
-                    },
+                    HeaderPair::new("Content-Type", "application/json; charset=utf-8"),
+                    HeaderPair::new(
+                        "Set-Cookie",
+                        "sid=abc123; Path=/; Domain=fluxproxy.dev; Secure; HttpOnly",
+                    ),
                 ],
                 request_body_base64: base64::engine::general_purpose::STANDARD.encode(req_json),
                 response_body_base64: base64::engine::general_purpose::STANDARD.encode(resp_json),
@@ -317,14 +305,8 @@ mod tests {
                     server_conn_reused: None,
                     ws_open: None,
                 },
-                request_headers: vec![HeaderPair {
-                    name: "Host".into(),
-                    value: "cdn.fluxproxy.dev".into(),
-                }],
-                response_headers: vec![HeaderPair {
-                    name: "Content-Type".into(),
-                    value: "image/png".into(),
-                }],
+                request_headers: vec![HeaderPair::new("Host", "cdn.fluxproxy.dev")],
+                response_headers: vec![HeaderPair::new("Content-Type", "image/png")],
                 request_body_base64: String::new(),
                 response_body_base64: base64::engine::general_purpose::STANDARD.encode(png_bytes),
                 request_body_text: None,
@@ -587,14 +569,14 @@ mod tests {
         detail.summary.url = "https://example.com/test\r\nInjected-Req: 1\0".into();
         detail.summary.host = "example.com\r\nX-Host-Injected: yes\0".into();
         detail.summary.content_type = "application/json\r\nSet-Cookie: pwn=1\0".into();
-        detail.request_headers = vec![crate::models::HeaderPair {
-            name: "X-Custom\r\nEvil".into(),
-            value: "val\r\nX-Smuggled: 1\0".into(),
-        }];
-        detail.response_headers = vec![crate::models::HeaderPair {
-            name: "X-Resp\nName".into(),
-            value: "ok\r\nSet-Cookie: bad=2\0".into(),
-        }];
+        detail.request_headers = vec![crate::models::HeaderPair::new(
+            "X-Custom\r\nEvil",
+            "val\r\nX-Smuggled: 1\0",
+        )];
+        detail.response_headers = vec![crate::models::HeaderPair::new(
+            "X-Resp\nName",
+            "ok\r\nSet-Cookie: bad=2\0",
+        )];
 
         let req_raw = String::from_utf8(build_raw_http_request_bytes(&detail)).unwrap();
         let req_head = req_raw.split("\r\n\r\n").next().unwrap();
@@ -681,10 +663,7 @@ mod tests {
 
     #[test]
     fn unifies_url_parsing_with_query_without_slash_and_at_signs() {
-        let headers = vec![HeaderPair {
-            name: "Host".into(),
-            value: "fallback.local".into(),
-        }];
+        let headers = vec![HeaderPair::new("Host", "fallback.local")];
 
         let (sch1, host1, path1) =
             split_url_components("http://user:p@ss@api.example.com:8080?a=1&b=2", &headers);
@@ -724,10 +703,7 @@ mod tests {
             br_enc.write_all(&gzipped).unwrap();
         }
 
-        let headers = vec![HeaderPair {
-            name: "Content-Encoding".into(),
-            value: "gzip, br".into(),
-        }];
+        let headers = vec![HeaderPair::new("Content-Encoding", "gzip, br")];
         let mut cumulative = 0u64;
         let decoded = decode_http_body(&br_out, &headers, &mut cumulative).unwrap();
         assert_eq!(decoded, plain);
@@ -786,18 +762,18 @@ mod tests {
         sessions[0].summary.process_name = Some("secret-app.exe".into());
         sessions[0].summary.process_pid = Some(4242);
         sessions[0].request_headers = vec![
-            HeaderPair { name: "Host".into(), value: "auth.fluxproxy.dev".into() },
-            HeaderPair { name: "Content-Type".into(), value: "application/json".into() },
-            HeaderPair { name: "Authorization".into(), value: "Bearer header-jwt-secret".into() },
-            HeaderPair { name: "Proxy-Authorization".into(), value: "Basic cHJveHk6c2VjcmV0".into() },
-            HeaderPair { name: "Cookie".into(), value: "sid=cookie-secret-val; theme=dark".into() },
-            HeaderPair { name: "X-Api-Key".into(), value: "x-api-key-secret".into() },
-            HeaderPair { name: "X-Auth-Token".into(), value: "x-auth-tok-secret".into() },
-            HeaderPair { name: "X-Custom-Session".into(), value: "custom-hdr-secret".into() },
+            HeaderPair::new("Host", "auth.fluxproxy.dev"),
+            HeaderPair::new("Content-Type", "application/json"),
+            HeaderPair::new("Authorization", "Bearer header-jwt-secret"),
+            HeaderPair::new("Proxy-Authorization", "Basic cHJveHk6c2VjcmV0"),
+            HeaderPair::new("Cookie", "sid=cookie-secret-val; theme=dark"),
+            HeaderPair::new("X-Api-Key", "x-api-key-secret"),
+            HeaderPair::new("X-Auth-Token", "x-auth-tok-secret"),
+            HeaderPair::new("X-Custom-Session", "custom-hdr-secret"),
         ];
         sessions[0].response_headers = vec![
-            HeaderPair { name: "Content-Type".into(), value: "application/json; charset=utf-8".into() },
-            HeaderPair { name: "Set-Cookie".into(), value: "session=set-cookie-secret; HttpOnly; Secure".into() },
+            HeaderPair::new("Content-Type", "application/json; charset=utf-8"),
+            HeaderPair::new("Set-Cookie", "session=set-cookie-secret; HttpOnly; Secure"),
         ];
         sessions[0].request_body_base64 =
             base64::engine::general_purpose::STANDARD.encode(json_req);
@@ -815,11 +791,8 @@ mod tests {
             "https://cdn.fluxproxy.dev/oauth/token?api_key=query-api-key-secret&mode=refresh"
                 .into();
         sessions[1].request_headers = vec![
-            HeaderPair { name: "Host".into(), value: "cdn.fluxproxy.dev".into() },
-            HeaderPair {
-                name: "Content-Type".into(),
-                value: "application/x-www-form-urlencoded".into(),
-            },
+            HeaderPair::new("Host", "cdn.fluxproxy.dev"),
+            HeaderPair::new("Content-Type", "application/x-www-form-urlencoded"),
         ];
         sessions[1].request_body_base64 =
             base64::engine::general_purpose::STANDARD.encode(form_req);
@@ -968,19 +941,19 @@ mod tests {
                 .into();
         sessions[0].summary.path = "/users/@alice?apiKey=qtok-secret&lang=en#id_token=frag-secret".into();
         sessions[0].request_headers = vec![
-            HeaderPair { name: "Host".into(), value: "auth.fluxproxy.dev".into() },
-            HeaderPair { name: "Content-Type".into(), value: "application/json".into() },
-            HeaderPair {
-                name: "Referer".into(),
-                value: "https://bob:refpass@portal.fluxproxy.dev/cb?apiKey=ref-apikey#access_token=ref-frag".into(),
-            },
+            HeaderPair::new("Host", "auth.fluxproxy.dev"),
+            HeaderPair::new("Content-Type", "application/json"),
+            HeaderPair::new(
+                "Referer",
+                "https://bob:refpass@portal.fluxproxy.dev/cb?apiKey=ref-apikey#access_token=ref-frag",
+            ),
         ];
         sessions[0].response_headers = vec![
-            HeaderPair { name: "Content-Type".into(), value: "text/event-stream; charset=utf-8".into() },
-            HeaderPair {
-                name: "Location".into(),
-                value: "https://carol:locpass@app.fluxproxy.dev/done?token=loc-tok#state=loc-frag".into(),
-            },
+            HeaderPair::new("Content-Type", "text/event-stream; charset=utf-8"),
+            HeaderPair::new(
+                "Location",
+                "https://carol:locpass@app.fluxproxy.dev/done?token=loc-tok#state=loc-frag",
+            ),
         ];
         sessions[0].request_body_base64 =
             base64::engine::general_purpose::STANDARD.encode(camel_req.as_bytes());
@@ -1106,10 +1079,7 @@ mod tests {
 
         // 1. Single-layer zstd and 2-layer gzip+zstd succeed
         let mut cumulative = 0u64;
-        let zstd_headers = vec![HeaderPair {
-            name: "Content-Encoding".into(),
-            value: "zstd".into(),
-        }];
+        let zstd_headers = vec![HeaderPair::new("Content-Encoding", "zstd")];
         assert_eq!(
             decode_http_body(&zstd_payload, &zstd_headers, &mut cumulative).unwrap(),
             plain
@@ -1119,10 +1089,7 @@ mod tests {
         gz.write_all(plain).unwrap();
         let gzipped = gz.finish().unwrap();
         let zstd_over_gzip = zstd::encode_all(gzipped.as_slice(), 1).unwrap();
-        let two_layer_headers = vec![HeaderPair {
-            name: "Content-Encoding".into(),
-            value: "gzip, zstd".into(),
-        }];
+        let two_layer_headers = vec![HeaderPair::new("Content-Encoding", "gzip, zstd")];
         let mut cumulative2 = 0u64;
         assert_eq!(
             decode_http_body(&zstd_over_gzip, &two_layer_headers, &mut cumulative2).unwrap(),
@@ -1131,10 +1098,7 @@ mod tests {
         assert_eq!(cumulative2, (gzipped.len() + plain.len()) as u64);
 
         // 2. More than 2 Content-Encoding layers are rejected
-        let three_layer_headers = vec![HeaderPair {
-            name: "Content-Encoding".into(),
-            value: "gzip, br, zstd".into(),
-        }];
+        let three_layer_headers = vec![HeaderPair::new("Content-Encoding", "gzip, br, zstd")];
         let mut cumulative3 = 0u64;
         assert!(decode_http_body(&zstd_over_gzip, &three_layer_headers, &mut cumulative3).is_err());
 
@@ -1185,14 +1149,8 @@ mod tests {
         let body_bytes = vec![b'A'; 1000];
         let body_text = String::from_utf8(body_bytes.clone()).unwrap();
         detail.response_headers = vec![
-            HeaderPair {
-                name: "Content-Type".into(),
-                value: "application/json; charset=utf-8".into(),
-            },
-            HeaderPair {
-                name: "Content-Encoding".into(),
-                value: "gzip".into(),
-            },
+            HeaderPair::new("Content-Type", "application/json; charset=utf-8"),
+            HeaderPair::new("Content-Encoding", "gzip"),
         ];
         detail.response_body_base64 = base64::engine::general_purpose::STANDARD.encode(&body_bytes);
         detail.response_body_text = Some(body_text);

@@ -267,10 +267,7 @@ mod tests {
             Some("r-contains")
         );
 
-        let hdrs = vec![HeaderPair {
-            name: "authorization".into(),
-            value: "Bearer Secret-Token".into(),
-        }];
+        let hdrs = vec![HeaderPair::new("authorization", "Bearer Secret-Token")];
         let header_match = engine.find_matching_rule("GET", "https://other.local/", &hdrs);
         assert_eq!(
             header_match.as_ref().map(|r| r.id.as_str()),

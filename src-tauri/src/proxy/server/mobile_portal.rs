@@ -189,24 +189,12 @@ pub(super) fn handle_builtin_portal_request(
     };
 
     let mut resp_headers = vec![
-        HeaderPair {
-            name: "Content-Type".into(),
-            value: content_type.into(),
-        },
-        HeaderPair {
-            name: "Cache-Control".into(),
-            value: "no-store, no-cache, must-revalidate".into(),
-        },
-        HeaderPair {
-            name: "X-Content-Type-Options".into(),
-            value: "nosniff".into(),
-        },
+        HeaderPair::new("Content-Type", content_type),
+        HeaderPair::new("Cache-Control", "no-store, no-cache, must-revalidate"),
+        HeaderPair::new("X-Content-Type-Options", "nosniff"),
     ];
     if let Some(disp) = disposition {
-        resp_headers.push(HeaderPair {
-            name: "Content-Disposition".into(),
-            value: disp.into(),
-        });
+        resp_headers.push(HeaderPair::new("Content-Disposition", disp));
     }
 
     let (client_reused, client_tls_ms) = client_conn.claim_request_seq();
@@ -309,12 +297,18 @@ pub(super) fn handle_builtin_portal_request(
         transfer_stats: Some(transfer_stats),
     };
 
-    ctx.store.insert(detail);
-    let _ = ctx.event_tx.send(summary);
+    if !client_conn.is_capture_suppressed() {
+        ctx.store.insert(detail);
+        let _ = ctx.event_tx.send(summary);
+    }
 
     let mut builder = Response::builder().status(StatusCode::OK);
     for h in &resp_headers {
-        builder = builder.header(&h.name, &h.value);
+        if let Ok(hn) = http::HeaderName::from_bytes(h.name.trim().as_bytes()) {
+            if let Ok(hv) = h.to_hyper_header_value() {
+                builder = builder.header(hn, hv);
+            }
+        }
     }
     builder
         .body(boxed_full(resp_bytes))

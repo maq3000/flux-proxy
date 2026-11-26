@@ -5,6 +5,47 @@ use serde::{Deserialize, Serialize};
 pub struct HeaderPair {
     pub name: String,
     pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_bytes_b64: Option<String>,
+}
+
+impl HeaderPair {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            raw_bytes_b64: None,
+        }
+    }
+
+    pub fn display_value_for_raw_bytes(raw: &[u8]) -> String {
+        if raw.is_empty() {
+            "<binary>".to_string()
+        } else {
+            let lossy = String::from_utf8_lossy(raw);
+            if lossy.is_empty() {
+                "<binary>".to_string()
+            } else {
+                lossy.into_owned()
+            }
+        }
+    }
+
+    pub fn to_hyper_header_value(
+        &self,
+    ) -> Result<http::HeaderValue, http::header::InvalidHeaderValue> {
+        use base64::Engine as _;
+
+        if let Some(ref b64) = self.raw_bytes_b64 {
+            if let Ok(raw_bytes) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+                let expected = Self::display_value_for_raw_bytes(&raw_bytes);
+                if self.value == expected || self.value == "<binary>" {
+                    return http::HeaderValue::from_bytes(&raw_bytes);
+                }
+            }
+        }
+        http::HeaderValue::from_str(&self.value)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -101,18 +101,9 @@ fn mutates_headers_for_cache_bypass_and_user_agent() {
     engine.update_config(cfg);
 
     let mut req_headers = vec![
-        HeaderPair {
-            name: "User-Agent".into(),
-            value: "OldBrowser/1.0".into(),
-        },
-        HeaderPair {
-            name: "If-Modified-Since".into(),
-            value: "Wed, 21 Oct 2026 07:28:00 GMT".into(),
-        },
-        HeaderPair {
-            name: "If-None-Match".into(),
-            value: "\"abc-123\"".into(),
-        },
+        HeaderPair::new("User-Agent", "OldBrowser/1.0"),
+        HeaderPair::new("If-Modified-Since", "Wed, 21 Oct 2026 07:28:00 GMT"),
+        HeaderPair::new("If-None-Match", "\"abc-123\""),
     ];
 
     let changed = engine.apply_header_mutations(
@@ -126,14 +117,8 @@ fn mutates_headers_for_cache_bypass_and_user_agent() {
     assert!(req_headers[0].value.contains("iPhone"));
 
     let mut resp_headers = vec![
-        HeaderPair {
-            name: "ETag".into(),
-            value: "\"abc-123\"".into(),
-        },
-        HeaderPair {
-            name: "Content-Type".into(),
-            value: "application/json".into(),
-        },
+        HeaderPair::new("ETag", "\"abc-123\""),
+        HeaderPair::new("Content-Type", "application/json"),
     ];
     let resp_changed = engine.apply_header_mutations(
         HeaderMutationDirection::Response,
@@ -282,22 +267,10 @@ fn strips_alt_svc_and_alternate_protocol_by_default_even_when_mutations_disabled
     engine.update_config(cfg);
 
     let mut resp_headers = vec![
-        HeaderPair {
-            name: "Content-Type".into(),
-            value: "application/json".into(),
-        },
-        HeaderPair {
-            name: "Alt-Svc".into(),
-            value: "h3=\":443\"; ma=86400, h3-29=\":443\"; ma=86400".into(),
-        },
-        HeaderPair {
-            name: "alternate-protocol".into(),
-            value: "443:quic".into(),
-        },
-        HeaderPair {
-            name: "Cache-Control".into(),
-            value: "no-store".into(),
-        },
+        HeaderPair::new("Content-Type", "application/json"),
+        HeaderPair::new("Alt-Svc", "h3=\":443\"; ma=86400, h3-29=\":443\"; ma=86400"),
+        HeaderPair::new("alternate-protocol", "443:quic"),
+        HeaderPair::new("Cache-Control", "no-store"),
     ];
 
     let mutated = engine.apply_header_mutations(
@@ -321,14 +294,8 @@ fn preserves_alt_svc_headers_when_strip_alt_svc_is_disabled() {
     assert!(!engine.is_strip_alt_svc_enabled());
 
     let mut resp_headers = vec![
-        HeaderPair {
-            name: "alt-svc".into(),
-            value: "h3=\":443\"; ma=2592000".into(),
-        },
-        HeaderPair {
-            name: "Alternate-Protocol".into(),
-            value: "443:quic,p=1".into(),
-        },
+        HeaderPair::new("alt-svc", "h3=\":443\"; ma=2592000"),
+        HeaderPair::new("Alternate-Protocol", "443:quic,p=1"),
     ];
 
     let mutated = engine.apply_header_mutations(

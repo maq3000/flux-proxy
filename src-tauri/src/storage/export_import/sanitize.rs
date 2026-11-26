@@ -105,6 +105,7 @@ pub(super) fn redact_headers_in_place(
         let is_custom = custom_headers_lower.iter().any(|c| c == &lower_name);
         if is_builtin || is_custom {
             h.value = replacement.to_string();
+            h.raw_bytes_b64 = None;
         }
     }
 }
@@ -415,6 +416,7 @@ pub(super) fn update_content_length_header(headers: &mut [HeaderPair], byte_len:
     for h in headers.iter_mut() {
         if h.name.trim().eq_ignore_ascii_case("content-length") {
             h.value = len_str.clone();
+            h.raw_bytes_b64 = None;
         }
     }
 }
@@ -691,8 +693,12 @@ pub fn sanitize_sessions(
                     if hdr.name.trim().eq_ignore_ascii_case("location")
                         || hdr.name.trim().eq_ignore_ascii_case("referer")
                     {
-                        hdr.value =
+                        let sanitized_val =
                             sanitize_url_query(&hdr.value, &strip_params_normalized, replacement);
+                        if sanitized_val != hdr.value {
+                            hdr.value = sanitized_val;
+                            hdr.raw_bytes_b64 = None;
+                        }
                     }
                 }
             }

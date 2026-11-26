@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -57,6 +57,13 @@ pub(super) async fn handle_outer_proxy_request(
         return plain_response(
             StatusCode::FORBIDDEN,
             "Forbidden: client IP is not in the LAN Client Allowlist",
+        );
+    }
+
+    if client_conn.is_draining_or_aborted() {
+        return plain_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable: FluxProxy is stopping",
         );
     }
 
@@ -514,25 +521,22 @@ pub(super) async fn handle_outer_proxy_request(
                     ),
                 };
 
-            let mut resp_headers = vec![HeaderPair {
-                name: "X-FluxProxy-TLS-Mode".into(),
-                value: mode_header_val,
-            }];
+            let mut resp_headers = vec![HeaderPair::new("X-FluxProxy-TLS-Mode", mode_header_val)];
             if let Some(ref target_label) = remapped_to {
                 passthrough_note.push_str(&format!(
                     "\nHOSTS Remapped Target: {connect_host}:{connect_port} (label: {target_label})"
                 ));
-                resp_headers.push(HeaderPair {
-                    name: "X-FluxProxy-Host-Remap".into(),
-                    value: format!("{connect_host}:{connect_port}"),
-                });
+                resp_headers.push(HeaderPair::new(
+                    "X-FluxProxy-Host-Remap",
+                    format!("{connect_host}:{connect_port}"),
+                ));
             }
             if let Some(ref proxy_label) = upstream_proxy_label {
                 passthrough_note.push_str(&format!("\nUpstream Proxy: {proxy_label}"));
-                resp_headers.push(HeaderPair {
-                    name: "X-FluxProxy-Upstream-Proxy".into(),
-                    value: proxy_label.clone(),
-                });
+                resp_headers.push(HeaderPair::new(
+                    "X-FluxProxy-Upstream-Proxy",
+                    proxy_label.clone(),
+                ));
             }
 
             let resp_headers_bytes =
@@ -641,63 +645,24 @@ pub(super) async fn handle_outer_proxy_request(
                 transfer_stats: Some(initial_stats),
             };
 
-            record_completed_session(&ctx, detail, None, None);
+            if !client_conn.is_capture_suppressed() {
+                record_completed_session(&ctx, detail, None, None);
+            }
 
-            tokio::spawn(async move {
-                match hyper::upgrade::on(req).await {
-                    Ok(upgraded) => {
-                        let mut client_io = TokioIo::new(upgraded);
-                        let mut throttled_upstream =
-                            ThrottledStream::new_without_initial_delay(upstream_tcp, ctx.throttle.clone());
-                        match tokio::io::copy_bidirectional(&mut client_io, &mut throttled_upstream).await
-                        {
-                            Ok((tx_bytes, rx_bytes)) => {
-                                let end_instant = Instant::now();
-                                let done_at = timestamp_at_instant(start, start_utc, end_instant);
-                                let overall_ms = duration_ms_f64(end_instant.saturating_duration_since(start));
-                                let transfer_ms = duration_ms_f64(
-                                    end_instant.saturating_duration_since(tunnel_start_instant),
-                                );
-                                if let Some(updated_summary) =
-                                    ctx.store.update_session_telemetry(session_id, |detail| {
-                                        detail.summary.body_size =
-                                            (tx_bytes.saturating_add(rx_bytes)) as usize;
-                                        detail.summary.duration_ms =
-                                            start.elapsed().as_millis() as u64;
-                                        let timings =
-                                            detail.timings.get_or_insert_with(Default::default);
-                                        timings.server_done_response = Some(done_at.clone());
-                                        timings.client_done_response = Some(done_at);
-                                        timings.content_download_ms = Some(transfer_ms);
-                                        timings.overall_elapsed_ms = Some(overall_ms);
-                                        timings.net_elapsed_ms = Some(overall_ms);
-                                        let stats = detail
-                                            .transfer_stats
-                                            .get_or_insert_with(Default::default);
-                                        stats.request_wire_body_bytes = Some(tx_bytes as usize);
-                                        stats.request_body_bytes = Some(tx_bytes as usize);
-                                        stats.response_wire_body_bytes = Some(rx_bytes as usize);
-                                        stats.response_body_bytes = Some(rx_bytes as usize);
-                                        let timings_clone = detail.timings.clone();
-                                        let stats_clone = detail.transfer_stats.clone();
-                                        detail
-                                            .summary
-                                            .apply_telemetry(timings_clone.as_ref(), stats_clone.as_ref());
-                                    })
-                                {
-                                    let _ = ctx.event_tx.send(updated_summary);
-                                }
-                            }
-                            Err(err) => {
-                                tracing::debug!("TLS passthrough tunnel closed for {host}: {err}");
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        tracing::debug!("HTTP CONNECT passthrough upgrade error: {err}");
-                    }
-                }
-            });
+            let tunnel_lifecycle = client_conn.lifecycle.clone();
+            tokio::spawn(tunnel_passthrough_bidirectional(
+                req,
+                upstream_tcp,
+                host,
+                port,
+                client_addr,
+                session_id,
+                start,
+                start_utc,
+                tunnel_start_instant,
+                tunnel_lifecycle,
+                ctx,
+            ));
 
             return Response::builder()
                 .status(StatusCode::OK)
@@ -706,156 +671,15 @@ pub(super) async fn handle_outer_proxy_request(
             }
         }
 
-        let mut filter_updates_rx = ctx.filters.subscribe_config_updates();
-
-        tokio::spawn(async move {
-            match hyper::upgrade::on(req).await {
-                Ok(upgraded) => {
-                    let server_cfg = match ctx.ca.server_config_for_host(&host) {
-                        Ok(cfg) => cfg,
-                        Err(err) => {
-                            tracing::error!("Failed to generate MITM cert for {host}: {err}");
-                            return;
-                        }
-                    };
-
-                    let tls_accept_start = Instant::now();
-                    let acceptor = TlsAcceptor::from(server_cfg);
-                    let tls_stream = match acceptor.accept(TokioIo::new(upgraded)).await {
-                        Ok(s) => s,
-                        Err(err) => {
-                            tracing::debug!("Client TLS handshake aborted for {host}: {err}");
-                            return;
-                        }
-                    };
-                    let client_tls_handshake_ms = elapsed_ms(tls_accept_start);
-
-                    if let ConnectTunnelDecision::Passthrough(reason) =
-                        ctx.filters.evaluate_connect_tunnel(&host, port)
-                    {
-                        tracing::info!(
-                            "Closing newly negotiated MITM tunnel for {}:{} after filter switch to Passthrough ({:?})",
-                            host,
-                            port,
-                            reason
-                        );
-                        return;
-                    }
-
-                    let client_tls_info = tls_stream.get_ref().1;
-                    let client_tls_version = client_tls_info
-                        .protocol_version()
-                        .map(format_tls_protocol);
-                    let client_tls_cipher = client_tls_info
-                        .negotiated_cipher_suite()
-                        .map(format_tls_cipher);
-                    let negotiated_alpn_opt = client_tls_info
-                        .alpn_protocol()
-                        .map(|p| String::from_utf8_lossy(p).to_string());
-                    let negotiated_alpn = negotiated_alpn_opt
-                        .clone()
-                        .unwrap_or_else(|| "http/1.1".to_string());
-                    let mitm_conn = client_conn.with_mitm_tls(
-                        client_tls_handshake_ms,
-                        client_tls_version,
-                        client_tls_cipher,
-                        negotiated_alpn_opt,
-                    );
-
-                    let inner_io = TokioIo::new(tls_stream);
-                    let authority_host = if host.contains(':') {
-                        if port == 443 {
-                            format!("[{host}]")
-                        } else {
-                            format!("[{host}]:{port}")
-                        }
-                    } else if port == 443 {
-                        host.clone()
-                    } else {
-                        format!("{host}:{port}")
-                    };
-                    let conn_ctx = ctx.clone();
-                    let mitm_host = host.clone();
-
-                    let service = service_fn(move |inner_req: Request<Incoming>| {
-                        let req_ctx = ctx.clone();
-                        let default_host = authority_host.clone();
-                        let alpn = negotiated_alpn.clone();
-                        let proc_info = client_proc.clone();
-                        let inner_conn = mitm_conn.clone();
-                        async move {
-                            Ok::<_, Infallible>(
-                                handle_intercepted_request(
-                                    inner_req,
-                                    "https",
-                                    Some(&default_host),
-                                    Some(&alpn),
-                                    client_addr,
-                                    proc_info,
-                                    inner_conn,
-                                    req_ctx,
-                                )
-                                .await,
-                            )
-                        }
-                    });
-
-                    let auto_builder = AutoConnBuilder::new(TokioExecutor::new());
-                    let conn = auto_builder.serve_connection_with_upgrades(inner_io, service);
-                    tokio::pin!(conn);
-
-                    loop {
-                        tokio::select! {
-                            res = conn.as_mut() => {
-                                let _ = res;
-                                break;
-                            }
-                            changed = filter_updates_rx.changed() => {
-                                if changed.is_err() {
-                                    let _ = conn.as_mut().await;
-                                    break;
-                                }
-                                if !conn_ctx.filters.is_lan_client_allowed(client_addr.ip()) {
-                                    tracing::info!(
-                                        "Gracefully shutting down active MITM tunnel for {}:{} after LAN Client Allowlist update excluded {}",
-                                        mitm_host,
-                                        port,
-                                        client_addr.ip()
-                                    );
-                                    conn.as_mut().graceful_shutdown();
-                                    let _ = tokio::time::timeout(
-                                        Duration::from_secs(2),
-                                        conn.as_mut(),
-                                    )
-                                    .await;
-                                    break;
-                                }
-                                if let ConnectTunnelDecision::Passthrough(reason) =
-                                    conn_ctx.filters.evaluate_connect_tunnel(&mitm_host, port)
-                                {
-                                    tracing::info!(
-                                        "Gracefully shutting down active MITM tunnel for {}:{} after filter switch to Passthrough ({:?})",
-                                        mitm_host,
-                                        port,
-                                        reason
-                                    );
-                                    conn.as_mut().graceful_shutdown();
-                                    let _ = tokio::time::timeout(
-                                        Duration::from_secs(2),
-                                        conn.as_mut(),
-                                    )
-                                    .await;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::debug!("HTTP CONNECT upgrade error: {err}");
-                }
-            }
-        });
+        tokio::spawn(serve_mitm_tls_connection(
+            req,
+            host,
+            port,
+            client_addr,
+            client_proc,
+            client_conn,
+            ctx,
+        ));
 
         // Acknowledge tunnel establishment so the client begins TLS ClientHello
         return Response::builder()
@@ -866,4 +690,335 @@ pub(super) async fn handle_outer_proxy_request(
 
     handle_intercepted_request(req, "http", None, None, client_addr, client_proc, client_conn, ctx)
         .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn tunnel_passthrough_bidirectional(
+    req: Request<Incoming>,
+    upstream_tcp: UpstreamTransportStream,
+    host: String,
+    port: u16,
+    client_addr: SocketAddr,
+    session_id: u64,
+    start: Instant,
+    start_utc: chrono::DateTime<Utc>,
+    tunnel_start_instant: Instant,
+    lifecycle: super::ConnectionLifecycle,
+    ctx: Arc<SharedProxyContext>,
+) {
+    let mut abort_sig = lifecycle.clone();
+    let mut drain_sig = lifecycle.clone();
+    let mut upgrade_drain_sig = lifecycle.clone();
+    let mut config_rx = ctx.filters.subscribe_config_updates();
+    let mut config_closed = false;
+    let mut drain_deadline: Option<tokio::time::Instant> = None;
+
+    let upgraded = tokio::select! {
+        biased;
+        _ = abort_sig.wait_abort() => return,
+        _ = upgrade_drain_sig.wait_drain_expired() => return,
+        res = hyper::upgrade::on(req) => match res {
+            Ok(upgraded) => upgraded,
+            Err(err) => {
+                tracing::debug!("HTTP CONNECT passthrough upgrade error: {err}");
+                return;
+            }
+        }
+    };
+
+    let mut client_io = TokioIo::new(upgraded);
+    let mut throttled_upstream =
+        ThrottledStream::new_without_initial_delay(upstream_tcp, ctx.throttle.clone());
+    let mut transfer_fut = std::pin::pin!(tokio::io::copy_bidirectional(
+        &mut client_io,
+        &mut throttled_upstream,
+    ));
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = abort_sig.wait_abort() => {
+                tracing::info!("Hard-aborting passthrough tunnel for {}:{}", host, port);
+                break;
+            }
+            changed = config_rx.changed(), if !config_closed => {
+                if changed.is_err() {
+                    config_closed = true;
+                } else {
+                    if !ctx.filters.is_lan_client_allowed(client_addr.ip()) {
+                        tracing::info!(
+                            "Hard-aborting active passthrough tunnel for {}:{} after LAN Client Allowlist excluded {}",
+                            host,
+                            port,
+                            client_addr.ip()
+                        );
+                        break;
+                    }
+                    if matches!(
+                        ctx.filters.evaluate_connect_tunnel(&host, port),
+                        ConnectTunnelDecision::InterceptMitm
+                    ) {
+                        tracing::info!(
+                            "Hard-aborting active passthrough tunnel for {}:{} after filter switch to MITM Intercept",
+                            host,
+                            port
+                        );
+                        break;
+                    }
+                }
+            }
+            deadline = drain_sig.wait_drain_started(), if drain_deadline.is_none() => {
+                drain_deadline = Some(deadline);
+            }
+            _ = async {
+                match drain_deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                tracing::info!(
+                    "Graceful drain deadline expired for passthrough tunnel {}:{}",
+                    host,
+                    port
+                );
+                break;
+            }
+            res = transfer_fut.as_mut() => {
+                match res {
+                    Ok((tx_bytes, rx_bytes)) => {
+                        if !lifecycle.is_capture_suppressed() {
+                            let end_instant = Instant::now();
+                            let done_at = timestamp_at_instant(start, start_utc, end_instant);
+                            let overall_ms =
+                                duration_ms_f64(end_instant.saturating_duration_since(start));
+                            let transfer_ms = duration_ms_f64(
+                                end_instant.saturating_duration_since(tunnel_start_instant),
+                            );
+                            if let Some(updated_summary) =
+                                ctx.store.update_session_telemetry(session_id, |detail| {
+                                    detail.summary.body_size =
+                                        (tx_bytes.saturating_add(rx_bytes)) as usize;
+                                    detail.summary.duration_ms =
+                                        start.elapsed().as_millis() as u64;
+                                    let timings =
+                                        detail.timings.get_or_insert_with(Default::default);
+                                    timings.server_done_response = Some(done_at.clone());
+                                    timings.client_done_response = Some(done_at);
+                                    timings.content_download_ms = Some(transfer_ms);
+                                    timings.overall_elapsed_ms = Some(overall_ms);
+                                    timings.net_elapsed_ms = Some(overall_ms);
+                                    let stats = detail
+                                        .transfer_stats
+                                        .get_or_insert_with(Default::default);
+                                    stats.request_wire_body_bytes = Some(tx_bytes as usize);
+                                    stats.request_body_bytes = Some(tx_bytes as usize);
+                                    stats.response_wire_body_bytes = Some(rx_bytes as usize);
+                                    stats.response_body_bytes = Some(rx_bytes as usize);
+                                    let timings_clone = detail.timings.clone();
+                                    let stats_clone = detail.transfer_stats.clone();
+                                    detail
+                                        .summary
+                                        .apply_telemetry(timings_clone.as_ref(), stats_clone.as_ref());
+                                })
+                            {
+                                let _ = ctx.event_tx.send(updated_summary);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!("TLS passthrough tunnel closed for {host}: {err}");
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+
+async fn serve_mitm_tls_connection(
+    req: Request<Incoming>,
+    host: String,
+    port: u16,
+    client_addr: SocketAddr,
+    client_proc: Option<ClientProcessInfo>,
+    client_conn: ClientConnContext,
+    ctx: Arc<SharedProxyContext>,
+) {
+    let mut filter_updates_rx = ctx.filters.subscribe_config_updates();
+    let mut filter_closed = false;
+    let mut abort_sig = client_conn.lifecycle.clone();
+    let mut drain_sig = client_conn.lifecycle.clone();
+    let mut upgrade_drain_sig = client_conn.lifecycle.clone();
+    let mut tls_drain_sig = client_conn.lifecycle.clone();
+    let mut drain_notified = false;
+    let mut drain_deadline: Option<tokio::time::Instant> = None;
+
+    let upgraded = tokio::select! {
+        biased;
+        _ = abort_sig.wait_abort() => return,
+        _ = upgrade_drain_sig.wait_drain_expired() => return,
+        res = hyper::upgrade::on(req) => match res {
+            Ok(upgraded) => upgraded,
+            Err(err) => {
+                tracing::debug!("HTTP CONNECT upgrade error: {err}");
+                return;
+            }
+        }
+    };
+
+    let server_cfg = match ctx.ca.server_config_for_host(&host) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            tracing::error!("Failed to generate MITM cert for {host}: {err}");
+            return;
+        }
+    };
+
+    let tls_accept_start = Instant::now();
+    let acceptor = TlsAcceptor::from(server_cfg);
+    let tls_stream = tokio::select! {
+        biased;
+        _ = abort_sig.wait_abort() => return,
+        _ = tls_drain_sig.wait_drain_expired() => return,
+        res = acceptor.accept(TokioIo::new(upgraded)) => match res {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::debug!("Client TLS handshake aborted for {host}: {err}");
+                return;
+            }
+        }
+    };
+    let client_tls_handshake_ms = elapsed_ms(tls_accept_start);
+
+    if abort_sig.is_aborted() || !ctx.filters.is_lan_client_allowed(client_addr.ip()) {
+        return;
+    }
+
+    if let ConnectTunnelDecision::Passthrough(reason) =
+        ctx.filters.evaluate_connect_tunnel(&host, port)
+    {
+        tracing::info!(
+            "Closing newly negotiated MITM tunnel for {}:{} after filter switch to Passthrough ({:?})",
+            host,
+            port,
+            reason
+        );
+        return;
+    }
+
+    let client_tls_info = tls_stream.get_ref().1;
+    let client_tls_version = client_tls_info
+        .protocol_version()
+        .map(format_tls_protocol);
+    let client_tls_cipher = client_tls_info
+        .negotiated_cipher_suite()
+        .map(format_tls_cipher);
+    let negotiated_alpn_opt = client_tls_info
+        .alpn_protocol()
+        .map(|p| String::from_utf8_lossy(p).to_string());
+    let negotiated_alpn = negotiated_alpn_opt
+        .clone()
+        .unwrap_or_else(|| "http/1.1".to_string());
+    let mitm_conn = client_conn.with_mitm_tls(
+        client_tls_handshake_ms,
+        client_tls_version,
+        client_tls_cipher,
+        negotiated_alpn_opt,
+    );
+
+    let inner_io = TokioIo::new(tls_stream);
+    let authority_host = if host.contains(':') {
+        if port == 443 {
+            format!("[{host}]")
+        } else {
+            format!("[{host}]:{port}")
+        }
+    } else if port == 443 {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
+    let conn_ctx = ctx.clone();
+    let mitm_host = host.clone();
+
+    let service = service_fn(move |inner_req: Request<Incoming>| {
+        let req_ctx = ctx.clone();
+        let default_host = authority_host.clone();
+        let alpn = negotiated_alpn.clone();
+        let proc_info = client_proc.clone();
+        let inner_conn = mitm_conn.clone();
+        async move {
+            Ok::<_, Infallible>(
+                handle_intercepted_request(
+                    inner_req,
+                    "https",
+                    Some(&default_host),
+                    Some(&alpn),
+                    client_addr,
+                    proc_info,
+                    inner_conn,
+                    req_ctx,
+                )
+                .await,
+            )
+        }
+    });
+
+    let auto_builder = AutoConnBuilder::new(TokioExecutor::new());
+    let conn = auto_builder.serve_connection_with_upgrades(inner_io, service);
+    tokio::pin!(conn);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = abort_sig.wait_abort() => {
+                tracing::info!("Hard-aborting MITM tunnel for {}:{}", mitm_host, port);
+                break;
+            }
+            res = conn.as_mut() => {
+                let _ = res;
+                break;
+            }
+            deadline = drain_sig.wait_drain_started(), if !drain_notified => {
+                drain_notified = true;
+                drain_deadline = Some(deadline);
+                conn.as_mut().graceful_shutdown();
+            }
+            _ = async {
+                match drain_deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                tracing::info!("Graceful drain deadline expired for MITM tunnel {}:{}", mitm_host, port);
+                break;
+            }
+            changed = filter_updates_rx.changed(), if !filter_closed => {
+                if changed.is_err() {
+                    filter_closed = true;
+                } else {
+                    if !conn_ctx.filters.is_lan_client_allowed(client_addr.ip()) {
+                        tracing::info!(
+                            "Hard-aborting active MITM tunnel for {}:{} after LAN Client Allowlist update excluded {}",
+                            mitm_host,
+                            port,
+                            client_addr.ip()
+                        );
+                        break;
+                    }
+                    if let ConnectTunnelDecision::Passthrough(reason) =
+                        conn_ctx.filters.evaluate_connect_tunnel(&mitm_host, port)
+                    {
+                        tracing::info!(
+                            "Hard-aborting active MITM tunnel for {}:{} after filter switch to Passthrough ({:?})",
+                            mitm_host,
+                            port,
+                            reason
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }

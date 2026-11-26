@@ -222,10 +222,7 @@ pub(super) fn split_raw_http_message(raw: &[u8]) -> (String, Vec<HeaderPair>, &[
             continue;
         }
         if let Some((name, val)) = trimmed.split_once(':') {
-            headers.push(HeaderPair {
-                name: name.trim().to_string(),
-                value: val.trim().to_string(),
-            });
+            headers.push(HeaderPair::new(name.trim(), val.trim()));
         }
     }
 
