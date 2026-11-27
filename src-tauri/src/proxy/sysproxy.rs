@@ -44,9 +44,19 @@ pub struct MacProxySnapshot {
     pub services: Vec<MacServiceProxySnapshot>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum LinuxProxyBackendKind {
+    #[default]
+    Gnome,
+    Kde,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LinuxProxySnapshot {
+    #[serde(default)]
+    pub backend: LinuxProxyBackendKind,
     pub mode: String,
     pub http_host: String,
     pub http_port: u16,
@@ -490,7 +500,34 @@ impl SystemProxyManager {
             Self::write_backup_file(&self.backup_path, &existing_mem)?;
             existing_mem
         } else {
-            let current_os = self.backend.capture_snapshot()?;
+            let current_os = match self.backend.capture_snapshot() {
+                Ok(snap) => snap,
+                Err(err) => {
+                    guard.desired_enabled = false;
+                    guard.active_target = (target_host, port);
+                    guard.last_error = Some(err.to_string());
+                    return Err(err);
+                }
+            };
+            if matches!(current_os, PlatformProxySnapshot::Unsupported) {
+                match self
+                    .backend
+                    .apply_system_proxy(&target_host, port, &current_os)
+                {
+                    Ok(()) => {
+                        guard.desired_enabled = true;
+                        guard.active_target = (target_host, port);
+                        guard.last_error = None;
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        guard.desired_enabled = false;
+                        guard.active_target = (target_host, port);
+                        guard.last_error = Some(err.to_string());
+                        return Err(err);
+                    }
+                }
+            }
             let safe_snapshot = if snapshot_points_to_self(&current_os, &target_host, port) {
                 tracing::warn!(
                     "OS system proxy already points to FluxProxy ({target_host}:{port}) without backup file; sanitizing fallback snapshot to disabled."
@@ -903,7 +940,11 @@ pub fn snapshot_points_to_self(snapshot: &PlatformProxySnapshot, host: &str, por
             let mode = l.mode.trim().trim_matches('\'');
             let http_h = l.http_host.trim().trim_matches('\'');
             let https_h = l.https_host.trim().trim_matches('\'');
-            mode.eq_ignore_ascii_case("manual")
+            let is_manual = match l.backend {
+                LinuxProxyBackendKind::Gnome => mode.eq_ignore_ascii_case("manual"),
+                LinuxProxyBackendKind::Kde => mode == "1",
+            };
+            is_manual
                 && (endpoint_matches(http_h, l.http_port, host, port)
                     || endpoint_matches(http_h, l.http_port, "127.0.0.1", 8888)
                     || endpoint_matches(https_h, l.https_port, host, port)
@@ -950,15 +991,236 @@ pub fn sanitize_self_referential_snapshot(
             PlatformProxySnapshot::Macos(m)
         }
         PlatformProxySnapshot::Linux(mut l) => {
-            l.mode = "'none'".to_string();
-            l.http_host = "''".to_string();
-            l.http_port = 0;
-            l.https_host = "''".to_string();
-            l.https_port = 0;
+            match l.backend {
+                LinuxProxyBackendKind::Gnome => {
+                    l.mode = "'none'".to_string();
+                    l.http_host = "''".to_string();
+                    l.http_port = 0;
+                    l.https_host = "''".to_string();
+                    l.https_port = 0;
+                }
+                LinuxProxyBackendKind::Kde => {
+                    l.mode = "0".to_string();
+                    l.http_host.clear();
+                    l.http_port = 0;
+                    l.https_host.clear();
+                    l.https_port = 0;
+                }
+            }
             PlatformProxySnapshot::Linux(l)
         }
         PlatformProxySnapshot::Unsupported => PlatformProxySnapshot::Unsupported,
     }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LinuxDesktopBackend {
+    Gnome,
+    Kde {
+        write_bin: &'static str,
+        read_bin: &'static str,
+    },
+    UnsupportedDe {
+        desktop_label: String,
+    },
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn detect_linux_desktop_backend_with(
+    xdg_current_desktop: Option<&str>,
+    desktop_session: Option<&str>,
+    kde_full_session: Option<&str>,
+    wm_env_hint: Option<&str>,
+    has_kwriteconfig6: bool,
+    has_kwriteconfig5: bool,
+    has_gsettings: bool,
+) -> LinuxDesktopBackend {
+    let mut tokens: Vec<String> = Vec::new();
+    for raw in [xdg_current_desktop, desktop_session]
+        .into_iter()
+        .flatten()
+    {
+        for part in raw.split([':', ';', ',', ' ']) {
+            let trimmed = part.trim().to_ascii_lowercase();
+            if !trimmed.is_empty() {
+                tokens.push(trimmed);
+            }
+        }
+    }
+
+    let is_kde = kde_full_session
+        .map(str::trim)
+        .is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        || tokens.iter().any(|t| t == "kde" || t.contains("plasma"));
+    if is_kde {
+        if has_kwriteconfig6 {
+            return LinuxDesktopBackend::Kde {
+                write_bin: "kwriteconfig6",
+                read_bin: "kreadconfig6",
+            };
+        }
+        if has_kwriteconfig5 {
+            return LinuxDesktopBackend::Kde {
+                write_bin: "kwriteconfig5",
+                read_bin: "kreadconfig5",
+            };
+        }
+        if has_gsettings {
+            return LinuxDesktopBackend::Gnome;
+        }
+        return LinuxDesktopBackend::UnsupportedDe {
+            desktop_label: xdg_current_desktop
+                .or(desktop_session)
+                .unwrap_or("KDE")
+                .trim()
+                .to_string(),
+        };
+    }
+
+    let is_standalone_wm = wm_env_hint.map(str::trim).is_some_and(|s| !s.is_empty())
+        || tokens.iter().any(|t| {
+            matches!(
+                t.as_str(),
+                "sway"
+                    | "hyprland"
+                    | "i3"
+                    | "i3wm"
+                    | "bspwm"
+                    | "dwm"
+                    | "awesome"
+                    | "river"
+                    | "wayfire"
+                    | "niri"
+                    | "qtile"
+                    | "xmonad"
+                    | "openbox"
+                    | "fluxbox"
+                    | "herbstluftwm"
+            )
+        });
+    if is_standalone_wm {
+        let label = wm_env_hint
+            .filter(|s| !s.trim().is_empty())
+            .or(xdg_current_desktop)
+            .or(desktop_session)
+            .unwrap_or("Tiling WM")
+            .trim()
+            .to_string();
+        return LinuxDesktopBackend::UnsupportedDe {
+            desktop_label: label,
+        };
+    }
+
+    let is_gnome_family = tokens.iter().any(|t| {
+        matches!(
+            t.as_str(),
+            "gnome" | "ubuntu" | "unity" | "cinnamon" | "x-cinnamon" | "budgie" | "pantheon" | "mate"
+        )
+    });
+    if is_gnome_family {
+        if has_gsettings {
+            return LinuxDesktopBackend::Gnome;
+        }
+        return LinuxDesktopBackend::UnsupportedDe {
+            desktop_label: xdg_current_desktop
+                .or(desktop_session)
+                .unwrap_or("GNOME")
+                .trim()
+                .to_string(),
+        };
+    }
+
+    let label = xdg_current_desktop
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| desktop_session.filter(|s| !s.trim().is_empty()))
+        .unwrap_or("no-DE")
+        .trim()
+        .to_string();
+    LinuxDesktopBackend::UnsupportedDe {
+        desktop_label: label,
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_kde_proxy_endpoint(raw: &str) -> (String, u16) {
+    let mut trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return (String::new(), 0);
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("HTTP://"))
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .or_else(|| trimmed.strip_prefix("HTTPS://"))
+    {
+        trimmed = rest;
+    }
+    trimmed = trimmed.trim_end_matches('/');
+
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    if parts.len() >= 2 {
+        let host_part = parts[0]
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .trim_start_matches("HTTP://")
+            .trim_start_matches("HTTPS://")
+            .trim_matches(['[', ']'])
+            .to_string();
+        let port = parts
+            .last()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(0);
+        return (host_part, port);
+    }
+
+    if let Some(after_open) = trimmed.strip_prefix('[') {
+        if let Some((host_inside, port_str)) = after_open.split_once("]:") {
+            let port = port_str.trim().parse::<u16>().unwrap_or(0);
+            return (host_inside.trim().to_string(), port);
+        }
+        return (after_open.trim_end_matches(']').trim().to_string(), 0);
+    }
+
+    if let Some((host_part, port_str)) = trimmed.rsplit_once(':') {
+        if let Ok(port) = port_str.trim().parse::<u16>() {
+            return (host_part.trim().to_string(), port);
+        }
+    }
+
+    (trimmed.to_string(), 0)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn format_kde_proxy_endpoint(host: &str, port: u16) -> String {
+    let clean = host.trim().trim_matches(['[', ']']);
+    if clean.contains(':') {
+        format!("http://[{clean}] {port}")
+    } else {
+        format!("http://{clean} {port}")
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn format_linux_no_de_proxy_error(
+    desktop_label: &str,
+    host: &str,
+    port: u16,
+) -> String {
+    let clean_host = host.trim().trim_matches(['[', ']']);
+    let endpoint = if clean_host.contains(':') {
+        format!("[{clean_host}]:{port}")
+    } else {
+        format!("{clean_host}:{port}")
+    };
+    let de_note = if desktop_label.trim().is_empty() {
+        "сессия без поддерживаемого DE (Wayland/X11 WM)".to_string()
+    } else {
+        format!("окружение '{desktop_label}'")
+    };
+    format!(
+        "Системный прокси недоступен для {de_note}: FluxProxy не изменяет /etc/environment с правами root. Настройте переменные окружения вручную:\nexport HTTP_PROXY=http://{endpoint} HTTPS_PROXY=http://{endpoint}"
+    )
 }
 
 // ============================================================================
@@ -1681,7 +1943,7 @@ mod platform {
 }
 
 // ============================================================================
-// Linux Implementation (`gsettings` `org.gnome.system.proxy` with safe fallback)
+// Linux Implementation (`gsettings` GNOME, `kwriteconfig6`/`5` KDE, no-DE fallback)
 // ============================================================================
 #[cfg(target_os = "linux")]
 mod platform {
@@ -1690,6 +1952,49 @@ mod platform {
 
     const DEFAULT_GNOME_IGNORE_HOSTS: &str =
         "['localhost', '127.0.0.0/8', '::1', '10.0.0.0/8', '192.168.0.0/16']";
+    const DEFAULT_KDE_NO_PROXY_FOR: &str =
+        "localhost,127.0.0.0/8,::1,10.0.0.0/8,192.168.0.0/16";
+
+    fn linux_binary_in_path(name: &str) -> bool {
+        if let Some(path_os) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path_os) {
+                if dir.join(name).is_file() {
+                    return true;
+                }
+            }
+        }
+        for dir in ["/usr/bin", "/bin", "/usr/local/bin"] {
+            if Path::new(dir).join(name).is_file() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn detect_linux_desktop_backend() -> LinuxDesktopBackend {
+        let xdg = std::env::var("XDG_CURRENT_DESKTOP").ok();
+        let session = std::env::var("DESKTOP_SESSION").ok();
+        let kde_full = std::env::var("KDE_FULL_SESSION").ok();
+        let wm_hint = if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+            Some("Hyprland".to_string())
+        } else if std::env::var_os("SWAYSOCK").is_some() {
+            Some("Sway".to_string())
+        } else if std::env::var_os("I3SOCK").is_some() {
+            Some("i3".to_string())
+        } else {
+            None
+        };
+
+        detect_linux_desktop_backend_with(
+            xdg.as_deref(),
+            session.as_deref(),
+            kde_full.as_deref(),
+            wm_hint.as_deref(),
+            linux_binary_in_path("kwriteconfig6"),
+            linux_binary_in_path("kwriteconfig5"),
+            linux_binary_in_path("gsettings"),
+        )
+    }
 
     fn gsettings_get(schema: &str, key: &str) -> Result<String, ProxyError> {
         let out = Command::new("gsettings")
@@ -1734,7 +2039,144 @@ mod platform {
             .unwrap_or(0)
     }
 
-    pub fn capture_snapshot() -> Result<PlatformProxySnapshot, ProxyError> {
+    fn kread_config(read_bin: &str, key: &str) -> Result<String, ProxyError> {
+        match Command::new(read_bin)
+            .args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", key])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            }
+            Ok(out) => Err(ProxyError::Custom(format!(
+                "{read_bin} kioslaverc {key} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(err) => Err(ProxyError::Custom(format!(
+                "{read_bin} unavailable in this KDE session ({err})"
+            ))),
+        }
+    }
+
+    fn kwrite_config(write_bin: &str, key: &str, value: &str) -> Result<(), ProxyError> {
+        let out = Command::new(write_bin)
+            .args([
+                "--file",
+                "kioslaverc",
+                "--group",
+                "Proxy Settings",
+                "--key",
+                key,
+                value,
+            ])
+            .output()
+            .map_err(|e| {
+                ProxyError::Custom(format!(
+                    "{write_bin} unavailable in this KDE session ({e}); configure HTTP_PROXY manually"
+                ))
+            })?;
+        if !out.status.success() {
+            return Err(ProxyError::Custom(format!(
+                "{write_bin} kioslaverc {key} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    fn notify_kde_kio_reparse() {
+        let _ = Command::new("dbus-send")
+            .args([
+                "--type=signal",
+                "/KIO/Scheduler",
+                "org.kde.KIO.Scheduler.reparseSlaveConfiguration",
+                "string:",
+            ])
+            .output();
+    }
+
+    fn capture_kde_snapshot(read_bin: &str) -> Result<LinuxProxySnapshot, ProxyError> {
+        let raw_type = kread_config(read_bin, "ProxyType").unwrap_or_default();
+        let mode = if raw_type.trim().is_empty() {
+            "0".to_string()
+        } else {
+            raw_type.trim().to_string()
+        };
+        let http_raw = kread_config(read_bin, "httpProxy").unwrap_or_default();
+        let https_raw = kread_config(read_bin, "httpsProxy").unwrap_or_default();
+        let (http_host, http_port) = parse_kde_proxy_endpoint(&http_raw);
+        let (https_host, https_port) = parse_kde_proxy_endpoint(&https_raw);
+        let ignore_hosts = kread_config(read_bin, "NoProxyFor")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_KDE_NO_PROXY_FOR.to_string());
+        let autoconfig_url = kread_config(read_bin, "Proxy Config Script")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+
+        Ok(LinuxProxySnapshot {
+            backend: LinuxProxyBackendKind::Kde,
+            mode,
+            http_host,
+            http_port,
+            https_host,
+            https_port,
+            ignore_hosts,
+            autoconfig_url,
+        })
+    }
+
+    fn apply_kde_proxy(
+        write_bin: &str,
+        host: &str,
+        port: u16,
+        baseline: &PlatformProxySnapshot,
+    ) -> Result<(), ProxyError> {
+        let endpoint = format_kde_proxy_endpoint(host, port);
+        let no_proxy = match baseline {
+            PlatformProxySnapshot::Linux(l)
+                if l.backend == LinuxProxyBackendKind::Kde && !l.ignore_hosts.trim().is_empty() =>
+            {
+                l.ignore_hosts.as_str()
+            }
+            _ => DEFAULT_KDE_NO_PROXY_FOR,
+        };
+        kwrite_config(write_bin, "httpProxy", &endpoint)?;
+        kwrite_config(write_bin, "httpsProxy", &endpoint)?;
+        let _ = kwrite_config(write_bin, "NoProxyFor", no_proxy);
+        let _ = kwrite_config(write_bin, "ReversedException", "false");
+        let _ = kwrite_config(write_bin, "Proxy Config Script", "");
+        kwrite_config(write_bin, "ProxyType", "1")?;
+        notify_kde_kio_reparse();
+        Ok(())
+    }
+
+    fn restore_kde_snapshot(write_bin: &str, l: &LinuxProxySnapshot) -> Result<(), ProxyError> {
+        let http_val = if !l.http_host.trim().is_empty() && l.http_port > 0 {
+            format_kde_proxy_endpoint(&l.http_host, l.http_port)
+        } else {
+            String::new()
+        };
+        let https_val = if !l.https_host.trim().is_empty() && l.https_port > 0 {
+            format_kde_proxy_endpoint(&l.https_host, l.https_port)
+        } else {
+            String::new()
+        };
+        let _ = kwrite_config(write_bin, "httpProxy", &http_val);
+        let _ = kwrite_config(write_bin, "httpsProxy", &https_val);
+        let _ = kwrite_config(write_bin, "NoProxyFor", &l.ignore_hosts);
+        let _ = kwrite_config(
+            write_bin,
+            "Proxy Config Script",
+            l.autoconfig_url.as_deref().unwrap_or(""),
+        );
+        let mode = if l.mode.trim().is_empty() { "0" } else { l.mode.trim() };
+        kwrite_config(write_bin, "ProxyType", mode)?;
+        notify_kde_kio_reparse();
+        Ok(())
+    }
+
+    fn capture_gnome_snapshot() -> Result<LinuxProxySnapshot, ProxyError> {
         let mode = gsettings_get("org.gnome.system.proxy", "mode")?;
         let ignore_hosts = gsettings_get("org.gnome.system.proxy", "ignore-hosts")
             .unwrap_or_else(|_| DEFAULT_GNOME_IGNORE_HOSTS.to_string());
@@ -1752,7 +2194,8 @@ mod platform {
             .map(|v| parse_gsettings_port(&v))
             .unwrap_or(0);
 
-        Ok(PlatformProxySnapshot::Linux(LinuxProxySnapshot {
+        Ok(LinuxProxySnapshot {
+            backend: LinuxProxyBackendKind::Gnome,
             mode,
             http_host,
             http_port,
@@ -1760,7 +2203,17 @@ mod platform {
             https_port,
             ignore_hosts,
             autoconfig_url,
-        }))
+        })
+    }
+
+    pub fn capture_snapshot() -> Result<PlatformProxySnapshot, ProxyError> {
+        match detect_linux_desktop_backend() {
+            LinuxDesktopBackend::Gnome => Ok(PlatformProxySnapshot::Linux(capture_gnome_snapshot()?)),
+            LinuxDesktopBackend::Kde { read_bin, .. } => {
+                Ok(PlatformProxySnapshot::Linux(capture_kde_snapshot(read_bin)?))
+            }
+            LinuxDesktopBackend::UnsupportedDe { .. } => Ok(PlatformProxySnapshot::Unsupported),
+        }
     }
 
     pub fn apply_system_proxy(
@@ -1768,49 +2221,73 @@ mod platform {
         port: u16,
         baseline: &PlatformProxySnapshot,
     ) -> Result<(), ProxyError> {
-        let quoted_host = format!("'{host}'");
-        let port_str = port.to_string();
-        let ignore_hosts = match baseline {
-            PlatformProxySnapshot::Linux(l)
-                if !l.ignore_hosts.trim().is_empty() && l.ignore_hosts != "@as []" =>
-            {
-                l.ignore_hosts.as_str()
-            }
-            _ => DEFAULT_GNOME_IGNORE_HOSTS,
-        };
+        match detect_linux_desktop_backend() {
+            LinuxDesktopBackend::Gnome => {
+                let quoted_host = format!("'{host}'");
+                let port_str = port.to_string();
+                let ignore_hosts = match baseline {
+                    PlatformProxySnapshot::Linux(l)
+                        if l.backend == LinuxProxyBackendKind::Gnome
+                            && !l.ignore_hosts.trim().is_empty()
+                            && l.ignore_hosts != "@as []" =>
+                    {
+                        l.ignore_hosts.as_str()
+                    }
+                    _ => DEFAULT_GNOME_IGNORE_HOSTS,
+                };
 
-        gsettings_set("org.gnome.system.proxy.http", "host", &quoted_host)?;
-        gsettings_set("org.gnome.system.proxy.http", "port", &port_str)?;
-        let _ = gsettings_set("org.gnome.system.proxy.http", "enabled", "true");
-        gsettings_set("org.gnome.system.proxy.https", "host", &quoted_host)?;
-        gsettings_set("org.gnome.system.proxy.https", "port", &port_str)?;
-        let _ = gsettings_set("org.gnome.system.proxy", "ignore-hosts", ignore_hosts);
-        gsettings_set("org.gnome.system.proxy", "mode", "'manual'")?;
-        Ok(())
+                gsettings_set("org.gnome.system.proxy.http", "host", &quoted_host)?;
+                gsettings_set("org.gnome.system.proxy.http", "port", &port_str)?;
+                let _ = gsettings_set("org.gnome.system.proxy.http", "enabled", "true");
+                gsettings_set("org.gnome.system.proxy.https", "host", &quoted_host)?;
+                gsettings_set("org.gnome.system.proxy.https", "port", &port_str)?;
+                let _ = gsettings_set("org.gnome.system.proxy", "ignore-hosts", ignore_hosts);
+                gsettings_set("org.gnome.system.proxy", "mode", "'manual'")?;
+                Ok(())
+            }
+            LinuxDesktopBackend::Kde { write_bin, .. } => {
+                apply_kde_proxy(write_bin, host, port, baseline)
+            }
+            LinuxDesktopBackend::UnsupportedDe { desktop_label } => Err(ProxyError::Custom(
+                format_linux_no_de_proxy_error(&desktop_label, host, port),
+            )),
+        }
     }
 
     pub fn restore_snapshot(snapshot: &PlatformProxySnapshot) -> Result<(), ProxyError> {
         let PlatformProxySnapshot::Linux(l) = snapshot else {
             return Ok(());
         };
-        let _ = gsettings_set("org.gnome.system.proxy.http", "host", &l.http_host);
-        let _ = gsettings_set(
-            "org.gnome.system.proxy.http",
-            "port",
-            &l.http_port.to_string(),
-        );
-        let _ = gsettings_set("org.gnome.system.proxy.https", "host", &l.https_host);
-        let _ = gsettings_set(
-            "org.gnome.system.proxy.https",
-            "port",
-            &l.https_port.to_string(),
-        );
-        let _ = gsettings_set("org.gnome.system.proxy", "ignore-hosts", &l.ignore_hosts);
-        if let Some(ref pac) = l.autoconfig_url {
-            let _ = gsettings_set("org.gnome.system.proxy", "autoconfig-url", pac);
+        match l.backend {
+            LinuxProxyBackendKind::Kde => {
+                let write_bin = if linux_binary_in_path("kwriteconfig6") {
+                    "kwriteconfig6"
+                } else {
+                    "kwriteconfig5"
+                };
+                restore_kde_snapshot(write_bin, l)
+            }
+            LinuxProxyBackendKind::Gnome => {
+                let _ = gsettings_set("org.gnome.system.proxy.http", "host", &l.http_host);
+                let _ = gsettings_set(
+                    "org.gnome.system.proxy.http",
+                    "port",
+                    &l.http_port.to_string(),
+                );
+                let _ = gsettings_set("org.gnome.system.proxy.https", "host", &l.https_host);
+                let _ = gsettings_set(
+                    "org.gnome.system.proxy.https",
+                    "port",
+                    &l.https_port.to_string(),
+                );
+                let _ = gsettings_set("org.gnome.system.proxy", "ignore-hosts", &l.ignore_hosts);
+                if let Some(ref pac) = l.autoconfig_url {
+                    let _ = gsettings_set("org.gnome.system.proxy", "autoconfig-url", pac);
+                }
+                gsettings_set("org.gnome.system.proxy", "mode", &l.mode)?;
+                Ok(())
+            }
         }
-        gsettings_set("org.gnome.system.proxy", "mode", &l.mode)?;
-        Ok(())
     }
 
     pub fn inspect_active_state(
@@ -1821,36 +2298,76 @@ mod platform {
             return Ok(OsActiveProxyState {
                 matches_flux: false,
                 any_proxy_enabled: false,
-                current_target_summary: "unsupported".to_string(),
+                current_target_summary: "no-de".to_string(),
             });
         };
 
-        let mode = snap.mode.trim().trim_matches('\'');
-        if mode.eq_ignore_ascii_case("none") {
-            return Ok(OsActiveProxyState {
-                matches_flux: false,
-                any_proxy_enabled: false,
-                current_target_summary: "disabled".to_string(),
-            });
-        }
+        match snap.backend {
+            LinuxProxyBackendKind::Kde => {
+                let mode = snap.mode.trim();
+                if mode.is_empty() || mode == "0" {
+                    return Ok(OsActiveProxyState {
+                        matches_flux: false,
+                        any_proxy_enabled: false,
+                        current_target_summary: "disabled".to_string(),
+                    });
+                }
+                if mode == "1" {
+                    let matches =
+                        endpoint_matches(&snap.http_host, snap.http_port, expected_host, expected_port)
+                            && endpoint_matches(
+                                &snap.https_host,
+                                snap.https_port,
+                                expected_host,
+                                expected_port,
+                            );
+                    return Ok(OsActiveProxyState {
+                        matches_flux: matches,
+                        any_proxy_enabled: true,
+                        current_target_summary: format!("{}:{}", snap.http_host, snap.http_port),
+                    });
+                }
+                Ok(OsActiveProxyState {
+                    matches_flux: false,
+                    any_proxy_enabled: true,
+                    current_target_summary: format!("KDE ProxyType={mode}"),
+                })
+            }
+            LinuxProxyBackendKind::Gnome => {
+                let mode = snap.mode.trim().trim_matches('\'');
+                if mode.eq_ignore_ascii_case("none") {
+                    return Ok(OsActiveProxyState {
+                        matches_flux: false,
+                        any_proxy_enabled: false,
+                        current_target_summary: "disabled".to_string(),
+                    });
+                }
 
-        if mode.eq_ignore_ascii_case("manual") {
-            let http_h = snap.http_host.trim().trim_matches('\'');
-            let https_h = snap.https_host.trim().trim_matches('\'');
-            let matches = endpoint_matches(http_h, snap.http_port, expected_host, expected_port)
-                && endpoint_matches(https_h, snap.https_port, expected_host, expected_port);
-            return Ok(OsActiveProxyState {
-                matches_flux: matches,
-                any_proxy_enabled: true,
-                current_target_summary: format!("{http_h}:{}", snap.http_port),
-            });
-        }
+                if mode.eq_ignore_ascii_case("manual") {
+                    let http_h = snap.http_host.trim().trim_matches('\'');
+                    let https_h = snap.https_host.trim().trim_matches('\'');
+                    let matches =
+                        endpoint_matches(http_h, snap.http_port, expected_host, expected_port)
+                            && endpoint_matches(
+                                https_h,
+                                snap.https_port,
+                                expected_host,
+                                expected_port,
+                            );
+                    return Ok(OsActiveProxyState {
+                        matches_flux: matches,
+                        any_proxy_enabled: true,
+                        current_target_summary: format!("{http_h}:{}", snap.http_port),
+                    });
+                }
 
-        Ok(OsActiveProxyState {
-            matches_flux: false,
-            any_proxy_enabled: true,
-            current_target_summary: format!("mode={mode}"),
-        })
+                Ok(OsActiveProxyState {
+                    matches_flux: false,
+                    any_proxy_enabled: true,
+                    current_target_summary: format!("mode={mode}"),
+                })
+            }
+        }
     }
 }
 
@@ -2316,6 +2833,228 @@ mod tests {
         let reloaded = SystemProxyManager::with_backend(&dir, backend);
         assert_eq!(reloaded.load_proxy_port_pref(), 8899);
         assert_eq!(reloaded.lock_inner().active_target.1, 8899);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_kde_gnome_and_no_de_linux_backends() {
+        assert_eq!(
+            detect_linux_desktop_backend_with(
+                Some("KDE"),
+                Some("plasma"),
+                Some("true"),
+                None,
+                true,
+                true,
+                true,
+            ),
+            LinuxDesktopBackend::Kde {
+                write_bin: "kwriteconfig6",
+                read_bin: "kreadconfig6",
+            }
+        );
+
+        assert_eq!(
+            detect_linux_desktop_backend_with(
+                None,
+                Some("plasmawayland"),
+                Some("true"),
+                None,
+                false,
+                true,
+                false,
+            ),
+            LinuxDesktopBackend::Kde {
+                write_bin: "kwriteconfig5",
+                read_bin: "kreadconfig5",
+            }
+        );
+
+        assert_eq!(
+            detect_linux_desktop_backend_with(
+                Some("ubuntu:GNOME"),
+                Some("ubuntu"),
+                None,
+                None,
+                false,
+                false,
+                true,
+            ),
+            LinuxDesktopBackend::Gnome
+        );
+
+        // Standalone WMs must return UnsupportedDe even when `gsettings` binary exists
+        assert_eq!(
+            detect_linux_desktop_backend_with(
+                Some("Hyprland"),
+                Some("hyprland"),
+                None,
+                Some("Hyprland"),
+                false,
+                false,
+                true,
+            ),
+            LinuxDesktopBackend::UnsupportedDe {
+                desktop_label: "Hyprland".to_string(),
+            }
+        );
+
+        assert_eq!(
+            detect_linux_desktop_backend_with(
+                Some("sway"),
+                None,
+                None,
+                Some("Sway"),
+                false,
+                false,
+                true,
+            ),
+            LinuxDesktopBackend::UnsupportedDe {
+                desktop_label: "Sway".to_string(),
+            }
+        );
+
+        assert_eq!(
+            detect_linux_desktop_backend_with(None, None, None, None, false, false, true),
+            LinuxDesktopBackend::UnsupportedDe {
+                desktop_label: "no-DE".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn kde_kioslaverc_endpoint_parsing_formatting_and_self_snapshot_sanitization() {
+        assert_eq!(
+            parse_kde_proxy_endpoint("http://127.0.0.1 8888"),
+            ("127.0.0.1".to_string(), 8888)
+        );
+        assert_eq!(
+            parse_kde_proxy_endpoint("http://127.0.0.1:8888"),
+            ("127.0.0.1".to_string(), 8888)
+        );
+        assert_eq!(
+            parse_kde_proxy_endpoint("127.0.0.1 9090"),
+            ("127.0.0.1".to_string(), 9090)
+        );
+        assert_eq!(
+            parse_kde_proxy_endpoint("127.0.0.1:9090"),
+            ("127.0.0.1".to_string(), 9090)
+        );
+        assert_eq!(
+            parse_kde_proxy_endpoint("http://[::1] 8888"),
+            ("::1".to_string(), 8888)
+        );
+
+        assert_eq!(
+            format_kde_proxy_endpoint("127.0.0.1", 8888),
+            "http://127.0.0.1 8888"
+        );
+        assert_eq!(
+            format_kde_proxy_endpoint("::1", 8888),
+            "http://[::1] 8888"
+        );
+
+        let kde_self = PlatformProxySnapshot::Linux(LinuxProxySnapshot {
+            backend: LinuxProxyBackendKind::Kde,
+            mode: "1".to_string(),
+            http_host: "127.0.0.1".to_string(),
+            http_port: 8888,
+            https_host: "127.0.0.1".to_string(),
+            https_port: 8888,
+            ignore_hosts: "localhost,127.0.0.0/8".to_string(),
+            autoconfig_url: None,
+        });
+        assert!(snapshot_points_to_self(&kde_self, "127.0.0.1", 8888));
+
+        let sanitized = sanitize_self_referential_snapshot(kde_self, "127.0.0.1", 8888);
+        match sanitized {
+            PlatformProxySnapshot::Linux(l) => {
+                assert_eq!(l.backend, LinuxProxyBackendKind::Kde);
+                assert_eq!(l.mode, "0");
+                assert_eq!(l.http_port, 0);
+                assert!(l.http_host.is_empty());
+            }
+            other => panic!("expected Linux snapshot, got {other:?}"),
+        }
+
+        // Backward-compatibility: legacy JSON without `backend` defaults to Gnome
+        let legacy_json = r#"{
+            "platform": "linux",
+            "mode": "'manual'",
+            "httpHost": "'127.0.0.1'",
+            "httpPort": 8888,
+            "httpsHost": "'127.0.0.1'",
+            "httpsPort": 8888,
+            "ignoreHosts": "['localhost']",
+            "autoconfigUrl": null
+        }"#;
+        let parsed: PlatformProxySnapshot = serde_json::from_str(legacy_json).unwrap();
+        match parsed {
+            PlatformProxySnapshot::Linux(l) => {
+                assert_eq!(l.backend, LinuxProxyBackendKind::Gnome);
+            }
+            other => panic!("expected Linux snapshot, got {other:?}"),
+        }
+    }
+
+    struct MockNoDeLinuxBackend;
+
+    impl OsProxyBackend for MockNoDeLinuxBackend {
+        fn capture_snapshot(&self) -> Result<PlatformProxySnapshot, ProxyError> {
+            Ok(PlatformProxySnapshot::Unsupported)
+        }
+
+        fn apply_system_proxy(
+            &self,
+            host: &str,
+            port: u16,
+            _baseline: &PlatformProxySnapshot,
+        ) -> Result<(), ProxyError> {
+            Err(ProxyError::Custom(format_linux_no_de_proxy_error(
+                "Hyprland",
+                host,
+                port,
+            )))
+        }
+
+        fn restore_snapshot(&self, _snapshot: &PlatformProxySnapshot) -> Result<(), ProxyError> {
+            Ok(())
+        }
+
+        fn inspect_active_state(
+            &self,
+            _expected_host: &str,
+            _expected_port: u16,
+        ) -> Result<OsActiveProxyState, ProxyError> {
+            Ok(OsActiveProxyState {
+                matches_flux: false,
+                any_proxy_enabled: false,
+                current_target_summary: "no-de".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn no_de_backend_populates_system_proxy_error_without_backup_file() {
+        let dir = make_temp_test_dir("linux-no-de");
+        let mgr = SystemProxyManager::with_backend(&dir, Arc::new(MockNoDeLinuxBackend));
+
+        let err = mgr
+            .enable("127.0.0.1", 8888)
+            .expect_err("no-DE backend must return manual HTTP_PROXY error")
+            .to_string();
+        assert!(err.contains("/etc/environment"));
+        assert!(err.contains("export HTTP_PROXY=http://127.0.0.1:8888 HTTPS_PROXY=http://127.0.0.1:8888"));
+        assert!(
+            !mgr.backup_file_path().exists(),
+            "Unsupported / no-DE must not create system-proxy-backup.json"
+        );
+
+        let (enabled, status_err) = mgr.status_for_listener("127.0.0.1", 8888);
+        assert!(!enabled);
+        let msg = status_err.expect("status_for_listener must surface no-DE error");
+        assert!(msg.contains("export HTTP_PROXY=http://127.0.0.1:8888"));
 
         let _ = fs::remove_dir_all(&dir);
     }

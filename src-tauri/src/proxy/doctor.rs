@@ -1,9 +1,15 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
 use crate::models::{BindHostMode, DoctorCheckResult, NetworkInterfaceInfo, ProxyError, ProxyStatus};
 use crate::proxy::network::{
@@ -13,9 +19,16 @@ use crate::proxy::server::{
     bind_listeners_with_cleanup, format_bind_sock_addr, resolve_bind_plan, ProxyEngineController,
 };
 use crate::proxy::sysproxy::resolve_sysproxy_host_for_bind;
+use crate::proxy::upstream_client::extract_peer_cert_subject_issuer;
 
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const TCP_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(600);
+const WIN32_ERROR_SUCCESS: u32 = 0;
+const WIN32_ERROR_MORE_DATA: u32 = 234;
+const WIN32_REG_SZ: u32 = 1;
+const MAX_FIREWALL_RULE_NAME_CHARS: usize = 16_384;
+const MAX_FIREWALL_RULE_DATA_BYTES: usize = 1024 * 1024;
+const MAX_FIREWALL_RULE_ENTRIES: u32 = 8192;
 
 fn format_endpoints_label(ips: &[String], port: u16) -> String {
     if ips.is_empty() {
@@ -82,6 +95,7 @@ async fn check_port_binding(status: &ProxyStatus) -> DoctorCheckResult {
             ),
             can_auto_fix: false,
             fix_label: None,
+            suggested_command: None,
         };
     }
 
@@ -99,6 +113,7 @@ async fn check_port_binding(status: &ProxyStatus) -> DoctorCheckResult {
                 ),
                 can_auto_fix: true,
                 fix_label: Some("Запустить листенер прокси".to_string()),
+                suggested_command: None,
             }
         }
         Err(err) => DoctorCheckResult {
@@ -111,6 +126,7 @@ async fn check_port_binding(status: &ProxyStatus) -> DoctorCheckResult {
             ),
             can_auto_fix: true,
             fix_label: Some("Перезапустить листенер".to_string()),
+            suggested_command: None,
         },
     }
 }
@@ -139,6 +155,7 @@ async fn check_root_ca_trust(controller: &ProxyEngineController) -> DoctorCheckR
                     ),
                     can_auto_fix: false,
                     fix_label: None,
+                    suggested_command: None,
                 }
             } else {
                 DoctorCheckResult {
@@ -153,6 +170,7 @@ async fn check_root_ca_trust(controller: &ProxyEngineController) -> DoctorCheckR
                     ),
                     can_auto_fix: true,
                     fix_label: Some("Установить Root CA в ОС".to_string()),
+                    suggested_command: info.manual_install_command,
                 }
             }
         }
@@ -164,7 +182,33 @@ async fn check_root_ca_trust(controller: &ProxyEngineController) -> DoctorCheckR
             details: format!("Ошибка фоновой задачи проверки CA: {err}"),
             can_auto_fix: true,
             fix_label: Some("Установить Root CA в ОС".to_string()),
+            suggested_command: None,
         },
+    }
+}
+
+pub(crate) fn read_windows_gpo_proxy_settings_per_user() -> Option<u32> {
+    #[cfg(target_os = "windows")]
+    {
+        win_reg::open_hklm(
+            "Software\\Policies\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+        )
+        .and_then(|guard| win_reg::query_dword(guard.0, "ProxySettingsPerUser"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+fn extract_export_proxy_command(err_msg: &str) -> Option<String> {
+    let idx = err_msg.find("export HTTP_PROXY=")?;
+    let tail = &err_msg[idx..];
+    let cmd = tail.lines().next().unwrap_or(tail).trim();
+    if cmd.is_empty() {
+        None
+    } else {
+        Some(cmd.to_string())
     }
 }
 
@@ -172,17 +216,60 @@ pub(crate) fn evaluate_system_proxy_sync(
     controller: &ProxyEngineController,
     status: &ProxyStatus,
 ) -> DoctorCheckResult {
+    evaluate_system_proxy_sync_with_policy(
+        controller,
+        status,
+        read_windows_gpo_proxy_settings_per_user(),
+    )
+}
+
+pub(crate) fn evaluate_system_proxy_sync_with_policy(
+    controller: &ProxyEngineController,
+    status: &ProxyStatus,
+    gpo_proxy_settings_per_user: Option<u32>,
+) -> DoctorCheckResult {
     let expected_host = resolve_sysproxy_host_for_bind(
         status.bind_mode,
         status.specific_bind_ip.as_deref(),
         status.also_bind_loopback,
     );
     let expected_endpoint = format_bind_sock_addr(&expected_host, status.port);
+
+    if gpo_proxy_settings_per_user == Some(0) {
+        let browser_cmd = format!("chrome --proxy-server=http://{expected_endpoint}");
+        return DoctorCheckResult {
+            id: "system_proxy_sync".to_string(),
+            title: "Синхронизация системного прокси ОС".to_string(),
+            status: "error".to_string(),
+            summary: "Системный прокси заблокирован политикой организации (GPO)".to_string(),
+            details: format!(
+                "В реестре Windows установлен запрет HKLM\\Software\\Policies\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\\ProxySettingsPerUser = 0 (настройки прокси задаются только на уровне машины/администратора; FluxProxy не пытается обходить политику через UAC).\nЗапустите отдельный экземпляр браузера с флагом прокси:\n  {browser_cmd}\n  msedge --proxy-server=http://{expected_endpoint}"
+            ),
+            can_auto_fix: false,
+            fix_label: None,
+            suggested_command: Some(browser_cmd),
+        };
+    }
+
     let (sys_enabled, sys_err) = controller
         .sysproxy
         .status_for_listener(&expected_host, status.port);
 
     if let Some(err_msg) = sys_err.or_else(|| status.system_proxy_error.clone()) {
+        if let Some(export_cmd) = extract_export_proxy_command(&err_msg) {
+            return DoctorCheckResult {
+                id: "system_proxy_sync".to_string(),
+                title: "Синхронизация системного прокси ОС".to_string(),
+                status: "warning".to_string(),
+                summary: format!(
+                    "Окружение Linux без DE: настройте HTTP_PROXY/HTTPS_PROXY вручную на {expected_endpoint}"
+                ),
+                details: err_msg,
+                can_auto_fix: false,
+                fix_label: None,
+                suggested_command: Some(export_cmd),
+            };
+        }
         return DoctorCheckResult {
             id: "system_proxy_sync".to_string(),
             title: "Синхронизация системного прокси ОС".to_string(),
@@ -194,6 +281,7 @@ pub(crate) fn evaluate_system_proxy_sync(
             ),
             can_auto_fix: true,
             fix_label: Some("Восстановить системный прокси".to_string()),
+            suggested_command: None,
         };
     }
 
@@ -208,6 +296,7 @@ pub(crate) fn evaluate_system_proxy_sync(
             details: "Системные браузеры будут получать ERR_PROXY_CONNECTION_FAILED, пока листенер не запущен. Автоисправление запустит прокси и синхронизирует системные настройки.".to_string(),
             can_auto_fix: true,
             fix_label: Some("Восстановить системный прокси".to_string()),
+            suggested_command: None,
         };
     }
 
@@ -223,6 +312,7 @@ pub(crate) fn evaluate_system_proxy_sync(
             ),
             can_auto_fix: false,
             fix_label: None,
+            suggested_command: None,
         };
     }
 
@@ -237,6 +327,7 @@ pub(crate) fn evaluate_system_proxy_sync(
             details: "Вероятно, системный прокси был временно отключён вручную или сторонним приложением. Нажмите «Включить системный прокси ОС» для восстановления.".to_string(),
             can_auto_fix: true,
             fix_label: Some("Включить системный прокси ОС".to_string()),
+            suggested_command: None,
         };
     }
 
@@ -250,6 +341,7 @@ pub(crate) fn evaluate_system_proxy_sync(
         ),
         can_auto_fix: true,
         fix_label: Some("Включить системный прокси ОС".to_string()),
+        suggested_command: None,
     }
 }
 
@@ -295,6 +387,7 @@ pub(crate) fn evaluate_vpn_interfaces(
             ),
             can_auto_fix: false,
             fix_label: None,
+            suggested_command: None,
         };
     }
 
@@ -318,6 +411,7 @@ pub(crate) fn evaluate_vpn_interfaces(
         ),
         can_auto_fix: false,
         fix_label: None,
+        suggested_command: None,
     }
 }
 
@@ -339,6 +433,7 @@ async fn check_vpn_interfaces() -> DoctorCheckResult {
             details: format!("Ошибка фоновой задачи анализа сетевых адаптеров: {err}"),
             can_auto_fix: false,
             fix_label: None,
+            suggested_command: None,
         },
     }
 }
@@ -385,6 +480,7 @@ pub(crate) fn evaluate_firewall_result(
             ),
             can_auto_fix: false,
             fix_label: None,
+            suggested_command: None,
         };
     }
 
@@ -409,6 +505,7 @@ pub(crate) fn evaluate_firewall_result(
             ),
             can_auto_fix: false,
             fix_label: None,
+            suggested_command: None,
         };
     }
 
@@ -422,6 +519,7 @@ pub(crate) fn evaluate_firewall_result(
                 details: format!("Состояние профилей: {}.", fw.active_profiles_summary),
                 can_auto_fix: false,
                 fix_label: None,
+                suggested_command: None,
             };
         }
 
@@ -437,6 +535,7 @@ pub(crate) fn evaluate_firewall_result(
                 ),
                 can_auto_fix: false,
                 fix_label: None,
+                suggested_command: None,
             };
         }
 
@@ -453,6 +552,7 @@ pub(crate) fn evaluate_firewall_result(
             ),
             can_auto_fix: false,
             fix_label: None,
+            suggested_command: Some(fix_cmd),
         };
     }
 
@@ -466,31 +566,125 @@ pub(crate) fn evaluate_firewall_result(
         ),
         can_auto_fix: false,
         fix_label: None,
+        suggested_command: Some(fix_cmd),
     }
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn scan_firewall_rules_with_enumerator<F>(port: u16, mut enumerate: F) -> bool
+where
+    F: FnMut(u32, &mut [u16], &mut u32, &mut u32, &mut [u8], &mut u32) -> u32,
+{
+    let port_token = format!("lport={port}");
+    let mut idx: u32 = 0;
+    let mut retries_for_idx: u8 = 0;
+    let mut name_buf = vec![0u16; 512];
+    let mut data_buf = vec![0u8; 4096];
+
+    loop {
+        if idx >= MAX_FIREWALL_RULE_ENTRIES {
+            break;
+        }
+        let mut name_len = name_buf.len() as u32;
+        let mut data_len = data_buf.len() as u32;
+        let mut reg_type: u32 = 0;
+        let rc = enumerate(
+            idx,
+            &mut name_buf,
+            &mut name_len,
+            &mut reg_type,
+            &mut data_buf,
+            &mut data_len,
+        );
+        if rc == WIN32_ERROR_MORE_DATA {
+            retries_for_idx = retries_for_idx.saturating_add(1);
+            if retries_for_idx > 8 {
+                idx += 1;
+                retries_for_idx = 0;
+                continue;
+            }
+            let mut grew = false;
+            let needed_data = (data_len as usize).saturating_add(2);
+            if needed_data > data_buf.len() && data_buf.len() < MAX_FIREWALL_RULE_DATA_BYTES {
+                let target_len = needed_data
+                    .max(data_buf.len().saturating_mul(2))
+                    .min(MAX_FIREWALL_RULE_DATA_BYTES);
+                if target_len > data_buf.len() {
+                    data_buf.resize(target_len, 0);
+                    grew = true;
+                }
+            }
+            let needed_name = (name_len as usize).saturating_add(1);
+            if (!grew
+                || needed_name > name_buf.len()
+                || (name_len as usize) >= name_buf.len().saturating_sub(1))
+                && name_buf.len() < MAX_FIREWALL_RULE_NAME_CHARS
+            {
+                let target_name_len = needed_name
+                    .max(name_buf.len().saturating_mul(2))
+                    .min(MAX_FIREWALL_RULE_NAME_CHARS);
+                if target_name_len > name_buf.len() {
+                    name_buf.resize(target_name_len, 0);
+                    grew = true;
+                }
+            }
+            if !grew {
+                idx += 1;
+                retries_for_idx = 0;
+            }
+            continue;
+        }
+        if rc != WIN32_ERROR_SUCCESS {
+            break;
+        }
+        retries_for_idx = 0;
+        idx += 1;
+
+        if reg_type == WIN32_REG_SZ && data_len >= 2 {
+            let wide_slice: Vec<u16> = data_buf[..(data_len as usize).min(data_buf.len())]
+                .chunks_exact(2)
+                .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                .collect();
+            let rule_str = String::from_utf16_lossy(&wide_slice)
+                .trim_end_matches('\0')
+                .to_ascii_lowercase();
+            let is_active = rule_str.contains("active=true");
+            let is_allow_in =
+                rule_str.contains("action=allow") && rule_str.contains("dir=in");
+            let matches_flux_or_port = rule_str.contains("fluxproxy")
+                || rule_str.contains("flux-proxy")
+                || rule_str
+                    .split('|')
+                    .any(|seg| seg.trim() == port_token);
+            if is_active && is_allow_in && matches_flux_or_port {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(target_os = "windows")]
-fn inspect_os_firewall_non_privileged(port: u16) -> FirewallInspection {
+mod win_reg {
     use std::ffi::c_void;
     use std::ptr::null_mut;
 
-    type HKey = *mut c_void;
-    const HKEY_LOCAL_MACHINE: HKey = (0x8000_0002u32 as i32 as isize) as HKey;
-    const KEY_QUERY_VALUE: u32 = 0x0001;
-    const REG_DWORD: u32 = 4;
-    const REG_SZ: u32 = 1;
-    const ERROR_SUCCESS: u32 = 0;
+    pub type HKey = *mut c_void;
+    pub const HKEY_LOCAL_MACHINE: HKey = (0x8000_0002u32 as i32 as isize) as HKey;
+    pub const KEY_QUERY_VALUE: u32 = 0x0001;
+    pub const REG_DWORD: u32 = 4;
+    pub const ERROR_SUCCESS: u32 = 0;
 
     #[link(name = "advapi32")]
     extern "system" {
-        fn RegOpenKeyExW(
+        pub fn RegOpenKeyExW(
             h_key: HKey,
             lp_sub_key: *const u16,
             ul_options: u32,
             sam_desired: u32,
             phk_result: *mut HKey,
         ) -> u32;
-        fn RegQueryValueExW(
+        pub fn RegQueryValueExW(
             h_key: HKey,
             lp_value_name: *const u16,
             lp_reserved: *mut u32,
@@ -498,7 +692,7 @@ fn inspect_os_firewall_non_privileged(port: u16) -> FirewallInspection {
             lp_data: *mut u8,
             lpcb_data: *mut u32,
         ) -> u32;
-        fn RegEnumValueW(
+        pub fn RegEnumValueW(
             h_key: HKey,
             dw_index: u32,
             lp_value_name: *mut u16,
@@ -508,10 +702,10 @@ fn inspect_os_firewall_non_privileged(port: u16) -> FirewallInspection {
             lp_data: *mut u8,
             lpcb_data: *mut u32,
         ) -> u32;
-        fn RegCloseKey(h_key: HKey) -> u32;
+        pub fn RegCloseKey(h_key: HKey) -> u32;
     }
 
-    struct KeyGuard(HKey);
+    pub struct KeyGuard(pub HKey);
     impl Drop for KeyGuard {
         fn drop(&mut self) {
             if !self.0.is_null() {
@@ -522,11 +716,11 @@ fn inspect_os_firewall_non_privileged(port: u16) -> FirewallInspection {
         }
     }
 
-    fn to_wide(s: &str) -> Vec<u16> {
+    pub fn to_wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    fn open_hklm(subkey: &str) -> Option<KeyGuard> {
+    pub fn open_hklm(subkey: &str) -> Option<KeyGuard> {
         let wide = to_wide(subkey);
         let mut hkey: HKey = null_mut();
         let rc = unsafe {
@@ -545,7 +739,7 @@ fn inspect_os_firewall_non_privileged(port: u16) -> FirewallInspection {
         }
     }
 
-    fn query_dword(hkey: HKey, name: &str) -> Option<u32> {
+    pub fn query_dword(hkey: HKey, name: &str) -> Option<u32> {
         let wide = to_wide(name);
         let mut reg_type: u32 = 0;
         let mut buf = [0u8; 4];
@@ -566,6 +760,11 @@ fn inspect_os_firewall_non_privileged(port: u16) -> FirewallInspection {
             None
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn inspect_os_firewall_non_privileged(port: u16) -> FirewallInspection {
+    use std::ptr::null_mut;
 
     let profiles = [
         (
@@ -588,10 +787,11 @@ fn inspect_os_firewall_non_privileged(port: u16) -> FirewallInspection {
     let mut parts = Vec::new();
 
     for (label, key_path) in profiles {
-        if let Some(guard) = open_hklm(key_path) {
+        if let Some(guard) = win_reg::open_hklm(key_path) {
             inspected = true;
-            let enabled = query_dword(guard.0, "EnableFirewall").unwrap_or(1) != 0;
-            let def_inbound_block = query_dword(guard.0, "DefaultInboundAction").unwrap_or(1) != 0;
+            let enabled = win_reg::query_dword(guard.0, "EnableFirewall").unwrap_or(1) != 0;
+            let def_inbound_block =
+                win_reg::query_dword(guard.0, "DefaultInboundAction").unwrap_or(1) != 0;
             if enabled {
                 any_enabled = true;
                 if def_inbound_block {
@@ -613,61 +813,25 @@ fn inspect_os_firewall_non_privileged(port: u16) -> FirewallInspection {
         }
     }
 
-    let port_token = format!("lport={port}");
     let mut has_allow_rule = None;
-    if let Some(rules_guard) =
-        open_hklm("SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules")
-    {
-        let mut found = false;
-        let mut idx: u32 = 0;
-        let mut name_buf = vec![0u16; 512];
-        let mut data_buf = vec![0u8; 4096];
-
-        loop {
-            let mut name_len = name_buf.len() as u32;
-            let mut data_len = data_buf.len() as u32;
-            let mut reg_type: u32 = 0;
-            let rc = unsafe {
-                RegEnumValueW(
+    if let Some(rules_guard) = win_reg::open_hklm(
+        "SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules",
+    ) {
+        let found = scan_firewall_rules_with_enumerator(
+            port,
+            |idx, name_buf, name_len, reg_type, data_buf, data_len| unsafe {
+                win_reg::RegEnumValueW(
                     rules_guard.0,
                     idx,
                     name_buf.as_mut_ptr(),
-                    &mut name_len,
+                    name_len,
                     null_mut(),
-                    &mut reg_type,
+                    reg_type,
                     data_buf.as_mut_ptr(),
-                    &mut data_len,
+                    data_len,
                 )
-            };
-            if rc != ERROR_SUCCESS {
-                break;
-            }
-            idx += 1;
-            if reg_type == REG_SZ && data_len >= 2 {
-                let wide_slice: Vec<u16> = data_buf[..(data_len as usize).min(data_buf.len())]
-                    .chunks_exact(2)
-                    .map(|p| u16::from_le_bytes([p[0], p[1]]))
-                    .collect();
-                let rule_str = String::from_utf16_lossy(&wide_slice)
-                    .trim_end_matches('\0')
-                    .to_ascii_lowercase();
-                let is_active = rule_str.contains("active=true");
-                let is_allow_in =
-                    rule_str.contains("action=allow") && rule_str.contains("dir=in");
-                let matches_flux_or_port = rule_str.contains("fluxproxy")
-                    || rule_str.contains("flux-proxy")
-                    || rule_str
-                        .split('|')
-                        .any(|seg| seg.trim() == port_token);
-                if is_active && is_allow_in && matches_flux_or_port {
-                    found = true;
-                    break;
-                }
-            }
-            if idx > 8192 {
-                break;
-            }
-        }
+            },
+        );
         has_allow_rule = Some(found);
     }
 
@@ -796,32 +960,370 @@ pub(crate) async fn probe_proxy_health_endpoint(probe_addr: &str) -> Result<(u16
     Ok((status_code, body, elapsed_ms))
 }
 
-async fn check_loopback_e2e(status: &ProxyStatus) -> DoctorCheckResult {
-    let probe_addr = resolve_probe_socket_addr(status);
-    if !status.running {
-        return DoctorCheckResult {
-            id: "loopback_e2e".to_string(),
-            title: "End-to-End loopback-маршрутизация (/health)".to_string(),
-            status: "error".to_string(),
-            summary: format!("Прокси остановлен — сокет {probe_addr} не прослушивается"),
-            details: "Запрос GET http://flux.proxy/health не может быть выполнен, пока прокси-движок остановлен.".to_string(),
-            can_auto_fix: true,
-            fix_label: Some("Запустить листенер прокси".to_string()),
-        };
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HttpsProbeOutcome {
+    Verified {
+        status_code: u16,
+        elapsed_ms: u64,
+        local_ca_sha256: String,
+        peer_sha256: Option<String>,
+    },
+    CertMismatch {
+        peer_sha256: String,
+        peer_subject: Option<String>,
+        peer_issuer: Option<String>,
+        detected_inspector: Option<String>,
+        local_ca_sha256: String,
+        reason: String,
+    },
+    TransportError(String),
+}
+
+#[derive(Debug, Clone)]
+struct CapturedProbeCert {
+    sha256: String,
+    subject: Option<String>,
+    issuer: Option<String>,
+    verified_by_local_ca: bool,
+}
+
+fn format_der_sha256_colon(der: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(der);
+    let digest = hex::encode_upper(hasher.finalize());
+    digest
+        .as_bytes()
+        .chunks(2)
+        .map(|c| std::str::from_utf8(c).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+pub(crate) fn detect_external_ssl_inspector(
+    subject: Option<&str>,
+    issuer: Option<&str>,
+) -> Option<&'static str> {
+    let combined = format!(
+        "{} {}",
+        subject.unwrap_or_default(),
+        issuer.unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    if combined.contains("zscaler") {
+        Some("Zscaler")
+    } else if combined.contains("kaspersky") {
+        Some("Kaspersky")
+    } else if combined.contains("netskope") {
+        Some("Netskope")
+    } else if combined.contains("fortinet") || combined.contains("fortigate") {
+        Some("Fortinet / FortiGate")
+    } else if combined.contains("palo alto") {
+        Some("Palo Alto Networks")
+    } else if combined.contains("crowdstrike") {
+        Some("CrowdStrike EDR")
+    } else if combined.contains("sentinelone") {
+        Some("SentinelOne EDR")
+    } else if combined.contains("sophos") {
+        Some("Sophos")
+    } else if combined.contains("eset") {
+        Some("ESET")
+    } else if combined.contains("bitdefender") {
+        Some("Bitdefender")
+    } else if combined.contains("trellix") || combined.contains("mcafee") {
+        Some("Trellix / McAfee")
+    } else if combined.contains("cisco umbrella") {
+        Some("Cisco Umbrella")
+    } else if combined.contains("forcepoint") {
+        Some("Forcepoint")
+    } else if combined.contains("symantec") || combined.contains("blue coat") {
+        Some("Symantec / Blue Coat")
+    } else if combined.contains("checkpoint") || combined.contains("check point") {
+        Some("Check Point")
+    } else if combined.contains("defender") {
+        Some("Microsoft Defender / EDR")
+    } else {
+        None
+    }
+}
+
+#[derive(Debug)]
+struct LocalCaInspectingVerifier {
+    inner: Arc<dyn ServerCertVerifier>,
+    captured: Arc<StdMutex<Option<CapturedProbeCert>>>,
+}
+
+impl ServerCertVerifier for LocalCaInspectingVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let sha256 = format_der_sha256_colon(end_entity.as_ref());
+        let (subject, issuer) = extract_peer_cert_subject_issuer(end_entity.as_ref());
+        let res = self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        );
+        if let Ok(mut guard) = self.captured.lock() {
+            *guard = Some(CapturedProbeCert {
+                sha256,
+                subject,
+                issuer,
+                verified_by_local_ca: res.is_ok(),
+            });
+        }
+        res
     }
 
-    match probe_proxy_health_endpoint(&probe_addr).await {
-        Ok((code, body, elapsed_ms)) => DoctorCheckResult {
-            id: "loopback_e2e".to_string(),
-            title: "End-to-End loopback-маршрутизация (/health)".to_string(),
-            status: "ok".to_string(),
-            summary: format!("GET http://flux.proxy/health → HTTP {code} ({elapsed_ms} мс)"),
-            details: format!(
-                "Локальный сокет {probe_addr} корректно обработал HTTP-запрос и вернул {body} без создания лишних сессий в TrafficStore."
-            ),
-            can_auto_fix: false,
-            fix_label: None,
-        },
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+async fn read_http_head_from_stream(
+    stream: &mut TcpStream,
+    probe_addr: &str,
+) -> Result<(u16, String), String> {
+    let mut head = Vec::with_capacity(512);
+    let mut byte = [0u8; 1];
+    loop {
+        if head.len() >= 8192 {
+            return Err(format!("Слишком длинный заголовок CONNECT от {probe_addr}"));
+        }
+        match tokio::time::timeout(HEALTH_PROBE_TIMEOUT, stream.read_exact(&mut byte)).await {
+            Ok(Ok(_)) => {
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Ok(Err(err)) => {
+                return Err(format!("Ошибка чтения CONNECT-ответа от {probe_addr}: {err}"));
+            }
+            Err(_) => {
+                return Err(format!("Таймаут ожидания CONNECT-ответа от {probe_addr}"));
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&head);
+    let status_line = text.split("\r\n").next().unwrap_or("");
+    let code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| format!("Некорректный CONNECT-ответ от {probe_addr}: '{status_line}'"))?;
+    Ok((code, status_line.to_string()))
+}
+
+pub(crate) async fn probe_proxy_https_health_endpoint(
+    probe_addr: &str,
+    local_ca_der: &[u8],
+    local_ca_sha256: &str,
+) -> HttpsProbeOutcome {
+    let started = Instant::now();
+    let mut root_store = rustls::RootCertStore::empty();
+    if let Err(err) = root_store.add(CertificateDer::from(local_ca_der.to_vec())) {
+        return HttpsProbeOutcome::TransportError(format!(
+            "Не удалось загрузить локальный Root CA в тестовый RootCertStore: {err}"
+        ));
+    }
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let inner_verifier = match rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(root_store),
+        Arc::clone(&provider),
+    )
+    .build()
+    {
+        Ok(v) => v,
+        Err(err) => {
+            return HttpsProbeOutcome::TransportError(format!(
+                "Ошибка инициализации WebPkiServerVerifier для HTTPS-пробы: {err}"
+            ));
+        }
+    };
+
+    let captured: Arc<StdMutex<Option<CapturedProbeCert>>> = Arc::new(StdMutex::new(None));
+    let inspecting_verifier = Arc::new(LocalCaInspectingVerifier {
+        inner: inner_verifier,
+        captured: Arc::clone(&captured),
+    });
+
+    let tls_config = match rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+    {
+        Ok(builder) => builder
+            .dangerous()
+            .with_custom_certificate_verifier(inspecting_verifier)
+            .with_no_client_auth(),
+        Err(err) => {
+            return HttpsProbeOutcome::TransportError(format!(
+                "Ошибка настройки TLS ClientConfig для HTTPS-пробы: {err}"
+            ));
+        }
+    };
+
+    let mut tcp = match tokio::time::timeout(HEALTH_PROBE_TIMEOUT, TcpStream::connect(probe_addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(err)) => {
+            return HttpsProbeOutcome::TransportError(format!(
+                "TCP-подключение для HTTPS-пробы к {probe_addr} не удалось: {err}"
+            ));
+        }
+        Err(_) => {
+            return HttpsProbeOutcome::TransportError(format!(
+                "Таймаут TCP-подключения для HTTPS-пробы к {probe_addr}"
+            ));
+        }
+    };
+
+    let connect_req = b"CONNECT flux.proxy:443 HTTP/1.1\r\nHost: flux.proxy:443\r\nUser-Agent: FluxProxy-Doctor/1.0\r\n\r\n";
+    if let Err(err) = tokio::time::timeout(HEALTH_PROBE_TIMEOUT, tcp.write_all(connect_req)).await {
+        return HttpsProbeOutcome::TransportError(format!(
+            "Ошибка отправки CONNECT flux.proxy:443 на {probe_addr}: {err}"
+        ));
+    }
+
+    match read_http_head_from_stream(&mut tcp, probe_addr).await {
+        Ok((200, _)) => {}
+        Ok((code, line)) => {
+            return HttpsProbeOutcome::TransportError(format!(
+                "CONNECT flux.proxy:443 вернул HTTP {code} ({line})"
+            ));
+        }
+        Err(err) => return HttpsProbeOutcome::TransportError(err),
+    }
+
+    let server_name = match ServerName::try_from("flux.proxy") {
+        Ok(sn) => sn,
+        Err(err) => {
+            return HttpsProbeOutcome::TransportError(format!("Некорректный SNI flux.proxy: {err}"));
+        }
+    };
+
+    let connector = TlsConnector::from(Arc::new(tls_config));
+    let mut tls_stream =
+        match tokio::time::timeout(HEALTH_PROBE_TIMEOUT, connector.connect(server_name, tcp)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(err)) => {
+                let maybe_cert = captured.lock().ok().and_then(|g| g.clone());
+                if let Some(cert) = maybe_cert {
+                    if !cert.verified_by_local_ca {
+                        let detected_inspector = detect_external_ssl_inspector(
+                            cert.subject.as_deref(),
+                            cert.issuer.as_deref(),
+                        )
+                        .map(str::to_string);
+                        return HttpsProbeOutcome::CertMismatch {
+                            peer_sha256: cert.sha256,
+                            peer_subject: cert.subject,
+                            peer_issuer: cert.issuer,
+                            detected_inspector,
+                            local_ca_sha256: local_ca_sha256.to_string(),
+                            reason: err.to_string(),
+                        };
+                    }
+                }
+                return HttpsProbeOutcome::TransportError(format!(
+                    "TLS-рукопожатие HTTPS-пробы с {probe_addr} завершилось ошибкой: {err}"
+                ));
+            }
+            Err(_) => {
+                return HttpsProbeOutcome::TransportError(format!(
+                    "Таймаут TLS-рукопожатия HTTPS-пробы с {probe_addr}"
+                ));
+            }
+        };
+
+    let https_req = b"GET /health HTTP/1.1\r\nHost: flux.proxy\r\nConnection: close\r\nUser-Agent: FluxProxy-Doctor/1.0\r\n\r\n";
+    if let Err(err) = tokio::time::timeout(HEALTH_PROBE_TIMEOUT, tls_stream.write_all(https_req)).await {
+        return HttpsProbeOutcome::TransportError(format!(
+            "Ошибка отправки HTTPS GET /health: {err}"
+        ));
+    }
+
+    let mut raw = Vec::with_capacity(1024);
+    let mut buf = [0u8; 1024];
+    loop {
+        if raw.len() >= 16 * 1024 {
+            break;
+        }
+        match tokio::time::timeout(HEALTH_PROBE_TIMEOUT, tls_stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => raw.extend_from_slice(&buf[..n]),
+            Ok(Err(err)) => {
+                return HttpsProbeOutcome::TransportError(format!(
+                    "Ошибка чтения HTTPS /health ответа: {err}"
+                ));
+            }
+            Err(_) => {
+                return HttpsProbeOutcome::TransportError(
+                    "Таймаут чтения HTTPS /health ответа".to_string(),
+                );
+            }
+        }
+    }
+
+    let text = String::from_utf8_lossy(&raw);
+    let status_line = text.split("\r\n").next().unwrap_or("");
+    let Some(status_code) = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+    else {
+        return HttpsProbeOutcome::TransportError(format!(
+            "Некорректный HTTPS-ответ от {probe_addr}: '{status_line}'"
+        ));
+    };
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.trim().to_string())
+        .unwrap_or_default();
+    if status_code != 200 || !body.contains("\"ok\"") {
+        return HttpsProbeOutcome::TransportError(format!(
+            "Неожиданный HTTPS /health ответ: HTTP {status_code} ({body})"
+        ));
+    }
+
+    let peer_sha256 = captured.lock().ok().and_then(|g| g.as_ref().map(|c| c.sha256.clone()));
+    HttpsProbeOutcome::Verified {
+        status_code,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        local_ca_sha256: local_ca_sha256.to_string(),
+        peer_sha256,
+    }
+}
+
+pub(crate) fn evaluate_loopback_e2e_result(
+    probe_addr: &str,
+    http_res: Result<(u16, String, u64), String>,
+    https_res: Option<HttpsProbeOutcome>,
+) -> DoctorCheckResult {
+    match http_res {
         Err(err) => DoctorCheckResult {
             id: "loopback_e2e".to_string(),
             title: "End-to-End loopback-маршрутизация (/health)".to_string(),
@@ -832,8 +1334,118 @@ async fn check_loopback_e2e(status: &ProxyStatus) -> DoctorCheckResult {
             ),
             can_auto_fix: true,
             fix_label: Some("Перезапустить листенер прокси".to_string()),
+            suggested_command: None,
+        },
+        Ok((code, body, elapsed_ms)) => match https_res {
+            Some(HttpsProbeOutcome::Verified {
+                elapsed_ms: https_ms,
+                local_ca_sha256,
+                peer_sha256,
+                ..
+            }) => DoctorCheckResult {
+                id: "loopback_e2e".to_string(),
+                title: "End-to-End loopback-маршрутизация (/health)".to_string(),
+                status: "ok".to_string(),
+                summary: format!(
+                    "HTTP/HTTPS /health → HTTP {code} ({elapsed_ms} мс / TLS {https_ms} мс), Root CA подтверждён"
+                ),
+                details: format!(
+                    "Локальный сокет {probe_addr} обработал HTTP ({body}) и HTTPS MITM /health без записи в TrafficStore.\nЛокальный Root CA SHA-256: {local_ca_sha256}{}",
+                    peer_sha256
+                        .map(|fp| format!("\nЛистовой сертификат (SHA-256): {fp}"))
+                        .unwrap_or_default()
+                ),
+                can_auto_fix: false,
+                fix_label: None,
+                suggested_command: None,
+            },
+            Some(HttpsProbeOutcome::CertMismatch {
+                peer_sha256,
+                peer_subject,
+                peer_issuer,
+                detected_inspector,
+                local_ca_sha256,
+                reason,
+            }) => {
+                let vendor_label = detected_inspector
+                    .as_deref()
+                    .map(|v| format!(" ({v})"))
+                    .unwrap_or_else(|| " (Zscaler / Kaspersky / EDR)".to_string());
+                DoctorCheckResult {
+                    id: "loopback_e2e".to_string(),
+                    title: "End-to-End loopback-маршрутизация (/health)".to_string(),
+                    status: "warning".to_string(),
+                    summary: format!(
+                        "Обнаружен внешний SSL-инспектор{vendor_label}: отпечаток HTTPS-пробы не совпадает с локальным Root CA"
+                    ),
+                    details: format!(
+                        "HTTP-проба http://flux.proxy/health прошла ({code}, {elapsed_ms} мс), но TLS-сертификат в HTTPS-пробе НЕ подписан локальным Root CA FluxProxy.\nВероятная причина: сторонний корпоративный прокси/антивирус/WFP-драйвер (Zscaler, Kaspersky, EDR) перехватывает и переподписывает локальный TLS-трафик.\nОжидаемый Root CA SHA-256: {local_ca_sha256}\nПолученный сертификат SHA-256: {peer_sha256}\nSubject: {}\nIssuer: {}\nОшибка проверки: {reason}\nРекомендация: добавьте 127.0.0.1 / flux.proxy и процесс FluxProxy в исключения SSL-сканирования вашего EDR/антивируса.",
+                        peer_subject.unwrap_or_else(|| "<неизвестно>".to_string()),
+                        peer_issuer.unwrap_or_else(|| "<неизвестно>".to_string()),
+                    ),
+                    can_auto_fix: false,
+                    fix_label: None,
+                    suggested_command: None,
+                }
+            }
+            Some(HttpsProbeOutcome::TransportError(tls_err)) => DoctorCheckResult {
+                id: "loopback_e2e".to_string(),
+                title: "End-to-End loopback-маршрутизация (/health)".to_string(),
+                status: "warning".to_string(),
+                summary: format!(
+                    "HTTP /health → HTTP {code} ({elapsed_ms} мс), но HTTPS-проба не завершилась"
+                ),
+                details: format!(
+                    "HTTP-маршрут через {probe_addr} работает ({body}), однако TLS/HTTPS-самопроверка завершилась ошибкой: {tls_err}"
+                ),
+                can_auto_fix: false,
+                fix_label: None,
+                suggested_command: None,
+            },
+            None => DoctorCheckResult {
+                id: "loopback_e2e".to_string(),
+                title: "End-to-End loopback-маршрутизация (/health)".to_string(),
+                status: "ok".to_string(),
+                summary: format!("GET http://flux.proxy/health → HTTP {code} ({elapsed_ms} мс)"),
+                details: format!(
+                    "Локальный сокет {probe_addr} корректно обработал HTTP-запрос и вернул {body} без создания лишних сессий в TrafficStore."
+                ),
+                can_auto_fix: false,
+                fix_label: None,
+                suggested_command: None,
+            },
         },
     }
+}
+
+async fn check_loopback_e2e(
+    controller: &ProxyEngineController,
+    status: &ProxyStatus,
+) -> DoctorCheckResult {
+    let probe_addr = resolve_probe_socket_addr(status);
+    if !status.running {
+        return DoctorCheckResult {
+            id: "loopback_e2e".to_string(),
+            title: "End-to-End loopback-маршрутизация (/health)".to_string(),
+            status: "error".to_string(),
+            summary: format!("Прокси остановлен — сокет {probe_addr} не прослушивается"),
+            details: "Запрос GET http://flux.proxy/health не может быть выполнен, пока прокси-движок остановлен.".to_string(),
+            can_auto_fix: true,
+            fix_label: Some("Запустить листенер прокси".to_string()),
+            suggested_command: None,
+        };
+    }
+
+    let http_res = probe_proxy_health_endpoint(&probe_addr).await;
+    let https_res = if http_res.is_ok() {
+        let local_ca_der = controller.context.ca.root_ca_der().to_vec();
+        let local_ca_sha256 = controller.context.ca.info().sha256_fingerprint;
+        Some(probe_proxy_https_health_endpoint(&probe_addr, &local_ca_der, &local_ca_sha256).await)
+    } else {
+        None
+    };
+
+    evaluate_loopback_e2e_result(&probe_addr, http_res, https_res)
 }
 
 pub async fn run_proxy_doctor(controller: &ProxyEngineController) -> Vec<DoctorCheckResult> {
@@ -844,7 +1456,7 @@ pub async fn run_proxy_doctor(controller: &ProxyEngineController) -> Vec<DoctorC
     let sysproxy_check = evaluate_system_proxy_sync(controller, &status);
     let vpn_check = check_vpn_interfaces().await;
     let firewall_check = check_firewall(&status).await;
-    let loopback_check = check_loopback_e2e(&status).await;
+    let loopback_check = check_loopback_e2e(controller, &status).await;
 
     vec![
         port_check,
@@ -884,12 +1496,17 @@ async fn restart_listener_with_recovery(
     for offset in 1..=10 {
         if let Some(candidate) = desired_port.checked_add(offset) {
             if let Ok(started) = controller.start_with_config(candidate).await {
+                controller.save_persisted_proxy_port(started.port);
                 return Ok(started);
             }
         }
     }
 
-    controller.start_with_config(0).await
+    let started = controller.start_with_config(0).await?;
+    if started.port > 0 {
+        controller.save_persisted_proxy_port(started.port);
+    }
+    Ok(started)
 }
 
 pub async fn fix_doctor_issue(
@@ -907,6 +1524,18 @@ pub async fn fix_doctor_issue(
                 .map_err(|e| ProxyError::Custom(format!("CA install task join error: {e}")))??;
         }
         "system_proxy_sync" => {
+            if read_windows_gpo_proxy_settings_per_user() == Some(0) {
+                let status = controller.status().await;
+                let host = resolve_sysproxy_host_for_bind(
+                    status.bind_mode,
+                    status.specific_bind_ip.as_deref(),
+                    status.also_bind_loopback,
+                );
+                let ep = format_bind_sock_addr(&host, status.port);
+                return Err(ProxyError::Custom(format!(
+                    "Системный прокси заблокирован политикой GPO (ProxySettingsPerUser = 0). Запустите браузер с --proxy-server=http://{ep}"
+                )));
+            }
             if !controller.status().await.running {
                 restart_listener_with_recovery(controller).await?;
             }
@@ -933,7 +1562,16 @@ pub async fn fix_doctor_issue(
             let (sys_enabled, sys_err) = controller
                 .sysproxy
                 .status_for_listener(&expected_host, post_listener_status.port);
-            if !sys_enabled || sys_err.is_some() || post_listener_status.system_proxy_error.is_some()
+            let gpo_blocked = read_windows_gpo_proxy_settings_per_user() == Some(0);
+            let is_no_de_linux = sys_err
+                .as_deref()
+                .or(post_listener_status.system_proxy_error.as_deref())
+                .is_some_and(|m| m.contains("export HTTP_PROXY="));
+            if !gpo_blocked
+                && !is_no_de_linux
+                && (!sys_enabled
+                    || sys_err.is_some()
+                    || post_listener_status.system_proxy_error.is_some())
             {
                 let updated = controller.set_system_proxy(true).await?;
                 if let Some(err) = updated.system_proxy_error {
@@ -1257,5 +1895,319 @@ mod tests {
             },
         );
         assert_eq!(fw_ok.status, "ok");
+    }
+
+    #[test]
+    fn firewall_scanner_resizes_buffers_on_error_more_data_and_finds_rule_after_large_entry() {
+        let oversized_rule = format!(
+            "v2.31|Action=Allow|Active=TRUE|Dir=In|LPort=5000|App={}|",
+            "A".repeat(3000)
+        );
+        let oversized_wide: Vec<u16> = oversized_rule.encode_utf16().chain(std::iter::once(0)).collect();
+        let oversized_bytes: Vec<u8> = oversized_wide.iter().flat_map(|u| u.to_le_bytes()).collect();
+        assert!(oversized_bytes.len() > 4096);
+
+        let long_name_chars: usize = 700;
+        let long_name_rule = "v2.31|Action=Allow|Active=TRUE|Dir=In|LPort=6000|Name=Other|";
+        let long_name_wide: Vec<u16> = long_name_rule.encode_utf16().chain(std::iter::once(0)).collect();
+        let long_name_bytes: Vec<u8> = long_name_wide.iter().flat_map(|u| u.to_le_bytes()).collect();
+
+        let flux_rule = "v2.31|Action=Allow|Active=TRUE|Dir=In|LPort=9443|Name=FluxProxy|";
+        let flux_wide: Vec<u16> = flux_rule.encode_utf16().chain(std::iter::once(0)).collect();
+        let flux_bytes: Vec<u8> = flux_wide.iter().flat_map(|u| u.to_le_bytes()).collect();
+
+        let mut max_seen_data_buf = 0usize;
+        let mut max_seen_name_buf = 0usize;
+
+        let found = scan_firewall_rules_with_enumerator(
+            9443,
+            |idx, name_buf, name_len, reg_type, data_buf, data_len| {
+                max_seen_data_buf = max_seen_data_buf.max(data_buf.len());
+                max_seen_name_buf = max_seen_name_buf.max(name_buf.len());
+                match idx {
+                    0 => {
+                        if data_buf.len() < oversized_bytes.len() {
+                            *data_len = oversized_bytes.len() as u32;
+                            *name_len = 8;
+                            return WIN32_ERROR_MORE_DATA;
+                        }
+                        let name_u16: Vec<u16> = "BigRule".encode_utf16().chain(std::iter::once(0)).collect();
+                        name_buf[..name_u16.len()].copy_from_slice(&name_u16);
+                        *name_len = (name_u16.len() - 1) as u32;
+                        data_buf[..oversized_bytes.len()].copy_from_slice(&oversized_bytes);
+                        *data_len = oversized_bytes.len() as u32;
+                        *reg_type = WIN32_REG_SZ;
+                        WIN32_ERROR_SUCCESS
+                    }
+                    1 => {
+                        if name_buf.len() <= long_name_chars {
+                            *name_len = long_name_chars as u32;
+                            *data_len = long_name_bytes.len() as u32;
+                            return WIN32_ERROR_MORE_DATA;
+                        }
+                        for slot in name_buf[..long_name_chars].iter_mut() {
+                            *slot = b'R' as u16;
+                        }
+                        name_buf[long_name_chars] = 0;
+                        *name_len = long_name_chars as u32;
+                        data_buf[..long_name_bytes.len()].copy_from_slice(&long_name_bytes);
+                        *data_len = long_name_bytes.len() as u32;
+                        *reg_type = WIN32_REG_SZ;
+                        WIN32_ERROR_SUCCESS
+                    }
+                    2 => {
+                        let name_u16: Vec<u16> = "FluxProxyRule".encode_utf16().chain(std::iter::once(0)).collect();
+                        name_buf[..name_u16.len()].copy_from_slice(&name_u16);
+                        *name_len = (name_u16.len() - 1) as u32;
+                        data_buf[..flux_bytes.len()].copy_from_slice(&flux_bytes);
+                        *data_len = flux_bytes.len() as u32;
+                        *reg_type = WIN32_REG_SZ;
+                        WIN32_ERROR_SUCCESS
+                    }
+                    _ => 259,
+                }
+            },
+        );
+
+        assert!(found, "must continue past oversized entries and detect FluxProxy rule");
+        assert!(max_seen_data_buf >= oversized_bytes.len());
+        assert!(max_seen_name_buf > long_name_chars);
+
+        let not_found = scan_firewall_rules_with_enumerator(
+            7777,
+            |idx, name_buf, name_len, reg_type, data_buf, data_len| match idx {
+                0 => {
+                    if data_buf.len() < oversized_bytes.len() {
+                        *data_len = oversized_bytes.len() as u32;
+                        return WIN32_ERROR_MORE_DATA;
+                    }
+                    *name_len = 1;
+                    name_buf[0] = b'X' as u16;
+                    data_buf[..oversized_bytes.len()].copy_from_slice(&oversized_bytes);
+                    *data_len = oversized_bytes.len() as u32;
+                    *reg_type = WIN32_REG_SZ;
+                    WIN32_ERROR_SUCCESS
+                }
+                _ => 259,
+            },
+        );
+        assert!(!not_found);
+    }
+
+    #[tokio::test]
+    async fn doctor_recovers_occupied_ports_and_persists_fallback_port() {
+        let (controller, _backend, tmp_dir) = make_test_controller("persist_fallback_port");
+
+        // Case A: desired port is occupied -> nearby port candidate+offset is chosen and persisted
+        let blocker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let conflict_port = blocker.local_addr().unwrap().port();
+        controller.set_port(conflict_port).await.unwrap();
+        assert_eq!(controller.sysproxy.load_proxy_port_pref(), conflict_port);
+
+        let _ = fix_doctor_issue(&controller, "port_binding")
+            .await
+            .expect("nearby port fallback must succeed");
+        let recovered_nearby = controller.status().await.port;
+        assert_ne!(recovered_nearby, conflict_port);
+        assert_eq!(controller.sysproxy.load_proxy_port_pref(), recovered_nearby);
+        assert_eq!(
+            std::fs::read_to_string(tmp_dir.join(crate::proxy::sysproxy::PROXY_PORT_PREF_FILE_NAME))
+                .unwrap()
+                .trim(),
+            recovered_nearby.to_string()
+        );
+        let _ = controller.stop().await;
+        drop(blocker);
+
+        // Case B: all 11 ports desired..=desired+10 are occupied -> ephemeral `:0` port is persisted
+        let mut range_blockers = Vec::new();
+        let mut base_port = None;
+        for candidate in (44000u16..45500u16).step_by(15) {
+            let mut held = Vec::new();
+            let mut all_ok = true;
+            for offset in 0..=10u16 {
+                match TcpListener::bind(("127.0.0.1", candidate + offset)).await {
+                    Ok(l) => held.push(l),
+                    Err(_) => {
+                        all_ok = false;
+                        break;
+                    }
+                }
+            }
+            if all_ok {
+                range_blockers = held;
+                base_port = Some(candidate);
+                break;
+            }
+        }
+        if let Some(base) = base_port {
+            controller.set_port(base).await.unwrap();
+            let _ = fix_doctor_issue(&controller, "port_binding")
+                .await
+                .expect("ephemeral :0 fallback must succeed when base..=base+10 are busy");
+            let ephemeral_port = controller.status().await.port;
+            assert!(ephemeral_port > 0);
+            assert!(!(base..=base + 10).contains(&ephemeral_port));
+            assert_eq!(controller.sysproxy.load_proxy_port_pref(), ephemeral_port);
+            drop(range_blockers);
+            let _ = controller.stop().await;
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn gpo_policy_blocks_per_user_proxy_and_suggests_browser_flag() {
+        let (controller, _backend, tmp_dir) = make_test_controller("gpo_policy");
+        let started = controller.start("127.0.0.1".to_string(), 0).await.unwrap();
+        let expected_cmd = format!("chrome --proxy-server=http://127.0.0.1:{}", started.port);
+
+        let blocked = evaluate_system_proxy_sync_with_policy(&controller, &started, Some(0));
+        assert_eq!(blocked.status, "error");
+        assert!(!blocked.can_auto_fix);
+        assert!(blocked.fix_label.is_none());
+        assert!(blocked.summary.contains("GPO"));
+        assert!(blocked.details.contains("ProxySettingsPerUser = 0"));
+        assert_eq!(blocked.suggested_command.as_deref(), Some(expected_cmd.as_str()));
+
+        let allowed_one = evaluate_system_proxy_sync_with_policy(&controller, &started, Some(1));
+        assert_eq!(allowed_one.status, "ok");
+        assert!(allowed_one.suggested_command.is_none());
+
+        let allowed_absent = evaluate_system_proxy_sync_with_policy(&controller, &started, None);
+        assert_eq!(allowed_absent.status, "ok");
+
+        let _ = controller.stop().await;
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn https_self_probe_verifies_local_ca_and_detects_external_edr_inspector() {
+        let (controller, _backend, tmp_dir) = make_test_controller("https_probe_edr");
+        let started = controller.start("127.0.0.1".to_string(), 0).await.unwrap();
+        let probe_addr = format!("127.0.0.1:{}", started.port);
+        let local_der = controller.context.ca.root_ca_der().to_vec();
+        let local_fp = controller.context.ca.info().sha256_fingerprint;
+
+        // 1. Fresh CA self-probe succeeds without creating TrafficStore records
+        let outcome = probe_proxy_https_health_endpoint(&probe_addr, &local_der, &local_fp).await;
+        assert!(
+            matches!(outcome, HttpsProbeOutcome::Verified { status_code: 200, .. }),
+            "expected Verified HTTPS probe on fresh CA, got {outcome:?}"
+        );
+        assert_eq!(controller.context.store.len(), 0);
+        let _ = controller.stop().await;
+
+        // 2. Reloaded CA from disk also passes self-probe
+        let reloaded_ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
+        let reloaded_rules = Arc::new(RuleEngine::new());
+        let reloaded_filters = Arc::new(ProxyFilterEngine::new());
+        let reloaded_store = Arc::new(TrafficStore::new(tmp_dir.join("doctor2.sqlite")).unwrap());
+        let reloaded_sysproxy =
+            Arc::new(SystemProxyManager::with_backend(&tmp_dir, MockOsProxyBackend::new()));
+        let reloaded_controller = ProxyEngineController::new_for_test(
+            reloaded_ca,
+            reloaded_rules,
+            reloaded_filters,
+            reloaded_store,
+            reloaded_sysproxy,
+        )
+        .unwrap();
+        let reloaded_started = reloaded_controller
+            .start("127.0.0.1".to_string(), 0)
+            .await
+            .unwrap();
+        let reloaded_probe = format!("127.0.0.1:{}", reloaded_started.port);
+        let reloaded_outcome = probe_proxy_https_health_endpoint(
+            &reloaded_probe,
+            reloaded_controller.context.ca.root_ca_der(),
+            &reloaded_controller.context.ca.info().sha256_fingerprint,
+        )
+        .await;
+        assert!(
+            matches!(reloaded_outcome, HttpsProbeOutcome::Verified { status_code: 200, .. }),
+            "expected Verified HTTPS probe on reloaded CA, got {reloaded_outcome:?}"
+        );
+        let _ = reloaded_controller.stop().await;
+
+        // 3. Mock external SSL inspector ("Zscaler Root CA") triggers CertMismatch & EDR warning
+        let mut edr_ca_params = rcgen::CertificateParams::default();
+        edr_ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let mut edr_dn = rcgen::DistinguishedName::new();
+        edr_dn.push(rcgen::DnType::CommonName, "Zscaler Intermediate Root CA");
+        edr_ca_params.distinguished_name = edr_dn;
+        let edr_ca_key = rcgen::KeyPair::generate().unwrap();
+        let edr_ca_cert = edr_ca_params.self_signed(&edr_ca_key).unwrap();
+
+        let mut edr_leaf_params =
+            rcgen::CertificateParams::new(vec!["flux.proxy".to_string()]).unwrap();
+        edr_leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let edr_leaf_key = rcgen::KeyPair::generate().unwrap();
+        let edr_leaf_cert = edr_leaf_params
+            .signed_by(&edr_leaf_key, &edr_ca_cert, &edr_ca_key)
+            .unwrap();
+        let edr_leaf_der = edr_leaf_cert.der().to_vec();
+        let edr_leaf_fp = format_der_sha256_colon(&edr_leaf_der);
+
+        let edr_tls_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(edr_leaf_der)],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+                edr_leaf_key.serialize_der(),
+            )),
+        )
+        .unwrap();
+
+        let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(edr_tls_cfg));
+        let server_task = tokio::spawn(async move {
+            if let Ok((mut tcp, _)) = mock_listener.accept().await {
+                let mut req_buf = [0u8; 512];
+                let _ = tcp.read(&mut req_buf).await;
+                let _ = tcp
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await;
+                let _ = acceptor.accept(tcp).await;
+            }
+        });
+
+        let edr_outcome = probe_proxy_https_health_endpoint(
+            &mock_addr.to_string(),
+            &local_der,
+            &local_fp,
+        )
+        .await;
+        let _ = server_task.await;
+
+        match &edr_outcome {
+            HttpsProbeOutcome::CertMismatch {
+                peer_sha256,
+                detected_inspector,
+                ..
+            } => {
+                assert_eq!(peer_sha256, &edr_leaf_fp);
+                assert_eq!(detected_inspector.as_deref(), Some("Zscaler"));
+            }
+            other => panic!("expected CertMismatch for Zscaler MITM cert, got {other:?}"),
+        }
+
+        let check = evaluate_loopback_e2e_result(
+            &mock_addr.to_string(),
+            Ok((200, "{\"status\":\"ok\"}".to_string(), 1)),
+            Some(edr_outcome),
+        );
+        assert_eq!(check.status, "warning");
+        assert!(!check.can_auto_fix);
+        assert!(check.summary.contains("Zscaler"));
+        assert!(check.details.contains(&local_fp));
+        assert!(check.details.contains(&edr_leaf_fp));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

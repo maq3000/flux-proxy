@@ -1560,6 +1560,10 @@ impl ProxyEngineController {
         self.lock_runtime().bind_addr.1
     }
 
+    pub fn save_persisted_proxy_port(&self, port: u16) {
+        self.sysproxy.save_proxy_port_pref(port);
+    }
+
     #[cfg(test)]
     pub(crate) fn set_drain_deadline_for_test(&self, deadline: Duration) {
         self.lock_runtime().drain_deadline = deadline;

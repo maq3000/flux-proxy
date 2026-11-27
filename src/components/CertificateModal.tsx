@@ -21,6 +21,32 @@ interface CertificateModalProps {
 interface StatusFeedback {
   tone: "success" | "error";
   text: string;
+  manualCommand?: string | null;
+}
+
+export function extractManualInstallCommand(
+  errorText: string,
+  caInfo: CaCertificateInfo | null
+): string | null {
+  const markers = [
+    "Команда для ручной установки в терминале:",
+    "Manual install command:",
+  ];
+  for (const marker of markers) {
+    const idx = errorText.indexOf(marker);
+    if (idx >= 0) {
+      const candidate = errorText
+        .slice(idx + marker.length)
+        .trim()
+        .split(/\r?\n/)[0]
+        ?.trim();
+      if (candidate) {
+        return candidate;
+      }
+    }
+  }
+  const fallback = caInfo?.manualInstallCommand?.trim();
+  return fallback ? fallback : null;
 }
 
 export const CertificateModal: React.FC<CertificateModalProps> = ({
@@ -100,8 +126,12 @@ export const CertificateModal: React.FC<CertificateModalProps> = ({
       onNotify(msg);
     } catch (err) {
       const errText = err instanceof Error ? err.message : String(err);
-      await refreshCaInfo().catch(() => undefined);
-      setStatusFeedback({ tone: "error", text: errText });
+      const latestInfo = await refreshCaInfo().catch(() => caInfo);
+      const manualCommand = extractManualInstallCommand(
+        errText,
+        latestInfo ?? caInfo
+      );
+      setStatusFeedback({ tone: "error", text: errText, manualCommand });
       onNotify(errText);
     } finally {
       setBusyAction(null);
@@ -118,8 +148,12 @@ export const CertificateModal: React.FC<CertificateModalProps> = ({
       onNotify(msg);
     } catch (err) {
       const errText = err instanceof Error ? err.message : String(err);
-      await refreshCaInfo().catch(() => undefined);
-      setStatusFeedback({ tone: "error", text: errText });
+      const latestInfo = await refreshCaInfo().catch(() => caInfo);
+      const manualCommand = extractManualInstallCommand(
+        errText,
+        latestInfo ?? caInfo
+      );
+      setStatusFeedback({ tone: "error", text: errText, manualCommand });
       onNotify(errText);
     } finally {
       setBusyAction(null);
@@ -245,9 +279,42 @@ export const CertificateModal: React.FC<CertificateModalProps> = ({
                 className="mt-0.5 h-3.5 w-3.5 shrink-0"
               />
             )}
-            <span className="break-words leading-relaxed">
+            <span className="whitespace-pre-wrap break-words leading-relaxed">
               {statusFeedback.text}
             </span>
+          </div>
+        )}
+
+        {statusFeedback?.tone === "error" && statusFeedback.manualCommand && (
+          <div
+            data-testid="ca-manual-install-fallback"
+            className="space-y-1.5 rounded-lg border border-amber-500/35 bg-canvas p-3 text-xs"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-semibold text-amber-300">
+                Ручная установка в терминале
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  void navigator.clipboard?.writeText(
+                    statusFeedback.manualCommand!
+                  );
+                  onNotify("Команда ручной установки Root CA скопирована");
+                }}
+                aria-label="Копировать команду ручной установки"
+                className="inline-flex items-center gap-1 rounded border border-hairline bg-surface px-2 py-1 text-[11px] font-medium text-fg hover:bg-hover"
+              >
+                <Copy aria-hidden="true" className="h-3 w-3" />
+                <span>Копировать команду</span>
+              </button>
+            </div>
+            <code
+              data-testid="ca-manual-install-command"
+              className="block break-all rounded border border-hairline bg-surface px-2.5 py-2 font-mono text-[11px] text-fg select-text"
+            >
+              {statusFeedback.manualCommand}
+            </code>
           </div>
         )}
       </div>

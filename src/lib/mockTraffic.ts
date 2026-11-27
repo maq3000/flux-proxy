@@ -1644,6 +1644,27 @@ export function buildPreviewDoctorChecks(params: {
         status.specificBindIp !== "::1")
   );
 
+  const firewallCmd = `netsh advfirewall firewall add rule name="FluxProxy" dir=in action=allow protocol=TCP localport=${status.port}`;
+  const manualCaCmd =
+    'certutil -user -addstore Root "%APPDATA%\\dev.fluxproxy.desktop\\ca\\fluxproxy-root-ca.cer"';
+
+  const sysErr = status.systemProxyError?.trim() || null;
+  const gpoBlocked = Boolean(
+    sysErr &&
+      (sysErr.includes("ProxySettingsPerUser") ||
+        sysErr.includes("--proxy-server="))
+  );
+  const noDeLinux = Boolean(sysErr && sysErr.includes("export HTTP_PROXY="));
+  const sysSuggestedCmd = gpoBlocked
+    ? `chrome --proxy-server=http://${expectedSysproxyEndpoint}`
+    : noDeLinux
+      ? sysErr!
+          .slice(sysErr!.indexOf("export HTTP_PROXY="))
+          .split(/\r?\n/)[0]
+          ?.trim() ||
+        `export HTTP_PROXY=http://${expectedSysproxyEndpoint} HTTPS_PROXY=http://${expectedSysproxyEndpoint}`
+      : null;
+
   return [
     {
       id: "port_binding",
@@ -1657,6 +1678,7 @@ export function buildPreviewDoctorChecks(params: {
         : "Пробная проверка сокета прошла успешно. Запустите прокси-листенер в 1 клик.",
       canAutoFix: !status.running,
       fixLabel: status.running ? null : "Запустить листенер прокси",
+      suggestedCommand: null,
     },
     {
       id: "root_ca_trust",
@@ -1670,34 +1692,51 @@ export function buildPreviewDoctorChecks(params: {
         : "Без установки Root CA в хранилище ОС браузеры отклоняют HTTPS MITM-соединения.",
       canAutoFix: !caTrusted,
       fixLabel: caTrusted ? null : "Установить Root CA в ОС",
+      suggestedCommand: caTrusted ? null : manualCaCmd,
     },
     {
       id: "system_proxy_sync",
       title: "Синхронизация системного прокси ОС",
-      status: status.systemProxyError
+      status: gpoBlocked
         ? "error"
-        : status.running && status.systemProxyEnabled
-          ? "ok"
-          : !status.running && status.systemProxyEnabled
+        : noDeLinux
+          ? "warning"
+          : sysErr
             ? "error"
-            : "warning",
-      summary: status.systemProxyError
-        ? `Системный прокси не синхронизирован с ${expectedSysproxyEndpoint}`
-        : status.running && status.systemProxyEnabled
-          ? `Системный прокси ОС активен и указывает на ${expectedSysproxyEndpoint}`
-          : "Системный прокси ОС отключён (режим Port Only)",
-      details: status.systemProxyError
-        ? `${status.systemProxyError}. Нажмите «Восстановить системный прокси» для переподключения.`
+            : status.running && status.systemProxyEnabled
+              ? "ok"
+              : !status.running && status.systemProxyEnabled
+                ? "error"
+                : "warning",
+      summary: gpoBlocked
+        ? "Системный прокси заблокирован политикой организации (GPO)"
+        : noDeLinux
+          ? `Окружение Linux без DE: настройте HTTP_PROXY/HTTPS_PROXY вручную на ${expectedSysproxyEndpoint}`
+          : sysErr
+            ? `Системный прокси не синхронизирован с ${expectedSysproxyEndpoint}`
+            : status.running && status.systemProxyEnabled
+              ? `Системный прокси ОС активен и указывает на ${expectedSysproxyEndpoint}`
+              : "Системный прокси ОС отключён (режим Port Only)",
+      details: sysErr
+        ? gpoBlocked || noDeLinux
+          ? sysErr
+          : `${sysErr}. Нажмите «Восстановить системный прокси» для переподключения.`
         : `Ожидаемый адрес системного прокси: ${expectedSysproxyEndpoint} (autoSystemProxy: ${
             status.autoSystemProxy ? "вкл" : "выкл"
           }).`,
-      canAutoFix: !(status.running && status.systemProxyEnabled && !status.systemProxyError),
+      canAutoFix:
+        !gpoBlocked &&
+        !noDeLinux &&
+        !(status.running && status.systemProxyEnabled && !sysErr),
       fixLabel:
-        status.running && status.systemProxyEnabled && !status.systemProxyError
+        gpoBlocked ||
+        noDeLinux ||
+        (status.running && status.systemProxyEnabled && !sysErr)
           ? null
-          : status.systemProxyError
+          : sysErr
             ? "Восстановить системный прокси"
             : "Включить системный прокси ОС",
+      suggestedCommand: sysSuggestedCmd,
     },
     {
       id: "vpn_interface_check",
@@ -1708,6 +1747,7 @@ export function buildPreviewDoctorChecks(params: {
         "VPN-клиенты в режиме TUN могут перехватывать системный прокси или сбрасывать WinINet ProxyServer. В нативном Tauri-режиме проверяются реальные адаптеры ОС.",
       canAutoFix: false,
       fixLabel: null,
+      suggestedCommand: null,
     },
     {
       id: "firewall_check",
@@ -1717,23 +1757,25 @@ export function buildPreviewDoctorChecks(params: {
         ? `LAN-режим активен (порт ${status.port}); проверьте входящее правило брандмауэра`
         : `Loopback-режим (127.0.0.1:${status.port}) защищён от внешней блокировки`,
       details: lanExposed
-        ? `При необходимости выполните: netsh advfirewall firewall add rule name="FluxProxy" dir=in action=allow protocol=TCP localport=${status.port}`
+        ? `При необходимости выполните: ${firewallCmd}`
         : "Локальный трафик 127.0.0.1 не блокируется внешним брандмауэром.",
       canAutoFix: false,
       fixLabel: null,
+      suggestedCommand: lanExposed ? firewallCmd : null,
     },
     {
       id: "loopback_e2e",
       title: "End-to-End loopback-маршрутизация (/health)",
       status: status.running ? "ok" : "error",
       summary: status.running
-        ? "GET http://flux.proxy/health → HTTP 200 (1 мс)"
+        ? "HTTP/HTTPS /health → HTTP 200 (1 мс / TLS 2 мс), Root CA подтверждён"
         : `Прокси остановлен — сокет ${expectedSysproxyEndpoint} не прослушивается`,
       details: status.running
-        ? 'Ответ {"status":"ok"} подтверждён (симуляция Browser Preview; без записи в TrafficStore).'
+        ? 'Ответ {"status":"ok"} подтверждён по HTTP и HTTPS MITM с проверкой отпечатка локального Root CA (симуляция Browser Preview; без записи в TrafficStore).'
         : "Запустите прокси-листенер, чтобы проверить прохождение трафика через локальный сокет.",
       canAutoFix: !status.running,
       fixLabel: status.running ? null : "Запустить листенер прокси",
+      suggestedCommand: null,
     },
   ];
 }

@@ -33,7 +33,6 @@ import type {
   WsInjectDirection,
   WsInjectOpcode,
 } from "../types/proxy";
-import { buildPreviewDoctorChecks } from "./mockTraffic";
 import { browserPreviewCodecTransform } from "./textWizard";
 import {
   DEFAULT_BREAKPOINT_CONFIG,
@@ -58,8 +57,6 @@ export type NativeDragDropPayload =
 export function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
-
-let previewCaTrusted = false;
 
 // ============================================================================
 // Unified Tauri IPC API Bridge
@@ -144,35 +141,14 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<DoctorCheckResult[]>("run_proxy_doctor");
     }
-    return buildPreviewDoctorChecks({
-      status: getPreviewEngine().getStatus(),
-      caTrusted: previewCaTrusted,
-    });
+    return getPreviewEngine().runProxyDoctor();
   },
 
   async fixDoctorIssue(issueId: string): Promise<DoctorCheckResult[]> {
     if (isTauriRuntime()) {
       return invoke<DoctorCheckResult[]>("fix_doctor_issue", { issueId });
     }
-    const previewEngine = getPreviewEngine();
-    if (issueId === "port_binding" || issueId === "loopback_e2e" || issueId === "all") {
-      if (!previewEngine.getStatus().running) {
-        previewEngine.setRunning(true);
-      }
-    }
-    if (issueId === "system_proxy_sync" || issueId === "all") {
-      if (!previewEngine.getStatus().running) {
-        previewEngine.setRunning(true);
-      }
-      previewEngine.setSystemProxy(true);
-    }
-    if (issueId === "root_ca_trust" || issueId === "all") {
-      previewCaTrusted = true;
-    }
-    return buildPreviewDoctorChecks({
-      status: previewEngine.getStatus(),
-      caTrusted: previewCaTrusted,
-    });
+    return getPreviewEngine().fixDoctorIssue(issueId);
   },
 
   async setPreviewPort(port: number): Promise<ProxyStatus> {
@@ -302,32 +278,21 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<CaCertificateInfo>("get_ca_info");
     }
-    return {
-      certPemPath: "%APPDATA%\\dev.fluxproxy.desktop\\ca\\fluxproxy-root-ca.pem",
-      certCerPath: "%APPDATA%\\dev.fluxproxy.desktop\\ca\\fluxproxy-root-ca.cer",
-      sha256Fingerprint:
-        "8F:4B:1C:92:A7:03:E1:55:9D:C4:11:7A:6E:20:B8:3C:44:F9:02:D1:77:8A:91:0E:5B:2D:6C:3F:19:A4:E8:10",
-      subject:
-        "CN=FluxProxy Local Debugging Root CA, O=FluxProxy Web Debugger",
-      validUntil: "2036-10-30 (ECDSA P-256 Root CA)",
-      isTrusted: previewCaTrusted,
-    };
+    return getPreviewEngine().getCaInfo();
   },
 
   async installRootCa(): Promise<string> {
     if (isTauriRuntime()) {
       return invoke<string>("install_root_ca");
     }
-    previewCaTrusted = true;
-    return "Preview Mode: Run inside Tauri (`cargo tauri dev`) to invoke native OS certificate trust (`certutil -user -addstore Root` / Keychain).";
+    return getPreviewEngine().installRootCa();
   },
 
   async uninstallRootCa(): Promise<string> {
     if (isTauriRuntime()) {
       return invoke<string>("uninstall_root_ca");
     }
-    previewCaTrusted = false;
-    return "Preview Mode: Run inside Tauri (`cargo tauri dev`) to remove the Root CA from the OS trust store (`certutil -user -delstore Root` / Keychain).";
+    return getPreviewEngine().uninstallRootCa();
   },
 
   async listClientCertificates(): Promise<ClientCertificateEntry[]> {

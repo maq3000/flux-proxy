@@ -359,6 +359,8 @@ export interface CaCertificateInfo {
   subject: string;
   validUntil: string;
   isTrusted?: boolean;
+  manualInstallCommand?: string | null;
+  trustStoreBackend?: string | null;
 }
 
 export type ClientCertificateFormat = "pkcs12" | "pem";
@@ -395,6 +397,7 @@ export interface DoctorCheckResult {
   details: string;
   canAutoFix: boolean;
   fixLabel?: string | null;
+  suggestedCommand?: string | null;
 }
 
 export interface NetworkInterfaceInfo {

@@ -544,6 +544,10 @@ pub struct CaCertificateInfo {
     pub valid_until: String,
     #[serde(default)]
     pub is_trusted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_install_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_store_backend: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -668,6 +672,8 @@ pub struct DoctorCheckResult {
     pub can_auto_fix: bool,
     #[serde(alias = "fix_label")]
     pub fix_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_command: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

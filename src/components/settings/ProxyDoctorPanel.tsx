@@ -158,7 +158,7 @@ export const ProxyDoctorPanel: React.FC<ProxyDoctorPanelProps> = ({
             <HelpTooltip
               label="Подробнее о Proxy Doctor"
               title="6 автоматических проверок среды"
-              content="Проверяет доступность TCP-порта и сокета, доверие Root CA в ОС, системный прокси, конфликтующие VPN/TUN-адаптеры, правила Firewall и сквозную loopback-проверку через http://flux.proxy/health."
+              content="Проверяет доступность TCP-порта и сокета, доверие Root CA в ОС, системный прокси (включая политики GPO и окружения Linux без DE), конфликтующие VPN/TUN-адаптеры, правила Firewall и сквозную HTTP/HTTPS loopback-проверку через flux.proxy/health (с выявлением внешних SSL-инспекторов / EDR)."
             />
           </div>
 
@@ -352,6 +352,32 @@ export const ProxyDoctorPanel: React.FC<ProxyDoctorPanelProps> = ({
                   </button>
                 </div>
               </div>
+
+              {check.suggestedCommand && (
+                <div
+                  data-testid={`doctor-suggested-command-${check.id}`}
+                  className="mt-2.5 flex flex-wrap items-center justify-between gap-2 rounded-md border border-amber-500/35 bg-surface px-3 py-2 text-[11px]"
+                >
+                  <code className="min-w-0 flex-1 break-all font-mono text-fg select-text">
+                    {check.suggestedCommand}
+                  </code>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void navigator.clipboard?.writeText(
+                        check.suggestedCommand!
+                      );
+                      onNotify(`Команда скопирована: ${check.title}`);
+                    }}
+                    title="Копировать команду в буфер обмена"
+                    aria-label={`Копировать команду ${check.id}`}
+                    className="inline-flex shrink-0 items-center gap-1 rounded border border-hairline bg-canvas px-2 py-1 text-[11px] font-medium text-muted hover:bg-hover hover:text-fg"
+                  >
+                    <Copy aria-hidden="true" className="h-3 w-3" />
+                    <span>Копировать команду</span>
+                  </button>
+                </div>
+              )}
 
               {isExpanded && check.details && (
                 <div className="mt-2.5 flex items-start justify-between gap-2 rounded-md border border-hairline bg-surface/75 px-3 py-2 font-mono text-[11px] leading-relaxed text-muted select-text">

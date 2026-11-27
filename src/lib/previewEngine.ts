@@ -6,9 +6,11 @@ import type {
   BreakpointConfig,
   BreakpointResolution,
   BreakpointStage,
+  CaCertificateInfo,
   ClientCertificateEntry,
   ClientCertificateFormat,
   ComposedRequest,
+  DoctorCheckResult,
   HostRemapRule,
   LoadedSessionBody,
   NetworkInterfaceInfo,
@@ -58,6 +60,7 @@ import {
 import {
   buildDefaultPreviewClientCertificates,
   buildInFlightSnapshot,
+  buildPreviewDoctorChecks,
   buildSimulatedSession,
   DEFAULT_AUTORESPONDER_RULES,
   DEFAULT_CLEAR_DB_ON_EXIT,
@@ -520,6 +523,7 @@ export class BrowserPreviewEngine {
   private systemProxyEnabled = true;
   private autoSystemProxy = true;
   private systemProxyError: string | null = null;
+  private caTrusted = false;
   private nextId = 1;
   private nextBpSeq = 1;
   private store = new Map<number, SessionDetail>();
@@ -1778,8 +1782,73 @@ export class BrowserPreviewEngine {
       throw new Error("Порт прокси должен быть целым числом от 1 до 65535");
     }
     this.port = port;
+    if (typeof window !== "undefined") {
+      try {
+        window.localStorage.setItem(
+          "fluxproxy.proxyPort.v1",
+          JSON.stringify(port)
+        );
+      } catch {
+        // ignore storage errors
+      }
+    }
     this.emitStatusChanged();
     return this.getStatus();
+  }
+
+  getCaInfo(): CaCertificateInfo {
+    return {
+      certPemPath: "%APPDATA%\\dev.fluxproxy.desktop\\ca\\fluxproxy-root-ca.pem",
+      certCerPath: "%APPDATA%\\dev.fluxproxy.desktop\\ca\\fluxproxy-root-ca.cer",
+      sha256Fingerprint:
+        "8F:4B:1C:92:A7:03:E1:55:9D:C4:11:7A:6E:20:B8:3C:44:F9:02:D1:77:8A:91:0E:5B:2D:6C:3F:19:A4:E8:10",
+      subject:
+        "CN=FluxProxy Local Debugging Root CA, O=FluxProxy Web Debugger",
+      validUntil: "2036-10-30 (ECDSA P-256 Root CA)",
+      isTrusted: this.caTrusted,
+      manualInstallCommand:
+        'certutil -user -addstore Root "%APPDATA%\\dev.fluxproxy.desktop\\ca\\fluxproxy-root-ca.cer"',
+      trustStoreBackend: "preview",
+    };
+  }
+
+  installRootCa(): string {
+    this.caTrusted = true;
+    return "Preview Mode: Run inside Tauri (`cargo tauri dev`) to invoke native OS certificate trust (`certutil -user -addstore Root` / Keychain).";
+  }
+
+  uninstallRootCa(): string {
+    this.caTrusted = false;
+    return "Preview Mode: Run inside Tauri (`cargo tauri dev`) to remove the Root CA from the OS trust store (`certutil -user -delstore Root` / Keychain).";
+  }
+
+  runProxyDoctor(): DoctorCheckResult[] {
+    return buildPreviewDoctorChecks({
+      status: this.getStatus(),
+      caTrusted: this.caTrusted,
+    });
+  }
+
+  fixDoctorIssue(issueId: string): DoctorCheckResult[] {
+    if (
+      issueId === "port_binding" ||
+      issueId === "loopback_e2e" ||
+      issueId === "all"
+    ) {
+      if (!this.running) {
+        this.setRunning(true);
+      }
+    }
+    if (issueId === "system_proxy_sync" || issueId === "all") {
+      if (!this.running) {
+        this.setRunning(true);
+      }
+      this.setSystemProxy(true);
+    }
+    if (issueId === "root_ca_trust" || issueId === "all") {
+      this.caTrusted = true;
+    }
+    return this.runProxyDoctor();
   }
 
   getSummaries(): SessionSummary[] {

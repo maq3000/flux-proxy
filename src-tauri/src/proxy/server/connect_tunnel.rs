@@ -894,16 +894,18 @@ async fn serve_mitm_tls_connection(
         return;
     }
 
-    if let ConnectTunnelDecision::Passthrough(reason) =
-        ctx.filters.evaluate_connect_tunnel(&host, port)
-    {
-        tracing::info!(
-            "Closing newly negotiated MITM tunnel for {}:{} after filter switch to Passthrough ({:?})",
-            host,
-            port,
-            reason
-        );
-        return;
+    if !is_virtual_portal_domain(&host) {
+        if let ConnectTunnelDecision::Passthrough(reason) =
+            ctx.filters.evaluate_connect_tunnel(&host, port)
+        {
+            tracing::info!(
+                "Closing newly negotiated MITM tunnel for {}:{} after filter switch to Passthrough ({:?})",
+                host,
+                port,
+                reason
+            );
+            return;
+        }
     }
 
     let client_tls_info = tls_stream.get_ref().1;
@@ -1006,16 +1008,18 @@ async fn serve_mitm_tls_connection(
                         );
                         break;
                     }
-                    if let ConnectTunnelDecision::Passthrough(reason) =
-                        conn_ctx.filters.evaluate_connect_tunnel(&mitm_host, port)
-                    {
-                        tracing::info!(
-                            "Hard-aborting active MITM tunnel for {}:{} after filter switch to Passthrough ({:?})",
-                            mitm_host,
-                            port,
-                            reason
-                        );
-                        break;
+                    if !is_virtual_portal_domain(&mitm_host) {
+                        if let ConnectTunnelDecision::Passthrough(reason) =
+                            conn_ctx.filters.evaluate_connect_tunnel(&mitm_host, port)
+                        {
+                            tracing::info!(
+                                "Hard-aborting active MITM tunnel for {}:{} after filter switch to Passthrough ({:?})",
+                                mitm_host,
+                                port,
+                                reason
+                            );
+                            break;
+                        }
                     }
                 }
             }

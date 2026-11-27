@@ -18,7 +18,129 @@ use time::{Duration, OffsetDateTime, UtcOffset};
 use crate::models::{CaCertificateInfo, ProxyError};
 
 pub const ROOT_CA_COMMON_NAME: &str = "FluxProxy Local Debugging Root CA";
-const LINUX_SYSTEM_CA_CERT_PATH: &str = "/usr/local/share/ca-certificates/fluxproxy-root-ca.crt";
+pub const OS_PRIVILEGE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const MAX_OS_CMD_CAPTURE_BYTES: usize = 1024 * 1024;
+
+const LINUX_DEBIAN_CA_DIR: &str = "/usr/local/share/ca-certificates";
+const LINUX_DEBIAN_CA_CERT_PATH: &str = "/usr/local/share/ca-certificates/fluxproxy-root-ca.crt";
+const LINUX_REDHAT_CA_DIR: &str = "/etc/pki/ca-trust/source/anchors";
+const LINUX_REDHAT_CA_CERT_PATH: &str = "/etc/pki/ca-trust/source/anchors/fluxproxy-root-ca.crt";
+const LINUX_ARCH_CA_DIR: &str = "/etc/ca-certificates/trust-source/anchors";
+const LINUX_ARCH_CA_CERT_PATH: &str = "/etc/ca-certificates/trust-source/anchors/fluxproxy-root-ca.crt";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const LINUX_ALL_CA_CERT_PATHS: [&str; 3] = [
+    LINUX_DEBIAN_CA_CERT_PATH,
+    LINUX_REDHAT_CA_CERT_PATH,
+    LINUX_ARCH_CA_CERT_PATH,
+];
+
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinuxCaStoreKind {
+    DebianUpdateCaCertificates,
+    RedHatUpdateCaTrust,
+    ArchTrustAnchor,
+}
+
+impl LinuxCaStoreKind {
+    pub fn cert_path(self) -> &'static str {
+        match self {
+            Self::DebianUpdateCaCertificates => LINUX_DEBIAN_CA_CERT_PATH,
+            Self::RedHatUpdateCaTrust => LINUX_REDHAT_CA_CERT_PATH,
+            Self::ArchTrustAnchor => LINUX_ARCH_CA_CERT_PATH,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn anchor_dir(self) -> &'static str {
+        match self {
+            Self::DebianUpdateCaCertificates => LINUX_DEBIAN_CA_DIR,
+            Self::RedHatUpdateCaTrust => LINUX_REDHAT_CA_DIR,
+            Self::ArchTrustAnchor => LINUX_ARCH_CA_DIR,
+        }
+    }
+
+    pub fn backend_id(self) -> &'static str {
+        match self {
+            Self::DebianUpdateCaCertificates => "update-ca-certificates",
+            Self::RedHatUpdateCaTrust => "update-ca-trust",
+            Self::ArchTrustAnchor => "trust-anchor",
+        }
+    }
+}
+
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(crate) fn detect_linux_ca_store_with<FDir, FBin>(
+    mut dir_exists: FDir,
+    mut bin_exists: FBin,
+) -> Option<LinuxCaStoreKind>
+where
+    FDir: FnMut(&str) -> bool,
+    FBin: FnMut(&str) -> bool,
+{
+    if bin_exists("update-ca-certificates") && dir_exists(LINUX_DEBIAN_CA_DIR) {
+        return Some(LinuxCaStoreKind::DebianUpdateCaCertificates);
+    }
+    if bin_exists("update-ca-trust") && dir_exists(LINUX_REDHAT_CA_DIR) {
+        return Some(LinuxCaStoreKind::RedHatUpdateCaTrust);
+    }
+    if bin_exists("trust") && dir_exists(LINUX_ARCH_CA_DIR) {
+        return Some(LinuxCaStoreKind::ArchTrustAnchor);
+    }
+
+    if bin_exists("update-ca-certificates") {
+        return Some(LinuxCaStoreKind::DebianUpdateCaCertificates);
+    }
+    if bin_exists("update-ca-trust") {
+        return Some(LinuxCaStoreKind::RedHatUpdateCaTrust);
+    }
+    if bin_exists("trust") {
+        return Some(LinuxCaStoreKind::ArchTrustAnchor);
+    }
+
+    if dir_exists(LINUX_DEBIAN_CA_DIR) {
+        return Some(LinuxCaStoreKind::DebianUpdateCaCertificates);
+    }
+    if dir_exists(LINUX_REDHAT_CA_DIR) {
+        return Some(LinuxCaStoreKind::RedHatUpdateCaTrust);
+    }
+    if dir_exists(LINUX_ARCH_CA_DIR) {
+        return Some(LinuxCaStoreKind::ArchTrustAnchor);
+    }
+
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_binary_exists(name: &str) -> bool {
+    if let Some(path_os) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_os) {
+            if dir.join(name).is_file() {
+                return true;
+            }
+        }
+    }
+    for fallback_dir in ["/usr/sbin", "/sbin", "/usr/bin", "/bin"] {
+        if Path::new(fallback_dir).join(name).is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn detect_linux_ca_store() -> Option<LinuxCaStoreKind> {
+    detect_linux_ca_store_with(|dir| Path::new(dir).is_dir(), linux_binary_exists)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn is_installed_in_linux_anchor_paths(paths: &[&Path], active_ca_der: &[u8]) -> bool {
+    paths.iter().any(|p| {
+        fs::read(p)
+            .map(|bytes| cert_file_matches_ca_der(&bytes, active_ca_der))
+            .unwrap_or(false)
+    })
+}
 
 fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -135,6 +257,20 @@ pub(crate) struct OsCommandSpec {
     pub success_message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommandExecutionOutcome {
+    Completed {
+        success: bool,
+        stdout: String,
+        stderr: String,
+    },
+    TimedOut {
+        timeout_secs: u64,
+        stdout: String,
+        stderr: String,
+    },
+}
+
 fn new_os_command(program: &str) -> Command {
     #[allow(unused_mut)]
     let mut cmd = Command::new(program);
@@ -145,6 +281,97 @@ fn new_os_command(program: &str) -> Command {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
+}
+
+fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
+    pipe: Option<R>,
+) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let text = if let Some(mut reader) = pipe {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let remaining = MAX_OS_CMD_CAPTURE_BYTES.saturating_sub(buf.len());
+                        if remaining > 0 {
+                            buf.extend_from_slice(&chunk[..n.min(remaining)]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        } else {
+            String::new()
+        };
+        let _ = tx.send(text);
+    });
+    rx
+}
+
+pub(crate) fn run_command_with_timeout(
+    program: &str,
+    args: &[String],
+    timeout: std::time::Duration,
+) -> Result<CommandExecutionOutcome, std::io::Error> {
+    use std::process::Stdio;
+
+    let mut child = new_os_command(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout_rx = spawn_pipe_reader(child.stdout.take());
+    let stderr_rx = spawn_pipe_reader(child.stderr.take());
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let stdout = stdout_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap_or_default();
+            let stderr = stderr_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap_or_default();
+            return Ok(CommandExecutionOutcome::Completed {
+                success: status.success(),
+                stdout,
+                stderr,
+            });
+        }
+
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stdout = stdout_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .unwrap_or_default();
+            let stderr = stderr_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .unwrap_or_default();
+            return Ok(CommandExecutionOutcome::TimedOut {
+                timeout_secs: timeout.as_secs().max(1),
+                stdout,
+                stderr,
+            });
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+fn shell_quote_posix(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "'\"'\"'"))
+}
+
+fn shell_quote_windows(raw: &str) -> String {
+    let escaped = raw.replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 fn format_command_error(stderr: &str, stdout: &str, fallback: &str) -> String {
@@ -309,6 +536,21 @@ impl CertificateAuthority {
     }
 
     pub fn info(&self) -> CaCertificateInfo {
+        let target_os = std::env::consts::OS;
+        #[cfg(target_os = "linux")]
+        let linux_store = detect_linux_ca_store();
+        #[cfg(not(target_os = "linux"))]
+        let linux_store: Option<LinuxCaStoreKind> = None;
+
+        let trust_store_backend = match target_os {
+            "windows" => Some("certutil".to_string()),
+            "macos" => Some("security".to_string()),
+            "linux" => linux_store.map(|s| s.backend_id().to_string()),
+            _ => None,
+        };
+        let manual_install_command =
+            Some(self.manual_install_command_for_os_and_store(target_os, linux_store));
+
         CaCertificateInfo {
             cert_pem_path: self.cert_pem_path.display().to_string(),
             cert_cer_path: self.cert_cer_path.display().to_string(),
@@ -316,6 +558,8 @@ impl CertificateAuthority {
             subject: format!("CN={ROOT_CA_COMMON_NAME}, O=FluxProxy Web Debugger"),
             valid_until: self.valid_until.clone(),
             is_trusted: false,
+            manual_install_command,
+            trust_store_backend,
         }
     }
 
@@ -349,24 +593,27 @@ impl CertificateAuthority {
 
         #[cfg(target_os = "macos")]
         {
-            new_os_command("security")
-                .args(["find-certificate", "-a", "-Z", "-c", ROOT_CA_COMMON_NAME])
-                .output()
-                .map(|o| {
-                    o.status.success()
-                        && output_contains_sha256_fingerprint(
-                            &String::from_utf8_lossy(&o.stdout),
-                            &self.sha256_fingerprint,
-                        )
-                })
-                .unwrap_or(false)
+            let args = vec![
+                "find-certificate".to_string(),
+                "-a".to_string(),
+                "-Z".to_string(),
+                "-c".to_string(),
+                ROOT_CA_COMMON_NAME.to_string(),
+            ];
+            matches!(
+                run_command_with_timeout("security", &args, OS_PRIVILEGE_COMMAND_TIMEOUT),
+                Ok(CommandExecutionOutcome::Completed {
+                    success: true,
+                    stdout,
+                    ..
+                }) if output_contains_sha256_fingerprint(&stdout, &self.sha256_fingerprint)
+            )
         }
 
         #[cfg(target_os = "linux")]
         {
-            fs::read(LINUX_SYSTEM_CA_CERT_PATH)
-                .map(|bytes| cert_file_matches_ca_der(&bytes, &self.ca_der))
-                .unwrap_or(false)
+            let paths: Vec<&Path> = LINUX_ALL_CA_CERT_PATHS.iter().map(Path::new).collect();
+            is_installed_in_linux_anchor_paths(&paths, &self.ca_der)
         }
 
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
@@ -523,94 +770,204 @@ impl CertificateAuthority {
         Ok(arc_cfg)
     }
 
-    /// Triggers explicit, OS-prompted installation of the local Root CA into the current user's trust store.
-    pub fn install_into_os_trust_store(&self) -> Result<String, ProxyError> {
-        #[cfg(target_os = "windows")]
-        {
-            let cert_path = self.cert_cer_path.display().to_string();
-            // Installs into CurrentUser Root store, triggering Windows' native Security Warning confirmation prompt.
-            let output = new_os_command("certutil")
-                .args(["-user", "-addstore", "Root", &cert_path])
-                .output()?;
-
-            if output.status.success() {
-                Ok("Root CA installed into Windows CurrentUser Trusted Root Store.".into())
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                Err(ProxyError::Custom(format_command_error(
-                    &stderr,
-                    &stdout,
-                    "Failed to install Root CA into Windows CurrentUser Root store.",
-                )))
+    pub(crate) fn manual_install_command_for_os_and_store(
+        &self,
+        target_os: &str,
+        linux_store: Option<LinuxCaStoreKind>,
+    ) -> String {
+        let pem = self.cert_pem_path.display().to_string();
+        let cer = self.cert_cer_path.display().to_string();
+        match target_os {
+            "windows" => format!(
+                "certutil -user -addstore Root {}",
+                shell_quote_windows(&cer)
+            ),
+            "macos" => format!(
+                "security add-trusted-cert -d -r trustRoot -k \"$HOME/Library/Keychains/login.keychain-db\" {}",
+                shell_quote_posix(&pem)
+            ),
+            "linux" => {
+                let store = linux_store.unwrap_or(LinuxCaStoreKind::DebianUpdateCaCertificates);
+                let quoted_pem = shell_quote_posix(&pem);
+                match store {
+                    LinuxCaStoreKind::DebianUpdateCaCertificates => format!(
+                        "sudo cp {quoted_pem} {LINUX_DEBIAN_CA_CERT_PATH} && sudo update-ca-certificates"
+                    ),
+                    LinuxCaStoreKind::RedHatUpdateCaTrust => format!(
+                        "sudo cp {quoted_pem} {LINUX_REDHAT_CA_CERT_PATH} && sudo update-ca-trust extract"
+                    ),
+                    LinuxCaStoreKind::ArchTrustAnchor => format!(
+                        "sudo cp {quoted_pem} {LINUX_ARCH_CA_CERT_PATH} && sudo trust anchor --store {LINUX_ARCH_CA_CERT_PATH} && sudo trust extract-compat"
+                    ),
+                }
             }
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let home = std::env::var("HOME").unwrap_or_default();
-            let login_keychain = format!("{home}/Library/Keychains/login.keychain-db");
-            let output = new_os_command("security")
-                .args([
-                    "add-trusted-cert",
-                    "-d",
-                    "-r",
-                    "trustRoot",
-                    "-k",
-                    &login_keychain,
-                    &self.cert_pem_path.display().to_string(),
-                ])
-                .output()?;
-
-            if output.status.success() {
-                Ok("Root CA installed into macOS login keychain.".into())
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                Err(ProxyError::Custom(format_command_error(
-                    &stderr,
-                    &stdout,
-                    "Failed to install Root CA into macOS login keychain.",
-                )))
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            let pem_path = self.cert_pem_path.display().to_string();
-            let output = new_os_command("pkexec")
-                .args([
-                    "sh",
-                    "-c",
-                    "cp \"$1\" \"$2\" && update-ca-certificates",
-                    "_",
-                    &pem_path,
-                    LINUX_SYSTEM_CA_CERT_PATH,
-                ])
-                .output()?;
-
-            if output.status.success() {
-                Ok("Root CA installed via update-ca-certificates.".into())
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                Err(ProxyError::Custom(format!(
-                    "Automatic install failed ({}). Import '{}' manually into your browser/OS trust store.",
-                    format_command_error(&stderr, &stdout, "pkexec error"),
-                    pem_path
-                )))
-            }
-        }
-
-        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-        {
-            Err(ProxyError::Custom(
-                "Automatic OS trust store installation is not supported on this platform.".into(),
-            ))
+            _ => pem,
         }
     }
 
+    pub(crate) fn install_command_spec_for_os_and_store(
+        &self,
+        target_os: &str,
+        linux_store: Option<LinuxCaStoreKind>,
+    ) -> Result<OsCommandSpec, ProxyError> {
+        let pem = self.cert_pem_path.display().to_string();
+        let cer = self.cert_cer_path.display().to_string();
+        match target_os {
+            "windows" => Ok(OsCommandSpec {
+                program: "certutil".into(),
+                args: vec!["-user".into(), "-addstore".into(), "Root".into(), cer],
+                success_message:
+                    "Root CA installed into Windows CurrentUser Trusted Root Store.".into(),
+            }),
+            "macos" => {
+                let home = std::env::var("HOME").unwrap_or_default();
+                let login_keychain = format!("{home}/Library/Keychains/login.keychain-db");
+                Ok(OsCommandSpec {
+                    program: "security".into(),
+                    args: vec![
+                        "add-trusted-cert".into(),
+                        "-d".into(),
+                        "-r".into(),
+                        "trustRoot".into(),
+                        "-k".into(),
+                        login_keychain,
+                        pem,
+                    ],
+                    success_message: "Root CA installed into macOS login keychain.".into(),
+                })
+            }
+            "linux" => {
+                let Some(store) = linux_store else {
+                    let manual_cmd = self.manual_install_command_for_os_and_store("linux", None);
+                    return Err(ProxyError::Custom(format!(
+                        "Не найдена поддерживаемая утилита системного доверия Linux (update-ca-certificates / update-ca-trust / trust).\nКоманда для ручной установки в терминале:\n{manual_cmd}"
+                    )));
+                };
+                let (script, success_msg) = match store {
+                    LinuxCaStoreKind::DebianUpdateCaCertificates => (
+                        "mkdir -p /usr/local/share/ca-certificates && cp \"$1\" \"$2\" && update-ca-certificates",
+                        "Root CA installed via update-ca-certificates.",
+                    ),
+                    LinuxCaStoreKind::RedHatUpdateCaTrust => (
+                        "mkdir -p /etc/pki/ca-trust/source/anchors && cp \"$1\" \"$2\" && update-ca-trust extract",
+                        "Root CA installed via update-ca-trust extract.",
+                    ),
+                    LinuxCaStoreKind::ArchTrustAnchor => (
+                        "mkdir -p /etc/ca-certificates/trust-source/anchors && cp \"$1\" \"$2\" && (trust anchor --store \"$2\" 2>/dev/null || true) && trust extract-compat",
+                        "Root CA installed via trust anchor / extract-compat.",
+                    ),
+                };
+                Ok(OsCommandSpec {
+                    program: "pkexec".into(),
+                    args: vec![
+                        "sh".into(),
+                        "-c".into(),
+                        script.into(),
+                        "_".into(),
+                        pem,
+                        store.cert_path().into(),
+                    ],
+                    success_message: success_msg.into(),
+                })
+            }
+            _ => Err(ProxyError::Custom(
+                "Automatic OS trust store installation is not supported on this platform.".into(),
+            )),
+        }
+    }
+
+    pub(crate) fn install_with_executor_and_store<F>(
+        &self,
+        target_os: &str,
+        linux_store: Option<LinuxCaStoreKind>,
+        mut executor: F,
+    ) -> Result<String, ProxyError>
+    where
+        F: FnMut(&str, &[String]) -> Result<CommandExecutionOutcome, std::io::Error>,
+    {
+        let spec = self.install_command_spec_for_os_and_store(target_os, linux_store)?;
+        let manual_cmd = self.manual_install_command_for_os_and_store(target_os, linux_store);
+        let outcome = match executor(&spec.program, &spec.args) {
+            Ok(out) => out,
+            Err(err) if target_os == "linux" && err.kind() == std::io::ErrorKind::NotFound => {
+                match executor("sh", &spec.args[1..]) {
+                    Ok(out) => out,
+                    Err(sh_err) => {
+                        return Err(ProxyError::Custom(format!(
+                            "Автоматическая установка завершилась ошибкой ({sh_err}).\nКоманда для ручной установки в терминале:\n{manual_cmd}"
+                        )));
+                    }
+                }
+            }
+            Err(err) => {
+                return Err(ProxyError::Custom(format!(
+                    "Не удалось запустить '{}': {err}.\nКоманда для ручной установки в терминале:\n{manual_cmd}",
+                    spec.program
+                )));
+            }
+        };
+
+        match outcome {
+            CommandExecutionOutcome::Completed {
+                success: true, ..
+            } => Ok(spec.success_message),
+            CommandExecutionOutcome::Completed {
+                success: false,
+                stdout,
+                stderr,
+            } => {
+                let detail = format_command_error(
+                    &stderr,
+                    &stdout,
+                    "Не удалось установить Root CA в хранилище ОС.",
+                );
+                Err(ProxyError::Custom(format!(
+                    "Автоматическая установка не выполнена ({detail}).\nКоманда для ручной установки в терминале:\n{manual_cmd}"
+                )))
+            }
+            CommandExecutionOutcome::TimedOut {
+                timeout_secs,
+                stdout,
+                stderr,
+            } => {
+                let extra = format_command_error(&stderr, &stdout, "");
+                let extra_note = if extra.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({extra})")
+                };
+                Err(ProxyError::Custom(format!(
+                    "Превышен таймаут ожидания подтверждения привилегий ({timeout_secs} с): процесс '{}' принудительно завершён{extra_note}.\nКоманда для ручной установки в терминале:\n{manual_cmd}",
+                    spec.program
+                )))
+            }
+        }
+    }
+
+    /// Triggers explicit, OS-prompted installation of the local Root CA into the current user's trust store.
+    pub fn install_into_os_trust_store(&self) -> Result<String, ProxyError> {
+        #[cfg(target_os = "linux")]
+        let linux_store = detect_linux_ca_store();
+        #[cfg(not(target_os = "linux"))]
+        let linux_store: Option<LinuxCaStoreKind> = None;
+
+        self.install_with_executor_and_store(std::env::consts::OS, linux_store, |program, args| {
+            run_command_with_timeout(program, args, OS_PRIVILEGE_COMMAND_TIMEOUT)
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn uninstall_command_spec_for_os(target_os: &str) -> Result<OsCommandSpec, ProxyError> {
+        Self::uninstall_command_spec_for_os_and_store(
+            target_os,
+            Some(LinuxCaStoreKind::DebianUpdateCaCertificates),
+        )
+    }
+
+    pub(crate) fn uninstall_command_spec_for_os_and_store(
+        target_os: &str,
+        linux_store: Option<LinuxCaStoreKind>,
+    ) -> Result<OsCommandSpec, ProxyError> {
         match target_os {
             "windows" => Ok(OsCommandSpec {
                 program: "certutil".into(),
@@ -632,26 +989,45 @@ impl CertificateAuthority {
                 ],
                 success_message: "Root CA removed from macOS keychain.".into(),
             }),
-            "linux" => Ok(OsCommandSpec {
-                program: "pkexec".into(),
-                args: vec![
-                    "sh".into(),
-                    "-c".into(),
-                    format!(
-                        "rm -f \"$1\" && update-ca-certificates --fresh # {LINUX_SYSTEM_CA_CERT_PATH}"
+            "linux" => {
+                let store = linux_store.ok_or_else(|| {
+                    ProxyError::Custom(
+                        "Не найдена поддерживаемая утилита удаления сертификата Linux.".into(),
+                    )
+                })?;
+                let (script, success_msg) = match store {
+                    LinuxCaStoreKind::DebianUpdateCaCertificates => (
+                        format!("rm -f \"$1\" && update-ca-certificates --fresh # {LINUX_DEBIAN_CA_CERT_PATH}"),
+                        "Root CA removed from /usr/local/share/ca-certificates/ via update-ca-certificates --fresh.",
                     ),
-                    "_".into(),
-                    LINUX_SYSTEM_CA_CERT_PATH.into(),
-                ],
-                success_message:
-                    "Root CA removed from /usr/local/share/ca-certificates/ via update-ca-certificates --fresh.".into(),
-            }),
+                    LinuxCaStoreKind::RedHatUpdateCaTrust => (
+                        format!("rm -f \"$1\" && update-ca-trust extract # {LINUX_REDHAT_CA_CERT_PATH}"),
+                        "Root CA removed from /etc/pki/ca-trust/source/anchors/ via update-ca-trust extract.",
+                    ),
+                    LinuxCaStoreKind::ArchTrustAnchor => (
+                        format!("(trust anchor --remove \"$1\" 2>/dev/null || true) && rm -f \"$1\" && trust extract-compat # {LINUX_ARCH_CA_CERT_PATH}"),
+                        "Root CA removed from /etc/ca-certificates/trust-source/anchors/ via trust extract-compat.",
+                    ),
+                };
+                Ok(OsCommandSpec {
+                    program: "pkexec".into(),
+                    args: vec![
+                        "sh".into(),
+                        "-c".into(),
+                        script,
+                        "_".into(),
+                        store.cert_path().into(),
+                    ],
+                    success_message: success_msg.into(),
+                })
+            }
             other => Err(ProxyError::Custom(format!(
                 "Automatic OS trust store uninstallation is not supported on '{other}'."
             ))),
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn uninstall_with_executor<F>(
         &self,
         target_os: &str,
@@ -660,46 +1036,96 @@ impl CertificateAuthority {
     where
         F: FnMut(&str, &[String]) -> Result<(bool, String, String), std::io::Error>,
     {
-        let spec = Self::uninstall_command_spec_for_os(target_os)?;
-        match executor(&spec.program, &spec.args) {
-            Ok((true, _, _)) => Ok(spec.success_message),
-            Ok((false, stdout, stderr)) => Err(ProxyError::Custom(format_command_error(
-                &stderr,
-                &stdout,
-                "Failed to remove Root CA from OS trust store.",
-            ))),
+        self.uninstall_with_executor_and_store(
+            target_os,
+            Some(LinuxCaStoreKind::DebianUpdateCaCertificates),
+            |program, args| match executor(program, args) {
+                Ok((success, stdout, stderr)) => Ok(CommandExecutionOutcome::Completed {
+                    success,
+                    stdout,
+                    stderr,
+                }),
+                Err(err) => Err(err),
+            },
+        )
+    }
+
+    pub(crate) fn uninstall_with_executor_and_store<F>(
+        &self,
+        target_os: &str,
+        linux_store: Option<LinuxCaStoreKind>,
+        mut executor: F,
+    ) -> Result<String, ProxyError>
+    where
+        F: FnMut(&str, &[String]) -> Result<CommandExecutionOutcome, std::io::Error>,
+    {
+        let spec = Self::uninstall_command_spec_for_os_and_store(target_os, linux_store)?;
+        let outcome = match executor(&spec.program, &spec.args) {
+            Ok(out) => out,
             Err(err) if target_os == "linux" && err.kind() == std::io::ErrorKind::NotFound => {
-                // Fallback for root/container Linux environments without `pkexec`
-                match fs::remove_file(LINUX_SYSTEM_CA_CERT_PATH) {
+                let store = linux_store.unwrap_or(LinuxCaStoreKind::DebianUpdateCaCertificates);
+                let cert_path = store.cert_path();
+                if matches!(store, LinuxCaStoreKind::ArchTrustAnchor) {
+                    let remove_args = vec![
+                        "anchor".to_string(),
+                        "--remove".to_string(),
+                        cert_path.to_string(),
+                    ];
+                    let _ = executor("trust", &remove_args);
+                }
+                match fs::remove_file(cert_path) {
                     Ok(()) => {}
                     Err(rm_err) if rm_err.kind() == std::io::ErrorKind::NotFound => {}
                     Err(rm_err) => return Err(ProxyError::Io(rm_err)),
                 }
-                let direct_args = vec!["--fresh".to_string()];
-                let (ok, stdout, stderr) = executor("update-ca-certificates", &direct_args)?;
-                if ok {
-                    Ok(spec.success_message)
-                } else {
-                    Err(ProxyError::Custom(format_command_error(
-                        &stderr,
-                        &stdout,
-                        "update-ca-certificates --fresh failed.",
-                    )))
-                }
+                let (direct_prog, direct_args) = match store {
+                    LinuxCaStoreKind::DebianUpdateCaCertificates => (
+                        "update-ca-certificates",
+                        vec!["--fresh".to_string()],
+                    ),
+                    LinuxCaStoreKind::RedHatUpdateCaTrust => (
+                        "update-ca-trust",
+                        vec!["extract".to_string()],
+                    ),
+                    LinuxCaStoreKind::ArchTrustAnchor => (
+                        "trust",
+                        vec!["extract-compat".to_string()],
+                    ),
+                };
+                executor(direct_prog, &direct_args)?
             }
-            Err(err) => Err(ProxyError::Io(err)),
+            Err(err) => return Err(ProxyError::Io(err)),
+        };
+
+        match outcome {
+            CommandExecutionOutcome::Completed {
+                success: true, ..
+            } => Ok(spec.success_message),
+            CommandExecutionOutcome::Completed {
+                success: false,
+                stdout,
+                stderr,
+            } => Err(ProxyError::Custom(format_command_error(
+                &stderr,
+                &stdout,
+                "Failed to remove Root CA from OS trust store.",
+            ))),
+            CommandExecutionOutcome::TimedOut { timeout_secs, .. } => Err(ProxyError::Custom(format!(
+                "Превышен таймаут удаления Root CA ({timeout_secs} с): процесс '{}' принудительно завершён.",
+                spec.program
+            ))),
         }
     }
 
     /// Removes the local FluxProxy Root CA certificate from the OS trust store.
     pub fn uninstall_from_os_trust_store(&self) -> Result<String, ProxyError> {
-        self.uninstall_with_executor(std::env::consts::OS, |program, args| {
-            let output = new_os_command(program).args(args).output()?;
-            Ok((
-                output.status.success(),
-                String::from_utf8_lossy(&output.stdout).into_owned(),
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ))
+        #[cfg(target_os = "linux")]
+        let linux_store = detect_linux_ca_store();
+        #[cfg(not(target_os = "linux"))]
+        let linux_store: Option<LinuxCaStoreKind> = None;
+
+        self.uninstall_with_executor_and_store(std::env::consts::OS, linux_store, |program, args| {
+            run_command_with_timeout(program, args, OS_PRIVILEGE_COMMAND_TIMEOUT)
         })
     }
 }
@@ -1042,5 +1468,237 @@ mod tests {
         assert!(!disk_after_migration.contains("-----BEGIN"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_debian_redhat_and_arch_linux_ca_stores() {
+        assert_eq!(
+            detect_linux_ca_store_with(
+                |d| d == LINUX_DEBIAN_CA_DIR,
+                |b| b == "update-ca-certificates",
+            ),
+            Some(LinuxCaStoreKind::DebianUpdateCaCertificates)
+        );
+        // Fedora/RHEL ships both `update-ca-trust` and p11-kit `trust`
+        assert_eq!(
+            detect_linux_ca_store_with(
+                |d| d == LINUX_REDHAT_CA_DIR,
+                |b| b == "update-ca-trust" || b == "trust",
+            ),
+            Some(LinuxCaStoreKind::RedHatUpdateCaTrust)
+        );
+        assert_eq!(
+            detect_linux_ca_store_with(
+                |d| d == LINUX_ARCH_CA_DIR,
+                |b| b == "trust",
+            ),
+            Some(LinuxCaStoreKind::ArchTrustAnchor)
+        );
+        assert_eq!(detect_linux_ca_store_with(|_| false, |_| false), None);
+
+        let dir = std::env::temp_dir().join(format!(
+            "fluxproxy_ca_linux_anchors_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let ca = CertificateAuthority::init_or_load(&dir).expect("init CA");
+        let missing_a = dir.join("missing-debian.crt");
+        let arch_file = dir.join("arch-anchor.crt");
+        fs::write(&arch_file, ca.root_ca_pem().as_bytes()).unwrap();
+        assert!(is_installed_in_linux_anchor_paths(
+            &[missing_a.as_path(), arch_file.as_path()],
+            ca.root_ca_der(),
+        ));
+        fs::write(&arch_file, b"stale-cert").unwrap();
+        assert!(!is_installed_in_linux_anchor_paths(
+            &[missing_a.as_path(), arch_file.as_path()],
+            ca.root_ca_der(),
+        ));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builds_install_uninstall_and_manual_cli_specs_for_all_linux_stores_and_macos() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxproxy_ca_specs_all_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let ca = CertificateAuthority::init_or_load(&dir).expect("init CA");
+
+        // 1. Debian, RedHat/Fedora, Arch install specs & manual commands
+        let deb_spec = ca
+            .install_command_spec_for_os_and_store(
+                "linux",
+                Some(LinuxCaStoreKind::DebianUpdateCaCertificates),
+            )
+            .unwrap();
+        assert_eq!(deb_spec.program, "pkexec");
+        assert!(deb_spec.args[2].contains("update-ca-certificates"));
+        assert_eq!(deb_spec.args[5], LINUX_DEBIAN_CA_CERT_PATH);
+        let deb_manual = ca.manual_install_command_for_os_and_store(
+            "linux",
+            Some(LinuxCaStoreKind::DebianUpdateCaCertificates),
+        );
+        assert!(deb_manual.contains("sudo update-ca-certificates"));
+
+        let rh_spec = ca
+            .install_command_spec_for_os_and_store(
+                "linux",
+                Some(LinuxCaStoreKind::RedHatUpdateCaTrust),
+            )
+            .unwrap();
+        assert!(rh_spec.args[2].contains("update-ca-trust extract"));
+        assert_eq!(rh_spec.args[5], LINUX_REDHAT_CA_CERT_PATH);
+        let rh_manual = ca.manual_install_command_for_os_and_store(
+            "linux",
+            Some(LinuxCaStoreKind::RedHatUpdateCaTrust),
+        );
+        assert!(rh_manual.contains("/etc/pki/ca-trust/source/anchors/"));
+        assert!(rh_manual.contains("update-ca-trust extract"));
+
+        let arch_spec = ca
+            .install_command_spec_for_os_and_store(
+                "linux",
+                Some(LinuxCaStoreKind::ArchTrustAnchor),
+            )
+            .unwrap();
+        assert!(arch_spec.args[2].contains("trust anchor --store"));
+        assert!(arch_spec.args[2].contains("trust extract-compat"));
+        assert_eq!(arch_spec.args[5], LINUX_ARCH_CA_CERT_PATH);
+        let arch_manual = ca.manual_install_command_for_os_and_store(
+            "linux",
+            Some(LinuxCaStoreKind::ArchTrustAnchor),
+        );
+        assert!(arch_manual.contains("/etc/ca-certificates/trust-source/anchors/"));
+        assert!(arch_manual.contains("trust anchor --store"));
+
+        // 2. RedHat & Arch uninstall specs
+        let rh_uninst = CertificateAuthority::uninstall_command_spec_for_os_and_store(
+            "linux",
+            Some(LinuxCaStoreKind::RedHatUpdateCaTrust),
+        )
+        .unwrap();
+        assert!(rh_uninst.args[2].contains("update-ca-trust extract"));
+        let arch_uninst = CertificateAuthority::uninstall_command_spec_for_os_and_store(
+            "linux",
+            Some(LinuxCaStoreKind::ArchTrustAnchor),
+        )
+        .unwrap();
+        assert!(arch_uninst.args[2].contains("trust anchor --remove"));
+        assert!(arch_uninst.args[2].contains("trust extract-compat"));
+
+        // 3. Timeout and failure include manual CLI command
+        let timeout_err = ca
+            .install_with_executor_and_store("macos", None, |prog, _args| {
+                assert_eq!(prog, "security");
+                Ok(CommandExecutionOutcome::TimedOut {
+                    timeout_secs: 60,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(timeout_err.contains("60 с"));
+        assert!(timeout_err.contains("security add-trusted-cert"));
+
+        let fail_err = ca
+            .install_with_executor_and_store(
+                "linux",
+                Some(LinuxCaStoreKind::RedHatUpdateCaTrust),
+                |_prog, _args| {
+                    Ok(CommandExecutionOutcome::Completed {
+                        success: false,
+                        stdout: String::new(),
+                        stderr: "No PolKit authentication agent found".into(),
+                    })
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(fail_err.contains("update-ca-trust extract"));
+
+        // 4. Direct `sh` fallback when `pkexec` is NotFound
+        let mut invoked_programs = Vec::new();
+        let fallback_ok = ca
+            .install_with_executor_and_store(
+                "linux",
+                Some(LinuxCaStoreKind::ArchTrustAnchor),
+                |prog, _args| {
+                    invoked_programs.push(prog.to_string());
+                    if prog == "pkexec" {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "pkexec missing",
+                        ))
+                    } else {
+                        Ok(CommandExecutionOutcome::Completed {
+                            success: true,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                        })
+                    }
+                },
+            )
+            .expect("sh fallback succeeds");
+        assert!(fallback_ok.contains("trust anchor"));
+        assert_eq!(invoked_programs, vec!["pkexec", "sh"]);
+
+        let info = ca.info();
+        assert!(info.manual_install_command.is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_command_with_timeout_kills_hanging_process_and_returns_timed_out() {
+        #[cfg(target_os = "windows")]
+        let (hang_prog, hang_args, ok_prog, ok_args) = (
+            "ping",
+            vec!["-n".to_string(), "15".to_string(), "127.0.0.1".to_string()],
+            "cmd",
+            vec!["/C".to_string(), "echo flux-ca-ok".to_string()],
+        );
+        #[cfg(not(target_os = "windows"))]
+        let (hang_prog, hang_args, ok_prog, ok_args) = (
+            "sleep",
+            vec!["10".to_string()],
+            "sh",
+            vec!["-c".to_string(), "echo flux-ca-ok".to_string()],
+        );
+
+        let started = std::time::Instant::now();
+        let outcome = run_command_with_timeout(
+            hang_prog,
+            &hang_args,
+            std::time::Duration::from_millis(200),
+        )
+        .expect("spawn hanging process");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "process kill on timeout took too long: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(outcome, CommandExecutionOutcome::TimedOut { .. }),
+            "expected TimedOut, got {outcome:?}"
+        );
+
+        let ok_outcome = run_command_with_timeout(
+            ok_prog,
+            &ok_args,
+            std::time::Duration::from_secs(5),
+        )
+        .expect("spawn fast process");
+        match ok_outcome {
+            CommandExecutionOutcome::Completed {
+                success, stdout, ..
+            } => {
+                assert!(success);
+                assert!(stdout.contains("flux-ca-ok"));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
     }
 }
