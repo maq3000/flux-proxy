@@ -37,13 +37,12 @@ use crate::proxy::upstream_client::{
     format_tls_cipher, format_tls_protocol, timestamp_at_instant,
 };
 use crate::proxy::upstream_proxy::{
-    connect_tunnel_via_upstream_with_tls, format_via_proxy_telemetry,
+    connect_tunnel_via_upstream_with_tls, format_via_proxy_telemetry, UpstreamTransportStream,
 };
 
-use super::http_handler::format_error_chain;
 use super::{
-    boxed_full, extract_hyper_headers, format_mitm_tls_display, format_raw_http_version,
-    is_hop_by_hop_header, is_loopback_ip, is_loopback_or_unspecified_host,
+    boxed_full, extract_hyper_headers, format_error_chain, format_mitm_tls_display,
+    format_raw_http_version, is_hop_by_hop_header, is_loopback_ip, is_loopback_or_unspecified_host,
     parse_host_and_optional_port, plain_response, record_and_return_error,
     record_and_return_error_with_opts, record_and_return_error_with_opts_and_code,
     record_completed_session, should_use_host_mtls_for_peer, validate_resolved_addrs_for_peer,
@@ -283,40 +282,44 @@ struct WsConnTimingInput {
     server_connected_at: String,
 }
 
-fn extract_direct_ws_plain_telemetry(
-    peer_addr: SocketAddr,
-    timing: WsConnTimingInput,
-) -> WsServerConnTelemetry {
-    WsServerConnTelemetry {
-        server_addr: Some(peer_addr.to_string()),
-        server_ip: Some(peer_addr.ip().to_string()),
-        server_port: Some(peer_addr.port()),
-        via_proxy_addr: None,
-        dns_ms: Some(timing.dns_ms),
-        tcp_connect_ms: Some(timing.tcp_connect_ms),
-        tls_handshake_ms: timing.tls_handshake_ms,
-        server_connected_at: Some(timing.server_connected_at),
-        server_tls_version: None,
-        server_tls_cipher: None,
-        server_tls_alpn: None,
-        server_cert_subject: None,
-        server_cert_issuer: None,
-        server_mtls_cn: None,
-    }
+enum WsEndpointMeta {
+    Direct(SocketAddr),
+    Proxied {
+        protocol: UpstreamProxyProtocol,
+        proxy_addr: SocketAddr,
+    },
 }
 
-fn extract_direct_ws_tls_telemetry(
-    peer_addr: SocketAddr,
-    conn: &rustls::ClientConnection,
+fn build_ws_server_telemetry(
+    endpoint: WsEndpointMeta,
     timing: WsConnTimingInput,
+    tls_conn: Option<&rustls::ClientConnection>,
     mtls_cn: Option<String>,
 ) -> WsServerConnTelemetry {
-    let (tls_ver, tls_cipher, tls_alpn, cert_subject, cert_issuer) = extract_ws_tls_fields(conn);
+    let (server_addr, server_ip, server_port, via_proxy_addr) = match endpoint {
+        WsEndpointMeta::Direct(peer_addr) => (
+            Some(peer_addr.to_string()),
+            Some(peer_addr.ip().to_string()),
+            Some(peer_addr.port()),
+            None,
+        ),
+        WsEndpointMeta::Proxied {
+            protocol,
+            proxy_addr,
+        } => {
+            let (via, via_ip) = format_via_proxy_telemetry(protocol, proxy_addr);
+            (None, Some(via_ip), None, Some(via))
+        }
+    };
+    let (tls_ver, tls_cipher, tls_alpn, cert_subject, cert_issuer) = match tls_conn {
+        Some(conn) => extract_ws_tls_fields(conn),
+        None => (None, None, None, None, None),
+    };
     WsServerConnTelemetry {
-        server_addr: Some(peer_addr.to_string()),
-        server_ip: Some(peer_addr.ip().to_string()),
-        server_port: Some(peer_addr.port()),
-        via_proxy_addr: None,
+        server_addr,
+        server_ip,
+        server_port,
+        via_proxy_addr,
         dns_ms: Some(timing.dns_ms),
         tcp_connect_ms: Some(timing.tcp_connect_ms),
         tls_handshake_ms: timing.tls_handshake_ms,
@@ -330,55 +333,268 @@ fn extract_direct_ws_tls_telemetry(
     }
 }
 
-fn extract_proxied_ws_tls_telemetry(
-    proxy_protocol: UpstreamProxyProtocol,
-    proxy_addr: SocketAddr,
-    conn: &rustls::ClientConnection,
-    timing: WsConnTimingInput,
-    mtls_cn: Option<String>,
-) -> WsServerConnTelemetry {
-    let (via_proxy_addr, via_server_ip) = format_via_proxy_telemetry(proxy_protocol, proxy_addr);
-    let (tls_ver, tls_cipher, tls_alpn, cert_subject, cert_issuer) = extract_ws_tls_fields(conn);
-    WsServerConnTelemetry {
-        server_addr: None,
-        server_ip: Some(via_server_ip),
-        server_port: None,
-        via_proxy_addr: Some(via_proxy_addr),
-        dns_ms: Some(timing.dns_ms),
-        tcp_connect_ms: Some(timing.tcp_connect_ms),
-        tls_handshake_ms: timing.tls_handshake_ms,
-        server_connected_at: Some(timing.server_connected_at),
-        server_tls_version: tls_ver,
-        server_tls_cipher: tls_cipher,
-        server_tls_alpn: tls_alpn,
-        server_cert_subject: cert_subject,
-        server_cert_issuer: cert_issuer,
-        server_mtls_cn: mtls_cn,
+enum WsUpstreamStream {
+    DirectPlain(ThrottledStream<tokio::net::TcpStream>),
+    DirectTls(Box<tokio_rustls::client::TlsStream<ThrottledStream<tokio::net::TcpStream>>>),
+    ProxiedPlain(ThrottledStream<UpstreamTransportStream>),
+    ProxiedTls(Box<tokio_rustls::client::TlsStream<ThrottledStream<UpstreamTransportStream>>>),
+}
+
+impl AsyncRead for WsUpstreamStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::DirectPlain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Self::DirectTls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+            Self::ProxiedPlain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Self::ProxiedTls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+        }
     }
 }
 
-fn extract_proxied_ws_plain_telemetry(
-    proxy_protocol: UpstreamProxyProtocol,
-    proxy_addr: SocketAddr,
-    timing: WsConnTimingInput,
-) -> WsServerConnTelemetry {
-    let (via_proxy_addr, via_server_ip) = format_via_proxy_telemetry(proxy_protocol, proxy_addr);
-    WsServerConnTelemetry {
-        server_addr: None,
-        server_ip: Some(via_server_ip),
-        server_port: None,
-        via_proxy_addr: Some(via_proxy_addr),
-        dns_ms: Some(timing.dns_ms),
-        tcp_connect_ms: Some(timing.tcp_connect_ms),
-        tls_handshake_ms: timing.tls_handshake_ms,
-        server_connected_at: Some(timing.server_connected_at),
-        server_tls_version: None,
-        server_tls_cipher: None,
-        server_tls_alpn: None,
-        server_cert_subject: None,
-        server_cert_issuer: None,
-        server_mtls_cn: None,
+impl AsyncWrite for WsUpstreamStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::DirectPlain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Self::DirectTls(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
+            Self::ProxiedPlain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Self::ProxiedTls(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
     }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::DirectPlain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Self::DirectTls(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
+            Self::ProxiedPlain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Self::ProxiedTls(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Self::DirectPlain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Self::DirectTls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
+            Self::ProxiedPlain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Self::ProxiedTls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
+        }
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Self::DirectPlain(s) => std::pin::Pin::new(s).poll_write_vectored(cx, bufs),
+            Self::DirectTls(s) => std::pin::Pin::new(s.as_mut()).poll_write_vectored(cx, bufs),
+            Self::ProxiedPlain(s) => std::pin::Pin::new(s).poll_write_vectored(cx, bufs),
+            Self::ProxiedTls(s) => std::pin::Pin::new(s.as_mut()).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::DirectPlain(s) => s.is_write_vectored(),
+            Self::DirectTls(s) => s.is_write_vectored(),
+            Self::ProxiedPlain(s) => s.is_write_vectored(),
+            Self::ProxiedTls(s) => s.is_write_vectored(),
+        }
+    }
+}
+
+enum WsTransportError {
+    Forbidden(String),
+    Gateway(String),
+}
+
+async fn upgrade_ws_stream_to_tls<S>(
+    ctx: &SharedProxyContext,
+    stream: S,
+    target_host: &str,
+    client_addr: SocketAddr,
+    ws_scheme: &str,
+    deadline: Instant,
+    connect_timeout: Duration,
+) -> Result<(tokio_rustls::client::TlsStream<S>, f64, Option<String>), WsTransportError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (tls_cfg, mtls_cn) =
+        build_ws_tls_config(ctx, target_host, client_addr, ws_scheme)
+            .map_err(WsTransportError::Gateway)?;
+    let sni_clean = target_host.trim_matches(['[', ']']).to_string();
+    let server_name = ServerName::try_from(sni_clean.clone()).map_err(|_| {
+        WsTransportError::Gateway(format!("Invalid TLS ServerName '{sni_clean}' for WSS"))
+    })?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(WsTransportError::Gateway(format!(
+            "WebSocket TLS handshake timed out after {}s",
+            connect_timeout.as_secs()
+        )));
+    }
+    let tls_start = Instant::now();
+    let tls_stream = tokio::time::timeout(
+        remaining,
+        TlsConnector::from(tls_cfg).connect(server_name, stream),
+    )
+    .await
+    .map_err(|_| {
+        WsTransportError::Gateway(format!(
+            "WebSocket upstream TLS handshake timed out after {}s",
+            connect_timeout.as_secs()
+        ))
+    })?
+    .map_err(|err| {
+        WsTransportError::Gateway(format!("WebSocket upstream TLS handshake failed: {err}"))
+    })?;
+    Ok((tls_stream, elapsed_ms(tls_start), mtls_cn))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn establish_ws_upstream_transport(
+    ctx: &SharedProxyContext,
+    active_upstream_proxy: Option<&crate::models::UpstreamProxyConfig>,
+    connect_host: &str,
+    connect_port: u16,
+    target_host: &str,
+    client_addr: SocketAddr,
+    ws_scheme: &str,
+    peer_is_remote: bool,
+    start: Instant,
+    start_utc: chrono::DateTime<Utc>,
+    connect_timeout: Duration,
+) -> Result<(WsUpstreamStream, WsServerConnTelemetry, Instant), WsTransportError> {
+    let deadline = Instant::now() + connect_timeout;
+
+    if let Some(proxy_cfg) = active_upstream_proxy {
+        let tunnel_res = connect_tunnel_via_upstream_with_tls(
+            proxy_cfg,
+            connect_host,
+            connect_port,
+            connect_timeout,
+            Some(&ctx.shared_http1_tls_config),
+        )
+        .await
+        .map_err(|err_msg| {
+            WsTransportError::Gateway(format!("WebSocket upstream proxy connect failed: {err_msg}"))
+        })?;
+        let throttled =
+            ThrottledStream::new_without_initial_delay(tunnel_res.stream, Arc::clone(&ctx.throttle));
+        let endpoint = WsEndpointMeta::Proxied {
+            protocol: proxy_cfg.protocol,
+            proxy_addr: tunnel_res.proxy_addr,
+        };
+        if ws_scheme == "wss" {
+            let (tls_stream, tls_ms, mtls_cn) = upgrade_ws_stream_to_tls(
+                ctx,
+                throttled,
+                target_host,
+                client_addr,
+                ws_scheme,
+                deadline,
+                connect_timeout,
+            )
+            .await?;
+            let server_connected_at = timestamp_at_instant(start, start_utc, Instant::now());
+            let tel = build_ws_server_telemetry(
+                endpoint,
+                WsConnTimingInput {
+                    dns_ms: tunnel_res.dns_ms,
+                    tcp_connect_ms: tunnel_res.tcp_connect_ms,
+                    tls_handshake_ms: Some(tls_ms),
+                    server_connected_at,
+                },
+                Some(tls_stream.get_ref().1),
+                mtls_cn,
+            );
+            return Ok((
+                WsUpstreamStream::ProxiedTls(Box::new(tls_stream)),
+                tel,
+                deadline,
+            ));
+        }
+        let server_connected_at = timestamp_at_instant(start, start_utc, Instant::now());
+        let tel = build_ws_server_telemetry(
+            endpoint,
+            WsConnTimingInput {
+                dns_ms: tunnel_res.dns_ms,
+                tcp_connect_ms: tunnel_res.tcp_connect_ms,
+                tls_handshake_ms: None,
+                server_connected_at,
+            },
+            None,
+            None,
+        );
+        return Ok((WsUpstreamStream::ProxiedPlain(throttled), tel, deadline));
+    }
+
+    let tcp_res =
+        measure_ws_tcp_connect(connect_host, connect_port, connect_timeout, peer_is_remote)
+            .await
+            .map_err(|e| match e {
+                WsTcpConnectError::Forbidden(msg) => WsTransportError::Forbidden(msg),
+                WsTcpConnectError::Connect(msg) => WsTransportError::Gateway(msg),
+            })?;
+    let throttled =
+        ThrottledStream::new_without_initial_delay(tcp_res.stream, Arc::clone(&ctx.throttle));
+    let endpoint = WsEndpointMeta::Direct(tcp_res.peer_addr);
+    if ws_scheme == "wss" {
+        let (tls_stream, tls_ms, mtls_cn) = upgrade_ws_stream_to_tls(
+            ctx,
+            throttled,
+            target_host,
+            client_addr,
+            ws_scheme,
+            deadline,
+            connect_timeout,
+        )
+        .await?;
+        let server_connected_at = timestamp_at_instant(start, start_utc, Instant::now());
+        let tel = build_ws_server_telemetry(
+            endpoint,
+            WsConnTimingInput {
+                dns_ms: tcp_res.dns_ms,
+                tcp_connect_ms: tcp_res.tcp_connect_ms,
+                tls_handshake_ms: Some(tls_ms),
+                server_connected_at,
+            },
+            Some(tls_stream.get_ref().1),
+            mtls_cn,
+        );
+        return Ok((
+            WsUpstreamStream::DirectTls(Box::new(tls_stream)),
+            tel,
+            deadline,
+        ));
+    }
+    let server_connected_at = timestamp_at_instant(start, start_utc, Instant::now());
+    let tel = build_ws_server_telemetry(
+        endpoint,
+        WsConnTimingInput {
+            dns_ms: tcp_res.dns_ms,
+            tcp_connect_ms: tcp_res.tcp_connect_ms,
+            tls_handshake_ms: None,
+            server_connected_at,
+        },
+        None,
+        None,
+    );
+    Ok((WsUpstreamStream::DirectPlain(throttled), tel, deadline))
 }
 
 struct WsHandshakeContext {
@@ -1261,290 +1477,46 @@ pub(super) async fn handle_websocket_intercept(
         remapped_to,
     };
 
-    if let Some(proxy_cfg) = active_upstream_proxy {
-        let deadline = Instant::now() + connect_timeout;
-        let tunnel_res = match connect_tunnel_via_upstream_with_tls(
-            &proxy_cfg,
-            &connect_host,
-            connect_port,
-            connect_timeout,
-            Some(&ctx.shared_http1_tls_config),
-        )
-        .await
-        {
-            Ok(res) => res,
-            Err(err_msg) => {
-                return record_and_return_error(
-                    &ctx,
-                    session_id,
-                    ws_scheme,
-                    "GET",
-                    &host_header,
-                    &path_and_query,
-                    &full_url,
-                    req_headers,
-                    Bytes::new(),
-                    start,
-                    timestamp,
-                    client_addr,
-                    client_proc.as_ref(),
-                    false,
-                    req_mutated,
-                    format!("WebSocket upstream proxy connect failed: {err_msg}"),
-                );
-            }
-        };
-
-        let throttled_tunnel =
-            ThrottledStream::new_without_initial_delay(tunnel_res.stream, Arc::clone(&ctx.throttle));
-
-        if ws_scheme == "wss" {
-            let (tls_cfg, mtls_cn) =
-                match build_ws_tls_config(&ctx, &target_host, client_addr, ws_scheme) {
-                    Ok(pair) => pair,
-                    Err(err_msg) => {
-                        return record_and_return_error(
-                            &ctx,
-                            session_id,
-                            ws_scheme,
-                            "GET",
-                            &host_header,
-                            &path_and_query,
-                            &full_url,
-                            req_headers,
-                            Bytes::new(),
-                            start,
-                            timestamp,
-                            client_addr,
-                            client_proc.as_ref(),
-                            false,
-                            req_mutated,
-                            err_msg,
-                        );
-                    }
-                };
-
-            let sni_clean = target_host.trim_matches(['[', ']']).to_string();
-            let server_name = match ServerName::try_from(sni_clean.clone()) {
-                Ok(sn) => sn,
-                Err(_) => {
-                    return record_and_return_error(
-                        &ctx,
-                        session_id,
-                        ws_scheme,
-                        "GET",
-                        &host_header,
-                        &path_and_query,
-                        &full_url,
-                        req_headers,
-                        Bytes::new(),
-                        start,
-                        timestamp,
-                        client_addr,
-                        client_proc.as_ref(),
-                        false,
-                        req_mutated,
-                        format!("Invalid TLS ServerName '{sni_clean}' for WSS"),
-                    );
-                }
-            };
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return record_and_return_error(
-                    &ctx,
-                    session_id,
-                    ws_scheme,
-                    "GET",
-                    &host_header,
-                    &path_and_query,
-                    &full_url,
-                    req_headers,
-                    Bytes::new(),
-                    start,
-                    timestamp,
-                    client_addr,
-                    client_proc.as_ref(),
-                    false,
-                    req_mutated,
-                    format!(
-                        "WebSocket TLS handshake timed out after {}s",
-                        connect_timeout.as_secs()
-                    ),
-                );
-            }
-
-            let tls_start = Instant::now();
-            let tls_stream = match tokio::time::timeout(
-                remaining,
-                TlsConnector::from(tls_cfg).connect(server_name, throttled_tunnel),
-            )
-            .await
-            {
-                Ok(Ok(s)) => s,
-                Ok(Err(err)) => {
-                    return record_and_return_error(
-                        &ctx,
-                        session_id,
-                        ws_scheme,
-                        "GET",
-                        &host_header,
-                        &path_and_query,
-                        &full_url,
-                        req_headers,
-                        Bytes::new(),
-                        start,
-                        timestamp,
-                        client_addr,
-                        client_proc.as_ref(),
-                        false,
-                        req_mutated,
-                        format!("WebSocket upstream TLS handshake failed: {err}"),
-                    );
-                }
-                Err(_) => {
-                    return record_and_return_error(
-                        &ctx,
-                        session_id,
-                        ws_scheme,
-                        "GET",
-                        &host_header,
-                        &path_and_query,
-                        &full_url,
-                        req_headers,
-                        Bytes::new(),
-                        start,
-                        timestamp,
-                        client_addr,
-                        client_proc.as_ref(),
-                        false,
-                        req_mutated,
-                        format!(
-                            "WebSocket upstream TLS handshake timed out after {}s",
-                            connect_timeout.as_secs()
-                        ),
-                    );
-                }
-            };
-            let tls_handshake_ms = elapsed_ms(tls_start);
-            let server_connected_at = timestamp_at_instant(start, start_utc, Instant::now());
-
-            let server_tel = extract_proxied_ws_tls_telemetry(
-                proxy_cfg.protocol,
-                tunnel_res.proxy_addr,
-                tls_stream.get_ref().1,
-                WsConnTimingInput {
-                    dns_ms: tunnel_res.dns_ms,
-                    tcp_connect_ms: tunnel_res.tcp_connect_ms,
-                    tls_handshake_ms: Some(tls_handshake_ms),
-                    server_connected_at,
-                },
-                mtls_cn,
-            );
-            let remaining_ws = deadline.saturating_duration_since(Instant::now());
-            if remaining_ws.is_zero() {
-                return record_and_return_error(
-                    &ctx,
-                    session_id,
-                    ws_scheme,
-                    "GET",
-                    &host_header,
-                    &path_and_query,
-                    &full_url,
-                    req_headers,
-                    Bytes::new(),
-                    start,
-                    timestamp,
-                    client_addr,
-                    client_proc.as_ref(),
-                    false,
-                    req_mutated,
-                    format!(
-                        "WebSocket upstream connect timed out after {}s",
-                        connect_timeout.as_secs()
-                    ),
-                );
-            }
-
-            let (upstream_ws, upstream_handshake_resp) = match tokio::time::timeout(
-                remaining_ws,
-                tokio_tungstenite::client_async(ws_req, tls_stream),
-            )
-            .await
-            {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(tokio_tungstenite::tungstenite::Error::Http(http_resp))) => {
-                    return handle_ws_handshake_http_rejection(&ctx, hs, http_resp);
-                }
-                Ok(Err(err)) => {
-                    let chain = format_error_chain(&err);
-                    return record_and_return_error(
-                        &ctx,
-                        session_id,
-                        ws_scheme,
-                        "GET",
-                        &host_header,
-                        &path_and_query,
-                        &full_url,
-                        req_headers,
-                        Bytes::new(),
-                        start,
-                        timestamp,
-                        client_addr,
-                        client_proc.as_ref(),
-                        false,
-                        req_mutated,
-                        format!("WebSocket upstream connect failed: {chain}"),
-                    );
-                }
-                Err(_) => {
-                    return record_and_return_error(
-                        &ctx,
-                        session_id,
-                        ws_scheme,
-                        "GET",
-                        &host_header,
-                        &path_and_query,
-                        &full_url,
-                        req_headers,
-                        Bytes::new(),
-                        start,
-                        timestamp,
-                        client_addr,
-                        client_proc.as_ref(),
-                        false,
-                        req_mutated,
-                        format!(
-                            "WebSocket upstream connect timed out after {}s",
-                            connect_timeout.as_secs()
-                        ),
-                    );
-                }
-            };
-
-            return finish_ws_handshake_and_spawn(
-                req,
-                upstream_ws,
-                upstream_handshake_resp,
-                server_tel,
-                hs,
-                ctx,
+    let (upstream_stream, server_tel, deadline) = match establish_ws_upstream_transport(
+        &ctx,
+        active_upstream_proxy.as_ref(),
+        &connect_host,
+        connect_port,
+        &target_host,
+        client_addr,
+        ws_scheme,
+        peer_is_remote,
+        start,
+        start_utc,
+        connect_timeout,
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(WsTransportError::Forbidden(err_msg)) => {
+            return record_and_return_error_with_opts_and_code(
+                &ctx,
+                session_id,
+                ws_scheme,
+                "GET",
+                &host_header,
+                &path_and_query,
+                &full_url,
+                req_headers,
+                Bytes::new(),
+                start,
+                timestamp,
+                client_addr,
+                client_proc.as_ref(),
+                false,
+                req_mutated,
+                StatusCode::FORBIDDEN,
+                hs.remapped_to,
+                err_msg,
+                Some(FLUXPROXY_ERR_FORBIDDEN_REMOTE_TARGET),
             );
         }
-
-        let server_connected_at = timestamp_at_instant(start, start_utc, Instant::now());
-        let server_tel = extract_proxied_ws_plain_telemetry(
-            proxy_cfg.protocol,
-            tunnel_res.proxy_addr,
-            WsConnTimingInput {
-                dns_ms: tunnel_res.dns_ms,
-                tcp_connect_ms: tunnel_res.tcp_connect_ms,
-                tls_handshake_ms: None,
-                server_connected_at,
-            },
-        );
-        let remaining_ws = deadline.saturating_duration_since(Instant::now());
-        if remaining_ws.is_zero() {
+        Err(WsTransportError::Gateway(err_msg)) => {
             return record_and_return_error(
                 &ctx,
                 session_id,
@@ -1561,376 +1533,11 @@ pub(super) async fn handle_websocket_intercept(
                 client_proc.as_ref(),
                 false,
                 req_mutated,
-                format!(
-                    "WebSocket upstream connect timed out after {}s",
-                    connect_timeout.as_secs()
-                ),
+                err_msg,
             );
         }
+    };
 
-        let (upstream_ws, upstream_handshake_resp) = match tokio::time::timeout(
-            remaining_ws,
-            tokio_tungstenite::client_async(ws_req, throttled_tunnel),
-        )
-        .await
-        {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(tokio_tungstenite::tungstenite::Error::Http(http_resp))) => {
-                return handle_ws_handshake_http_rejection(&ctx, hs, http_resp);
-            }
-            Ok(Err(err)) => {
-                let chain = format_error_chain(&err);
-                return record_and_return_error(
-                    &ctx,
-                    session_id,
-                    ws_scheme,
-                    "GET",
-                    &host_header,
-                    &path_and_query,
-                    &full_url,
-                    req_headers,
-                    Bytes::new(),
-                    start,
-                    timestamp,
-                    client_addr,
-                    client_proc.as_ref(),
-                    false,
-                    req_mutated,
-                    format!("WebSocket upstream connect failed: {chain}"),
-                );
-            }
-            Err(_) => {
-                return record_and_return_error(
-                    &ctx,
-                    session_id,
-                    ws_scheme,
-                    "GET",
-                    &host_header,
-                    &path_and_query,
-                    &full_url,
-                    req_headers,
-                    Bytes::new(),
-                    start,
-                    timestamp,
-                    client_addr,
-                    client_proc.as_ref(),
-                    false,
-                    req_mutated,
-                    format!(
-                        "WebSocket upstream connect timed out after {}s",
-                        connect_timeout.as_secs()
-                    ),
-                );
-            }
-        };
-
-        return finish_ws_handshake_and_spawn(
-            req,
-            upstream_ws,
-            upstream_handshake_resp,
-            server_tel,
-            hs,
-            ctx,
-        );
-    }
-
-    // Direct WebSocket connection (honoring HOSTS Remapping, Bandwidth Throttling, and mTLS)
-    let deadline = Instant::now() + connect_timeout;
-    let tcp_res =
-        match measure_ws_tcp_connect(&connect_host, connect_port, connect_timeout, peer_is_remote)
-            .await
-        {
-            Ok(res) => res,
-            Err(WsTcpConnectError::Forbidden(err_msg)) => {
-                return record_and_return_error_with_opts_and_code(
-                    &ctx,
-                    session_id,
-                    ws_scheme,
-                    "GET",
-                    &host_header,
-                    &path_and_query,
-                    &full_url,
-                    req_headers,
-                    Bytes::new(),
-                    start,
-                    timestamp,
-                    client_addr,
-                    client_proc.as_ref(),
-                    false,
-                    req_mutated,
-                    StatusCode::FORBIDDEN,
-                    hs.remapped_to,
-                    err_msg,
-                    Some(FLUXPROXY_ERR_FORBIDDEN_REMOTE_TARGET),
-                );
-            }
-            Err(WsTcpConnectError::Connect(err_msg)) => {
-                return record_and_return_error(
-                    &ctx,
-                    session_id,
-                    ws_scheme,
-                    "GET",
-                    &host_header,
-                    &path_and_query,
-                    &full_url,
-                    req_headers,
-                    Bytes::new(),
-                    start,
-                    timestamp,
-                    client_addr,
-                    client_proc.as_ref(),
-                    false,
-                    req_mutated,
-                    err_msg,
-                );
-            }
-        };
-    let throttled_tcp =
-        ThrottledStream::new_without_initial_delay(tcp_res.stream, Arc::clone(&ctx.throttle));
-
-    if ws_scheme == "wss" {
-        let (tls_cfg, mtls_cn) =
-            match build_ws_tls_config(&ctx, &target_host, client_addr, ws_scheme) {
-                Ok(pair) => pair,
-                Err(err_msg) => {
-                    return record_and_return_error(
-                        &ctx,
-                        session_id,
-                        ws_scheme,
-                        "GET",
-                        &host_header,
-                        &path_and_query,
-                        &full_url,
-                        req_headers,
-                        Bytes::new(),
-                        start,
-                        timestamp,
-                        client_addr,
-                        client_proc.as_ref(),
-                        false,
-                        req_mutated,
-                        err_msg,
-                    );
-                }
-            };
-
-        let sni_clean = target_host.trim_matches(['[', ']']).to_string();
-        let server_name = match ServerName::try_from(sni_clean.clone()) {
-            Ok(sn) => sn,
-            Err(_) => {
-                return record_and_return_error(
-                    &ctx,
-                    session_id,
-                    ws_scheme,
-                    "GET",
-                    &host_header,
-                    &path_and_query,
-                    &full_url,
-                    req_headers,
-                    Bytes::new(),
-                    start,
-                    timestamp,
-                    client_addr,
-                    client_proc.as_ref(),
-                    false,
-                    req_mutated,
-                    format!("Invalid TLS ServerName '{sni_clean}' for WSS"),
-                );
-            }
-        };
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return record_and_return_error(
-                &ctx,
-                session_id,
-                ws_scheme,
-                "GET",
-                &host_header,
-                &path_and_query,
-                &full_url,
-                req_headers,
-                Bytes::new(),
-                start,
-                timestamp,
-                client_addr,
-                client_proc.as_ref(),
-                false,
-                req_mutated,
-                format!(
-                    "WebSocket TLS handshake timed out after {}s",
-                    connect_timeout.as_secs()
-                ),
-            );
-        }
-
-        let tls_start = Instant::now();
-        let tls_stream = match tokio::time::timeout(
-            remaining,
-            TlsConnector::from(tls_cfg).connect(server_name, throttled_tcp),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(err)) => {
-                return record_and_return_error(
-                    &ctx,
-                    session_id,
-                    ws_scheme,
-                    "GET",
-                    &host_header,
-                    &path_and_query,
-                    &full_url,
-                    req_headers,
-                    Bytes::new(),
-                    start,
-                    timestamp,
-                    client_addr,
-                    client_proc.as_ref(),
-                    false,
-                    req_mutated,
-                    format!("WebSocket upstream TLS handshake failed: {err}"),
-                );
-            }
-            Err(_) => {
-                return record_and_return_error(
-                    &ctx,
-                    session_id,
-                    ws_scheme,
-                    "GET",
-                    &host_header,
-                    &path_and_query,
-                    &full_url,
-                    req_headers,
-                    Bytes::new(),
-                    start,
-                    timestamp,
-                    client_addr,
-                    client_proc.as_ref(),
-                    false,
-                    req_mutated,
-                    format!(
-                        "WebSocket upstream TLS handshake timed out after {}s",
-                        connect_timeout.as_secs()
-                    ),
-                );
-            }
-        };
-        let tls_handshake_ms = elapsed_ms(tls_start);
-        let server_connected_at = timestamp_at_instant(start, start_utc, Instant::now());
-        let server_tel = extract_direct_ws_tls_telemetry(
-            tcp_res.peer_addr,
-            tls_stream.get_ref().1,
-            WsConnTimingInput {
-                dns_ms: tcp_res.dns_ms,
-                tcp_connect_ms: tcp_res.tcp_connect_ms,
-                tls_handshake_ms: Some(tls_handshake_ms),
-                server_connected_at,
-            },
-            mtls_cn,
-        );
-
-        let remaining_ws = deadline.saturating_duration_since(Instant::now());
-        if remaining_ws.is_zero() {
-            return record_and_return_error(
-                &ctx,
-                session_id,
-                ws_scheme,
-                "GET",
-                &host_header,
-                &path_and_query,
-                &full_url,
-                req_headers,
-                Bytes::new(),
-                start,
-                timestamp,
-                client_addr,
-                client_proc.as_ref(),
-                false,
-                req_mutated,
-                format!(
-                    "WebSocket upstream connect timed out after {}s",
-                    connect_timeout.as_secs()
-                ),
-            );
-        }
-
-        let (upstream_ws, upstream_handshake_resp) = match tokio::time::timeout(
-            remaining_ws,
-            tokio_tungstenite::client_async(ws_req, tls_stream),
-        )
-        .await
-        {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(tokio_tungstenite::tungstenite::Error::Http(http_resp))) => {
-                return handle_ws_handshake_http_rejection(&ctx, hs, http_resp);
-            }
-            Ok(Err(err)) => {
-                let chain = format_error_chain(&err);
-                return record_and_return_error(
-                    &ctx,
-                    session_id,
-                    ws_scheme,
-                    "GET",
-                    &host_header,
-                    &path_and_query,
-                    &full_url,
-                    req_headers,
-                    Bytes::new(),
-                    start,
-                    timestamp,
-                    client_addr,
-                    client_proc.as_ref(),
-                    false,
-                    req_mutated,
-                    format!("WebSocket upstream connect failed: {chain}"),
-                );
-            }
-            Err(_) => {
-                return record_and_return_error(
-                    &ctx,
-                    session_id,
-                    ws_scheme,
-                    "GET",
-                    &host_header,
-                    &path_and_query,
-                    &full_url,
-                    req_headers,
-                    Bytes::new(),
-                    start,
-                    timestamp,
-                    client_addr,
-                    client_proc.as_ref(),
-                    false,
-                    req_mutated,
-                    format!(
-                        "WebSocket upstream connect timed out after {}s",
-                        connect_timeout.as_secs()
-                    ),
-                );
-            }
-        };
-
-        return finish_ws_handshake_and_spawn(
-            req,
-            upstream_ws,
-            upstream_handshake_resp,
-            server_tel,
-            hs,
-            ctx,
-        );
-    }
-
-    let server_connected_at = timestamp_at_instant(start, start_utc, Instant::now());
-    let server_tel = extract_direct_ws_plain_telemetry(
-        tcp_res.peer_addr,
-        WsConnTimingInput {
-            dns_ms: tcp_res.dns_ms,
-            tcp_connect_ms: tcp_res.tcp_connect_ms,
-            tls_handshake_ms: None,
-            server_connected_at,
-        },
-    );
     let remaining_ws = deadline.saturating_duration_since(Instant::now());
     if remaining_ws.is_zero() {
         return record_and_return_error(
@@ -1958,7 +1565,7 @@ pub(super) async fn handle_websocket_intercept(
 
     let (upstream_ws, upstream_handshake_resp) = match tokio::time::timeout(
         remaining_ws,
-        tokio_tungstenite::client_async(ws_req, throttled_tcp),
+        tokio_tungstenite::client_async(ws_req, upstream_stream),
     )
     .await
     {

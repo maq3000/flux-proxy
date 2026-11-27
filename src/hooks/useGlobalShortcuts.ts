@@ -24,7 +24,8 @@ export interface UseGlobalShortcutsOptions {
   setShortcutsModalOpen: Dispatch<SetStateAction<boolean>>;
   selectedId: number | null;
   effectiveSelectedIds: number[];
-  filteredSessions: SessionSummary[];
+  filteredSessions?: SessionSummary[];
+  getFilteredSessions?: () => SessionSummary[];
   sortedSessionsRef: MutableRefObject<SessionSummary[]>;
   clearAllSessions: () => Promise<void> | void;
   copyUrlsForIds: (ids: number[]) => void;
@@ -65,6 +66,7 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
     selectedId,
     effectiveSelectedIds,
     filteredSessions,
+    getFilteredSessions,
     sortedSessionsRef,
     clearAllSessions,
     copyUrlsForIds,
@@ -331,10 +333,13 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
       ) {
         if (activeSection === "traffic") {
           e.preventDefault();
+          const currentFiltered = getFilteredSessions
+            ? getFilteredSessions()
+            : (filteredSessions ?? []);
           const ids =
-            sortedSessionsRef.current.length === filteredSessions.length
+            sortedSessionsRef.current.length === currentFiltered.length
               ? sortedSessionsRef.current.map((s) => s.id)
-              : filteredSessions.map((s) => s.id);
+              : currentFiltered.map((s) => s.id);
           if (ids.length > 0) {
             selectSessions(ids);
           }
@@ -542,6 +547,7 @@ export function useGlobalShortcuts(options: UseGlobalShortcutsOptions): void {
     effectiveSelectedIds,
     exportAllSessionsAs,
     filteredSessions,
+    getFilteredSessions,
     handleFocusSearch,
     importArchiveDialog,
     onToggleSettingsAt,

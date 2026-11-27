@@ -1,16 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type {
-  AutoResponderRule,
-  BreakpointConfig,
-  HostRemapRule,
-  ProxyFilterBackendConfig,
-  ProxyStatus,
-  PythonRunnerStatus,
-  StorageStats,
-  ThrottleConfig,
-  UpstreamProxyConfig,
-  UpstreamTimeoutConfig,
-} from "../types/proxy";
+import type { BreakpointConfig, ProxyStatus, ThrottleConfig } from "../types/proxy";
 import {
   CURRENT_SETTINGS_SCHEMA_VERSION,
   PROXY_STATUS_SYNCED_EVENT,
@@ -18,223 +7,32 @@ import {
   type FluxUserSettingsProfile,
 } from "../types/settings";
 import { DEFAULT_BACKEND_FILTER_CONFIG } from "./filterEngine";
-import { DEFAULT_AUTORESPONDER_RULES, DEFAULT_PYTHON_SCRIPT_CODE } from "./appDefaults";
 
-const { mockState, mockProxyBridge, mockDefaultBpConfig } = vi.hoisted(() => {
-  const defaultBp: BreakpointConfig = {
-    breakBeforeRequest: false,
-    breakAfterResponse: false,
-    timeoutSecs: 120,
-    rules: [],
-  };
-
-  const state = {
-    status: {
-      running: true,
-      bindAddr: "127.0.0.1",
-      port: 8888,
-      activeSessions: 0,
-      systemProxyEnabled: true,
-      autoSystemProxy: true,
-      systemProxyError: null,
-      allowRemote: false,
-      bindMode: "loopback",
-      specificBindIp: null,
-      alsoBindLoopback: true,
-      boundIps: ["127.0.0.1"],
-    } as ProxyStatus,
-    filterCfg: null as unknown as ProxyFilterBackendConfig,
-    bpCfg: structuredClone(defaultBp) as BreakpointConfig,
-    autoRespEnabled: true,
-    autoRespRules: [] as AutoResponderRule[],
-    stats: {
-      ramSessions: 10,
-      sqliteSizeBytes: 1024,
-      droppedSessionsCount: 0,
-      sessionRetentionLimit: 10_000,
-      dropNonMatching: false,
-    } as StorageStats,
-    clearOnExit: false,
-    pythonStatus: {
-      available: false,
-      enabled: false,
-      running: false,
-      pythonExecutable: null,
-      pythonVersion: null,
-      workerPid: null,
-      hasOnRequest: false,
-      hasOnResponse: false,
-      timeoutMs: 1500,
-      lastError: null,
-      restartCount: 0,
-      invocationsCount: 0,
-      timeoutCount: 0,
-      isSimulator: true,
-      code: "",
-    } as PythonRunnerStatus,
-    hostRemapRules: [] as HostRemapRule[],
-    throttleConfig: {
-      preset: "none",
-      downloadKbps: 0,
-      uploadKbps: 0,
-      latencyMs: 0,
-    } as ThrottleConfig,
-    upstreamProxyConfig: {
-      enabled: false,
-      protocol: "http",
-      host: "",
-      port: 8080,
-      username: null,
-      hasPassword: false,
-      bypassList: ["localhost", "127.0.0.1", "::1", "<local>"],
-    } as UpstreamProxyConfig,
-    upstreamTimeouts: {
-      connectTimeoutSec: 15,
-      responseHeaderTimeoutSec: 0,
-      composerTimeoutSec: 120,
-    } as UpstreamTimeoutConfig,
-  };
-
-  const bridge = {
-    getStatus: vi.fn(async () => structuredClone(state.status)),
-    getFilterBackendConfig: vi.fn(async () => structuredClone(state.filterCfg)),
-    getBreakpointConfig: vi.fn(async () => structuredClone(state.bpCfg)),
-    getAutoResponderEnabled: vi.fn(async () => state.autoRespEnabled),
-    listRules: vi.fn(async () => structuredClone(state.autoRespRules)),
-    getMemoryStorageStats: vi.fn(async () => structuredClone(state.stats)),
-    getClearDbOnExit: vi.fn(async () => state.clearOnExit),
-    getPythonRunnerStatus: vi.fn(async () => structuredClone(state.pythonStatus)),
-    getHostRemapRules: vi.fn(async () => structuredClone(state.hostRemapRules)),
-    updateHostRemapRules: vi.fn(async (rules: HostRemapRule[]) => {
-      state.hostRemapRules = structuredClone(rules);
-      return structuredClone(rules);
-    }),
-    getThrottleConfig: vi.fn(async () => structuredClone(state.throttleConfig)),
-    setThrottleConfig: vi.fn(async (cfg: ThrottleConfig) => {
-      state.throttleConfig = structuredClone(cfg);
-      return structuredClone(cfg);
-    }),
-    getUpstreamProxyConfig: vi.fn(async () =>
-      structuredClone(state.upstreamProxyConfig)
-    ),
-    setUpstreamProxyConfig: vi.fn(async (cfg: UpstreamProxyConfig) => {
-      const next: UpstreamProxyConfig = {
-        enabled: cfg.enabled,
-        protocol: cfg.protocol,
-        host: cfg.host,
-        port: cfg.port,
-        username: cfg.username ?? null,
-        hasPassword:
-          cfg.password === "" || cfg.password === null
-            ? false
-            : typeof cfg.password === "string" && cfg.password.length > 0
-              ? true
-              : Boolean(state.upstreamProxyConfig.hasPassword),
-        bypassList: [...(cfg.bypassList ?? [])],
-      };
-      state.upstreamProxyConfig = structuredClone(next);
-      return structuredClone(next);
-    }),
-    getUpstreamTimeouts: vi.fn(async () =>
-      structuredClone(state.upstreamTimeouts)
-    ),
-    setUpstreamTimeouts: vi.fn(async (cfg: UpstreamTimeoutConfig) => {
-      state.upstreamTimeouts = structuredClone(cfg);
-      return structuredClone(cfg);
-    }),
-    injectWebSocketFrame: vi.fn(async () => {
-      throw new Error("not implemented in settingsManager mock");
-    }),
-    updateFilterBackendConfig: vi.fn(async (cfg: ProxyFilterBackendConfig) => {
-      state.filterCfg = structuredClone(cfg);
-      return structuredClone(cfg);
-    }),
-    updateBreakpointConfig: vi.fn(async (cfg: BreakpointConfig) => {
-      state.bpCfg = structuredClone(cfg);
-      return structuredClone(cfg);
-    }),
-    setAutoResponderConfig: vi.fn(
-      async (enabled: boolean, rules: AutoResponderRule[]) => {
-        state.autoRespEnabled = enabled;
-        state.autoRespRules = structuredClone(rules);
-        return structuredClone(rules);
-      }
-    ),
-    setSessionRetentionLimit: vi.fn(async (limit: number | null) => {
-      state.stats = { ...state.stats, sessionRetentionLimit: limit };
-    }),
-    setDropNonMatching: vi.fn(async (enabled: boolean) => {
-      state.stats = { ...state.stats, dropNonMatching: enabled };
-    }),
-    setClearDbOnExit: vi.fn(async (enabled: boolean) => {
-      state.clearOnExit = enabled;
-      return enabled;
-    }),
-    setPythonScript: vi.fn(async (code: string, enabled: boolean) => {
-      state.pythonStatus = { ...state.pythonStatus, code, enabled };
-      return structuredClone(state.pythonStatus);
-    }),
-    setAutoSystemProxy: vi.fn(async (auto: boolean) => {
-      state.status = {
-        ...state.status,
-        autoSystemProxy: auto,
-        systemProxyEnabled: auto ? state.status.running : state.status.systemProxyEnabled,
-      };
-      return structuredClone(state.status);
-    }),
-    setSystemProxy: vi.fn(async (enabled: boolean) => {
-      state.status = { ...state.status, systemProxyEnabled: enabled };
-      return structuredClone(state.status);
-    }),
-    setBindConfiguration: vi.fn(
-      async (
-        bindMode: ProxyStatus["bindMode"],
-        specificBindIp?: string | null,
-        alsoBindLoopback = true
-      ) => {
-        state.status = {
-          ...state.status,
-          bindMode,
-          specificBindIp: specificBindIp ?? null,
-          alsoBindLoopback,
-          allowRemote: bindMode === "all",
-          bindAddr:
-            bindMode === "all"
-              ? "0.0.0.0"
-              : bindMode === "specific" && specificBindIp
-                ? specificBindIp
-                : "127.0.0.1",
-        };
-        return structuredClone(state.status);
-      }
-    ),
-    stopProxy: vi.fn(async () => {
-      state.status = { ...state.status, running: false, systemProxyEnabled: false };
-      return structuredClone(state.status);
-    }),
-    startProxy: vi.fn(async (_host?: string, port = 8888) => {
-      state.status = {
-        ...state.status,
-        running: true,
-        port,
-        systemProxyEnabled: state.status.autoSystemProxy,
-      };
-      return structuredClone(state.status);
-    }),
-    setPreviewPort: vi.fn(async (port: number) => {
-      state.status = { ...state.status, port };
-      return structuredClone(state.status);
-    }),
-    pickSaveFileDialog: vi.fn(async () => null),
-    exportSettingsJsonFile: vi.fn(async () => undefined),
-  };
-
-  return {
-    mockState: state,
-    mockProxyBridge: bridge,
-    mockDefaultBpConfig: defaultBp,
-  };
-});
+const { mockState, mockProxyBridge, mockDefaultBpConfig, resetMockEnv } =
+  await vi.hoisted(async () => {
+    const { DEFAULT_BREAKPOINT_CONFIG } = await import("../types/proxy");
+    const { createStatefulMockProxyBridge } = await import(
+      "../test/mockProxyBridge"
+    );
+    const env = createStatefulMockProxyBridge({
+      stats: {
+        ramSessions: 10,
+        sqliteSizeBytes: 1024,
+        droppedSessionsCount: 0,
+        sessionRetentionLimit: 10_000,
+        dropNonMatching: false,
+      },
+    });
+    env.bridge.injectWebSocketFrame.mockRejectedValue(
+      new Error("not implemented in settingsManager mock")
+    );
+    return {
+      mockState: env.state,
+      mockProxyBridge: env.bridge,
+      mockDefaultBpConfig: structuredClone(DEFAULT_BREAKPOINT_CONFIG),
+      resetMockEnv: env.reset,
+    };
+  });
 
 vi.mock("../lib/monaco", () => ({
   FLUX_MONACO_THEME: "fluxproxy-active",
@@ -268,70 +66,17 @@ import {
 } from "./settingsManager";
 
 function resetMockState(): void {
-  mockState.status = {
-    running: true,
-    bindAddr: "127.0.0.1",
-    port: 8888,
-    activeSessions: 0,
-    systemProxyEnabled: true,
-    autoSystemProxy: true,
-    systemProxyError: null,
-    allowRemote: false,
-    bindMode: "loopback",
-    specificBindIp: null,
-    alsoBindLoopback: true,
-    boundIps: ["127.0.0.1"],
-  };
+  resetMockEnv({
+    stats: {
+      ramSessions: 10,
+      sqliteSizeBytes: 1024,
+      droppedSessionsCount: 0,
+      sessionRetentionLimit: 10_000,
+      dropNonMatching: false,
+    },
+  });
   mockState.filterCfg = structuredClone(DEFAULT_BACKEND_FILTER_CONFIG);
   mockState.bpCfg = structuredClone(mockDefaultBpConfig);
-  mockState.autoRespEnabled = true;
-  mockState.autoRespRules = structuredClone(DEFAULT_AUTORESPONDER_RULES);
-  mockState.stats = {
-    ramSessions: 10,
-    sqliteSizeBytes: 1024,
-    droppedSessionsCount: 0,
-    sessionRetentionLimit: 10_000,
-    dropNonMatching: false,
-  };
-  mockState.clearOnExit = false;
-  mockState.pythonStatus = {
-    available: false,
-    enabled: false,
-    running: false,
-    pythonExecutable: null,
-    pythonVersion: null,
-    workerPid: null,
-    hasOnRequest: false,
-    hasOnResponse: false,
-    timeoutMs: 1500,
-    lastError: null,
-    restartCount: 0,
-    invocationsCount: 0,
-    timeoutCount: 0,
-    isSimulator: true,
-    code: DEFAULT_PYTHON_SCRIPT_CODE,
-  };
-  mockState.hostRemapRules = [];
-  mockState.throttleConfig = {
-    preset: "none",
-    downloadKbps: 0,
-    uploadKbps: 0,
-    latencyMs: 0,
-  };
-  mockState.upstreamProxyConfig = {
-    enabled: false,
-    protocol: "http",
-    host: "",
-    port: 8080,
-    username: null,
-    hasPassword: false,
-    bypassList: ["localhost", "127.0.0.1", "::1", "<local>"],
-  };
-  mockState.upstreamTimeouts = {
-    connectTimeoutSec: 15,
-    responseHeaderTimeoutSec: 0,
-    composerTimeoutSec: 120,
-  };
 }
 
 describe("settingsManager — schema validation, migration & BreakpointConfig", () => {

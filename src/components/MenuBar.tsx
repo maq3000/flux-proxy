@@ -6,6 +6,10 @@ import {
 } from "../hooks/useUiPreferences";
 import { getSectionMeta } from "../lib/sectionRegistry";
 import { SESSION_RETENTION_PRESETS } from "../types/proxy";
+import {
+  SessionCountsBadge,
+  TelemetryMenuButton,
+} from "./workspaces/TrafficCountBadges";
 import type {
   ActiveNavSection,
   BreakpointConfig,
@@ -23,8 +27,8 @@ function formatMenuRetentionLabel(limit: number | null): string {
 
 interface MenuBarProps {
   status: ProxyStatus;
-  totalCount: number;
-  filteredCount: number;
+  totalCount?: number;
+  filteredCount?: number;
   hasSelection: boolean;
   selectedCount: number;
   activeSection: ActiveNavSection;
@@ -269,7 +273,7 @@ function startSubmenuSafeTriangle(
   submenu.addEventListener("toggle", stop, { once: true });
 }
 
-export const MenuBar: React.FC<MenuBarProps> = ({
+const MenuBarInner: React.FC<MenuBarProps> = ({
   status,
   totalCount,
   filteredCount,
@@ -992,16 +996,18 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 <span>Разрешить подключения с удаленных устройств (0.0.0.0)</span>
               </button>
               <hr />
-              <button
-                type="button"
-                disabled={totalCount === 0}
+              <TelemetryMenuButton
+                mode="total"
+                explicitDisabled={
+                  totalCount !== undefined ? totalCount === 0 : undefined
+                }
                 onClick={(e) => activateCommand(e, onSaveAllSessionsAs)}
               >
                 <span>Save All Sessions As...</span>
                 <span className="hint" aria-hidden="true">
                   Ctrl+S
                 </span>
-              </button>
+              </TelemetryMenuButton>
               <button
                 type="button"
                 disabled={!hasSelection}
@@ -1012,23 +1018,27 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                   {selectedCount > 1 ? ` (${selectedCount})` : ""}
                 </span>
               </button>
-              <button
-                type="button"
-                disabled={totalCount === 0}
+              <TelemetryMenuButton
+                mode="total"
+                explicitDisabled={
+                  totalCount !== undefined ? totalCount === 0 : undefined
+                }
                 onClick={(e) => activateCommand(e, onOpenSanitizedExport)}
               >
                 <span>{getSectionMeta("sanitizedExport").title}</span>
                 <span className="hint" aria-hidden="true">
                   Ctrl+Shift+S
                 </span>
-              </button>
-              <button
-                type="button"
-                disabled={totalCount === 0}
+              </TelemetryMenuButton>
+              <TelemetryMenuButton
+                mode="total"
+                explicitDisabled={
+                  totalCount !== undefined ? totalCount === 0 : undefined
+                }
                 onClick={(e) => activateCommand(e, onOpenOpenApiExport)}
               >
                 <span>{getSectionMeta("openApiExport").title}</span>
-              </button>
+              </TelemetryMenuButton>
               <button
                 type="button"
                 onClick={(e) => activateCommand(e, onImportArchive)}
@@ -1109,16 +1119,20 @@ export const MenuBar: React.FC<MenuBarProps> = ({
             >
               {onSelectAllSessions && (
                 <>
-                  <button
-                    type="button"
-                    disabled={filteredCount === 0}
+                  <TelemetryMenuButton
+                    mode="filtered"
+                    explicitDisabled={
+                      filteredCount !== undefined
+                        ? filteredCount === 0
+                        : undefined
+                    }
                     onClick={(e) => activateCommand(e, onSelectAllSessions)}
                   >
                     <span>Select All Sessions</span>
                     <span className="hint" aria-hidden="true">
                       Ctrl+A
                     </span>
-                  </button>
+                  </TelemetryMenuButton>
                   <hr />
                 </>
               )}
@@ -1619,15 +1633,19 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                     </div>
                   )}
                   {onOpenTrafficStatistics && (
-                    <button
-                      type="button"
-                      disabled={filteredCount === 0}
+                    <TelemetryMenuButton
+                      mode="filtered"
+                      explicitDisabled={
+                        filteredCount !== undefined
+                          ? filteredCount === 0
+                          : undefined
+                      }
                       onClick={(e) =>
                         activateCommand(e, onOpenTrafficStatistics)
                       }
                     >
                       <span>Traffic Statistics Summary…</span>
-                    </button>
+                    </TelemetryMenuButton>
                   )}
                 </>
               )}
@@ -1784,13 +1802,17 @@ export const MenuBar: React.FC<MenuBarProps> = ({
                 </span>
               </button>
               {onOpenTrafficStatistics && (
-                <button
-                  type="button"
-                  disabled={filteredCount === 0}
+                <TelemetryMenuButton
+                  mode="filtered"
+                  explicitDisabled={
+                    filteredCount !== undefined
+                      ? filteredCount === 0
+                      : undefined
+                  }
                   onClick={(e) => activateCommand(e, onOpenTrafficStatistics)}
                 >
                   <span>Traffic Statistics Report…</span>
-                </button>
+                </TelemetryMenuButton>
               )}
               <button
                 type="button"
@@ -2067,9 +2089,13 @@ export const MenuBar: React.FC<MenuBarProps> = ({
 
       {/* Right: Compact Telemetry & Command Palette Trigger */}
       <div className="flex items-center gap-2 font-mono text-[11px] text-subtle">
-        <span className="hidden tabular-nums sm:inline">
-          {filteredCount.toLocaleString()} / {totalCount.toLocaleString()} sessions
-        </span>
+        {totalCount !== undefined && filteredCount !== undefined ? (
+          <span className="hidden tabular-nums sm:inline">
+            {filteredCount.toLocaleString()} / {totalCount.toLocaleString()} sessions
+          </span>
+        ) : (
+          <SessionCountsBadge format="menuBar" />
+        )}
         <button
           type="button"
           onClick={onOpenCommandPalette}
@@ -2084,3 +2110,6 @@ export const MenuBar: React.FC<MenuBarProps> = ({
     </div>
   );
 };
+
+export const MenuBar = React.memo(MenuBarInner);
+MenuBar.displayName = "MenuBar";

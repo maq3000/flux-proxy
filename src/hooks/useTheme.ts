@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo } from "react";
+import { useCallback, useMemo } from "react";
 import {
   resolveEffectiveThemeTokens,
   type CustomColorOverrides,
@@ -8,16 +8,11 @@ import {
   type ThemeTokenKey,
 } from "../lib/themePresets";
 import {
-  applyThemeToDocument,
   CUSTOM_COLOR_OVERRIDES_STORAGE_KEY,
   THEME_PREFERENCE_STORAGE_KEY,
   THEME_PRESET_STORAGE_KEY,
   useUiStore,
 } from "../stores/uiStore";
-import {
-  SETTINGS_APPLIED_EVENT,
-  type FluxUserSettingsProfile,
-} from "../types/settings";
 
 export {
   CUSTOM_COLOR_OVERRIDES_STORAGE_KEY,
@@ -27,10 +22,6 @@ export {
 export type { StatusFgTokenKey, ThemePreference, ThemePresetId, ThemeTokenKey };
 
 export function useTheme() {
-  useEffect(() => {
-    useUiStore.getState().syncThemeFromLocalStorage();
-  }, []);
-
   const systemDark = useUiStore((s) => s.systemDark);
   const preference = useUiStore((s) => s.preference);
   const themePreset = useUiStore((s) => s.themePreset);
@@ -59,43 +50,6 @@ export function useTheme() {
   );
 
   const resolvedTheme: "dark" | "light" = resolvedPalette.baseScheme;
-
-  useEffect(() => {
-    applyThemeToDocument(
-      preference,
-      themePreset,
-      customColorOverrides,
-      systemDark
-    );
-  }, [preference, themePreset, customColorOverrides, systemDark]);
-
-  useEffect(() => {
-    const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const handleChange = (e: MediaQueryListEvent) => {
-      useUiStore.getState().setSystemDark(e.matches);
-    };
-    mq.addEventListener("change", handleChange);
-
-    const handleStorage = (e: StorageEvent) => {
-      useUiStore.getState().applyThemeFromStorageEvent(e);
-    };
-
-    const handleSettingsApplied = (event: Event) => {
-      const detail = (event as CustomEvent<FluxUserSettingsProfile>).detail;
-      if (detail) {
-        useUiStore.getState().applyThemeFromSettingsProfile(detail);
-      }
-    };
-
-    window.addEventListener("storage", handleStorage);
-    window.addEventListener(SETTINGS_APPLIED_EVENT, handleSettingsApplied);
-
-    return () => {
-      mq.removeEventListener("change", handleChange);
-      window.removeEventListener("storage", handleStorage);
-      window.removeEventListener(SETTINGS_APPLIED_EVENT, handleSettingsApplied);
-    };
-  }, []);
 
   const toggleLightDark = useCallback(() => {
     setTheme(resolvedTheme === "dark" ? "light" : "dark");

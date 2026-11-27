@@ -35,7 +35,7 @@ interface SidebarProps {
   onCollapseSidebar?: () => void;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({
+const SidebarInner: React.FC<SidebarProps> = ({
   activeSection,
   onSelectSection,
   onDropSessionToComposer,
@@ -321,3 +321,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
     </aside>
   );
 };
+
+export const Sidebar = React.memo(SidebarInner);
+Sidebar.displayName = "Sidebar";

@@ -38,6 +38,10 @@ import {
   SESSION_RETENTION_PRESETS,
   THROTTLE_PRESET_DEFINITIONS,
 } from "../types/proxy";
+import {
+  DroppedSessionsBadge,
+  MarkedSessionsBadge,
+} from "./workspaces/TrafficCountBadges";
 import type {
   BreakpointConfig,
   ColumnId,
@@ -78,7 +82,7 @@ interface TopToolbarProps {
   onToggleBreakBeforeRequest: () => void;
   onToggleBreakAfterResponse: () => void;
   onOpenBreakpointsModal: () => void;
-  markedCount: number;
+  markedCount?: number;
   followTail: boolean;
   onToggleFollowTail: () => void;
   // Layout & View Customization
@@ -96,7 +100,7 @@ interface TopToolbarProps {
   onSetSessionRetentionLimit: (limit: number | null) => void;
   dropNonMatching: boolean;
   onToggleDropNonMatching: () => void;
-  droppedSessionsCount: number;
+  droppedSessionsCount?: number;
   customRetentionTriggerSeq?: number;
   // Proxy & Storage
   onToggleProxy: () => void;
@@ -193,7 +197,7 @@ function toggleInvokerFallback(
   }
 }
 
-export const TopToolbar: React.FC<TopToolbarProps> = ({
+const TopToolbarInner: React.FC<TopToolbarProps> = ({
   status,
   searchInputRef,
   onFocusTrafficGrid,
@@ -872,10 +876,14 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
               <span className="whitespace-nowrap text-[11px] font-medium">
                 Drop Non-Matching
               </span>
-              {droppedSessionsCount > 0 && (
-                <span className="rounded-full bg-canvas/80 px-1.5 font-mono text-[10px] font-semibold tabular-nums text-fg">
-                  {droppedSessionsCount.toLocaleString()}
-                </span>
+              {droppedSessionsCount !== undefined ? (
+                droppedSessionsCount > 0 && (
+                  <span className="rounded-full bg-canvas/80 px-1.5 font-mono text-[10px] font-semibold tabular-nums text-fg">
+                    {droppedSessionsCount.toLocaleString()}
+                  </span>
+                )
+              ) : (
+                <DroppedSessionsBadge />
               )}
             </label>
           )}
@@ -1574,11 +1582,16 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
               }`}
             >
               <span>{cat.label}</span>
-              {cat.id === "marked" && markedCount > 0 && (
-                <span className="rounded-full bg-status4xx-bg px-1 font-mono text-[9px] font-semibold text-status4xx-fg tabular-nums">
-                  {markedCount}
-                </span>
-              )}
+              {cat.id === "marked" &&
+                (markedCount !== undefined ? (
+                  markedCount > 0 && (
+                    <span className="rounded-full bg-status4xx-bg px-1 font-mono text-[9px] font-semibold text-status4xx-fg tabular-nums">
+                      {markedCount}
+                    </span>
+                  )
+                ) : (
+                  <MarkedSessionsBadge />
+                ))}
             </button>
           ))}
         </div>
@@ -1721,3 +1734,6 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
     </header>
   );
 };
+
+export const TopToolbar = React.memo(TopToolbarInner);
+TopToolbar.displayName = "TopToolbar";

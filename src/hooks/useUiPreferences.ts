@@ -1,4 +1,3 @@
-import { useEffect } from "react";
 import {
   clearPersistedPanelLayouts,
   COLUMN_MIN_WIDTHS,
@@ -20,10 +19,6 @@ import {
   type InspectorSplitDirection,
   type ToolbarGroupDefinition,
 } from "../stores/uiStore";
-import {
-  SETTINGS_APPLIED_EVENT,
-  type FluxUserSettingsProfile,
-} from "../types/settings";
 
 export {
   clearPersistedPanelLayouts,
@@ -45,10 +40,6 @@ export {
 export type { ColumnDefinition, InspectorSplitDirection, ToolbarGroupDefinition };
 
 export function useUiPreferences() {
-  useEffect(() => {
-    useUiStore.getState().syncUiFromLocalStorage();
-  }, []);
-
   const layout = useUiStore((s) => s.layout);
   const toolbarGroups = useUiStore((s) => s.toolbarGroups);
   const visibleColumns = useUiStore((s) => s.visibleColumns);
@@ -76,20 +67,6 @@ export function useUiPreferences() {
   const setColumnWidths = useUiStore((s) => s.setColumnWidths);
   const resetColumns = useUiStore((s) => s.resetColumns);
   const resetAllUiPreferences = useUiStore((s) => s.resetAllUiPreferences);
-
-  useEffect(() => {
-    const handleSettingsApplied = (event: Event) => {
-      const detail = (event as CustomEvent<FluxUserSettingsProfile>).detail;
-      if (detail) {
-        useUiStore.getState().applyUiFromSettingsProfile(detail);
-      }
-    };
-
-    window.addEventListener(SETTINGS_APPLIED_EVENT, handleSettingsApplied);
-    return () => {
-      window.removeEventListener(SETTINGS_APPLIED_EVENT, handleSettingsApplied);
-    };
-  }, []);
 
   const resolvedInspectorSplitDirection = resolveInspectorSplitDirection(
     layout.inspectorSplitDirection,

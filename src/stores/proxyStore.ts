@@ -413,11 +413,22 @@ export function findSessionById(
   return undefined;
 }
 
+export function countMarkedSessions(sessions: readonly SessionSummary[]): number {
+  let count = 0;
+  for (let i = 0; i < sessions.length; i += 1) {
+    if (sessions[i].markedColor || sessions[i].comment) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
 function readInitialProxySlice() {
   const persisted = readPersistedProxyConfigFromLocalStorage();
   return {
     sessions: [] as SessionSummary[],
     sessionIndexById: new Map<number, number>() as ReadonlyMap<number, number>,
+    markedSessionsCount: 0,
     selectedId: null as number | null,
     selectedIds: [] as number[],
     selectedDetail: null as SessionDetail | null,
@@ -447,6 +458,7 @@ function resolveUpdater<T>(updater: Updater<T>, prev: T): T {
 export interface ProxyStoreState {
   sessions: SessionSummary[];
   sessionIndexById: ReadonlyMap<number, number>;
+  markedSessionsCount: number;
   selectedId: number | null;
   selectedIds: number[];
   selectedDetail: SessionDetail | null;
@@ -536,6 +548,7 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
       return {
         sessions: nextSessions,
         sessionIndexById: buildSessionIndexById(nextSessions),
+        markedSessionsCount: countMarkedSessions(nextSessions),
       };
     });
   },
@@ -553,15 +566,24 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
         baseIndex === state.sessionIndexById
           ? null
           : (baseIndex as Map<number, number>);
+      let markedDelta = 0;
 
       for (let i = 0; i < incoming.length; i += 1) {
         const item = incoming[i];
+        const nextMarked = Boolean(item.markedColor || item.comment);
         const existingIdx = clonedIndex
           ? clonedIndex.get(item.id)
           : baseIndex.get(item.id);
         if (existingIdx !== undefined) {
+          const prevItem = next[existingIdx];
+          if (Boolean(prevItem.markedColor || prevItem.comment) !== nextMarked) {
+            markedDelta += nextMarked ? 1 : -1;
+          }
           next[existingIdx] = item;
         } else {
+          if (nextMarked) {
+            markedDelta += 1;
+          }
           if (!clonedIndex) {
             clonedIndex = new Map(baseIndex);
           }
@@ -575,12 +597,14 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
         return {
           sessions: next,
           sessionIndexById: buildSessionIndexById(next),
+          markedSessionsCount: countMarkedSessions(next),
         };
       }
 
       return {
         sessions: next,
         sessionIndexById: clonedIndex ?? baseIndex,
+        markedSessionsCount: Math.max(0, state.markedSessionsCount + markedDelta),
       };
     });
   },
@@ -892,6 +916,10 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
           nextSessions === state.sessions
             ? state.sessionIndexById
             : buildSessionIndexById(nextSessions),
+        markedSessionsCount:
+          nextSessions === state.sessions
+            ? state.markedSessionsCount
+            : countMarkedSessions(nextSessions),
         dropNonMatching: nextDropNonMatching,
         clearDbOnExit: nextClearDbOnExit,
         status: nextStatusOptimistic,

@@ -2,11 +2,7 @@ import React from "react";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
-  BreakpointConfig,
-  ComposedRequest,
   PausedBreakpointItem,
-  ProxyFilterBackendConfig,
-  ProxyStatus,
   SessionDetail,
   SessionSummary,
   StorageStats,
@@ -25,237 +21,20 @@ const {
   listeners,
   unlistenSpies,
   mockProxyBridge,
-} = vi.hoisted(() => {
-  const defaultBp: BreakpointConfig = {
-    breakBeforeRequest: false,
-    breakAfterResponse: false,
-    timeoutSecs: 120,
-    rules: [],
-  };
-
-  const state = {
-    status: {
-      running: true,
-      bindAddr: "127.0.0.1",
-      port: 8888,
-      activeSessions: 0,
-      systemProxyEnabled: true,
-      autoSystemProxy: true,
-      systemProxyError: null,
-      allowRemote: false,
-      bindMode: "loopback",
-      specificBindIp: null,
-      alsoBindLoopback: true,
-      boundIps: ["127.0.0.1"],
-    } as ProxyStatus,
-    sessions: [] as SessionSummary[],
-    details: new Map<number, SessionDetail>(),
-    offloadedBodies: new Map<
-      number,
-      { bodyBase64: string; bodyText: string | null; bodySize: number }
-    >(),
-    stats: {
-      ramSessions: 0,
-      sqliteSizeBytes: 0,
-      droppedSessionsCount: 0,
-      sessionRetentionLimit: 10_000,
-      dropNonMatching: false,
-    } as StorageStats,
-    filterCfg: null as unknown as ProxyFilterBackendConfig,
-    bpCfg: structuredClone(defaultBp) as BreakpointConfig,
-    clearOnExit: false,
-  };
-
-  const listenerSets = {
-    batches: new Set<(batch: SessionSummary[]) => void>(),
-    removed: new Set<(ids: number[]) => void>(),
-    breakpoints: new Set<(items: PausedBreakpointItem[]) => void>(),
-    status: new Set<(status: ProxyStatus) => void>(),
-    stats: new Set<(stats: StorageStats) => void>(),
-  };
-
-  const unlistenCounts = {
-    batches: vi.fn(),
-    removed: vi.fn(),
-    breakpoints: vi.fn(),
-    status: vi.fn(),
-    stats: vi.fn(),
-  };
-
-  const bridge = {
-    setSessionRetentionLimit: vi.fn(async (limit: number | null) => {
-      state.stats = { ...state.stats, sessionRetentionLimit: limit };
-    }),
-    updateFilterBackendConfig: vi.fn(async (cfg: ProxyFilterBackendConfig) => {
-      state.filterCfg = structuredClone(cfg);
-      return structuredClone(cfg);
-    }),
-    updateBreakpointConfig: vi.fn(async (cfg: BreakpointConfig) => {
-      state.bpCfg = structuredClone(cfg);
-      return structuredClone(cfg);
-    }),
-    listPausedBreakpoints: vi.fn(async () => [] as PausedBreakpointItem[]),
-    setDropNonMatching: vi.fn(async (enabled: boolean) => {
-      state.stats = { ...state.stats, dropNonMatching: enabled };
-    }),
-    getClearDbOnExit: vi.fn(async () => state.clearOnExit),
-    setClearDbOnExit: vi.fn(async (enabled: boolean) => {
-      state.clearOnExit = enabled;
-      return enabled;
-    }),
-    getStatus: vi.fn(async () => structuredClone(state.status)),
-    getSessions: vi.fn(async () => structuredClone(state.sessions)),
-    getMemoryStorageStats: vi.fn(async () => structuredClone(state.stats)),
-    setAutoSystemProxy: vi.fn(async (auto: boolean) => {
-      state.status = { ...state.status, autoSystemProxy: auto };
-      return structuredClone(state.status);
-    }),
-    setSystemProxy: vi.fn(async (enabled: boolean) => {
-      state.status = { ...state.status, systemProxyEnabled: enabled };
-      return structuredClone(state.status);
-    }),
-    setBindConfiguration: vi.fn(
-      async (
-        bindMode: ProxyStatus["bindMode"],
-        specificBindIp?: string | null,
-        alsoBindLoopback = true
-      ) => {
-        state.status = {
-          ...state.status,
-          bindMode,
-          specificBindIp: specificBindIp ?? null,
-          alsoBindLoopback,
-        };
-        return structuredClone(state.status);
-      }
-    ),
-    stopProxy: vi.fn(async () => {
-      state.status = { ...state.status, running: false, systemProxyEnabled: false };
-      return structuredClone(state.status);
-    }),
-    startProxy: vi.fn(async (_host?: string, port = 8888) => {
-      state.status = {
-        ...state.status,
-        running: true,
-        port,
-        systemProxyEnabled: state.status.autoSystemProxy,
-      };
-      return structuredClone(state.status);
-    }),
-    setPreviewPort: vi.fn(async (port: number) => {
-      state.status = { ...state.status, port };
-      return structuredClone(state.status);
-    }),
-    subscribeSessionBatches: vi.fn(
-      async (cb: (batch: SessionSummary[]) => void) => {
-        listenerSets.batches.add(cb);
-        return () => {
-          listenerSets.batches.delete(cb);
-          unlistenCounts.batches();
-        };
-      }
-    ),
-    subscribeSessionsRemoved: vi.fn(async (cb: (ids: number[]) => void) => {
-      listenerSets.removed.add(cb);
-      return () => {
-        listenerSets.removed.delete(cb);
-        unlistenCounts.removed();
-      };
-    }),
-    subscribeBreakpointsChanged: vi.fn(
-      async (cb: (items: PausedBreakpointItem[]) => void) => {
-        listenerSets.breakpoints.add(cb);
-        return () => {
-          listenerSets.breakpoints.delete(cb);
-          unlistenCounts.breakpoints();
-        };
-      }
-    ),
-    subscribeStatusChanged: vi.fn(async (cb: (s: ProxyStatus) => void) => {
-      listenerSets.status.add(cb);
-      return () => {
-        listenerSets.status.delete(cb);
-        unlistenCounts.status();
-      };
-    }),
-    subscribeStorageStatsChanged: vi.fn(
-      async (cb: (s: StorageStats) => void) => {
-        listenerSets.stats.add(cb);
-        return () => {
-          listenerSets.stats.delete(cb);
-          unlistenCounts.stats();
-        };
-      }
-    ),
-    getSessionDetail: vi.fn(async (id: number) => {
-      const detail = state.details.get(id) ?? null;
-      return detail ? structuredClone(detail) : null;
-    }),
-    loadSessionBody: vi.fn(async (id: number, isResponse: boolean) => {
-      const entry = state.offloadedBodies.get(id);
-      return {
-        id,
-        isResponse,
-        bodyBase64: entry?.bodyBase64 ?? "",
-        bodyText: entry?.bodyText ?? null,
-        bodySize: entry?.bodySize ?? 0,
-      };
-    }),
-    executeComposedRequest: vi.fn(
-      async (req: ComposedRequest): Promise<SessionDetail> => {
-        const nextId = 900 + state.sessions.length + 1;
-        const urlObj = new URL(req.url);
-        const created: SessionDetail = {
-          summary: {
-            id: nextId,
-            status: 200,
-            protocol: "HTTPS/1.1",
-            scheme: urlObj.protocol.replace(":", ""),
-            method: req.method,
-            host: urlObj.host,
-            path: `${urlObj.pathname}${urlObj.search}`,
-            url: req.url,
-            contentType: "application/json",
-            bodySize: 15,
-            durationMs: 12,
-            timestamp: "2026-11-19T12:00:00.000Z",
-            isMocked: false,
-          },
-          requestHeaders: req.headers,
-          responseHeaders: [{ name: "Content-Type", value: "application/json" }],
-          requestBodyBase64: req.bodyBase64 ?? "",
-          responseBodyBase64: btoa('{"ok":true}'),
-          requestBodyText: req.body,
-          responseBodyText: '{"ok":true}',
-          clientAddr: "127.0.0.1:50000",
-          websocketFrames: [],
-        };
-        return created;
-      }
-    ),
-    updateSessionAnnotations: vi.fn(async () => []),
-    deleteSessions: vi.fn(async (ids: number[]) => ids.length),
-    clearSessions: vi.fn(async () => undefined),
-    saveSessionsSqlite: vi.fn(async () => 0),
-    loadSessionsSqlite: vi.fn(async () => [] as SessionSummary[]),
-    clearSqliteDatabase: vi.fn(async () => structuredClone(state.stats)),
-    resolveBreakpoint: vi.fn(async () => true),
-    resumeAllBreakpoints: vi.fn(async () => 0),
-    generateStressTestSessions: vi.fn(async () => 0),
-    pickSaveFileDialog: vi.fn(async () => null as string | null),
-    exportSessionsFile: vi.fn(async (..._args: unknown[]) => 0),
-    pickOpenFileDialog: vi.fn(async () => null),
-    importSessionsFile: vi.fn(async () => [] as SessionSummary[]),
-    importSessionsBytes: vi.fn(async () => [] as SessionSummary[]),
-    saveSessionBodyFile: vi.fn(async () => 0),
-  };
-
+  resetMockBridgeState,
+} = await vi.hoisted(async () => {
+  const { DEFAULT_BREAKPOINT_CONFIG } = await import("../types/proxy");
+  const { createStatefulMockProxyBridge } = await import(
+    "../test/mockProxyBridge"
+  );
+  const env = createStatefulMockProxyBridge();
   return {
-    mockDefaultBp: defaultBp,
-    mockState: state,
-    listeners: listenerSets,
-    unlistenSpies: unlistenCounts,
-    mockProxyBridge: bridge,
+    mockDefaultBp: structuredClone(DEFAULT_BREAKPOINT_CONFIG),
+    mockState: env.state,
+    listeners: env.listeners,
+    unlistenSpies: env.unlistenSpies,
+    mockProxyBridge: env.bridge,
+    resetMockBridgeState: env.reset,
   };
 });
 
@@ -309,39 +88,9 @@ function makeSessionDetail(
 }
 
 function resetHookEnv(): void {
-  mockState.status = {
-    running: true,
-    bindAddr: "127.0.0.1",
-    port: 8888,
-    activeSessions: 0,
-    systemProxyEnabled: true,
-    autoSystemProxy: true,
-    systemProxyError: null,
-    allowRemote: false,
-    bindMode: "loopback",
-    specificBindIp: null,
-    alsoBindLoopback: true,
-    boundIps: ["127.0.0.1"],
-  };
-  mockState.sessions = [];
-  mockState.details.clear();
-  mockState.offloadedBodies.clear();
-  mockState.stats = {
-    ramSessions: 0,
-    sqliteSizeBytes: 0,
-    droppedSessionsCount: 0,
-    sessionRetentionLimit: 10_000,
-    dropNonMatching: false,
-  };
+  resetMockBridgeState();
   mockState.filterCfg = structuredClone(DEFAULT_BACKEND_FILTER_CONFIG);
   mockState.bpCfg = structuredClone(mockDefaultBp);
-  mockState.clearOnExit = false;
-
-  listeners.batches.clear();
-  listeners.removed.clear();
-  listeners.breakpoints.clear();
-  listeners.status.clear();
-  listeners.stats.clear();
 
   useProxyStore.setState({
     sessions: [],

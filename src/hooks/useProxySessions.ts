@@ -1,21 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import {
   BUILT_IN_FILTER_PRESETS,
-  compileFilterMatrix,
-  compileHostListFilter,
   countActiveNoiseThresholds,
   DEFAULT_HOST_LIST_FILTER_CONFIG,
   DEFAULT_NOISE_THRESHOLDS,
-  evaluateSessionAgainstFilters,
   matchHostRuleList,
   normalizeHostToken,
   normalizeNoiseThresholds,
 } from "../lib/filterEngine";
 import {
   formatBytes,
-  getRowSemanticTone,
   suggestSessionBodyFileName,
 } from "../lib/formatters";
+import {
+  computeDetectedProcesses,
+  computeFilteredSessions,
+  computeRegexError,
+  getCompiledHostListCached,
+  getCompiledMatrixCached,
+  getFilteredSessionsSnapshot,
+} from "../lib/trafficFilter";
+import { syncTrafficTelemetry } from "../stores/trafficTelemetryStore";
 import {
   type FileDialogFilter,
   isTauriRuntime,
@@ -54,7 +59,6 @@ import type {
   BreakpointAction,
   BreakpointConfig,
   BreakpointResolution,
-  DetectedProcessItem,
   FilterConditionRule,
   FilterPreset,
   HostListFilterConfig,
@@ -70,9 +74,188 @@ import type {
   TlsInterceptMode,
 } from "../types/proxy";
 
-export function useProxySessions() {
+export function useSessionDetailSync(): void {
+  const selectedId = useProxyStore((s) => s.selectedId);
+  const selectedIds = useProxyStore((s) => s.selectedIds);
+  const setSelectedDetail = useProxyStore((s) => s.setSelectedDetail);
+  const setDiffLeftDetail = useProxyStore((s) => s.setDiffLeftDetail);
+  const setDiffRightDetail = useProxyStore((s) => s.setDiffRightDetail);
+  const setToastMessage = useProxyStore((s) => s.setToastMessage);
+
+  const showToast = useCallback(
+    (msg: string) => {
+      setToastMessage(msg);
+      window.setTimeout(() => {
+        setToastMessage((prev) => (prev === msg ? null : prev));
+      }, 3200);
+    },
+    [setToastMessage]
+  );
+
+  // Primitive selector keeps this hook immune to unrelated session batches.
+  const selectedSummarySignature = useProxyStore((s) => {
+    if (s.selectedId === null) return "";
+    const found = findSessionById(s.sessions, s.sessionIndexById, s.selectedId);
+    if (!found) return "";
+    return `${found.status}:${found.bodySize}:${found.durationMs}:${found.contentType}:${found.error ?? ""}:${found.breakpointPaused ?? ""}:${found.breakpointModified ? "1" : "0"}:${found.comment ?? ""}:${found.markedColor ?? ""}:${found.wsOpen ? "1" : "0"}`;
+  });
+
+  const selectedIdRef = useRef<number | null>(selectedId);
+  selectedIdRef.current = selectedId;
+
+  // Fetch full SessionDetail on-demand when selected row changes or updates in-place
+  useEffect(() => {
+    let active = true;
+    const targetId = selectedId;
+    if (targetId === null) {
+      setSelectedDetail(null);
+      return;
+    }
+    setSelectedDetail((prev) =>
+      prev && prev.summary.id === targetId ? prev : null
+    );
+    void proxyBridge
+      .getSessionDetail(targetId)
+      .then((detail) => {
+        if (!active || selectedIdRef.current !== targetId) return;
+        setSelectedDetail(detail);
+      })
+      .catch((err) => {
+        if (!active || selectedIdRef.current !== targetId) return;
+        setSelectedDetail(null);
+        showToast(
+          `⚠️ Ошибка загрузки деталей сессии #${targetId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedId, selectedSummarySignature, setSelectedDetail, showToast]);
+
+  const diffLeftId = selectedIds.length >= 2 ? selectedIds[0] : null;
+  const diffRightId = selectedIds.length >= 2 ? selectedIds[1] : null;
+
+  const diffPairSignature = useProxyStore((s) => {
+    if (s.selectedIds.length < 2) return "";
+    const leftId = s.selectedIds[0];
+    const rightId = s.selectedIds[1];
+    const l = findSessionById(s.sessions, s.sessionIndexById, leftId);
+    const r = findSessionById(s.sessions, s.sessionIndexById, rightId);
+    const sig = (item?: SessionSummary) =>
+      item
+        ? `${item.status}:${item.bodySize}:${item.durationMs}:${item.contentType}:${item.error ?? ""}:${item.comment ?? ""}:${item.markedColor ?? ""}`
+        : "none";
+    return `${leftId}(${sig(l)})|${rightId}(${sig(r)})`;
+  });
+
+  // Fetch full SessionDetails for both compared sessions when 2+ rows are selected
+  useEffect(() => {
+    let active = true;
+    if (diffLeftId === null || diffRightId === null) {
+      setDiffLeftDetail(null);
+      setDiffRightDetail(null);
+      return;
+    }
+    const targetLeft = diffLeftId;
+    const targetRight = diffRightId;
+    setDiffLeftDetail((prev) =>
+      prev && prev.summary.id === targetLeft ? prev : null
+    );
+    setDiffRightDetail((prev) =>
+      prev && prev.summary.id === targetRight ? prev : null
+    );
+    void Promise.all([
+      proxyBridge.getSessionDetail(targetLeft),
+      proxyBridge.getSessionDetail(targetRight),
+    ])
+      .then(([left, right]) => {
+        if (!active) return;
+        setDiffLeftDetail(left);
+        setDiffRightDetail(right);
+      })
+      .catch((err) => {
+        if (!active) return;
+        setDiffLeftDetail(null);
+        setDiffRightDetail(null);
+        showToast(
+          `⚠️ Ошибка загрузки сессий для сравнения: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      });
+    return () => {
+      active = false;
+    };
+  }, [
+    diffLeftId,
+    diffPairSignature,
+    diffRightId,
+    setDiffLeftDetail,
+    setDiffRightDetail,
+    showToast,
+  ]);
+}
+
+export function useFilteredSessions() {
   const sessions = useProxyStore((s) => s.sessions);
-  const sessionIndexById = useProxyStore((s) => s.sessionIndexById);
+  const filterQuery = useFilterStore((s) => s.filterQuery);
+  const useRegex = useFilterStore((s) => s.useRegex);
+  const quickCategory = useFilterStore((s) => s.quickCategory);
+  const matrixEnabled = useFilterStore((s) => s.matrixEnabled);
+  const filterRules = useFilterStore((s) => s.filterRules);
+  const thresholds = useFilterStore((s) => s.thresholds);
+  const hostListFilter = useFilterStore((s) => s.hostListFilter);
+
+  const compiledMatrix = useMemo(
+    () => getCompiledMatrixCached(filterRules),
+    [filterRules]
+  );
+  const compiledHostList = useMemo(
+    () => getCompiledHostListCached(hostListFilter),
+    [hostListFilter]
+  );
+
+  const { filteredSessions, regexError } = useMemo(
+    () =>
+      computeFilteredSessions(
+        sessions,
+        {
+          filterQuery,
+          useRegex,
+          quickCategory,
+          matrixEnabled,
+          filterRules,
+          thresholds,
+          hostListFilter,
+        },
+        compiledMatrix,
+        compiledHostList
+      ),
+    [
+      sessions,
+      filterQuery,
+      useRegex,
+      quickCategory,
+      matrixEnabled,
+      filterRules,
+      thresholds,
+      hostListFilter,
+      compiledMatrix,
+      compiledHostList,
+    ]
+  );
+
+  return {
+    filteredSessions,
+    regexError,
+    ruleErrors: compiledMatrix.ruleErrors,
+    totalSessionsCount: sessions.length,
+  };
+}
+
+export function useProxySessionController() {
   const setSessions = useProxyStore((s) => s.setSessions);
   const mergeSessionBatch = useProxyStore((s) => s.mergeSessionBatch);
   const selectedId = useProxyStore((s) => s.selectedId);
@@ -80,11 +263,8 @@ export function useProxySessions() {
   const selectedIds = useProxyStore((s) => s.selectedIds);
   const setSelectedIds = useProxyStore((s) => s.setSelectedIds);
   const selectionAnchorIdRef = useRef<number | null>(null);
-  const selectedDetail = useProxyStore((s) => s.selectedDetail);
   const setSelectedDetail = useProxyStore((s) => s.setSelectedDetail);
-  const diffLeftDetail = useProxyStore((s) => s.diffLeftDetail);
   const setDiffLeftDetail = useProxyStore((s) => s.setDiffLeftDetail);
-  const diffRightDetail = useProxyStore((s) => s.diffRightDetail);
   const setDiffRightDetail = useProxyStore((s) => s.setDiffRightDetail);
 
   const setSelectedId = useCallback(
@@ -150,7 +330,6 @@ export function useProxySessions() {
   const clearDbOnExitRef = useRef<boolean>(clearDbOnExit);
   clearDbOnExitRef.current = clearDbOnExit;
 
-  const storageStats = useProxyStore((s) => s.storageStats);
   const setStorageStats = useProxyStore((s) => s.setStorageStats);
 
   const backendFilterConfig = useFilterStore((s) => s.backendFilterConfig);
@@ -607,6 +786,7 @@ export function useProxySessions() {
         cappedInitial.splice(0, cappedInitial.length - limit);
       }
       setSessions(cappedInitial);
+      syncTrafficTelemetry();
       if (cappedInitial.length > 0) {
         setSelectedId(cappedInitial[0].id);
       }
@@ -784,101 +964,6 @@ export function useProxySessions() {
     };
   }, [applyProxyStatusUpdate, refreshStorageStats]);
 
-  const selectedSummarySignature = useMemo(() => {
-    if (selectedId === null) return "";
-    const found = findSessionById(sessions, sessionIndexById, selectedId);
-    if (!found) return "";
-    return `${found.status}:${found.bodySize}:${found.durationMs}:${found.contentType}:${found.error ?? ""}:${found.breakpointPaused ?? ""}:${found.breakpointModified ? "1" : "0"}:${found.comment ?? ""}:${found.markedColor ?? ""}:${found.wsOpen ? "1" : "0"}`;
-  }, [selectedId, sessionIndexById, sessions]);
-
-  const selectedIdRef = useRef<number | null>(selectedId);
-  selectedIdRef.current = selectedId;
-
-  // Fetch full SessionDetail on-demand when selected row changes or updates in-place
-  useEffect(() => {
-    let active = true;
-    const targetId = selectedId;
-    if (targetId === null) {
-      setSelectedDetail(null);
-      return;
-    }
-    setSelectedDetail((prev) =>
-      prev && prev.summary.id === targetId ? prev : null
-    );
-    void proxyBridge
-      .getSessionDetail(targetId)
-      .then((detail) => {
-        if (!active || selectedIdRef.current !== targetId) return;
-        setSelectedDetail(detail);
-      })
-      .catch((err) => {
-        if (!active || selectedIdRef.current !== targetId) return;
-        setSelectedDetail(null);
-        showToast(
-          `⚠️ Ошибка загрузки деталей сессии #${targetId}: ${
-            err instanceof Error ? err.message : String(err)
-          }`
-        );
-      });
-    return () => {
-      active = false;
-    };
-  }, [selectedId, selectedSummarySignature, showToast]);
-
-  const diffLeftId = selectedIds.length >= 2 ? selectedIds[0] : null;
-  const diffRightId = selectedIds.length >= 2 ? selectedIds[1] : null;
-
-  const diffPairSignature = useMemo(() => {
-    if (diffLeftId === null || diffRightId === null) return "";
-    const l = findSessionById(sessions, sessionIndexById, diffLeftId);
-    const r = findSessionById(sessions, sessionIndexById, diffRightId);
-    const sig = (s?: SessionSummary) =>
-      s
-        ? `${s.status}:${s.bodySize}:${s.durationMs}:${s.contentType}:${s.error ?? ""}:${s.comment ?? ""}:${s.markedColor ?? ""}`
-        : "none";
-    return `${diffLeftId}(${sig(l)})|${diffRightId}(${sig(r)})`;
-  }, [diffLeftId, diffRightId, sessionIndexById, sessions]);
-
-  // Fetch full SessionDetails for both compared sessions when 2+ rows are selected
-  useEffect(() => {
-    let active = true;
-    if (diffLeftId === null || diffRightId === null) {
-      setDiffLeftDetail(null);
-      setDiffRightDetail(null);
-      return;
-    }
-    const targetLeft = diffLeftId;
-    const targetRight = diffRightId;
-    setDiffLeftDetail((prev) =>
-      prev && prev.summary.id === targetLeft ? prev : null
-    );
-    setDiffRightDetail((prev) =>
-      prev && prev.summary.id === targetRight ? prev : null
-    );
-    void Promise.all([
-      proxyBridge.getSessionDetail(targetLeft),
-      proxyBridge.getSessionDetail(targetRight),
-    ])
-      .then(([left, right]) => {
-        if (!active) return;
-        setDiffLeftDetail(left);
-        setDiffRightDetail(right);
-      })
-      .catch((err) => {
-        if (!active) return;
-        setDiffLeftDetail(null);
-        setDiffRightDetail(null);
-        showToast(
-          `⚠️ Ошибка загрузки сессий для сравнения: ${
-            err instanceof Error ? err.message : String(err)
-          }`
-        );
-      });
-    return () => {
-      active = false;
-    };
-  }, [diffLeftId, diffRightId, diffPairSignature, showToast]);
-
   const updateBackendFilterConfig = useCallback(
     async (next: ProxyFilterBackendConfig) => {
       backendFilterConfigRef.current = next;
@@ -909,12 +994,12 @@ export function useProxySessions() {
   );
 
   const compiledMatrix = useMemo(
-    () => compileFilterMatrix(filterRules),
+    () => getCompiledMatrixCached(filterRules),
     [filterRules]
   );
 
   const compiledHostList = useMemo(
-    () => compileHostListFilter(hostListFilter),
+    () => getCompiledHostListCached(hostListFilter),
     [hostListFilter]
   );
 
@@ -1171,25 +1256,6 @@ export function useProxySessions() {
     }
   }, [showToast]);
 
-  const detectedProcesses = useMemo<DetectedProcessItem[]>(() => {
-    const map = new Map<string, DetectedProcessItem>();
-    for (const s of sessions) {
-      if (!s.processName) continue;
-      const key = `${s.processName}::${s.processPid ?? ""}`;
-      const existing = map.get(key);
-      if (existing) {
-        existing.count += 1;
-      } else {
-        map.set(key, {
-          name: s.processName,
-          pid: s.processPid ?? null,
-          count: 1,
-        });
-      }
-    }
-    return Array.from(map.values()).sort((a, b) => b.count - a.count);
-  }, [sessions]);
-
   const isForceNoCacheActive = useMemo(() => {
     if (!backendFilterConfig.headerMutationsEnabled) return false;
     const reqRule = backendFilterConfig.headerMutations.find(
@@ -1226,101 +1292,10 @@ export function useProxySessions() {
     backendFilterConfig,
   ]);
 
-  const { filteredSessions, regexError } = useMemo(() => {
-    let compiledQuickRegex: RegExp | null = null;
-    const trimmed = filterQuery.trim();
-
-    if (trimmed && useRegex) {
-      try {
-        compiledQuickRegex = new RegExp(trimmed, "i");
-      } catch (err) {
-        return {
-          filteredSessions: sessions,
-          regexError: err instanceof Error ? err.message : "Invalid RegExp",
-        };
-      }
-    }
-
-    const qLower = trimmed.toLowerCase();
-
-    const result = sessions.filter((s) => {
-      const isInFlight = s.status === 0 && !s.error && !s.tlsBypassed;
-      // 1. Quick Category Bar
-      if (quickCategory !== "all") {
-        const tone = getRowSemanticTone(s);
-        if (quickCategory === "json" && !isInFlight && tone !== "json") {
-          return false;
-        }
-        if (quickCategory === "images" && !isInFlight && tone !== "image") {
-          return false;
-        }
-        if (quickCategory === "errors" && !isInFlight && tone !== "error") {
-          return false;
-        }
-        if (quickCategory === "ws" && tone !== "ws") return false;
-        if (quickCategory === "sse" && !isInFlight && tone !== "sse") {
-          return false;
-        }
-        if (quickCategory === "mocked" && !isInFlight && !s.isMocked) {
-          return false;
-        }
-        if (quickCategory === "marked" && !s.comment && !s.markedColor) {
-          return false;
-        }
-      }
-
-      // 2. Bulk Hosts List + Advanced Filter Matrix + Thresholds + Noise Cleanup
-      if (
-        !evaluateSessionAgainstFilters(
-          s,
-          compiledMatrix,
-          matrixEnabled,
-          thresholds,
-          compiledHostList
-        )
-      ) {
-        return false;
-      }
-
-      // 3. Quick Search Bar (URL / Host / Method / Status / Content-Type / Process / Comment)
-      if (!trimmed) return true;
-
-      if (compiledQuickRegex) {
-        return (
-          compiledQuickRegex.test(s.url) ||
-          compiledQuickRegex.test(s.method) ||
-          compiledQuickRegex.test(String(s.status)) ||
-          compiledQuickRegex.test(s.contentType) ||
-          (s.processName ? compiledQuickRegex.test(s.processName) : false) ||
-          (s.clientIp ? compiledQuickRegex.test(s.clientIp) : false) ||
-          (s.comment ? compiledQuickRegex.test(s.comment) : false)
-        );
-      }
-
-      return (
-        s.url.toLowerCase().includes(qLower) ||
-        s.host.toLowerCase().includes(qLower) ||
-        s.method.toLowerCase().includes(qLower) ||
-        String(s.status).includes(qLower) ||
-        s.contentType.toLowerCase().includes(qLower) ||
-        (s.processName ? s.processName.toLowerCase().includes(qLower) : false) ||
-        (s.processPid != null ? String(s.processPid).includes(qLower) : false) ||
-        (s.clientIp ? s.clientIp.toLowerCase().includes(qLower) : false) ||
-        (s.comment ? s.comment.toLowerCase().includes(qLower) : false)
-      );
-    });
-
-    return { filteredSessions: result, regexError: null };
-  }, [
-    sessions,
-    filterQuery,
-    useRegex,
-    quickCategory,
-    compiledMatrix,
-    matrixEnabled,
-    thresholds,
-    compiledHostList,
-  ]);
+  const regexError = useMemo(
+    () => computeRegexError(filterQuery, useRegex),
+    [filterQuery, useRegex]
+  );
 
   const applyPreset = useCallback(
     (presetId: string) => {
@@ -2046,9 +2021,12 @@ export function useProxySessions() {
   const toggleSessionSelection = useCallback(
     (id: number) => {
       selectionAnchorIdRef.current = id;
+      const currentSelectedId = useProxyStore.getState().selectedId;
       setSelectedIds((prev) => {
         const base =
-          prev.length === 0 && selectedId !== null ? [selectedId] : prev;
+          prev.length === 0 && currentSelectedId !== null
+            ? [currentSelectedId]
+            : prev;
         if (base.includes(id)) {
           const next = base.filter((item) => item !== id);
           const nextPrimary = next.length > 0 ? next[next.length - 1] : null;
@@ -2061,14 +2039,17 @@ export function useProxySessions() {
         return next;
       });
     },
-    [selectedId]
+    [setSelectedIdState, setSelectedIds]
   );
 
   const selectSessionRange = useCallback(
     (targetId: number, orderedSessions?: SessionSummary[]) => {
-      const pool = orderedSessions ?? filteredSessions;
+      const pool = orderedSessions ?? getFilteredSessionsSnapshot();
+      const storeState = useProxyStore.getState();
       const anchor =
-        selectionAnchorIdRef.current ?? selectedIds[0] ?? selectedId;
+        selectionAnchorIdRef.current ??
+        storeState.selectedIds[0] ??
+        storeState.selectedId;
       if (anchor === null) {
         selectionAnchorIdRef.current = targetId;
         setSelectedIdState(targetId);
@@ -2090,13 +2071,17 @@ export function useProxySessions() {
       }
       const step = anchorIdx <= targetIdx ? 1 : -1;
       const rangeIds: number[] = [];
-      for (let i = anchorIdx; step > 0 ? i <= targetIdx : i >= targetIdx; i += step) {
+      for (
+        let i = anchorIdx;
+        step > 0 ? i <= targetIdx : i >= targetIdx;
+        i += step
+      ) {
         rangeIds.push(pool[i].id);
       }
       setSelectedIdState(targetId);
       setSelectedIds(rangeIds);
     },
-    [filteredSessions, selectedId, selectedIds]
+    [setSelectedIdState, setSelectedIds]
   );
 
   const selectSessions = useCallback(
@@ -2108,20 +2093,22 @@ export function useProxySessions() {
         return;
       }
       const uniqueIds = Array.from(new Set(ids));
+      const currentSelectedId = useProxyStore.getState().selectedId;
       const nextPrimary =
-        selectedId !== null && uniqueIds.includes(selectedId)
-          ? selectedId
+        currentSelectedId !== null && uniqueIds.includes(currentSelectedId)
+          ? currentSelectedId
           : uniqueIds[0];
       selectionAnchorIdRef.current = nextPrimary;
       setSelectedIdState(nextPrimary);
       setSelectedIds(uniqueIds);
     },
-    [selectedId]
+    [setSelectedIdState, setSelectedIds]
   );
 
   const compareWithSession = useCallback(
     (targetId: number) => {
-      const baseId = selectedIds[0] ?? selectedId;
+      const storeState = useProxyStore.getState();
+      const baseId = storeState.selectedIds[0] ?? storeState.selectedId;
       if (baseId === null || baseId === targetId) {
         setSelectedIdState(targetId);
         setSelectedIds([targetId]);
@@ -2130,18 +2117,21 @@ export function useProxySessions() {
       setSelectedIdState(targetId);
       setSelectedIds([baseId, targetId]);
     },
-    [selectedId, selectedIds]
+    [setSelectedIdState, setSelectedIds]
   );
 
-  const setComparePairIds = useCallback((leftId: number, rightId: number) => {
-    if (leftId === rightId) {
-      setSelectedIdState(leftId);
-      setSelectedIds([leftId]);
-      return;
-    }
-    setSelectedIdState(rightId);
-    setSelectedIds([leftId, rightId]);
-  }, []);
+  const setComparePairIds = useCallback(
+    (leftId: number, rightId: number) => {
+      if (leftId === rightId) {
+        setSelectedIdState(leftId);
+        setSelectedIds([leftId]);
+        return;
+      }
+      setSelectedIdState(rightId);
+      setSelectedIds([leftId, rightId]);
+    },
+    [setSelectedIdState, setSelectedIds]
+  );
 
   const swapCompareSessions = useCallback(() => {
     setSelectedIds((prev) => {
@@ -2150,12 +2140,7 @@ export function useProxySessions() {
       setSelectedIdState(next[1]);
       return next;
     });
-  }, []);
-
-  const markedSessionsCount = useMemo(
-    () => sessions.filter((s) => Boolean(s.comment || s.markedColor)).length,
-    [sessions]
-  );
+  }, [setSelectedIdState, setSelectedIds]);
 
   const annotateSessions = useCallback(
     async (
@@ -2171,9 +2156,7 @@ export function useProxySessions() {
       );
       if (updated.length > 0) {
         const byId = new Map(updated.map((u) => [u.id, u]));
-        setSessions((prev) =>
-          prev.map((s) => byId.get(s.id) ?? s)
-        );
+        setSessions((prev) => prev.map((s) => byId.get(s.id) ?? s));
       }
       const hasAnnotation = Boolean(comment?.trim() || markedColor?.trim());
       if (hasAnnotation) {
@@ -2190,7 +2173,7 @@ export function useProxySessions() {
         );
       }
     },
-    [showToast]
+    [setSessions, showToast]
   );
 
   const unmarkSessions = useCallback(
@@ -2199,8 +2182,9 @@ export function useProxySessions() {
         showToast("Сначала выберите сессию в таблице трафика");
         return;
       }
+      const currentSessions = useProxyStore.getState().sessions;
       const idSet = new Set(ids);
-      const targets = sessions.filter((s) => idSet.has(s.id));
+      const targets = currentSessions.filter((s) => idSet.has(s.id));
       const markedTargets = targets.filter((s) => Boolean(s.markedColor));
       if (markedTargets.length === 0) {
         showToast("У выбранных сессий нет цветовой метки");
@@ -2240,36 +2224,38 @@ export function useProxySessions() {
           : `Цветовые метки сняты (${markedTargets.length} сессий)`
       );
     },
-    [sessions, showToast]
+    [setSessions, showToast]
   );
 
   const deleteSessions = useCallback(
     async (ids: number[]) => {
       if (ids.length === 0) return;
       const removeSet = new Set(ids);
+      const filteredPool = getFilteredSessionsSnapshot();
+      const currentSelectedId = useProxyStore.getState().selectedId;
 
       // Compute nearest surviving row in filteredSessions so keyboard navigation stays continuous
       let nextSelected: number | null = null;
-      const firstRemovedIdx = filteredSessions.findIndex((s) =>
+      const firstRemovedIdx = filteredPool.findIndex((s) =>
         removeSet.has(s.id)
       );
       if (firstRemovedIdx !== -1) {
-        for (let i = firstRemovedIdx + 1; i < filteredSessions.length; i++) {
-          if (!removeSet.has(filteredSessions[i].id)) {
-            nextSelected = filteredSessions[i].id;
+        for (let i = firstRemovedIdx + 1; i < filteredPool.length; i++) {
+          if (!removeSet.has(filteredPool[i].id)) {
+            nextSelected = filteredPool[i].id;
             break;
           }
         }
         if (nextSelected === null) {
           for (let i = firstRemovedIdx - 1; i >= 0; i--) {
-            if (!removeSet.has(filteredSessions[i].id)) {
-              nextSelected = filteredSessions[i].id;
+            if (!removeSet.has(filteredPool[i].id)) {
+              nextSelected = filteredPool[i].id;
               break;
             }
           }
         }
-      } else if (selectedId !== null && !removeSet.has(selectedId)) {
-        nextSelected = selectedId;
+      } else if (currentSelectedId !== null && !removeSet.has(currentSelectedId)) {
+        nextSelected = currentSelectedId;
       }
 
       try {
@@ -2301,7 +2287,16 @@ export function useProxySessions() {
         );
       }
     },
-    [filteredSessions, refreshStorageStats, selectedId, showToast]
+    [
+      refreshStorageStats,
+      setDiffLeftDetail,
+      setDiffRightDetail,
+      setSelectedDetail,
+      setSelectedIdState,
+      setSelectedIds,
+      setSessions,
+      showToast,
+    ]
   );
 
   const replaySessions = useCallback(
@@ -2404,12 +2399,12 @@ export function useProxySessions() {
       next.splice(0, next.length - limit);
     }
     setSessions(next);
-    if (next.length > 0 && selectedId === null) {
+    if (next.length > 0 && useProxyStore.getState().selectedId === null) {
       setSelectedId(next[0].id);
     }
     await refreshStorageStats();
     showToast(`Loaded ${next.length.toLocaleString()} sessions from SQLite`);
-  }, [refreshStorageStats, selectedId, setSelectedId, showToast]);
+  }, [refreshStorageStats, setSelectedId, setSessions, showToast]);
 
   const mergeImportedSummaries = useCallback(
     (imported: SessionSummary[]) => {
@@ -2555,13 +2550,13 @@ export function useProxySessions() {
 
   const exportAllSessionsAs = useCallback(
     async (forcedFormat?: "har" | "saz" | "json") => {
-      if (sessions.length === 0) {
+      if (useProxyStore.getState().sessions.length === 0) {
         showToast("⚠️ Нет захваченных сессий для сохранения");
         return;
       }
       await exportSessionsWithDialog([], forcedFormat);
     },
-    [exportSessionsWithDialog, sessions.length, showToast]
+    [exportSessionsWithDialog, showToast]
   );
 
   const exportSelectedSessionsAs = useCallback(
@@ -2569,13 +2564,14 @@ export function useProxySessions() {
       explicitIds?: number[],
       forcedFormat?: "har" | "saz" | "json" | "raw"
     ) => {
+      const storeState = useProxyStore.getState();
       const ids =
         explicitIds && explicitIds.length > 0
           ? explicitIds
-          : selectedIds.length > 0
-            ? selectedIds
-            : selectedId !== null
-              ? [selectedId]
+          : storeState.selectedIds.length > 0
+            ? storeState.selectedIds
+            : storeState.selectedId !== null
+              ? [storeState.selectedId]
               : [];
       if (ids.length === 0) {
         showToast("⚠️ Выделите хотя бы одну сессию для экспорта");
@@ -2583,7 +2579,7 @@ export function useProxySessions() {
       }
       await exportSessionsWithDialog(ids, forcedFormat);
     },
-    [exportSessionsWithDialog, selectedId, selectedIds, showToast]
+    [exportSessionsWithDialog, showToast]
   );
 
   const exportSanitizedSessions = useCallback(
@@ -2593,9 +2589,10 @@ export function useProxySessions() {
       sanitization: SanitizationOptions,
       includeEvictedSqlite = false
     ): Promise<boolean> => {
-      const archivedSessions = storageStats.archivedSessions ?? 0;
+      const storeState = useProxyStore.getState();
+      const archivedSessions = storeState.storageStats.archivedSessions ?? 0;
       if (
-        sessions.length === 0 &&
+        storeState.sessions.length === 0 &&
         !(includeEvictedSqlite && targetSessionIds.length === 0 && archivedSessions > 0)
       ) {
         showToast("⚠️ Нет захваченных сессий для экспорта");
@@ -2608,7 +2605,7 @@ export function useProxySessions() {
         includeEvictedSqlite
       );
     },
-    [exportSessionsWithDialog, sessions.length, showToast, storageStats.archivedSessions]
+    [exportSessionsWithDialog, showToast]
   );
 
   const importArchiveFromPath = useCallback(
@@ -2680,9 +2677,11 @@ export function useProxySessions() {
   const saveSessionBodyAs = useCallback(
     async (sessionId: number, isResponse: boolean) => {
       try {
+        const storeState = useProxyStore.getState();
         let detail =
-          selectedDetail && selectedDetail.summary.id === sessionId
-            ? selectedDetail
+          storeState.selectedDetail &&
+          storeState.selectedDetail.summary.id === sessionId
+            ? storeState.selectedDetail
             : null;
         if (!detail) {
           detail = await proxyBridge.getSessionDetail(sessionId);
@@ -2704,7 +2703,11 @@ export function useProxySessions() {
               )?.value ?? null;
           }
         } else if (isResponse) {
-          const summary = findSessionById(sessions, sessionIndexById, sessionId);
+          const summary = findSessionById(
+            storeState.sessions,
+            storeState.sessionIndexById,
+            sessionId
+          );
           mimeType = summary?.contentType ?? null;
         }
 
@@ -2743,7 +2746,7 @@ export function useProxySessions() {
         );
       }
     },
-    [selectedDetail, sessionIndexById, sessions, showToast]
+    [showToast]
   );
 
   const generateStress10k = useCallback(async () => {
@@ -2921,10 +2924,50 @@ export function useProxySessions() {
     [showToast]
   );
 
+  const setMatrixEnabledStable = useCallback(
+    (v: boolean) => {
+      setMatrixEnabled(v);
+    },
+    [setMatrixEnabled]
+  );
+
+  const setFilterRulesStable = useCallback(
+    (
+      updater:
+        | FilterConditionRule[]
+        | ((prev: FilterConditionRule[]) => FilterConditionRule[])
+    ) => {
+      setActivePresetId(null);
+      setFilterRules(updater);
+    },
+    [setActivePresetId, setFilterRules]
+  );
+
+  const setThresholdsStable = useCallback(
+    (
+      updater:
+        | NoiseThresholdsConfig
+        | ((prev: NoiseThresholdsConfig) => NoiseThresholdsConfig)
+    ) => {
+      setActivePresetId(null);
+      setThresholds(updater);
+    },
+    [setActivePresetId, setThresholds]
+  );
+
+  const setHostListFilterStable = useCallback(
+    (
+      updater:
+        | HostListFilterConfig
+        | ((prev: HostListFilterConfig) => HostListFilterConfig)
+    ) => {
+      setActivePresetId(null);
+      setHostListFilterState(updater);
+    },
+    [setActivePresetId, setHostListFilterState]
+  );
+
   return {
-    sessions,
-    sessionIndexById,
-    filteredSessions,
     selectedId,
     setSelectedId,
     selectedIds,
@@ -2934,10 +2977,6 @@ export function useProxySessions() {
     compareWithSession,
     setComparePairIds,
     swapCompareSessions,
-    selectedDetail,
-    diffLeftDetail,
-    diffRightDetail,
-    markedSessionsCount,
     annotateSessions,
     unmarkSessions,
     deleteSessions,
@@ -2956,37 +2995,14 @@ export function useProxySessions() {
     showToast,
     // Advanced Filter System
     matrixEnabled,
-    setMatrixEnabled: (v: boolean) => {
-      setMatrixEnabled(v);
-    },
+    setMatrixEnabled: setMatrixEnabledStable,
     filterRules,
-    setFilterRules: (
-      updater:
-        | FilterConditionRule[]
-        | ((prev: FilterConditionRule[]) => FilterConditionRule[])
-    ) => {
-      setActivePresetId(null);
-      setFilterRules(updater);
-    },
+    setFilterRules: setFilterRulesStable,
     ruleErrors: compiledMatrix.ruleErrors,
     thresholds,
-    setThresholds: (
-      updater:
-        | NoiseThresholdsConfig
-        | ((prev: NoiseThresholdsConfig) => NoiseThresholdsConfig)
-    ) => {
-      setActivePresetId(null);
-      setThresholds(updater);
-    },
+    setThresholds: setThresholdsStable,
     hostListFilter,
-    setHostListFilter: (
-      updater:
-        | HostListFilterConfig
-        | ((prev: HostListFilterConfig) => HostListFilterConfig)
-    ) => {
-      setActivePresetId(null);
-      setHostListFilterState(updater);
-    },
+    setHostListFilter: setHostListFilterStable,
     compiledHostList,
     customPresets,
     allPresets,
@@ -2998,7 +3014,6 @@ export function useProxySessions() {
     resetAdvancedFilters,
     backendFilterConfig,
     updateBackendFilterConfig,
-    detectedProcesses,
     quickFilterByProcess,
     quickFilterByClientIp,
     setTlsInterceptMode,
@@ -3030,7 +3045,6 @@ export function useProxySessions() {
     clearDbOnExit,
     setClearDbOnExit,
     clearSqliteDatabase,
-    storageStats,
     refreshStorageStats,
     // Core Proxy Actions
     toggleProxy,
@@ -3053,5 +3067,35 @@ export function useProxySessions() {
     importArchiveFromDroppedFile,
     saveSessionBodyAs,
     generateStress10k,
+  };
+}
+
+export function useProxySessions() {
+  const controller = useProxySessionController();
+  useSessionDetailSync();
+  const sessions = useProxyStore((s) => s.sessions);
+  const sessionIndexById = useProxyStore((s) => s.sessionIndexById);
+  const selectedDetail = useProxyStore((s) => s.selectedDetail);
+  const diffLeftDetail = useProxyStore((s) => s.diffLeftDetail);
+  const diffRightDetail = useProxyStore((s) => s.diffRightDetail);
+  const markedSessionsCount = useProxyStore((s) => s.markedSessionsCount);
+  const storageStats = useProxyStore((s) => s.storageStats);
+  const { filteredSessions } = useFilteredSessions();
+  const detectedProcesses = useMemo(
+    () => computeDetectedProcesses(sessions),
+    [sessions]
+  );
+
+  return {
+    ...controller,
+    sessions,
+    sessionIndexById,
+    filteredSessions,
+    selectedDetail,
+    diffLeftDetail,
+    diffRightDetail,
+    markedSessionsCount,
+    detectedProcesses,
+    storageStats,
   };
 }
