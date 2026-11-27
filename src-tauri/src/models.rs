@@ -434,6 +434,15 @@ pub struct NoiseThresholdsBackendConfig {
     #[serde(default)]
     pub hide_connect_tunnels: bool,
     #[serde(default)]
+    pub hide_css: bool,
+    #[serde(default)]
+    pub hide_images: bool,
+    #[serde(default)]
+    pub hide_fonts: bool,
+    #[serde(default)]
+    pub hide_js: bool,
+    /// Legacy migration-only input for pre-Stage 49 configs; cleared after normalization.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hide_static_assets: bool,
     #[serde(default)]
     pub min_body_size_bytes: Option<usize>,

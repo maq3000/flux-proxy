@@ -1159,3 +1159,182 @@ fn lan_client_allowlist_matches_exact_ips_cidrs_and_always_allows_loopback() {
     assert!(engine.is_lan_client_allowed(loopback_v4));
     assert!(!engine.is_lan_client_allowed(remote_v4));
 }
+
+#[test]
+fn granular_css_images_fonts_js_filters_and_json_protection() {
+    let make_asset = |path: &str, content_type: &str, status: u16| {
+        let mut sum = make_summary_for_filter("GET", "cdn.example.com", path, status, Some("chrome.exe"));
+        sum.content_type = content_type.into();
+        sum
+    };
+
+    let css_mime = make_asset("/theme", "text/css; charset=utf-8", 200);
+    let css_path = make_asset("/styles/main.css?v=1", "application/octet-stream", 200);
+    let css_map = make_asset("/styles/main.css.map", "application/json", 200);
+    let img_mime = make_asset("/avatar", "image/webp", 200);
+    let img_avif = make_asset("/hero.avif?w=600", "application/octet-stream", 200);
+    let img_heic = make_asset("/photo.heic", "", 200);
+    let font_mime = make_asset("/font-a", "application/font-woff", 200);
+    let font_ms = make_asset("/font-b", "application/vnd.ms-fontobject", 200);
+    let font_x = make_asset("/font-c", "application/x-font-opentype", 200);
+    let font_eot = make_asset("/icons.eot?v=4", "", 200);
+    let js_mime = make_asset("/sdk", "application/javascript; charset=utf-8", 200);
+    let es_mime = make_asset("/esm", "text/ecmascript", 200);
+    let js_mjs = make_asset("/chunks/app.mjs?h=123", "text/plain", 200);
+    let js_cjs = make_asset("/chunks/vendor.cjs", "", 200);
+    let js_jsx = make_asset("/src/Button.jsx", "", 200);
+    let js_map = make_asset("/chunks/app.js.map", "application/json", 200);
+    let mjs_map = make_asset("/chunks/app.mjs.map?v=2", "", 200);
+    let cjs_map = make_asset("/chunks/vendor.cjs.map", "", 200);
+    let json_api = make_asset("/api/config.json?env=prod", "application/json", 200);
+    let jsp_page = make_asset("/legacy/login.jsp", "text/html", 200);
+
+    // 1. CSS only
+    let engine = ProxyFilterEngine::new();
+    let mut cfg = default_backend_config();
+    cfg.drop_non_matching_on_capture = true;
+    cfg.noise_thresholds.hide_css = true;
+    engine.update_config(cfg);
+    assert!(!engine.evaluate_should_store_session(&css_mime));
+    assert!(!engine.evaluate_should_store_session(&css_path));
+    assert!(!engine.evaluate_should_store_session(&css_map));
+    assert!(engine.evaluate_should_store_session(&js_map));
+    assert!(engine.evaluate_should_store_session(&img_avif));
+    assert!(engine.evaluate_should_store_session(&font_eot));
+    assert!(engine.evaluate_should_store_session(&js_mjs));
+    assert!(engine.evaluate_should_store_session(&json_api));
+
+    // 2. Images only
+    let mut cfg = default_backend_config();
+    cfg.drop_non_matching_on_capture = true;
+    cfg.noise_thresholds.hide_images = true;
+    engine.update_config(cfg);
+    for ext in ["png", "jpg", "jpeg", "gif", "webp", "avif", "svg", "ico", "bmp", "cur", "tif", "tiff", "heic"] {
+        let sample = make_asset(&format!("/img.{ext}"), "", 200);
+        assert!(
+            !engine.evaluate_should_store_session(&sample),
+            "expected .{ext} to be hidden when hide_images = true"
+        );
+    }
+    assert!(!engine.evaluate_should_store_session(&img_mime));
+    assert!(!engine.evaluate_should_store_session(&img_avif));
+    assert!(!engine.evaluate_should_store_session(&img_heic));
+    assert!(engine.evaluate_should_store_session(&css_path));
+    assert!(engine.evaluate_should_store_session(&font_eot));
+    assert!(engine.evaluate_should_store_session(&js_mjs));
+    assert!(engine.evaluate_should_store_session(&json_api));
+
+    // 3. Fonts only
+    let mut cfg = default_backend_config();
+    cfg.drop_non_matching_on_capture = true;
+    cfg.noise_thresholds.hide_fonts = true;
+    engine.update_config(cfg);
+    for sample in [
+        &font_mime,
+        &font_ms,
+        &font_x,
+        &font_eot,
+        &make_asset("/f.woff", "", 200),
+        &make_asset("/f.woff2", "", 200),
+        &make_asset("/f.ttf", "", 200),
+        &make_asset("/f.otf", "", 200),
+        &make_asset("/f-mime", "font/woff2", 200),
+    ] {
+        assert!(!engine.evaluate_should_store_session(sample));
+    }
+    assert!(engine.evaluate_should_store_session(&css_path));
+    assert!(engine.evaluate_should_store_session(&img_avif));
+    assert!(engine.evaluate_should_store_session(&js_mjs));
+    assert!(engine.evaluate_should_store_session(&json_api));
+
+    // 4. JavaScript only (must never match .json, application/json, .jsp, or .css.map)
+    let mut cfg = default_backend_config();
+    cfg.drop_non_matching_on_capture = true;
+    cfg.noise_thresholds.hide_js = true;
+    engine.update_config(cfg);
+    for sample in [&js_mime, &es_mime, &js_mjs, &js_cjs, &js_jsx, &js_map, &mjs_map, &cjs_map] {
+        assert!(!engine.evaluate_should_store_session(sample));
+    }
+    assert!(engine.evaluate_should_store_session(&json_api));
+    assert!(engine.evaluate_should_store_session(&jsp_page));
+    assert!(engine.evaluate_should_store_session(&css_map));
+    assert!(engine.evaluate_should_store_session(&img_avif));
+    assert!(engine.evaluate_should_store_session(&font_eot));
+
+    // In-flight pending request defers MIME check while matching explicit JS path
+    let in_flight_mime = make_asset("/api/stream", "application/javascript", 0);
+    let in_flight_path = make_asset("/assets/bundle.js", "", 0);
+    assert!(engine.evaluate_should_store_session(&in_flight_mime));
+    assert!(!engine.evaluate_should_store_session(&in_flight_path));
+}
+
+#[test]
+fn legacy_hide_static_assets_serde_migrates_without_hiding_js() {
+    let legacy_json = r#"{
+        "tlsInterceptMode": "interceptAll",
+        "tlsBypassEnabled": true,
+        "tlsBypassRules": [],
+        "tlsTargetRules": [],
+        "headerMutationsEnabled": true,
+        "headerMutations": [],
+        "dropNonMatchingOnCapture": true,
+        "noiseThresholds": {
+            "hideStaticAssets": true
+        }
+    }"#;
+    let parsed: ProxyFilterBackendConfig =
+        serde_json::from_str(legacy_json).expect("deserialize legacy noiseThresholds");
+    let engine = ProxyFilterEngine::new();
+    let normalized = engine.update_config(parsed);
+
+    assert!(normalized.noise_thresholds.hide_css);
+    assert!(normalized.noise_thresholds.hide_images);
+    assert!(normalized.noise_thresholds.hide_fonts);
+    assert!(!normalized.noise_thresholds.hide_js);
+    assert!(!normalized.noise_thresholds.hide_static_assets);
+
+    let reserialized = serde_json::to_string(&normalized).expect("serialize normalized config");
+    assert!(!reserialized.contains("hideStaticAssets"));
+
+    let mut css = make_summary_for_filter("GET", "cdn.test", "/a.css", 200, Some("chrome.exe"));
+    css.content_type = "text/css".into();
+    let mut img = make_summary_for_filter("GET", "cdn.test", "/a.png", 200, Some("chrome.exe"));
+    img.content_type = "image/png".into();
+    let mut font = make_summary_for_filter("GET", "cdn.test", "/a.woff2", 200, Some("chrome.exe"));
+    font.content_type = "font/woff2".into();
+    let mut js = make_summary_for_filter("GET", "cdn.test", "/app.js", 200, Some("chrome.exe"));
+    js.content_type = "application/javascript".into();
+
+    assert!(!engine.evaluate_should_store_session(&css));
+    assert!(!engine.evaluate_should_store_session(&img));
+    assert!(!engine.evaluate_should_store_session(&font));
+    assert!(engine.evaluate_should_store_session(&js));
+
+    // Explicit granular flag alongside legacy hideStaticAssets=true must NOT trigger expansion
+    let explicit_json = r#"{
+        "tlsInterceptMode": "interceptAll",
+        "tlsBypassEnabled": true,
+        "tlsBypassRules": [],
+        "tlsTargetRules": [],
+        "headerMutationsEnabled": true,
+        "headerMutations": [],
+        "dropNonMatchingOnCapture": true,
+        "noiseThresholds": {
+            "hideStaticAssets": true,
+            "hideJs": true
+        }
+    }"#;
+    let parsed_explicit: ProxyFilterBackendConfig =
+        serde_json::from_str(explicit_json).expect("deserialize explicit + legacy");
+    let norm_explicit = engine.update_config(parsed_explicit);
+    assert!(!norm_explicit.noise_thresholds.hide_css);
+    assert!(!norm_explicit.noise_thresholds.hide_images);
+    assert!(!norm_explicit.noise_thresholds.hide_fonts);
+    assert!(norm_explicit.noise_thresholds.hide_js);
+    assert!(!norm_explicit.noise_thresholds.hide_static_assets);
+
+    assert!(engine.evaluate_should_store_session(&css));
+    assert!(engine.evaluate_should_store_session(&img));
+    assert!(engine.evaluate_should_store_session(&font));
+    assert!(!engine.evaluate_should_store_session(&js));
+}

@@ -3,11 +3,13 @@ import {
   BUILT_IN_FILTER_PRESETS,
   compileFilterMatrix,
   compileHostListFilter,
+  countActiveNoiseThresholds,
   DEFAULT_HOST_LIST_FILTER_CONFIG,
   DEFAULT_NOISE_THRESHOLDS,
   evaluateSessionAgainstFilters,
   matchHostRuleList,
   normalizeHostToken,
+  normalizeNoiseThresholds,
 } from "../lib/filterEngine";
 import {
   formatBytes,
@@ -1207,13 +1209,7 @@ export function useProxySessions() {
     if (hostListFilter.enabled && compiledHostList.activeCount > 0) {
       count += compiledHostList.activeCount;
     }
-    if (thresholds.hide304NotModified) count += 1;
-    if (thresholds.hideOptionsPreflight) count += 1;
-    if (thresholds.hideConnectTunnels) count += 1;
-    if (thresholds.hideStaticAssets) count += 1;
-    if (thresholds.minBodySizeBytes !== null) count += 1;
-    if (thresholds.maxBodySizeBytes !== null) count += 1;
-    if (thresholds.onlySlowRequests) count += 1;
+    count += countActiveNoiseThresholds(thresholds);
     if (backendFilterConfig.tlsInterceptMode === "targetedOnly") count += 1;
     if (backendFilterConfig.headerMutationsEnabled) {
       count += backendFilterConfig.headerMutations.filter(
@@ -1332,7 +1328,7 @@ export function useProxySessions() {
       if (!target) return;
       setMatrixEnabled(target.matrixEnabled);
       setFilterRules(structuredClone(target.rules));
-      setThresholds({ ...DEFAULT_NOISE_THRESHOLDS, ...target.thresholds });
+      setThresholds(normalizeNoiseThresholds(target.thresholds));
       if (target.hostListFilter) {
         setHostListFilterState({
           ...DEFAULT_HOST_LIST_FILTER_CONFIG,

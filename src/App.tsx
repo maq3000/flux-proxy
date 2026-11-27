@@ -2457,7 +2457,8 @@ const AppContent: React.FC = () => {
         category: "Preset",
         group: "filters",
         label: "Применить пресет: «Только API бэкенда»",
-        description: "Оставить JSON/GraphQL/API-запросы и скрыть статику со шрифтами",
+        description:
+          "Оставить JSON/GraphQL/API-запросы и скрыть CSS, картинки, шрифты и JS-скрипты",
         statusBadge:
           activePresetId === "preset-backend-api" ? "Активно" : undefined,
         perform: () => applyPreset("preset-backend-api"),

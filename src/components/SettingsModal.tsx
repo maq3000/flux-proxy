@@ -18,7 +18,10 @@ import {
 } from "lucide-react";
 import type { ThemePreference } from "../hooks/useTheme";
 import { TRAFFIC_COLUMNS } from "../hooks/useUiPreferences";
-import { compileHostListFilter } from "../lib/filterEngine";
+import {
+  compileHostListFilter,
+  countActiveNoiseThresholds,
+} from "../lib/filterEngine";
 import { getSectionMeta } from "../lib/sectionRegistry";
 import { proxyBridge } from "../lib/tauriBridge";
 import {
@@ -231,9 +234,29 @@ const SETTINGS_SEARCH_INDEX: readonly SettingsSearchEntry[] = [
   },
   {
     id: "noise-thresholds",
-    title: "Noise & Thresholds (304, OPTIONS, Static, Time Heat)",
-    description: "Скрытие шума, фильтры по размеру тела и пороги подсветки медленных запросов",
-    keywords: ["noise", "threshold", "304", "options", "static", "time heat", "warning", "critical", "шум"],
+    title: "Noise & Thresholds (304, OPTIONS, CSS/Img/Fonts/JS, Time Heat)",
+    description: "Скрытие протокольного шума и фронтенд-ассетов (CSS, Images, Fonts, JS), фильтры по размеру тела и пороги медленных запросов",
+    keywords: [
+      "noise",
+      "threshold",
+      "304",
+      "options",
+      "static",
+      "time heat",
+      "warning",
+      "critical",
+      "шум",
+      "js",
+      "javascript",
+      "scripts",
+      "css",
+      "images",
+      "fonts",
+      "скрипты",
+      "стили",
+      "шрифты",
+      "картинки",
+    ],
     tab: "filters",
     subTab: "thresholds",
     sectionId: "filters-subtab-content",
@@ -987,11 +1010,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     if (hostFilters.enabled) {
       filterActiveCount += compiledHosts.activeCount;
     }
-    if (noiseThresholds.hide304NotModified) filterActiveCount++;
-    if (noiseThresholds.hideOptionsPreflight) filterActiveCount++;
-    if (noiseThresholds.hideConnectTunnels) filterActiveCount++;
-    if (noiseThresholds.hideStaticAssets) filterActiveCount++;
-    if (noiseThresholds.onlySlowRequests) filterActiveCount++;
+    filterActiveCount += countActiveNoiseThresholds(noiseThresholds);
     if (backendFilterConfig.headerMutationsEnabled) {
       filterActiveCount += backendFilterConfig.headerMutations.filter(
         (m) => m.enabled

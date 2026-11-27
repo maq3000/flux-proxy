@@ -91,6 +91,9 @@ beforeAll(() => {
       disconnect() {}
     };
   }
+  if (typeof Element.prototype.scrollIntoView !== "function") {
+    Element.prototype.scrollIntoView = vi.fn();
+  }
 });
 
 function createDefaultProps(
@@ -344,6 +347,87 @@ describe("SettingsModal (Unified Fullscreen Settings Hub)", () => {
 
     await waitFor(() => {
       expect(document.getElementById("throttling-section")).not.toBeNull();
+    });
+  });
+
+  it("stage 49: searches JS/font keywords, renders 4 granular asset toggles + 1-click chips, and counts active threshold badge", async () => {
+    const onSetNoiseThresholds = vi.fn();
+    render(
+      <SettingsModal
+        {...createDefaultProps({
+          noiseThresholds: {
+            ...DEFAULT_NOISE_THRESHOLDS,
+            hideCss: true,
+            hideJs: true,
+          },
+          onSetNoiseThresholds,
+        })}
+      />
+    );
+
+    const tablist = screen.getByRole("tablist", {
+      name: "Разделы настроек FluxProxy",
+    });
+    const filtersTab = within(tablist).getByRole("tab", { name: /Filters/i });
+    expect(filtersTab.textContent).toContain("2");
+
+    const searchInput = screen.getByRole("searchbox", {
+      name: "Поиск по настройкам",
+    });
+    fireEvent.change(searchInput, { target: { value: "javascript" } });
+    expect(
+      screen.getByRole("button", { name: /Noise & Thresholds/i })
+    ).toBeTruthy();
+
+    fireEvent.change(searchInput, { target: { value: "шрифты" } });
+    fireEvent.click(
+      screen.getByRole("button", { name: /Noise & Thresholds/i })
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText("Скрывать JavaScript (JS)")).toBeTruthy();
+    });
+
+    expect(screen.getByLabelText(/Скрывать CSS/i)).toBeTruthy();
+    expect(screen.getByLabelText(/Скрывать Images/i)).toBeTruthy();
+    expect(screen.getByLabelText(/Скрывать Fonts/i)).toBeTruthy();
+    expect(screen.getByLabelText(/Скрывать JavaScript \(JS\)/i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Скрыть всё (4)" }));
+    const hideAllUpdater = onSetNoiseThresholds.mock.calls.at(-1)?.[0];
+    expect(hideAllUpdater(DEFAULT_NOISE_THRESHOLDS)).toMatchObject({
+      hideCss: true,
+      hideImages: true,
+      hideFonts: true,
+      hideJs: true,
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Только статика (CSS / Img / Fonts)" })
+    );
+    const onlyStaticUpdater = onSetNoiseThresholds.mock.calls.at(-1)?.[0];
+    expect(onlyStaticUpdater({ ...DEFAULT_NOISE_THRESHOLDS, hideJs: true })).toMatchObject({
+      hideCss: true,
+      hideImages: true,
+      hideFonts: true,
+      hideJs: false,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Сбросить" }));
+    const resetUpdater = onSetNoiseThresholds.mock.calls.at(-1)?.[0];
+    expect(
+      resetUpdater({
+        ...DEFAULT_NOISE_THRESHOLDS,
+        hideCss: true,
+        hideImages: true,
+        hideFonts: true,
+        hideJs: true,
+      })
+    ).toMatchObject({
+      hideCss: false,
+      hideImages: false,
+      hideFonts: false,
+      hideJs: false,
     });
   });
 });

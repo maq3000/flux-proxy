@@ -1,6 +1,9 @@
 import React, { useMemo } from "react";
 import { Flame, Globe, ListFilter, RotateCcw, Wand2 } from "lucide-react";
-import type { CompiledHostListFilter } from "../../lib/filterEngine";
+import {
+  countActiveNoiseThresholds,
+  type CompiledHostListFilter,
+} from "../../lib/filterEngine";
 import type {
   DetectedProcessItem,
   FilterConditionRule,
@@ -109,17 +112,10 @@ export const FiltersSettingsTab: React.FC<FiltersSettingsTabProps> = ({
     ? compiledHosts.activeCount
     : 0;
 
-  const activeThresholdCount = useMemo(() => {
-    let n = 0;
-    if (noiseThresholds.hide304NotModified) n++;
-    if (noiseThresholds.hideOptionsPreflight) n++;
-    if (noiseThresholds.hideConnectTunnels) n++;
-    if (noiseThresholds.hideStaticAssets) n++;
-    if (noiseThresholds.minBodySizeBytes !== null) n++;
-    if (noiseThresholds.maxBodySizeBytes !== null) n++;
-    if (noiseThresholds.onlySlowRequests) n++;
-    return n;
-  }, [noiseThresholds]);
+  const activeThresholdCount = useMemo(
+    () => countActiveNoiseThresholds(noiseThresholds),
+    [noiseThresholds]
+  );
 
   const activeHeaderMutCount = useMemo(
     () =>

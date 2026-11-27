@@ -517,7 +517,10 @@ struct FilterEngineState {
     compiled_capture_matrix: CompiledCaptureMatrix,
     compiled_query_regex: Option<Regex>,
     compiled_lan_allowlist: CompiledLanAllowlist,
-    static_asset_ext_re: Regex,
+    css_asset_ext_re: Regex,
+    image_asset_ext_re: Regex,
+    font_asset_ext_re: Regex,
+    js_asset_ext_re: Regex,
 }
 
 /// Real-time proxy filter subsystem handling:
@@ -584,12 +587,13 @@ impl ProxyFilterEngine {
     }
 
     pub fn update_config(&self, next: ProxyFilterBackendConfig) -> ProxyFilterBackendConfig {
-        let next_state = build_filter_engine_state(next.clone());
+        let next_state = build_filter_engine_state(next);
+        let stored = next_state.config.clone();
         if let Ok(mut guard) = self.state.write() {
             *guard = next_state;
         }
         self.config_version_tx.send_modify(|v| *v = v.wrapping_add(1));
-        next
+        stored
     }
 
     pub fn set_drop_non_matching(&self, enabled: bool) {
@@ -668,14 +672,40 @@ impl ProxyFilterEngine {
                 return false;
             }
         }
-        if th.hide_static_assets {
-            let ct = summary.content_type.to_ascii_lowercase();
-            let ct_is_static = !is_in_flight
-                && (ct.starts_with("image/")
-                    || ct.starts_with("font/")
-                    || ct.contains("text/css"));
-            if ct_is_static || guard.static_asset_ext_re.is_match(&summary.path) {
+        if th.hide_css || th.hide_images || th.hide_fonts || th.hide_js {
+            let ct = if !is_in_flight {
+                summary.content_type.to_ascii_lowercase()
+            } else {
+                String::new()
+            };
+            if th.hide_css
+                && ((!is_in_flight && ct.contains("text/css"))
+                    || guard.css_asset_ext_re.is_match(&summary.path))
+            {
                 return false;
+            }
+            if th.hide_images
+                && ((!is_in_flight && ct.starts_with("image/"))
+                    || guard.image_asset_ext_re.is_match(&summary.path))
+            {
+                return false;
+            }
+            if th.hide_fonts {
+                let ct_is_font = !is_in_flight
+                    && (ct.starts_with("font/")
+                        || ct.contains("application/font-woff")
+                        || ct.contains("application/vnd.ms-fontobject")
+                        || ct.contains("application/x-font-"));
+                if ct_is_font || guard.font_asset_ext_re.is_match(&summary.path) {
+                    return false;
+                }
+            }
+            if th.hide_js {
+                let ct_is_js =
+                    !is_in_flight && (ct.contains("javascript") || ct.contains("ecmascript"));
+                if ct_is_js || guard.js_asset_ext_re.is_match(&summary.path) {
+                    return false;
+                }
             }
         }
 
@@ -1187,6 +1217,10 @@ pub fn default_backend_config() -> ProxyFilterBackendConfig {
             hide_304_not_modified: false,
             hide_options_preflight: false,
             hide_connect_tunnels: false,
+            hide_css: false,
+            hide_images: false,
+            hide_fonts: false,
+            hide_js: false,
             hide_static_assets: false,
             min_body_size_bytes: None,
             max_body_size_bytes: None,
@@ -1202,7 +1236,22 @@ pub fn default_backend_config() -> ProxyFilterBackendConfig {
     }
 }
 
-fn build_filter_engine_state(config: ProxyFilterBackendConfig) -> FilterEngineState {
+fn normalize_noise_thresholds_backend(th: &mut NoiseThresholdsBackendConfig) {
+    if th.hide_static_assets
+        && !th.hide_css
+        && !th.hide_images
+        && !th.hide_fonts
+        && !th.hide_js
+    {
+        th.hide_css = true;
+        th.hide_images = true;
+        th.hide_fonts = true;
+    }
+    th.hide_static_assets = false;
+}
+
+fn build_filter_engine_state(mut config: ProxyFilterBackendConfig) -> FilterEngineState {
+    normalize_noise_thresholds_backend(&mut config.noise_thresholds);
     let compiled_tls_bypass_rules = CompiledHostRuleList::compile(&config.tls_bypass_rules);
     let compiled_tls_target_rules = CompiledHostRuleList::compile(&config.tls_target_rules);
     let compiled_header_mutations = config
@@ -1224,8 +1273,12 @@ fn build_filter_engine_state(config: ProxyFilterBackendConfig) -> FilterEngineSt
         None
     };
     let compiled_lan_allowlist = CompiledLanAllowlist::compile(&config.lan_client_allowlist);
-    let static_asset_ext_re =
-        Regex::new(r"(?i)\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|css|map)(\?|$)").unwrap();
+    let css_asset_ext_re = Regex::new(r"(?i)\.(css|css\.map)(\?|$)").unwrap();
+    let image_asset_ext_re =
+        Regex::new(r"(?i)\.(png|jpe?g|gif|webp|avif|svg|ico|bmp|cur|tiff?|heic)(\?|$)")
+            .unwrap();
+    let font_asset_ext_re = Regex::new(r"(?i)\.(woff2?|ttf|otf|eot)(\?|$)").unwrap();
+    let js_asset_ext_re = Regex::new(r"(?i)\.(([cm]?js)(\.map)?|jsx)(\?|$)").unwrap();
 
     FilterEngineState {
         config,
@@ -1237,7 +1290,10 @@ fn build_filter_engine_state(config: ProxyFilterBackendConfig) -> FilterEngineSt
         compiled_capture_matrix,
         compiled_query_regex,
         compiled_lan_allowlist,
-        static_asset_ext_re,
+        css_asset_ext_re,
+        image_asset_ext_re,
+        font_asset_ext_re,
+        js_asset_ext_re,
     }
 }
 

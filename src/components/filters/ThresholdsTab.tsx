@@ -1,5 +1,5 @@
 import React from "react";
-import { Flame, Gauge } from "lucide-react";
+import { Flame, Gauge, Layers } from "lucide-react";
 import { HelpTooltip } from "../ui/HelpTooltip";
 import { formatBytes } from "../../lib/formatters";
 import type { NoiseThresholdsConfig } from "../../types/proxy";
@@ -17,12 +17,23 @@ export const ThresholdsTab: React.FC<ThresholdsTabProps> = ({
   thresholds,
   onThresholdsChange,
 }) => {
+  const allAssetsHidden =
+    thresholds.hideCss &&
+    thresholds.hideImages &&
+    thresholds.hideFonts &&
+    thresholds.hideJs;
+  const onlyStaticHidden =
+    thresholds.hideCss &&
+    thresholds.hideImages &&
+    thresholds.hideFonts &&
+    !thresholds.hideJs;
+
   return (
           <>
             {/* Noise Cleanup Checkboxes */}
             <section className="rounded-lg border border-hairline bg-surface p-3.5 space-y-3">
               <div className="flex items-center gap-2 text-xs font-semibold text-fg">
-                <Gauge className="h-4 w-4 text-sky-400" />
+                <Gauge className="h-4 w-4 text-sky-400" aria-hidden="true" />
                 <span>Автоматическая очистка протокольного и браузерного шума</span>
               </div>
 
@@ -60,16 +71,123 @@ export const ThresholdsTab: React.FC<ThresholdsTabProps> = ({
                   title="Скрывать CONNECT / TLS Bypass туннели"
                   subtitle="Оставляет только расшифрованные HTTP/HTTPS/WSS запросы"
                 />
+              </div>
+            </section>
+
+            {/* Static Assets & JavaScript Filtering */}
+            <section className="rounded-lg border border-hairline bg-surface p-3.5 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-xs font-semibold text-fg">
+                  <Layers className="h-4 w-4 text-sky-400" aria-hidden="true" />
+                  <span>Отсеивание статических ассетов и JavaScript-скриптов</span>
+                </div>
+                <div
+                  className="flex flex-wrap items-center gap-1"
+                  role="group"
+                  aria-label="Быстрые пресеты статических ассетов и JS"
+                >
+                  <button
+                    type="button"
+                    aria-pressed={allAssetsHidden}
+                    onClick={() =>
+                      onThresholdsChange((prev) => ({
+                        ...prev,
+                        hideCss: true,
+                        hideImages: true,
+                        hideFonts: true,
+                        hideJs: true,
+                      }))
+                    }
+                    className={`min-h-6 rounded px-2 py-1 text-[11px] transition-colors ${
+                      allAssetsHidden
+                        ? "bg-sky-500/20 text-sky-400 ring-1 ring-sky-500/40"
+                        : "bg-canvas text-muted hover:text-fg"
+                    }`}
+                  >
+                    Скрыть всё (4)
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={onlyStaticHidden}
+                    onClick={() =>
+                      onThresholdsChange((prev) => ({
+                        ...prev,
+                        hideCss: true,
+                        hideImages: true,
+                        hideFonts: true,
+                        hideJs: false,
+                      }))
+                    }
+                    className={`min-h-6 rounded px-2 py-1 text-[11px] transition-colors ${
+                      onlyStaticHidden
+                        ? "bg-sky-500/20 text-sky-400 ring-1 ring-sky-500/40"
+                        : "bg-canvas text-muted hover:text-fg"
+                    }`}
+                  >
+                    Только статика (CSS / Img / Fonts)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onThresholdsChange((prev) => ({
+                        ...prev,
+                        hideCss: false,
+                        hideImages: false,
+                        hideFonts: false,
+                        hideJs: false,
+                      }))
+                    }
+                    className="min-h-6 rounded bg-canvas px-2 py-1 text-[11px] text-muted transition-colors hover:text-fg"
+                  >
+                    Сбросить
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
                 <NoiseToggleCard
-                  checked={thresholds.hideStaticAssets}
+                  checked={thresholds.hideCss}
                   onChange={(v) =>
                     onThresholdsChange((prev) => ({
                       ...prev,
-                      hideStaticAssets: v,
+                      hideCss: v,
                     }))
                   }
-                  title="Скрывать статику (Images / Fonts / CSS)"
-                  subtitle="Скрывает картинки, шрифты .woff2, иконки и таблицы стилей"
+                  title="Скрывать CSS"
+                  subtitle="Таблицы стилей text/css, файлы .css и source-map .css.map"
+                />
+                <NoiseToggleCard
+                  checked={thresholds.hideImages}
+                  onChange={(v) =>
+                    onThresholdsChange((prev) => ({
+                      ...prev,
+                      hideImages: v,
+                    }))
+                  }
+                  title="Скрывать Images"
+                  subtitle="Изображения image/* (.png, .jpg, .webp, .avif, .svg, .ico и др.)"
+                />
+                <NoiseToggleCard
+                  checked={thresholds.hideFonts}
+                  onChange={(v) =>
+                    onThresholdsChange((prev) => ({
+                      ...prev,
+                      hideFonts: v,
+                    }))
+                  }
+                  title="Скрывать Fonts"
+                  subtitle="Веб-шрифты font/* и legacy MIME (.woff, .woff2, .ttf, .otf, .eot)"
+                />
+                <NoiseToggleCard
+                  checked={thresholds.hideJs}
+                  onChange={(v) =>
+                    onThresholdsChange((prev) => ({
+                      ...prev,
+                      hideJs: v,
+                    }))
+                  }
+                  title="Скрывать JavaScript (JS)"
+                  subtitle="Скрипты javascript/ecmascript (.js, .mjs, .cjs, .jsx, .js.map; без .json)"
                 />
               </div>
             </section>

@@ -234,7 +234,12 @@ export interface NoiseThresholdsConfig {
   hide304NotModified: boolean;
   hideOptionsPreflight: boolean;
   hideConnectTunnels: boolean;
-  hideStaticAssets: boolean;
+  hideCss: boolean;
+  hideImages: boolean;
+  hideFonts: boolean;
+  hideJs: boolean;
+  /** Legacy migration-only input for pre-Stage 49 profiles/localStorage. */
+  hideStaticAssets?: boolean;
   minBodySizeBytes: number | null;
   maxBodySizeBytes: number | null;
   timeHeatEnabled: boolean;
@@ -286,7 +291,12 @@ export interface NoiseThresholdsBackendSyncConfig {
   hide304NotModified: boolean;
   hideOptionsPreflight: boolean;
   hideConnectTunnels: boolean;
-  hideStaticAssets: boolean;
+  hideCss: boolean;
+  hideImages: boolean;
+  hideFonts: boolean;
+  hideJs: boolean;
+  /** Legacy migration-only input for pre-Stage 49 configs. */
+  hideStaticAssets?: boolean;
   minBodySizeBytes: number | null;
   maxBodySizeBytes: number | null;
   timeHeatWarningMs: number;

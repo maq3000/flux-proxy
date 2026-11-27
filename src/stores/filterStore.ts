@@ -3,7 +3,7 @@ import {
   compileHostListFilter,
   DEFAULT_BACKEND_FILTER_CONFIG,
   DEFAULT_HOST_LIST_FILTER_CONFIG,
-  DEFAULT_NOISE_THRESHOLDS,
+  normalizeNoiseThresholds,
 } from "../lib/filterEngine";
 import type {
   FilterConditionRule,
@@ -68,45 +68,53 @@ export function buildCaptureHostListPayload(
 export function buildNoiseThresholdsSyncPayload(
   th: NoiseThresholdsConfig
 ): NoiseThresholdsBackendSyncConfig {
+  const normalized = normalizeNoiseThresholds(th);
   return {
-    hide304NotModified: th.hide304NotModified,
-    hideOptionsPreflight: th.hideOptionsPreflight,
-    hideConnectTunnels: th.hideConnectTunnels,
-    hideStaticAssets: th.hideStaticAssets,
-    minBodySizeBytes: th.minBodySizeBytes,
-    maxBodySizeBytes: th.maxBodySizeBytes,
-    timeHeatWarningMs: th.timeHeatWarningMs,
-    onlySlowRequests: th.onlySlowRequests,
+    hide304NotModified: normalized.hide304NotModified,
+    hideOptionsPreflight: normalized.hideOptionsPreflight,
+    hideConnectTunnels: normalized.hideConnectTunnels,
+    hideCss: normalized.hideCss,
+    hideImages: normalized.hideImages,
+    hideFonts: normalized.hideFonts,
+    hideJs: normalized.hideJs,
+    minBodySizeBytes: normalized.minBodySizeBytes,
+    maxBodySizeBytes: normalized.maxBodySizeBytes,
+    timeHeatWarningMs: normalized.timeHeatWarningMs,
+    onlySlowRequests: normalized.onlySlowRequests,
   };
 }
 
 function readInitialFilterSlice(dropNonMatching: boolean) {
-  const initialPersisted = loadFilterJson<PersistedFilterState>(
+  const rawActive = loadFilterJson<Partial<PersistedFilterState> | null>(
     LS_ACTIVE_FILTER_STATE_KEY,
-    {
-      matrixEnabled: true,
-      rules: [],
-      thresholds: { ...DEFAULT_NOISE_THRESHOLDS },
-      activePresetId: null,
-      hostListFilter: { ...DEFAULT_HOST_LIST_FILTER_CONFIG },
-    }
+    null
   );
-  const thresholds: NoiseThresholdsConfig = {
-    ...DEFAULT_NOISE_THRESHOLDS,
-    ...initialPersisted.thresholds,
-  };
+  const rawSavedBackend = loadFilterJson<Partial<ProxyFilterBackendConfig> | null>(
+    LS_BACKEND_FILTER_CFG_KEY,
+    null
+  );
+  const matrixEnabled = rawActive?.matrixEnabled ?? true;
+  const rules = Array.isArray(rawActive?.rules) ? rawActive.rules : [];
+  const activePresetId = rawActive?.activePresetId ?? null;
+  const thresholds = normalizeNoiseThresholds(
+    rawActive?.thresholds ?? rawSavedBackend?.noiseThresholds
+  );
   const hostListFilter: HostListFilterConfig = {
     ...DEFAULT_HOST_LIST_FILTER_CONFIG,
-    ...(initialPersisted.hostListFilter ?? {}),
+    ...(rawActive?.hostListFilter ?? {}),
   };
-  const customPresets = loadFilterJson<FilterPreset[]>(
+  const rawCustomPresets = loadFilterJson<FilterPreset[]>(
     LS_CUSTOM_PRESETS_KEY,
     []
   );
-  const savedBackend = loadFilterJson<Partial<ProxyFilterBackendConfig>>(
-    LS_BACKEND_FILTER_CFG_KEY,
-    structuredClone(DEFAULT_BACKEND_FILTER_CONFIG)
-  );
+  const customPresets: FilterPreset[] = Array.isArray(rawCustomPresets)
+    ? rawCustomPresets.map((preset) => ({
+        ...preset,
+        thresholds: normalizeNoiseThresholds(preset?.thresholds),
+      }))
+    : [];
+  const savedBackend =
+    rawSavedBackend ?? structuredClone(DEFAULT_BACKEND_FILTER_CONFIG);
   const bootCompiled = compileHostListFilter(hostListFilter);
   const backendFilterConfig: ProxyFilterBackendConfig = {
     ...structuredClone(DEFAULT_BACKEND_FILTER_CONFIG),
@@ -126,8 +134,8 @@ function readInitialFilterSlice(dropNonMatching: boolean) {
       bootCompiled.activeCount
     ),
     noiseThresholds: buildNoiseThresholdsSyncPayload(thresholds),
-    captureMatrixEnabled: initialPersisted.matrixEnabled,
-    captureFilterRules: initialPersisted.rules,
+    captureMatrixEnabled: matrixEnabled,
+    captureFilterRules: rules,
     quickCategory: "all",
     filterQuery: "",
     useRegexQuery: false,
@@ -142,11 +150,11 @@ function readInitialFilterSlice(dropNonMatching: boolean) {
     filterQuery: "",
     useRegex: false,
     quickCategory: "all" as QuickFilterCategory,
-    matrixEnabled: initialPersisted.matrixEnabled,
-    filterRules: initialPersisted.rules,
+    matrixEnabled,
+    filterRules: rules,
     thresholds,
     hostListFilter,
-    activePresetId: initialPersisted.activePresetId,
+    activePresetId,
     customPresets,
     backendFilterConfig,
   };
@@ -271,7 +279,9 @@ export const useFilterStore = create<FilterStoreState>((set) => ({
 
   setThresholds: (updater) => {
     set((state) => {
-      const thresholds = resolveUpdater(updater, state.thresholds);
+      const thresholds = normalizeNoiseThresholds(
+        resolveUpdater(updater, state.thresholds)
+      );
       const next = { ...state, thresholds };
       persistActiveFilterState(next);
       return { thresholds };
@@ -311,14 +321,16 @@ export const useFilterStore = create<FilterStoreState>((set) => ({
   },
 
   applySettingsProfileFilters: (detail) => {
-    const customPresets = structuredClone(detail.filters.userPresets);
+    const customPresets = structuredClone(detail.filters.userPresets).map(
+      (preset) => ({
+        ...preset,
+        thresholds: normalizeNoiseThresholds(preset?.thresholds),
+      })
+    );
     const activePresetId = detail.filters.activePresetId;
     const matrixEnabled = detail.filters.matrixEnabled ?? true;
     const filterRules = structuredClone(detail.filters.filterRules ?? []);
-    const thresholds = {
-      ...DEFAULT_NOISE_THRESHOLDS,
-      ...detail.filters.noiseThresholds,
-    };
+    const thresholds = normalizeNoiseThresholds(detail.filters.noiseThresholds);
     const hostListFilter = {
       ...DEFAULT_HOST_LIST_FILTER_CONFIG,
       ...detail.filters.hostFilters,

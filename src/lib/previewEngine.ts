@@ -51,6 +51,7 @@ import {
   evaluateShouldStoreSessionInPreview,
   evaluateTlsConnectInPreview,
   matchHostRuleList,
+  normalizeNoiseThresholds,
 } from "./filterEngine";
 import {
   buildFullRawHttpMessage,
@@ -2186,7 +2187,24 @@ export class BrowserPreviewEngine {
   updateFilterBackendConfig(
     config: ProxyFilterBackendConfig
   ): ProxyFilterBackendConfig {
-    this.filterConfig = structuredClone(config);
+    const cloned = structuredClone(config);
+    if (cloned.noiseThresholds) {
+      const th = normalizeNoiseThresholds(cloned.noiseThresholds);
+      cloned.noiseThresholds = {
+        hide304NotModified: th.hide304NotModified,
+        hideOptionsPreflight: th.hideOptionsPreflight,
+        hideConnectTunnels: th.hideConnectTunnels,
+        hideCss: th.hideCss,
+        hideImages: th.hideImages,
+        hideFonts: th.hideFonts,
+        hideJs: th.hideJs,
+        minBodySizeBytes: th.minBodySizeBytes,
+        maxBodySizeBytes: th.maxBodySizeBytes,
+        timeHeatWarningMs: th.timeHeatWarningMs,
+        onlySlowRequests: th.onlySlowRequests,
+      };
+    }
+    this.filterConfig = cloned;
     return structuredClone(this.filterConfig);
   }
 

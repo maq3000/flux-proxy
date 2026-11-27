@@ -248,6 +248,12 @@ vi.mock("./tauriBridge", () => ({
 }));
 
 import {
+  LS_ACTIVE_FILTER_STATE_KEY,
+  LS_BACKEND_FILTER_CFG_KEY,
+  LS_CUSTOM_PRESETS_KEY,
+  useFilterStore,
+} from "../stores/filterStore";
+import {
   SETTINGS_STORAGE_KEYS,
   applySettingsProfile,
   buildBackendFilterConfigFromProfile,
@@ -1237,5 +1243,192 @@ describe("settingsManager — applySettingsProfile & transactional rollback", ()
       "192.168.1.42",
       "192.168.2.0/24",
     ]);
+  });
+
+  it("stage 49: migrates legacy hideStaticAssets in profiles, custom presets, and localStorage without hiding JS", () => {
+    // 1. Legacy schemaVersion: 1 profile with hideStaticAssets: true migrates silently (0 warnings)
+    const legacyProfile = createDefaultSettingsProfile() as unknown as Record<
+      string,
+      unknown
+    >;
+    legacyProfile.filters = {
+      activePresetId: "legacy-preset",
+      matrixEnabled: true,
+      filterRules: [],
+      hostFilters: {
+        enabled: true,
+        mode: "whitelist",
+        rawText: "",
+        applyToTlsPassthrough: false,
+      },
+      noiseThresholds: {
+        hide304NotModified: true,
+        hideOptionsPreflight: false,
+        hideConnectTunnels: true,
+        hideStaticAssets: true,
+        minBodySizeBytes: null,
+        maxBodySizeBytes: null,
+        timeHeatEnabled: true,
+        timeHeatWarningMs: 500,
+        timeHeatCriticalMs: 1500,
+        onlySlowRequests: false,
+      },
+      userPresets: [
+        {
+          id: "legacy-preset",
+          name: "Old Preset",
+          description: "Pre-stage 49",
+          matrixEnabled: true,
+          rules: [],
+          thresholds: {
+            hideStaticAssets: true,
+          },
+        },
+      ],
+    };
+
+    const legacyReport =
+      validateAndMigrateSettingsProfileWithReport(legacyProfile);
+    expect(legacyReport.warnings).toEqual([]);
+    expect(legacyReport.profile.filters.noiseThresholds).toMatchObject({
+      hide304NotModified: true,
+      hideConnectTunnels: true,
+      hideCss: true,
+      hideImages: true,
+      hideFonts: true,
+      hideJs: false,
+    });
+    expect(
+      "hideStaticAssets" in legacyReport.profile.filters.noiseThresholds
+    ).toBe(false);
+    expect(legacyReport.profile.filters.userPresets[0].thresholds).toMatchObject(
+      {
+        hideCss: true,
+        hideImages: true,
+        hideFonts: true,
+        hideJs: false,
+      }
+    );
+
+    const backendCfg = buildBackendFilterConfigFromProfile(legacyReport.profile);
+    expect(backendCfg.noiseThresholds).toMatchObject({
+      hideCss: true,
+      hideImages: true,
+      hideFonts: true,
+      hideJs: false,
+    });
+    expect("hideStaticAssets" in (backendCfg.noiseThresholds ?? {})).toBe(false);
+
+    // 2. Explicit granular flags override legacy hideStaticAssets and invalid types warn cleanly
+    const explicitProfile = createDefaultSettingsProfile() as unknown as Record<
+      string,
+      unknown
+    >;
+    explicitProfile.filters = {
+      ...(explicitProfile.filters as Record<string, unknown>),
+      noiseThresholds: {
+        hideStaticAssets: true,
+        hideJs: true,
+      },
+    };
+    const explicitReport =
+      validateAndMigrateSettingsProfileWithReport(explicitProfile);
+    expect(explicitReport.warnings).toEqual([]);
+    expect(explicitReport.profile.filters.noiseThresholds).toMatchObject({
+      hideCss: false,
+      hideImages: false,
+      hideFonts: false,
+      hideJs: true,
+    });
+
+    const damagedProfile = createDefaultSettingsProfile() as unknown as Record<
+      string,
+      unknown
+    >;
+    damagedProfile.filters = {
+      ...(damagedProfile.filters as Record<string, unknown>),
+      noiseThresholds: {
+        hideJs: "yes",
+      },
+    };
+    const damagedReport =
+      validateAndMigrateSettingsProfileWithReport(damagedProfile);
+    expect(damagedReport.profile.filters.noiseThresholds.hideJs).toBe(false);
+    expect(damagedReport.warnings.some((w) => w.includes("hideJs"))).toBe(true);
+
+    // 3. Legacy localStorage migration in collectCurrentSettingsProfile() and filterStore
+    window.localStorage.setItem(
+      LS_ACTIVE_FILTER_STATE_KEY,
+      JSON.stringify({
+        matrixEnabled: true,
+        rules: [],
+        activePresetId: null,
+        thresholds: { hideStaticAssets: true },
+      })
+    );
+    window.localStorage.setItem(
+      LS_CUSTOM_PRESETS_KEY,
+      JSON.stringify([
+        {
+          id: "ls-legacy",
+          name: "LS Legacy",
+          description: "",
+          matrixEnabled: true,
+          rules: [],
+          thresholds: { hideStaticAssets: true },
+        },
+      ])
+    );
+    window.localStorage.setItem(
+      LS_BACKEND_FILTER_CFG_KEY,
+      JSON.stringify({
+        noiseThresholds: { hideStaticAssets: true },
+      })
+    );
+
+    const collected = collectCurrentSettingsProfile();
+    expect(collected.filters.noiseThresholds).toMatchObject({
+      hideCss: true,
+      hideImages: true,
+      hideFonts: true,
+      hideJs: false,
+    });
+    expect(collected.filters.userPresets[0].thresholds).toMatchObject({
+      hideCss: true,
+      hideImages: true,
+      hideFonts: true,
+      hideJs: false,
+    });
+
+    useFilterStore.getState().syncFromLocalStorage(false);
+    const storeState = useFilterStore.getState();
+    expect(storeState.thresholds).toMatchObject({
+      hideCss: true,
+      hideImages: true,
+      hideFonts: true,
+      hideJs: false,
+    });
+    expect(storeState.customPresets[0].thresholds).toMatchObject({
+      hideCss: true,
+      hideImages: true,
+      hideFonts: true,
+      hideJs: false,
+    });
+    expect(storeState.backendFilterConfig.noiseThresholds).toMatchObject({
+      hideCss: true,
+      hideImages: true,
+      hideFonts: true,
+      hideJs: false,
+    });
+
+    // Fallback to LS_BACKEND_FILTER_CFG_KEY when LS_ACTIVE_FILTER_STATE_KEY is absent
+    window.localStorage.removeItem(LS_ACTIVE_FILTER_STATE_KEY);
+    useFilterStore.getState().syncFromLocalStorage(false);
+    expect(useFilterStore.getState().thresholds).toMatchObject({
+      hideCss: true,
+      hideImages: true,
+      hideFonts: true,
+      hideJs: false,
+    });
   });
 });

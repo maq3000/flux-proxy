@@ -6,11 +6,13 @@ import type {
   TlsBypassRule,
 } from "../types/proxy";
 import {
+  BUILT_IN_FILTER_PRESETS,
   DEFAULT_BACKEND_FILTER_CONFIG,
   DEFAULT_NOISE_THRESHOLDS,
   applyHeaderMutationsInPreview,
   compileFilterMatrix,
   compileHostListFilter,
+  countActiveNoiseThresholds,
   evaluateSessionAgainstFilters,
   evaluateShouldStoreSessionInPreview,
   evaluateTlsConnectInPreview,
@@ -19,6 +21,7 @@ import {
   matchHostRuleList,
   matchesCompiledHostList,
   normalizeHostToken,
+  normalizeNoiseThresholds,
   parseBulkTextToTlsRules,
   parseThresholdNumber,
   tlsRulesToBulkText,
@@ -154,7 +157,10 @@ describe("filterEngine — matrix compilation, thresholds & DNF evaluation", () 
       hide304NotModified: true,
       hideOptionsPreflight: true,
       hideConnectTunnels: true,
-      hideStaticAssets: true,
+      hideCss: true,
+      hideImages: true,
+      hideFonts: true,
+      hideJs: true,
       minBodySizeBytes: 100,
       maxBodySizeBytes: 1000,
       onlySlowRequests: true,
@@ -538,5 +544,236 @@ describe("filterEngine — header mutations, OS noise & capture storage", () => 
         jsonCatCfg
       )
     ).toBe(false);
+  });
+});
+
+describe("filterEngine — Stage 49 granular CSS / Images / Fonts / JS filtering", () => {
+  it("normalizes legacy hideStaticAssets without auto-hiding JS and honors explicit granular flags", () => {
+    const cleanDefault = normalizeNoiseThresholds({});
+    expect(cleanDefault).toEqual(DEFAULT_NOISE_THRESHOLDS);
+    expect("hideStaticAssets" in cleanDefault).toBe(false);
+
+    const migratedLegacy = normalizeNoiseThresholds({
+      hideStaticAssets: true,
+      hide304NotModified: true,
+    });
+    expect(migratedLegacy).toMatchObject({
+      hide304NotModified: true,
+      hideCss: true,
+      hideImages: true,
+      hideFonts: true,
+      hideJs: false,
+    });
+    expect("hideStaticAssets" in migratedLegacy).toBe(false);
+
+    const explicitJsOnly = normalizeNoiseThresholds({
+      hideStaticAssets: true,
+      hideJs: true,
+    });
+    expect(explicitJsOnly).toMatchObject({
+      hideCss: false,
+      hideImages: false,
+      hideFonts: false,
+      hideJs: true,
+    });
+
+    const explicitFalseOverride = normalizeNoiseThresholds({
+      hideStaticAssets: true,
+      hideCss: false,
+    });
+    expect(explicitFalseOverride).toMatchObject({
+      hideCss: false,
+      hideImages: false,
+      hideFonts: false,
+      hideJs: false,
+    });
+  });
+
+  it("filters CSS, Images, Fonts, and JavaScript independently with full TS & Preview parity and no JSON/JSP false positives", () => {
+    const emptyCompiled = compileFilterMatrix([]);
+    const evalBoth = (
+      summary: SessionSummary,
+      thresholdsPatch: Partial<typeof DEFAULT_NOISE_THRESHOLDS>
+    ) => {
+      const th = { ...DEFAULT_NOISE_THRESHOLDS, ...thresholdsPatch };
+      const gridVisible = evaluateSessionAgainstFilters(
+        summary,
+        emptyCompiled,
+        true,
+        th
+      );
+      const previewStored = evaluateShouldStoreSessionInPreview(summary, {
+        ...structuredClone(DEFAULT_BACKEND_FILTER_CONFIG),
+        dropNonMatchingOnCapture: true,
+        noiseThresholds: {
+          hide304NotModified: th.hide304NotModified,
+          hideOptionsPreflight: th.hideOptionsPreflight,
+          hideConnectTunnels: th.hideConnectTunnels,
+          hideCss: th.hideCss,
+          hideImages: th.hideImages,
+          hideFonts: th.hideFonts,
+          hideJs: th.hideJs,
+          minBodySizeBytes: th.minBodySizeBytes,
+          maxBodySizeBytes: th.maxBodySizeBytes,
+          timeHeatWarningMs: th.timeHeatWarningMs,
+          onlySlowRequests: th.onlySlowRequests,
+        },
+      });
+      expect(gridVisible).toBe(previewStored);
+      return gridVisible;
+    };
+
+    const cssMime = makeSummary({ path: "/theme", contentType: "text/css; charset=utf-8" });
+    const cssFile = makeSummary({ path: "/assets/app.css?v=1", contentType: "application/octet-stream" });
+    const cssMap = makeSummary({ path: "/assets/app.css.map", contentType: "application/json" });
+    const imgMime = makeSummary({ path: "/avatar", contentType: "image/svg+xml" });
+    const imgAvif = makeSummary({ path: "/hero.avif?w=800", contentType: "application/octet-stream" });
+    const imgHeic = makeSummary({ path: "/photo.heic", contentType: "" });
+    const fontMime = makeSummary({ path: "/font", contentType: "application/font-woff" });
+    const fontLegacy = makeSummary({ path: "/font2", contentType: "application/vnd.ms-fontobject" });
+    const fontX = makeSummary({ path: "/font3", contentType: "application/x-font-ttf" });
+    const fontEot = makeSummary({ path: "/icons.eot?v=4", contentType: "application/octet-stream" });
+    const jsMime = makeSummary({ path: "/sdk", contentType: "application/javascript; charset=utf-8" });
+    const ecmascriptMime = makeSummary({ path: "/esm", contentType: "text/ecmascript" });
+    const jsFile = makeSummary({ path: "/static/chunk.mjs?hash=1", contentType: "text/plain" });
+    const cjsFile = makeSummary({ path: "/static/vendor.cjs", contentType: "" });
+    const jsxFile = makeSummary({ path: "/src/App.jsx", contentType: "" });
+    const jsMap = makeSummary({ path: "/static/app.js.map", contentType: "application/json" });
+    const mjsMap = makeSummary({ path: "/static/chunk.mjs.map?t=9", contentType: "" });
+    const cjsMap = makeSummary({ path: "/static/vendor.cjs.map", contentType: "" });
+    const jsonApi = makeSummary({ path: "/api/config.json?env=prod", contentType: "application/json" });
+    const jspPage = makeSummary({ path: "/legacy/login.jsp", contentType: "text/html" });
+
+    // 1. CSS only
+    for (const s of [cssMime, cssFile, cssMap]) {
+      expect(evalBoth(s, { hideCss: true })).toBe(false);
+    }
+    for (const s of [jsMap, imgAvif, fontEot, jsFile, jsonApi]) {
+      expect(evalBoth(s, { hideCss: true })).toBe(true);
+    }
+
+    // 2. Images only
+    for (const ext of ["png", "jpg", "jpeg", "gif", "webp", "avif", "svg", "ico", "bmp", "cur", "tif", "tiff", "heic"]) {
+      expect(
+        evalBoth(makeSummary({ path: `/media/item.${ext}`, contentType: "" }), {
+          hideImages: true,
+        })
+      ).toBe(false);
+    }
+    for (const s of [imgMime, imgAvif, imgHeic]) {
+      expect(evalBoth(s, { hideImages: true })).toBe(false);
+    }
+    for (const s of [cssFile, fontEot, jsFile, jsonApi]) {
+      expect(evalBoth(s, { hideImages: true })).toBe(true);
+    }
+
+    // 3. Fonts only
+    for (const s of [
+      fontMime,
+      fontLegacy,
+      fontX,
+      fontEot,
+      makeSummary({ path: "/f.woff", contentType: "" }),
+      makeSummary({ path: "/f.woff2", contentType: "" }),
+      makeSummary({ path: "/f.ttf", contentType: "" }),
+      makeSummary({ path: "/f.otf", contentType: "" }),
+      makeSummary({ path: "/f-mime", contentType: "font/woff2" }),
+    ]) {
+      expect(evalBoth(s, { hideFonts: true })).toBe(false);
+    }
+    for (const s of [cssFile, imgAvif, jsFile, jsonApi]) {
+      expect(evalBoth(s, { hideFonts: true })).toBe(true);
+    }
+
+    // 4. JavaScript only (protects .json, .jsp, .css.map)
+    for (const s of [jsMime, ecmascriptMime, jsFile, cjsFile, jsxFile, jsMap, mjsMap, cjsMap]) {
+      expect(evalBoth(s, { hideJs: true })).toBe(false);
+    }
+    for (const s of [jsonApi, jspPage, cssMap, imgAvif, fontEot]) {
+      expect(evalBoth(s, { hideJs: true })).toBe(true);
+    }
+
+    // 5. In-flight deferral: MIME is deferred while status === 0, path extension still filters
+    const inFlightMimeOnly = makeSummary({
+      status: 0,
+      path: "/api/stream",
+      contentType: "application/javascript",
+    });
+    expect(evalBoth(inFlightMimeOnly, { hideJs: true })).toBe(true);
+    const inFlightJsPath = makeSummary({
+      status: 0,
+      path: "/assets/bundle.js",
+      contentType: "",
+    });
+    expect(evalBoth(inFlightJsPath, { hideJs: true })).toBe(false);
+
+    // 6. Preview capture legacy fallback with hideStaticAssets: true hides CSS/Images/Fonts, preserves JS
+    const legacyCfg = {
+      ...structuredClone(DEFAULT_BACKEND_FILTER_CONFIG),
+      dropNonMatchingOnCapture: true,
+      noiseThresholds: {
+        hide304NotModified: false,
+        hideOptionsPreflight: false,
+        hideConnectTunnels: false,
+        hideStaticAssets: true,
+        minBodySizeBytes: null,
+        maxBodySizeBytes: null,
+        timeHeatWarningMs: 500,
+        onlySlowRequests: false,
+      } as unknown as ProxyFilterBackendConfig["noiseThresholds"],
+    };
+    expect(evaluateShouldStoreSessionInPreview(cssFile, legacyCfg)).toBe(false);
+    expect(evaluateShouldStoreSessionInPreview(imgAvif, legacyCfg)).toBe(false);
+    expect(evaluateShouldStoreSessionInPreview(fontEot, legacyCfg)).toBe(false);
+    expect(evaluateShouldStoreSessionInPreview(jsFile, legacyCfg)).toBe(true);
+  });
+
+  it("updates preset-backend-api to hide all 4 asset categories and counts active thresholds uniformly", () => {
+    const backendApiPreset = BUILT_IN_FILTER_PRESETS.find(
+      (p) => p.id === "preset-backend-api"
+    );
+    expect(backendApiPreset).toBeDefined();
+    expect(backendApiPreset?.thresholds).toMatchObject({
+      hide304NotModified: true,
+      hideOptionsPreflight: true,
+      hideConnectTunnels: true,
+      hideCss: true,
+      hideImages: true,
+      hideFonts: true,
+      hideJs: true,
+    });
+
+    expect(countActiveNoiseThresholds(DEFAULT_NOISE_THRESHOLDS)).toBe(0);
+    expect(
+      countActiveNoiseThresholds({
+        ...DEFAULT_NOISE_THRESHOLDS,
+        timeHeatEnabled: false,
+      })
+    ).toBe(0);
+    expect(
+      countActiveNoiseThresholds({
+        ...DEFAULT_NOISE_THRESHOLDS,
+        hide304NotModified: true,
+        hideOptionsPreflight: true,
+        hideConnectTunnels: true,
+        hideCss: true,
+        hideImages: true,
+        hideFonts: true,
+        hideJs: true,
+        minBodySizeBytes: 128,
+        maxBodySizeBytes: 4096,
+        onlySlowRequests: true,
+      })
+    ).toBe(10);
+    expect(
+      countActiveNoiseThresholds({
+        ...DEFAULT_NOISE_THRESHOLDS,
+        hideCss: undefined as unknown as boolean,
+        hideImages: undefined as unknown as boolean,
+        hideFonts: undefined as unknown as boolean,
+        hideJs: undefined as unknown as boolean,
+        hideStaticAssets: true,
+      })
+    ).toBe(3);
   });
 });

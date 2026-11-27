@@ -33,6 +33,7 @@ import {
   DEFAULT_BACKEND_FILTER_CONFIG,
   DEFAULT_HOST_LIST_FILTER_CONFIG,
   DEFAULT_NOISE_THRESHOLDS,
+  normalizeNoiseThresholds,
 } from "./filterEngine";
 import {
   DEFAULT_AUTORESPONDER_RULES,
@@ -597,7 +598,19 @@ function sanitizeNoiseThresholds(
     `${fieldPrefix}.timeHeatCriticalMs`,
     warnings
   );
-  return {
+  const hasExplicitAssetFlag =
+    raw.hideCss !== undefined ||
+    raw.hideImages !== undefined ||
+    raw.hideFonts !== undefined ||
+    raw.hideJs !== undefined;
+  const legacyStaticAssets = sanitizeBoolean(
+    raw.hideStaticAssets,
+    false,
+    `${fieldPrefix}.hideStaticAssets`,
+    warnings
+  );
+
+  return normalizeNoiseThresholds({
     hide304NotModified: sanitizeBoolean(
       raw.hide304NotModified,
       def.hide304NotModified,
@@ -616,12 +629,34 @@ function sanitizeNoiseThresholds(
       `${fieldPrefix}.hideConnectTunnels`,
       warnings
     ),
-    hideStaticAssets: sanitizeBoolean(
-      raw.hideStaticAssets,
-      def.hideStaticAssets,
-      `${fieldPrefix}.hideStaticAssets`,
-      warnings
-    ),
+    ...(hasExplicitAssetFlag
+      ? {
+          hideCss: sanitizeBoolean(
+            raw.hideCss,
+            false,
+            `${fieldPrefix}.hideCss`,
+            warnings
+          ),
+          hideImages: sanitizeBoolean(
+            raw.hideImages,
+            false,
+            `${fieldPrefix}.hideImages`,
+            warnings
+          ),
+          hideFonts: sanitizeBoolean(
+            raw.hideFonts,
+            false,
+            `${fieldPrefix}.hideFonts`,
+            warnings
+          ),
+          hideJs: sanitizeBoolean(
+            raw.hideJs,
+            false,
+            `${fieldPrefix}.hideJs`,
+            warnings
+          ),
+        }
+      : { hideStaticAssets: legacyStaticAssets }),
     minBodySizeBytes: sanitizeNullablePositiveInt(
       raw.minBodySizeBytes,
       def.minBodySizeBytes,
@@ -648,7 +683,7 @@ function sanitizeNoiseThresholds(
       `${fieldPrefix}.onlySlowRequests`,
       warnings
     ),
-  };
+  });
 }
 
 function sanitizeHostListFilter(
@@ -2547,11 +2582,9 @@ export function collectCurrentSettingsProfile(): FluxUserSettingsProfile {
       userPresets: structuredClone(
         live.filters?.userPresets ?? storedCustomPresets
       ),
-      noiseThresholds: {
-        ...DEFAULT_NOISE_THRESHOLDS,
-        ...(storedActiveFilter.thresholds ?? {}),
-        ...(live.filters?.noiseThresholds ?? {}),
-      },
+      noiseThresholds: live.filters?.noiseThresholds
+        ? normalizeNoiseThresholds(live.filters.noiseThresholds)
+        : normalizeNoiseThresholds(storedActiveFilter.thresholds),
       hostFilters: {
         ...DEFAULT_HOST_LIST_FILTER_CONFIG,
         ...(storedActiveFilter.hostListFilter ?? {}),
@@ -2845,7 +2878,7 @@ export function buildBackendFilterConfigFromProfile(
 ): ProxyFilterBackendConfig {
   const hostFilter = profile.filters.hostFilters;
   const compiledHl = compileHostListFilter(hostFilter);
-  const th = profile.filters.noiseThresholds;
+  const th = normalizeNoiseThresholds(profile.filters.noiseThresholds);
   const dropNonMatching = Boolean(profile.proxy.dropNonMatching ?? false);
 
   return {
@@ -2875,7 +2908,10 @@ export function buildBackendFilterConfigFromProfile(
       hide304NotModified: th.hide304NotModified,
       hideOptionsPreflight: th.hideOptionsPreflight,
       hideConnectTunnels: th.hideConnectTunnels,
-      hideStaticAssets: th.hideStaticAssets,
+      hideCss: th.hideCss,
+      hideImages: th.hideImages,
+      hideFonts: th.hideFonts,
+      hideJs: th.hideJs,
       minBodySizeBytes: th.minBodySizeBytes,
       maxBodySizeBytes: th.maxBodySizeBytes,
       timeHeatWarningMs: th.timeHeatWarningMs,

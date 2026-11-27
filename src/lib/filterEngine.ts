@@ -24,7 +24,10 @@ export const DEFAULT_NOISE_THRESHOLDS: NoiseThresholdsConfig = {
   hide304NotModified: false,
   hideOptionsPreflight: false,
   hideConnectTunnels: false,
-  hideStaticAssets: false,
+  hideCss: false,
+  hideImages: false,
+  hideFonts: false,
+  hideJs: false,
   minBodySizeBytes: null,
   maxBodySizeBytes: null,
   timeHeatEnabled: true,
@@ -32,6 +35,90 @@ export const DEFAULT_NOISE_THRESHOLDS: NoiseThresholdsConfig = {
   timeHeatCriticalMs: 1500,
   onlySlowRequests: false,
 };
+
+export function normalizeNoiseThresholds(
+  raw?: Partial<NoiseThresholdsConfig> | null
+): NoiseThresholdsConfig {
+  const src = raw ?? {};
+  const hasExplicitAssetFlag =
+    typeof src.hideCss === "boolean" ||
+    typeof src.hideImages === "boolean" ||
+    typeof src.hideFonts === "boolean" ||
+    typeof src.hideJs === "boolean";
+  const migrateLegacyStatic =
+    !hasExplicitAssetFlag && src.hideStaticAssets === true;
+
+  return {
+    hide304NotModified:
+      typeof src.hide304NotModified === "boolean"
+        ? src.hide304NotModified
+        : DEFAULT_NOISE_THRESHOLDS.hide304NotModified,
+    hideOptionsPreflight:
+      typeof src.hideOptionsPreflight === "boolean"
+        ? src.hideOptionsPreflight
+        : DEFAULT_NOISE_THRESHOLDS.hideOptionsPreflight,
+    hideConnectTunnels:
+      typeof src.hideConnectTunnels === "boolean"
+        ? src.hideConnectTunnels
+        : DEFAULT_NOISE_THRESHOLDS.hideConnectTunnels,
+    hideCss: hasExplicitAssetFlag ? src.hideCss === true : migrateLegacyStatic,
+    hideImages: hasExplicitAssetFlag
+      ? src.hideImages === true
+      : migrateLegacyStatic,
+    hideFonts: hasExplicitAssetFlag
+      ? src.hideFonts === true
+      : migrateLegacyStatic,
+    hideJs: hasExplicitAssetFlag ? src.hideJs === true : false,
+    minBodySizeBytes:
+      src.minBodySizeBytes === null ||
+      (typeof src.minBodySizeBytes === "number" &&
+        Number.isFinite(src.minBodySizeBytes))
+        ? src.minBodySizeBytes
+        : DEFAULT_NOISE_THRESHOLDS.minBodySizeBytes,
+    maxBodySizeBytes:
+      src.maxBodySizeBytes === null ||
+      (typeof src.maxBodySizeBytes === "number" &&
+        Number.isFinite(src.maxBodySizeBytes))
+        ? src.maxBodySizeBytes
+        : DEFAULT_NOISE_THRESHOLDS.maxBodySizeBytes,
+    timeHeatEnabled:
+      typeof src.timeHeatEnabled === "boolean"
+        ? src.timeHeatEnabled
+        : DEFAULT_NOISE_THRESHOLDS.timeHeatEnabled,
+    timeHeatWarningMs:
+      typeof src.timeHeatWarningMs === "number" &&
+      Number.isFinite(src.timeHeatWarningMs)
+        ? src.timeHeatWarningMs
+        : DEFAULT_NOISE_THRESHOLDS.timeHeatWarningMs,
+    timeHeatCriticalMs:
+      typeof src.timeHeatCriticalMs === "number" &&
+      Number.isFinite(src.timeHeatCriticalMs)
+        ? src.timeHeatCriticalMs
+        : DEFAULT_NOISE_THRESHOLDS.timeHeatCriticalMs,
+    onlySlowRequests:
+      typeof src.onlySlowRequests === "boolean"
+        ? src.onlySlowRequests
+        : DEFAULT_NOISE_THRESHOLDS.onlySlowRequests,
+  };
+}
+
+export function countActiveNoiseThresholds(
+  thresholds: NoiseThresholdsConfig
+): number {
+  const th = normalizeNoiseThresholds(thresholds);
+  let count = 0;
+  if (th.hide304NotModified) count += 1;
+  if (th.hideOptionsPreflight) count += 1;
+  if (th.hideConnectTunnels) count += 1;
+  if (th.hideCss) count += 1;
+  if (th.hideImages) count += 1;
+  if (th.hideFonts) count += 1;
+  if (th.hideJs) count += 1;
+  if (th.minBodySizeBytes !== null) count += 1;
+  if (th.maxBodySizeBytes !== null) count += 1;
+  if (th.onlySlowRequests) count += 1;
+  return count;
+}
 
 export const FILTER_FIELD_OPTIONS: {
   value: FilterField;
@@ -75,7 +162,7 @@ export const BUILT_IN_FILTER_PRESETS: FilterPreset[] = [
     id: "preset-backend-api",
     name: "Только API бэкенда",
     description:
-      "Показывает JSON / GraphQL / REST API эндпоинты, скрывая CORS preflight, 304 и статику",
+      "Показывает JSON / GraphQL / REST API эндпоинты, скрывая CORS preflight, 304, статику и JS-скрипты",
     builtIn: true,
     matrixEnabled: true,
     rules: [
@@ -112,7 +199,10 @@ export const BUILT_IN_FILTER_PRESETS: FilterPreset[] = [
       hide304NotModified: true,
       hideOptionsPreflight: true,
       hideConnectTunnels: true,
-      hideStaticAssets: true,
+      hideCss: true,
+      hideImages: true,
+      hideFonts: true,
+      hideJs: true,
     },
   },
   {
@@ -335,7 +425,10 @@ export const DEFAULT_BACKEND_FILTER_CONFIG: ProxyFilterBackendConfig = {
     hide304NotModified: false,
     hideOptionsPreflight: false,
     hideConnectTunnels: false,
-    hideStaticAssets: false,
+    hideCss: false,
+    hideImages: false,
+    hideFonts: false,
+    hideJs: false,
     minBodySizeBytes: null,
     maxBodySizeBytes: null,
     timeHeatWarningMs: 500,
@@ -745,7 +838,77 @@ function evalDnfGroups(
   return false;
 }
 
-const STATIC_ASSET_EXT_RE = /\.(png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|css|map)(\?|$)/i;
+const CSS_ASSET_EXT_RE = /\.(css|css\.map)(\?|$)/i;
+const IMAGE_ASSET_EXT_RE =
+  /\.(png|jpe?g|gif|webp|avif|svg|ico|bmp|cur|tiff?|heic)(\?|$)/i;
+const FONT_ASSET_EXT_RE = /\.(woff2?|ttf|otf|eot)(\?|$)/i;
+const JS_ASSET_EXT_RE = /\.(([cm]?js)(\.map)?|jsx)(\?|$)/i;
+
+export function matchesHiddenAssetCategory(
+  summary: Pick<SessionSummary, "contentType" | "path">,
+  thresholds: Pick<
+    NoiseThresholdsConfig,
+    "hideCss" | "hideImages" | "hideFonts" | "hideJs" | "hideStaticAssets"
+  >,
+  isInFlight: boolean
+): boolean {
+  const hasExplicitAssetFlag =
+    typeof thresholds.hideCss === "boolean" ||
+    typeof thresholds.hideImages === "boolean" ||
+    typeof thresholds.hideFonts === "boolean" ||
+    typeof thresholds.hideJs === "boolean";
+  const hideCss = hasExplicitAssetFlag
+    ? thresholds.hideCss === true
+    : thresholds.hideStaticAssets === true;
+  const hideImages = hasExplicitAssetFlag
+    ? thresholds.hideImages === true
+    : thresholds.hideStaticAssets === true;
+  const hideFonts = hasExplicitAssetFlag
+    ? thresholds.hideFonts === true
+    : thresholds.hideStaticAssets === true;
+  const hideJs = hasExplicitAssetFlag ? thresholds.hideJs === true : false;
+
+  if (!hideCss && !hideImages && !hideFonts && !hideJs) {
+    return false;
+  }
+
+  const ct = !isInFlight ? summary.contentType.toLowerCase() : "";
+
+  if (
+    hideCss &&
+    ((!isInFlight && ct.includes("text/css")) ||
+      CSS_ASSET_EXT_RE.test(summary.path))
+  ) {
+    return true;
+  }
+  if (
+    hideImages &&
+    ((!isInFlight && ct.startsWith("image/")) ||
+      IMAGE_ASSET_EXT_RE.test(summary.path))
+  ) {
+    return true;
+  }
+  if (hideFonts) {
+    const ctIsFont =
+      !isInFlight &&
+      (ct.startsWith("font/") ||
+        ct.includes("application/font-woff") ||
+        ct.includes("application/vnd.ms-fontobject") ||
+        ct.includes("application/x-font-"));
+    if (ctIsFont || FONT_ASSET_EXT_RE.test(summary.path)) {
+      return true;
+    }
+  }
+  if (hideJs) {
+    const ctIsJs =
+      !isInFlight && (ct.includes("javascript") || ct.includes("ecmascript"));
+    if (ctIsJs || JS_ASSET_EXT_RE.test(summary.path)) {
+      return true;
+    }
+  }
+
+  return false;
+}
 
 // ============================================================================
 // High-Performance Bulk Hosts & URL Filter (Cached Set + Combined RegExp)
@@ -1543,16 +1706,8 @@ export function evaluateSessionAgainstFilters(
     }
   }
 
-  if (thresholds.hideStaticAssets) {
-    const ct = s.contentType.toLowerCase();
-    const ctIsStatic =
-      !isInFlight &&
-      (ct.startsWith("image/") ||
-        ct.startsWith("font/") ||
-        ct.includes("text/css"));
-    if (ctIsStatic || STATIC_ASSET_EXT_RE.test(s.path)) {
-      return false;
-    }
+  if (matchesHiddenAssetCategory(s, thresholds, isInFlight)) {
+    return false;
   }
 
   // 3. Filter Rules Matrix (Include / Exclude with AND / OR DNF grouping)
@@ -2357,10 +2512,7 @@ export function evaluateShouldStoreSessionInPreview(
   }
 
   const isInFlight = isInFlightPendingSession(summary);
-  const th: NoiseThresholdsConfig = {
-    ...DEFAULT_NOISE_THRESHOLDS,
-    ...(config.noiseThresholds ?? {}),
-  };
+  const th = normalizeNoiseThresholds(config.noiseThresholds);
 
   if (!isInFlight && th.hide304NotModified && summary.status === 304) return false;
   if (th.hideOptionsPreflight && summary.method.toUpperCase() === "OPTIONS") {
@@ -2383,16 +2535,8 @@ export function evaluateShouldStoreSessionInPreview(
       return false;
     }
   }
-  if (th.hideStaticAssets) {
-    const ct = summary.contentType.toLowerCase();
-    const ctIsStatic =
-      !isInFlight &&
-      (ct.startsWith("image/") ||
-        ct.startsWith("font/") ||
-        ct.includes("text/css"));
-    if (ctIsStatic || STATIC_ASSET_EXT_RE.test(summary.path)) {
-      return false;
-    }
+  if (matchesHiddenAssetCategory(summary, th, isInFlight)) {
+    return false;
   }
 
   let explicitlyWhitelisted = false;
