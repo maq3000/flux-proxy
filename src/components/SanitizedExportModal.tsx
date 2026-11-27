@@ -705,7 +705,7 @@ export const SanitizedExportModal: React.FC<SanitizedExportModalProps> = ({
                   htmlFor="sanitize-json-keys"
                   className="font-semibold text-fg"
                 >
-                  Ключи JSON и Form-Urlencoded для маскирования
+                  Ключи JSON, Form-Urlencoded и Multipart для маскирования
                 </label>
                 <button
                   type="button"
