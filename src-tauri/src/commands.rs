@@ -18,8 +18,8 @@ use crate::proxy::codec::execute_codec_transform;
 use crate::proxy::network::list_network_interfaces_with_options;
 use crate::proxy::server::ProxyEngineController;
 use crate::storage::export_import::{
-    export_sessions_to_path, import_sessions_from_bytes, import_sessions_from_path,
-    sanitize_sessions, write_raw_bytes_to_file,
+    import_sessions_from_bytes, import_sessions_from_path, write_raw_bytes_to_file,
+    CompiledSanitizationOptions, StreamingSessionExporter,
 };
 
 pub struct AppState {
@@ -404,6 +404,19 @@ pub async fn resume_all_breakpoints(
         .context
         .breakpoints
         .resume_all(action.unwrap_or(BreakpointAction::Continue)))
+}
+
+#[tauri::command]
+pub async fn load_breakpoint_body(
+    breakpoint_id: String,
+    is_response: bool,
+    state: State<'_, AppState>,
+) -> Result<Option<LoadedSessionBody>, ProxyError> {
+    let breakpoints = state.controller.context.breakpoints.clone();
+    run_blocking("Load breakpoint body", move || {
+        breakpoints.load_paused_body(&breakpoint_id, is_response)
+    })
+    .await?
 }
 
 #[tauri::command]
@@ -851,6 +864,7 @@ pub async fn export_sessions_file(
     format: String,
     file_path: String,
     sanitization: Option<SanitizationOptions>,
+    include_evicted_sqlite: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<usize, ProxyError> {
     let validated_path = validate_user_file_path(
@@ -882,14 +896,22 @@ pub async fn export_sessions_file(
         }
     }
 
+    let include_archived = include_evicted_sqlite.unwrap_or(false);
     let store = state.controller.context.store.clone();
     tokio::task::spawn_blocking(move || {
-        let sessions = store.collect_sessions_for_export(&session_ids)?;
-        let effective_sessions = match sanitization.as_ref() {
-            Some(opts) => sanitize_sessions(&sessions, opts),
-            None => sessions,
-        };
-        export_sessions_to_path(&effective_sessions, &format, &validated_path)
+        let compiled_sanitization = sanitization.as_ref().map(CompiledSanitizationOptions::new);
+        let estimated_count = store.estimate_export_count(&session_ids, include_archived);
+        let mut exporter =
+            StreamingSessionExporter::create(&validated_path, &format, estimated_count)?;
+        store.for_each_export_session(&session_ids, include_archived, |detail| {
+            if let Some(ref sanitizer) = compiled_sanitization {
+                let sanitized = sanitizer.sanitize_detail(&detail);
+                exporter.write_session(&sanitized)
+            } else {
+                exporter.write_session(&detail)
+            }
+        })?;
+        exporter.finish()
     })
     .await
     .map_err(|e| ProxyError::Custom(format!("Export task join error: {e}")))?

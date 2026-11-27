@@ -29,7 +29,12 @@ import {
   detectTextWizardTab,
 } from "../lib/contextMenuBuilders";
 import { formatBytes, tryFormatJson } from "../lib/formatters";
+import {
+  exceedsMonacoRenderLimit,
+  MONACO_MODEL_PATHS,
+} from "../lib/monacoLimits";
 import { textToHex } from "../lib/textWizard";
+import { MonacoSizeGuardNotice } from "./MonacoSizeGuardNotice";
 import {
   analyzeAuth,
   analyzeCaching,
@@ -288,25 +293,37 @@ export const SseInspectorPanel: React.FC<{
             <span>+{selectedEvent?.offsetMs ?? 0} ms</span>
           </div>
           <div className="flex-1 overflow-hidden">
-            <Editor
-              height="100%"
-              language={selectedEvent?.parsedJson ? "json" : "plaintext"}
-              theme={monacoTheme}
-              value={
-                selectedEvent
-                  ? selectedEvent.parsedJson
-                    ? JSON.stringify(selectedEvent.parsedJson, null, 2)
-                    : selectedEvent.data
-                  : ""
+            {(() => {
+              const sseText = selectedEvent
+                ? selectedEvent.parsedJson
+                  ? JSON.stringify(selectedEvent.parsedJson, null, 2)
+                  : selectedEvent.data
+                : "";
+              if (exceedsMonacoRenderLimit(sseText, selectedEvent?.byteLength)) {
+                return (
+                  <MonacoSizeGuardNotice
+                    payloadLabel="SSE событие"
+                    sizeBytes={selectedEvent?.byteLength}
+                  />
+                );
               }
-              options={{
-                readOnly: true,
-                minimap: { enabled: false },
-                fontSize: 11,
-                wordWrap: "on",
-                scrollBeyondLastLine: false,
-              }}
-            />
+              return (
+                <Editor
+                  height="100%"
+                  path={MONACO_MODEL_PATHS.inspectorSseEvent}
+                  language={selectedEvent?.parsedJson ? "json" : "plaintext"}
+                  theme={monacoTheme}
+                  value={sseText}
+                  options={{
+                    readOnly: true,
+                    minimap: { enabled: false },
+                    fontSize: 11,
+                    wordWrap: "on",
+                    scrollBeyondLastLine: false,
+                  }}
+                />
+              );
+            })()}
           </div>
         </div>
       </div>
@@ -1123,19 +1140,24 @@ export const ProtobufGrpcPanel: React.FC<{
         <div className="p-4 text-xs text-rose-300">{analysis.error}</div>
       ) : viewMode === "json" ? (
         <div className="flex-1 overflow-hidden">
-          <Editor
-            height="100%"
-            language="json"
-            theme={monacoTheme}
-            value={analysis.jsonProjection}
-            options={{
-              readOnly: true,
-              minimap: { enabled: false },
-              fontSize: 12,
-              wordWrap: "on",
-              scrollBeyondLastLine: false,
-            }}
-          />
+          {exceedsMonacoRenderLimit(analysis.jsonProjection) ? (
+            <MonacoSizeGuardNotice payloadLabel="Protobuf JSON" />
+          ) : (
+            <Editor
+              height="100%"
+              path={MONACO_MODEL_PATHS.inspectorProtobufJson}
+              language="json"
+              theme={monacoTheme}
+              value={analysis.jsonProjection}
+              options={{
+                readOnly: true,
+                minimap: { enabled: false },
+                fontSize: 12,
+                wordWrap: "on",
+                scrollBeyondLastLine: false,
+              }}
+            />
+          )}
         </div>
       ) : (
         <div

@@ -30,6 +30,39 @@ pub fn serialize_full_raw_http(sessions: &[SessionDetail]) -> Vec<u8> {
     out
 }
 
+/// Streams raw HTTP request/response transcripts one session at a time into `W`.
+pub struct RawHttpStreamWriter<W: Write> {
+    writer: W,
+    count: usize,
+}
+
+impl<W: Write> RawHttpStreamWriter<W> {
+    pub fn new(writer: W) -> Self {
+        Self { writer, count: 0 }
+    }
+
+    pub fn write_session(&mut self, detail: &SessionDetail) -> Result<(), ProxyError> {
+        if self.count > 0 {
+            self.writer.write_all(
+                b"\r\n------------------------------------------------------------------\r\n\r\n",
+            )?;
+        }
+        let req_raw = build_raw_http_request_bytes(detail);
+        self.writer.write_all(&req_raw)?;
+        self.writer.write_all(b"\r\n\r\n")?;
+        let resp_raw = build_raw_http_response_bytes(detail);
+        self.writer.write_all(&resp_raw)?;
+        self.writer.write_all(b"\r\n")?;
+        self.count += 1;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<usize, ProxyError> {
+        self.writer.flush()?;
+        Ok(self.count)
+    }
+}
+
 /// Writes raw binary or text payload bytes directly to `path`, creating parent directories if needed.
 pub fn write_raw_bytes_to_file(path: &Path, bytes: &[u8]) -> Result<usize, ProxyError> {
     ensure_parent_dir(path)?;

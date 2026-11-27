@@ -242,8 +242,8 @@ const {
     resolveBreakpoint: vi.fn(async () => true),
     resumeAllBreakpoints: vi.fn(async () => 0),
     generateStressTestSessions: vi.fn(async () => 0),
-    pickSaveFileDialog: vi.fn(async () => null),
-    exportSessionsFile: vi.fn(async () => 0),
+    pickSaveFileDialog: vi.fn(async () => null as string | null),
+    exportSessionsFile: vi.fn(async (..._args: unknown[]) => 0),
     pickOpenFileDialog: vi.fn(async () => null),
     importSessionsFile: vi.fn(async () => [] as SessionSummary[]),
     importSessionsBytes: vi.fn(async () => [] as SessionSummary[]),
@@ -873,5 +873,85 @@ describe("useProxySessions — Port lifecycle, StrictMode & Replay", () => {
     expect(next.pausedBreakpoints).toEqual([sampleBreakpoint]);
     expect(next.storageStats).toEqual(customStats);
     expect(next.toastMessage).toBe("keep-me");
+  });
+
+  it("defaults clearDbOnExit to false on SETTINGS_APPLIED_EVENT and forwards includeEvictedSqlite in exportSanitizedSessions", async () => {
+    const { SETTINGS_APPLIED_EVENT } = await import("../types/settings");
+    const { DEFAULT_SANITIZATION_OPTIONS } = await import("../types/proxy");
+    mockProxyBridge.pickSaveFileDialog.mockResolvedValue("C:\\Exports\\all.har");
+    mockProxyBridge.exportSessionsFile.mockResolvedValue(42);
+    mockState.sessions = [makeSessionSummary(1)];
+    mockState.stats = {
+      ramSessions: 1,
+      archivedSessions: 41,
+      sqliteSizeBytes: 8192,
+      droppedSessionsCount: 0,
+      sessionRetentionLimit: 10_000,
+      dropNonMatching: false,
+    };
+    useProxyStore.setState({
+      sessions: [makeSessionSummary(1)],
+      clearDbOnExit: false,
+      storageStats: structuredClone(mockState.stats),
+    });
+    const filterState = useFilterStore.getState();
+
+    const { result } = renderHook(() => useProxySessions());
+
+    await waitFor(() => {
+      expect(result.current.sessions.length).toBe(1);
+    });
+
+    await act(async () => {
+      window.dispatchEvent(
+        new CustomEvent(SETTINGS_APPLIED_EVENT, {
+          detail: {
+            proxy: {
+              port: 8888,
+              autoSystemProxy: true,
+              allowRemote: false,
+              tlsInterceptMode: "all",
+              tlsBypassRules: [],
+              tlsTargetRules: [],
+              headerMutations: [],
+              sessionRetentionLimit: 10_000,
+              dropNonMatching: false,
+              clearDbOnExit: undefined,
+              breakpoints: mockDefaultBp,
+            },
+            ui: { followTail: true },
+            filters: {
+              activePresetId: filterState.activePresetId,
+              userPresets: [],
+              noiseThresholds: filterState.thresholds,
+              hostFilters: filterState.hostListFilter,
+              matrixEnabled: false,
+              filterRules: [],
+            },
+          },
+        })
+      );
+    });
+
+    expect(result.current.clearDbOnExit).toBe(false);
+
+    let ok = false;
+    await act(async () => {
+      ok = await result.current.exportSanitizedSessions(
+        [],
+        "har",
+        DEFAULT_SANITIZATION_OPTIONS,
+        true
+      );
+    });
+
+    expect(ok).toBe(true);
+    expect(mockProxyBridge.exportSessionsFile).toHaveBeenCalledWith(
+      [],
+      "har",
+      "C:\\Exports\\all.har",
+      DEFAULT_SANITIZATION_OPTIONS,
+      true
+    );
   });
 });

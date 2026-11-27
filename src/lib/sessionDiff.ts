@@ -9,6 +9,7 @@ import {
   parseQueryParams,
   statusReasonPhrase,
 } from "./formatters";
+import { MAX_MONACO_RENDER_BYTES } from "./monacoLimits";
 import { inspectJwt } from "./textWizard";
 
 export interface SessionMarkPreset {
@@ -166,11 +167,20 @@ function formatBodyForDiff(
 
   // Pretty-print JSON payloads (and optionally canonicalize key order)
   const trimmed = bodyText.trim();
-  if (
+  const isJsonLike =
     ctLower.includes("json") ||
     trimmed.startsWith("{") ||
-    trimmed.startsWith("[")
-  ) {
+    trimmed.startsWith("[");
+  const isXmlLike =
+    ctLower.includes("xml") ||
+    ctLower.includes("html") ||
+    trimmed.startsWith("<");
+
+  if (bodyText.length > MAX_MONACO_RENDER_BYTES) {
+    return { text: bodyText, isJson: isJsonLike, isXml: isXmlLike };
+  }
+
+  if (isJsonLike) {
     try {
       const parsed: unknown = JSON.parse(trimmed);
       const normalized = sortKeys ? sortJsonValueDeep(parsed) : parsed;

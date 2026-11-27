@@ -182,7 +182,7 @@ export function useProxySessions() {
       );
       dropNonMatchingRef.current = nextDropNonMatching;
 
-      const nextClearDbOnExit = Boolean(detail.proxy.clearDbOnExit ?? true);
+      const nextClearDbOnExit = Boolean(detail.proxy.clearDbOnExit ?? false);
       clearDbOnExitRef.current = nextClearDbOnExit;
 
       useProxyStore.getState().applySettingsProfileProxy(detail);
@@ -234,6 +234,7 @@ export function useProxySessions() {
     setStorageStats((prev) => {
       if (
         prev.ramSessions === nextStats.ramSessions &&
+        (prev.archivedSessions ?? 0) === (nextStats.archivedSessions ?? 0) &&
         prev.sqliteSizeBytes === nextStats.sqliteSizeBytes &&
         prev.droppedSessionsCount === nextStats.droppedSessionsCount &&
         prev.sessionRetentionLimit === nextStats.sessionRetentionLimit &&
@@ -2466,7 +2467,8 @@ export function useProxySessions() {
     async (
       targetSessionIds: number[],
       forcedFormat?: "har" | "saz" | "json" | "raw",
-      sanitization?: SanitizationOptions | null
+      sanitization?: SanitizationOptions | null,
+      includeEvictedSqlite = false
     ): Promise<boolean> => {
       try {
         const stamp = new Date()
@@ -2554,7 +2556,8 @@ export function useProxySessions() {
           targetSessionIds,
           resolvedFormat,
           chosenPath,
-          sanitization
+          sanitization,
+          includeEvictedSqlite
         );
         const baseName = chosenPath.split(/[\\/]/).pop() ?? chosenPath;
         showToast(
@@ -2610,15 +2613,25 @@ export function useProxySessions() {
     async (
       targetSessionIds: number[],
       format: "har" | "saz" | "json" | "raw",
-      sanitization: SanitizationOptions
+      sanitization: SanitizationOptions,
+      includeEvictedSqlite = false
     ): Promise<boolean> => {
-      if (sessions.length === 0) {
+      const archivedSessions = storageStats.archivedSessions ?? 0;
+      if (
+        sessions.length === 0 &&
+        !(includeEvictedSqlite && targetSessionIds.length === 0 && archivedSessions > 0)
+      ) {
         showToast("⚠️ Нет захваченных сессий для экспорта");
         return false;
       }
-      return exportSessionsWithDialog(targetSessionIds, format, sanitization);
+      return exportSessionsWithDialog(
+        targetSessionIds,
+        format,
+        sanitization,
+        includeEvictedSqlite
+      );
     },
-    [exportSessionsWithDialog, sessions.length, showToast]
+    [exportSessionsWithDialog, sessions.length, showToast, storageStats.archivedSessions]
   );
 
   const importArchiveFromPath = useCallback(

@@ -20,6 +20,11 @@ import {
 } from "../lib/contextMenuBuilders";
 import { statusReasonPhrase, tryFormatJson } from "../lib/formatters";
 import { getMonacoThemeName } from "../lib/monaco";
+import {
+  exceedsMonacoRenderLimit,
+  MAX_MONACO_RENDER_BYTES,
+  MONACO_MODEL_PATHS,
+} from "../lib/monacoLimits";
 import { isTauriRuntime, proxyBridge } from "../lib/tauriBridge";
 import type {
   BreakpointAction,
@@ -30,6 +35,7 @@ import type {
   HeaderPair,
   PausedBreakpointItem,
 } from "../types/proxy";
+import { MonacoSizeGuardNotice } from "./MonacoSizeGuardNotice";
 import { SectionHeader } from "./ui/SectionHeader";
 
 export type BreakpointsPanelMode = "intercept" | "rules";
@@ -96,6 +102,9 @@ export const BreakpointsPanel: React.FC<BreakpointsPanelProps> = ({
   const [draftBody, setDraftBody] = useState("");
   const [isBinaryBody, setIsBinaryBody] = useState(false);
   const [bodyModified, setBodyModified] = useState(false);
+  const [loadingBodyId, setLoadingBodyId] = useState<string | null>(null);
+  const [loadBodyError, setLoadBodyError] = useState<string | null>(null);
+  const [activeLoadedBodySize, setActiveLoadedBodySize] = useState<number>(0);
 
   // New `bpu` / `bpafter` rule form
   const [newRulePattern, setNewRulePattern] = useState("");
@@ -104,6 +113,7 @@ export const BreakpointsPanel: React.FC<BreakpointsPanelProps> = ({
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   const lastAppliedSeqRef = useRef(0);
+  const bodyLoadSeqRef = useRef(0);
   const pausedCountRef = useRef(pausedItems.length);
   pausedCountRef.current = pausedItems.length;
 
@@ -131,7 +141,66 @@ export const BreakpointsPanel: React.FC<BreakpointsPanelProps> = ({
     }
   }, [requestSeq, requestedMode, selectedBreakpointId]);
 
+  const applyInlineBodyToDraft = (
+    base64: string,
+    text: string | null | undefined,
+    declaredSize?: number
+  ) => {
+    const itemIsBinary = Boolean(base64 && text == null);
+    setIsBinaryBody(itemIsBinary);
+    setBodyModified(false);
+    setActiveLoadedBodySize(declaredSize ?? text?.length ?? 0);
+    if (itemIsBinary) {
+      setDraftBody(base64);
+    } else {
+      const rawText = text ?? "";
+      if (rawText.length <= MAX_MONACO_RENDER_BYTES) {
+        const pretty = tryFormatJson(rawText);
+        setDraftBody(pretty.valid ? pretty.formatted : rawText);
+      } else {
+        setDraftBody(rawText);
+      }
+    }
+  };
+
+  const fetchLazyBreakpointBody = async (item: PausedBreakpointItem) => {
+    const seq = ++bodyLoadSeqRef.current;
+    const isResp = item.stage === "response";
+    setLoadingBodyId(item.breakpointId);
+    setLoadBodyError(null);
+    setDraftBody("");
+    setBodyModified(false);
+    try {
+      const loaded = await proxyBridge.loadBreakpointBody(
+        item.breakpointId,
+        isResp
+      );
+      if (bodyLoadSeqRef.current !== seq) return;
+      if (loaded) {
+        applyInlineBodyToDraft(
+          loaded.bodyBase64,
+          loaded.bodyText,
+          loaded.bodySize
+        );
+      } else {
+        setLoadBodyError("Тело breakpoint не найдено в SQLite");
+      }
+    } catch (err) {
+      if (bodyLoadSeqRef.current !== seq) return;
+      setLoadBodyError(
+        err instanceof Error ? err.message : String(err ?? "Ошибка загрузки тела")
+      );
+    } finally {
+      if (bodyLoadSeqRef.current === seq) {
+        setLoadingBodyId(null);
+      }
+    }
+  };
+
   const loadItemIntoDraft = (item: PausedBreakpointItem) => {
+    bodyLoadSeqRef.current += 1;
+    setLoadingBodyId(null);
+    setLoadBodyError(null);
     setDraftMethod(item.method);
     setDraftUrl(item.url);
     setDraftStatus(item.responseStatus ?? 200);
@@ -141,17 +210,19 @@ export const BreakpointsPanel: React.FC<BreakpointsPanelProps> = ({
           .filter((h) => h.name.toLowerCase() !== "content-length")
           .map((h) => ({ ...h }))
       );
-      const itemIsBinary = Boolean(
-        item.responseBodyBase64 && item.responseBodyText == null
+      const isOffloaded = Boolean(
+        item.responseBodyOffloaded ?? item.bodyOffloaded
       );
-      setIsBinaryBody(itemIsBinary);
-      setBodyModified(false);
-      if (itemIsBinary) {
-        setDraftBody(item.responseBodyBase64);
+      const declSize = item.responseBodySize ?? item.bodySize ?? 0;
+      setActiveLoadedBodySize(declSize);
+      if (isOffloaded) {
+        void fetchLazyBreakpointBody(item);
       } else {
-        const rawResp = item.responseBodyText ?? "";
-        const pretty = tryFormatJson(rawResp);
-        setDraftBody(pretty.valid ? pretty.formatted : rawResp);
+        applyInlineBodyToDraft(
+          item.responseBodyBase64,
+          item.responseBodyText,
+          declSize
+        );
       }
     } else {
       setDraftHeaders(
@@ -159,17 +230,19 @@ export const BreakpointsPanel: React.FC<BreakpointsPanelProps> = ({
           .filter((h) => h.name.toLowerCase() !== "content-length")
           .map((h) => ({ ...h }))
       );
-      const itemIsBinary = Boolean(
-        item.requestBodyBase64 && item.requestBodyText == null
+      const isOffloaded = Boolean(
+        item.requestBodyOffloaded ?? item.bodyOffloaded
       );
-      setIsBinaryBody(itemIsBinary);
-      setBodyModified(false);
-      if (itemIsBinary) {
-        setDraftBody(item.requestBodyBase64);
+      const declSize = item.requestBodySize ?? item.bodySize ?? 0;
+      setActiveLoadedBodySize(declSize);
+      if (isOffloaded) {
+        void fetchLazyBreakpointBody(item);
       } else {
-        const rawReq = item.requestBodyText ?? "";
-        const pretty = tryFormatJson(rawReq);
-        setDraftBody(pretty.valid ? pretty.formatted : rawReq);
+        applyInlineBodyToDraft(
+          item.requestBodyBase64,
+          item.requestBodyText,
+          declSize
+        );
       }
     }
   };
@@ -211,6 +284,15 @@ export const BreakpointsPanel: React.FC<BreakpointsPanelProps> = ({
   const handleContinueWithEdits = async () => {
     if (!activeItem) return;
     const cleanHeaders = draftHeaders.filter((h) => h.name.trim().length > 0);
+    const bodyUpdate = !bodyModified
+      ? {}
+      : isBinaryBody
+        ? activeItem.stage === "response"
+          ? { responseBodyBase64: draftBody.trim(), responseBodyText: null }
+          : { requestBodyBase64: draftBody.trim(), requestBodyText: null }
+        : activeItem.stage === "response"
+          ? { responseBodyText: draftBody }
+          : { requestBodyText: draftBody };
 
     if (activeItem.stage === "response") {
       await onResolve({
@@ -218,16 +300,7 @@ export const BreakpointsPanel: React.FC<BreakpointsPanelProps> = ({
         action: "continue",
         statusCode: Math.max(100, Math.min(599, Number(draftStatus) || 200)),
         responseHeaders: cleanHeaders,
-        ...(isBinaryBody
-          ? {
-              responseBodyBase64: bodyModified
-                ? draftBody.trim()
-                : activeItem.responseBodyBase64,
-              responseBodyText: null,
-            }
-          : {
-              responseBodyText: draftBody,
-            }),
+        ...bodyUpdate,
       });
     } else {
       await onResolve({
@@ -236,16 +309,7 @@ export const BreakpointsPanel: React.FC<BreakpointsPanelProps> = ({
         method: draftMethod,
         url: draftUrl.trim() || activeItem.url,
         requestHeaders: cleanHeaders,
-        ...(isBinaryBody
-          ? {
-              requestBodyBase64: bodyModified
-                ? draftBody.trim()
-                : activeItem.requestBodyBase64,
-              requestBodyText: null,
-            }
-          : {
-              requestBodyText: draftBody,
-            }),
+        ...bodyUpdate,
       });
     }
   };
@@ -668,23 +732,46 @@ export const BreakpointsPanel: React.FC<BreakpointsPanelProps> = ({
               {/* Editor Workspace */}
               <div className="min-h-0 flex-1 overflow-hidden bg-canvas">
                 {editorSubTab === "body" ? (
-                  <Editor
-                    height="100%"
-                    language={detectedLanguage}
-                    theme={monacoTheme}
-                    value={draftBody}
-                    onChange={(val) => {
-                      setDraftBody(val ?? "");
-                      setBodyModified(true);
-                    }}
-                    options={{
-                      minimap: { enabled: false },
-                      fontSize: 12,
-                      wordWrap: "on",
-                      scrollBeyondLastLine: false,
-                      automaticLayout: true,
-                    }}
-                  />
+                  loadingBodyId === activeItem.breakpointId ? (
+                    <div className="flex h-full items-center justify-center text-xs text-muted">
+                      Загрузка тела breakpoint из SQLite...
+                    </div>
+                  ) : loadBodyError ? (
+                    <div className="flex h-full flex-col items-center justify-center gap-2 p-4 text-center text-xs text-status5xx-fg">
+                      <p>{loadBodyError}</p>
+                      <button
+                        type="button"
+                        onClick={() => void fetchLazyBreakpointBody(activeItem)}
+                        className="rounded border border-hairline bg-surface px-2.5 py-1 text-[11px] text-fg hover:bg-hover"
+                      >
+                        Повторить загрузку
+                      </button>
+                    </div>
+                  ) : exceedsMonacoRenderLimit(draftBody, activeLoadedBodySize) ? (
+                    <MonacoSizeGuardNotice
+                      payloadLabel="тело breakpoint"
+                      sizeBytes={activeLoadedBodySize || draftBody.length}
+                    />
+                  ) : (
+                    <Editor
+                      height="100%"
+                      path={MONACO_MODEL_PATHS.breakpointBody}
+                      language={detectedLanguage}
+                      theme={monacoTheme}
+                      value={draftBody}
+                      onChange={(val) => {
+                        setDraftBody(val ?? "");
+                        setBodyModified(true);
+                      }}
+                      options={{
+                        minimap: { enabled: false },
+                        fontSize: 12,
+                        wordWrap: "on",
+                        scrollBeyondLastLine: false,
+                        automaticLayout: true,
+                      }}
+                    />
+                  )
                 ) : (
                   <div className="h-full space-y-1.5 overflow-y-auto p-3">
                     {draftHeaders.map((hdr, idx) => (

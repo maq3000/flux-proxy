@@ -498,6 +498,8 @@ pub struct ProxyFilterBackendConfig {
 #[serde(rename_all = "camelCase")]
 pub struct StorageStats {
     pub ram_sessions: usize,
+    #[serde(default)]
+    pub archived_sessions: usize,
     pub sqlite_size_bytes: u64,
     pub dropped_sessions_count: u64,
     pub session_retention_limit: Option<usize>,
@@ -588,10 +590,22 @@ pub struct PausedBreakpointItem {
     pub request_headers: Vec<HeaderPair>,
     pub request_body_base64: String,
     pub request_body_text: Option<String>,
+    #[serde(default)]
+    pub request_body_offloaded: bool,
+    #[serde(default)]
+    pub request_body_size: usize,
     pub response_status: Option<u16>,
     pub response_headers: Vec<HeaderPair>,
     pub response_body_base64: String,
     pub response_body_text: Option<String>,
+    #[serde(default)]
+    pub response_body_offloaded: bool,
+    #[serde(default)]
+    pub response_body_size: usize,
+    #[serde(default)]
+    pub body_offloaded: bool,
+    #[serde(default)]
+    pub body_size: usize,
     pub process_name: Option<String>,
     pub process_pid: Option<u32>,
 }
@@ -962,6 +976,7 @@ fn default_upstream_proxy_port() -> u16 {
 
 pub fn default_upstream_bypass_list() -> Vec<String> {
     vec![
+        "<local>".to_string(),
         "localhost".to_string(),
         "127.0.0.1".to_string(),
         "::1".to_string(),
@@ -1143,4 +1158,18 @@ pub fn validate_composer_timeout_sec(timeout_sec: u64) -> Result<(), ProxyError>
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_upstream_bypass_list;
+
+    #[test]
+    fn default_upstream_bypass_list_includes_local_rule() {
+        let list = default_upstream_bypass_list();
+        assert!(list.contains(&"<local>".to_string()));
+        assert!(list.contains(&"localhost".to_string()));
+        assert!(list.contains(&"127.0.0.1".to_string()));
+        assert!(list.contains(&"::1".to_string()));
+    }
 }

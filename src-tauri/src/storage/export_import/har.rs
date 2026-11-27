@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use base64::Engine as _;
 use chrono::{SecondsFormat, TimeZone, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -537,6 +539,101 @@ pub fn deserialize_har_1_2(json_str: &str) -> Result<Vec<SessionDetail>, ProxyEr
 pub fn serialize_json_archive(sessions: &[SessionDetail]) -> Result<String, ProxyError> {
     serde_json::to_string_pretty(sessions)
         .map_err(|e| ProxyError::Custom(format!("Ошибка сериализации JSON архива: {e}")))
+}
+
+/// Streams a HAR 1.2 JSON file one `HarEntry` at a time without materializing all entries in RAM.
+pub struct HarStreamWriter<W: Write> {
+    writer: W,
+    header_written: bool,
+    count: usize,
+}
+
+impl<W: Write> HarStreamWriter<W> {
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer,
+            header_written: false,
+            count: 0,
+        }
+    }
+
+    fn write_prefix(&mut self, first_ts: Option<&str>) -> Result<(), ProxyError> {
+        self.writer
+            .write_all(b"{\"log\":{\"version\":\"1.2\",\"creator\":")?;
+        serde_json::to_writer(&mut self.writer, &default_har_creator())
+            .map_err(|e| ProxyError::Custom(format!("Ошибка сериализации HAR 1.2: {e}")))?;
+        self.writer.write_all(b",\"pages\":[")?;
+        if let Some(ts) = first_ts {
+            let page = HarPage {
+                started_date_time: normalize_iso8601_timestamp(ts),
+                id: "page_1".to_string(),
+                title: "FluxProxy Capture".to_string(),
+                page_timings: HarPageTimings::default(),
+                comment: None,
+            };
+            serde_json::to_writer(&mut self.writer, &page)
+                .map_err(|e| ProxyError::Custom(format!("Ошибка сериализации HAR 1.2: {e}")))?;
+        }
+        self.writer.write_all(b"],\"entries\":[\n")?;
+        self.header_written = true;
+        Ok(())
+    }
+
+    pub fn write_session(&mut self, detail: &SessionDetail) -> Result<(), ProxyError> {
+        if !self.header_written {
+            self.write_prefix(Some(&detail.summary.timestamp))?;
+        }
+        if self.count > 0 {
+            self.writer.write_all(b",\n")?;
+        }
+        let entry = session_to_har_entry(detail, Some("page_1".to_string()));
+        serde_json::to_writer(&mut self.writer, &entry)
+            .map_err(|e| ProxyError::Custom(format!("Ошибка сериализации HAR 1.2: {e}")))?;
+        self.count += 1;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<usize, ProxyError> {
+        if !self.header_written {
+            self.write_prefix(None)?;
+        }
+        self.writer.write_all(b"\n]}}\n")?;
+        self.writer.flush()?;
+        Ok(self.count)
+    }
+}
+
+/// Streams a JSON array of `SessionDetail` objects one entry at a time into `W`.
+pub struct JsonStreamWriter<W: Write> {
+    writer: W,
+    count: usize,
+}
+
+impl<W: Write> JsonStreamWriter<W> {
+    pub fn new(mut writer: W) -> Result<Self, ProxyError> {
+        writer.write_all(b"[\n")?;
+        Ok(Self { writer, count: 0 })
+    }
+
+    pub fn write_session(&mut self, detail: &SessionDetail) -> Result<(), ProxyError> {
+        if self.count > 0 {
+            self.writer.write_all(b",\n")?;
+        }
+        serde_json::to_writer(&mut self.writer, detail)
+            .map_err(|e| ProxyError::Custom(format!("Ошибка сериализации JSON архива: {e}")))?;
+        self.count += 1;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<usize, ProxyError> {
+        if self.count > 0 {
+            self.writer.write_all(b"\n]\n")?;
+        } else {
+            self.writer.write_all(b"]\n")?;
+        }
+        self.writer.flush()?;
+        Ok(self.count)
+    }
 }
 
 /// Deserializes a JSON string containing either a HAR 1.2 object (`{ "log": ... }`)

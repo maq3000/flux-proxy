@@ -1,16 +1,23 @@
 use std::sync::{Arc, RwLock};
 
+use base64::Engine as _;
 use dashmap::DashMap;
 use regex::Regex;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::models::{
     BreakpointAction, BreakpointConfig, BreakpointResolution, BreakpointRule, BreakpointStage,
-    PausedBreakpointItem,
+    LoadedSessionBody, PausedBreakpointItem, ProxyError,
 };
+use crate::storage::TrafficStore;
+
+/// Maximum decoded body size inlined directly inside `PausedBreakpointItem` snapshots (256 KiB).
+/// Larger payloads are offloaded to SQLite `offloaded_bodies` and fetched lazily on queue selection.
+pub const BREAKPOINT_INLINE_BODY_LIMIT_BYTES: usize = 256 * 1024;
 
 struct PendingBreakpoint {
     item: PausedBreakpointItem,
+    offloaded_keys: Vec<(u64, bool)>,
     tx: oneshot::Sender<BreakpointResolution>,
 }
 
@@ -166,6 +173,7 @@ pub struct BreakpointEngine {
     state: RwLock<CompiledBreakpointState>,
     pending: DashMap<String, PendingBreakpoint>,
     snapshot_tx: Option<mpsc::UnboundedSender<Vec<PausedBreakpointItem>>>,
+    store: Option<Arc<TrafficStore>>,
 }
 
 impl Default for BreakpointEngine {
@@ -176,10 +184,94 @@ impl Default for BreakpointEngine {
 
 impl BreakpointEngine {
     pub fn new(snapshot_tx: Option<mpsc::UnboundedSender<Vec<PausedBreakpointItem>>>) -> Self {
+        Self::new_with_store(snapshot_tx, None)
+    }
+
+    pub fn new_with_store(
+        snapshot_tx: Option<mpsc::UnboundedSender<Vec<PausedBreakpointItem>>>,
+        store: Option<Arc<TrafficStore>>,
+    ) -> Self {
         Self {
             state: RwLock::new(CompiledBreakpointState::from_config(default_breakpoint_config())),
             pending: DashMap::new(),
             snapshot_tx,
+            store,
+        }
+    }
+
+    fn cleanup_offloaded(&self, offloaded_keys: &[(u64, bool)]) {
+        if offloaded_keys.is_empty() {
+            return;
+        }
+        if let Some(ref store) = self.store {
+            store.delete_breakpoint_offloaded_bodies(offloaded_keys);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_stage_body(
+        store: Option<&Arc<TrafficStore>>,
+        session_id: u64,
+        is_response: bool,
+        raw: Option<&[u8]>,
+        body_base64: &mut String,
+        body_text: &mut Option<String>,
+        body_offloaded: &mut bool,
+        body_size: &mut usize,
+        offloaded_keys: &mut Vec<(u64, bool)>,
+    ) {
+        let decoded_owned: Option<Vec<u8>> = if raw.is_some() {
+            None
+        } else if !body_base64.is_empty() {
+            base64::engine::general_purpose::STANDARD
+                .decode(body_base64.as_bytes())
+                .ok()
+        } else {
+            body_text.as_ref().map(|t| t.as_bytes().to_vec())
+        };
+
+        let effective_bytes: &[u8] = match (raw, decoded_owned.as_deref()) {
+            (Some(slice), _) => slice,
+            (None, Some(vec)) => vec,
+            (None, None) => &[],
+        };
+
+        *body_size = effective_bytes.len();
+        if effective_bytes.len() > BREAKPOINT_INLINE_BODY_LIMIT_BYTES {
+            let offloaded_ok = store
+                .map(|st| {
+                    st.save_breakpoint_offloaded_body(
+                        session_id,
+                        is_response,
+                        effective_bytes.to_vec(),
+                    )
+                    .is_ok()
+                })
+                .unwrap_or(false);
+
+            if offloaded_ok {
+                *body_offloaded = true;
+                body_base64.clear();
+                *body_text = None;
+                offloaded_keys.push((session_id, is_response));
+            } else {
+                *body_offloaded = false;
+                let clipped =
+                    &effective_bytes[..effective_bytes.len().min(BREAKPOINT_INLINE_BODY_LIMIT_BYTES)];
+                *body_base64 = base64::engine::general_purpose::STANDARD.encode(clipped);
+                *body_text = truncate_utf8_prefix(clipped);
+            }
+        } else {
+            *body_offloaded = false;
+            if let Some(slice) = raw {
+                if slice.is_empty() {
+                    body_base64.clear();
+                    *body_text = None;
+                } else {
+                    *body_base64 = base64::engine::general_purpose::STANDARD.encode(slice);
+                    *body_text = std::str::from_utf8(slice).ok().map(str::to_owned);
+                }
+            }
         }
     }
 
@@ -225,7 +317,19 @@ impl BreakpointEngine {
 
     /// Registers a paused request/response and returns a `(oneshot::Receiver, timeout_secs)` pair
     /// on which `handle_intercepted_request` awaits the developer's verdict.
-    pub fn park(&self, mut item: PausedBreakpointItem) -> (oneshot::Receiver<BreakpointResolution>, u64) {
+    pub fn park(&self, item: PausedBreakpointItem) -> (oneshot::Receiver<BreakpointResolution>, u64) {
+        self.park_with_bodies(item, None, None)
+    }
+
+    /// Registers a paused request/response with optional raw byte buffers so payloads exceeding
+    /// `BREAKPOINT_INLINE_BODY_LIMIT_BYTES` (256 KiB) are offloaded into `offloaded_bodies` instead
+    /// of inflating `PausedBreakpointItem` snapshots and IPC broadcasts.
+    pub fn park_with_bodies(
+        &self,
+        mut item: PausedBreakpointItem,
+        raw_req_bytes: Option<&[u8]>,
+        raw_resp_bytes: Option<&[u8]>,
+    ) -> (oneshot::Receiver<BreakpointResolution>, u64) {
         let timeout_secs = self
             .state
             .read()
@@ -233,17 +337,124 @@ impl BreakpointEngine {
             .unwrap_or(120);
         item.timeout_secs = timeout_secs;
 
+        let mut offloaded_keys = Vec::new();
+        Self::prepare_stage_body(
+            self.store.as_ref(),
+            item.session_id,
+            false,
+            raw_req_bytes,
+            &mut item.request_body_base64,
+            &mut item.request_body_text,
+            &mut item.request_body_offloaded,
+            &mut item.request_body_size,
+            &mut offloaded_keys,
+        );
+        Self::prepare_stage_body(
+            self.store.as_ref(),
+            item.session_id,
+            true,
+            raw_resp_bytes,
+            &mut item.response_body_base64,
+            &mut item.response_body_text,
+            &mut item.response_body_offloaded,
+            &mut item.response_body_size,
+            &mut offloaded_keys,
+        );
+
+        match item.stage {
+            BreakpointStage::Request | BreakpointStage::Both => {
+                item.body_offloaded = item.request_body_offloaded;
+                item.body_size = item.request_body_size;
+            }
+            BreakpointStage::Response => {
+                item.body_offloaded = item.response_body_offloaded;
+                item.body_size = item.response_body_size;
+            }
+        }
+
         let (tx, rx) = oneshot::channel();
         let bp_id = item.breakpoint_id.clone();
-        self.pending.insert(bp_id, PendingBreakpoint { item, tx });
+        self.pending.insert(
+            bp_id,
+            PendingBreakpoint {
+                item,
+                offloaded_keys,
+                tx,
+            },
+        );
         self.emit_snapshot();
         (rx, timeout_secs)
+    }
+
+    /// Lazily loads a paused breakpoint's full body (hydrating from `offloaded_bodies` if > 256 KiB).
+    pub fn load_paused_body(
+        &self,
+        breakpoint_id: &str,
+        is_response: bool,
+    ) -> Result<Option<LoadedSessionBody>, ProxyError> {
+        let Some(entry) = self.pending.get(breakpoint_id) else {
+            return Ok(None);
+        };
+        let session_id = entry.item.session_id;
+        let (offloaded, inline_b64, inline_txt, expected_size) = if is_response {
+            (
+                entry.item.response_body_offloaded,
+                entry.item.response_body_base64.clone(),
+                entry.item.response_body_text.clone(),
+                entry.item.response_body_size,
+            )
+        } else {
+            (
+                entry.item.request_body_offloaded,
+                entry.item.request_body_base64.clone(),
+                entry.item.request_body_text.clone(),
+                entry.item.request_body_size,
+            )
+        };
+        drop(entry);
+
+        if offloaded {
+            if let Some(ref store) = self.store {
+                if let Some(raw_bytes) =
+                    store.load_breakpoint_offloaded_body(session_id, is_response)?
+                {
+                    return Ok(Some(LoadedSessionBody {
+                        id: session_id,
+                        is_response,
+                        body_base64: base64::engine::general_purpose::STANDARD.encode(&raw_bytes),
+                        body_text: std::str::from_utf8(&raw_bytes).ok().map(str::to_owned),
+                        body_size: raw_bytes.len().max(expected_size),
+                    }));
+                }
+            }
+            return Ok(None);
+        }
+
+        let decoded_len = if !inline_b64.is_empty() {
+            base64::engine::general_purpose::STANDARD
+                .decode(inline_b64.as_bytes())
+                .map(|b| b.len())
+                .unwrap_or(expected_size)
+        } else if let Some(ref txt) = inline_txt {
+            txt.len()
+        } else {
+            0
+        };
+
+        Ok(Some(LoadedSessionBody {
+            id: session_id,
+            is_response,
+            body_base64: inline_b64,
+            body_text: inline_txt,
+            body_size: decoded_len.max(expected_size),
+        }))
     }
 
     /// Delivers the UI's Continue (with optional edits) or Abort verdict to a parked task.
     pub fn resolve(&self, resolution: BreakpointResolution) -> bool {
         let removed = self.pending.remove(&resolution.breakpoint_id);
         if let Some((_, entry)) = removed {
+            self.cleanup_offloaded(&entry.offloaded_keys);
             let _ = entry.tx.send(resolution);
             self.emit_snapshot();
             true
@@ -256,8 +467,10 @@ impl BreakpointEngine {
     pub fn resume_all(&self, action: BreakpointAction) -> usize {
         let keys: Vec<String> = self.pending.iter().map(|e| e.key().clone()).collect();
         let mut count = 0;
+        let mut offloaded_cleanup = Vec::new();
         for key in keys {
             if let Some((_, entry)) = self.pending.remove(&key) {
+                offloaded_cleanup.extend(entry.offloaded_keys);
                 let _ = entry.tx.send(BreakpointResolution {
                     breakpoint_id: key,
                     action,
@@ -274,6 +487,7 @@ impl BreakpointEngine {
                 count += 1;
             }
         }
+        self.cleanup_offloaded(&offloaded_cleanup);
         if count > 0 {
             self.emit_snapshot();
         }
@@ -282,7 +496,8 @@ impl BreakpointEngine {
 
     /// Cleans up a parked entry if the safety timeout elapsed before the user responded.
     pub fn remove_expired(&self, breakpoint_id: &str) {
-        if self.pending.remove(breakpoint_id).is_some() {
+        if let Some((_, entry)) = self.pending.remove(breakpoint_id) {
+            self.cleanup_offloaded(&entry.offloaded_keys);
             self.emit_snapshot();
         }
     }
@@ -290,7 +505,8 @@ impl BreakpointEngine {
     /// Cancels a parked breakpoint entry by `breakpoint_id` (e.g., on client disconnect)
     /// and emits an updated snapshot if it was still pending.
     pub fn cancel_pending(&self, breakpoint_id: &str) -> bool {
-        if self.pending.remove(breakpoint_id).is_some() {
+        if let Some((_, entry)) = self.pending.remove(breakpoint_id) {
+            self.cleanup_offloaded(&entry.offloaded_keys);
             self.emit_snapshot();
             true
         } else {
@@ -308,11 +524,14 @@ impl BreakpointEngine {
             .map(|entry| entry.key().clone())
             .collect();
         let mut count = 0usize;
+        let mut offloaded_cleanup = Vec::new();
         for key in keys {
-            if self.pending.remove(&key).is_some() {
+            if let Some((_, entry)) = self.pending.remove(&key) {
+                offloaded_cleanup.extend(entry.offloaded_keys);
                 count += 1;
             }
         }
+        self.cleanup_offloaded(&offloaded_cleanup);
         if count > 0 {
             self.emit_snapshot();
         }
@@ -393,6 +612,25 @@ pub fn default_breakpoint_config() -> BreakpointConfig {
     }
 }
 
+fn truncate_utf8_prefix(slice: &[u8]) -> Option<String> {
+    if slice.is_empty() {
+        return None;
+    }
+    match std::str::from_utf8(slice) {
+        Ok(s) => Some(s.to_owned()),
+        Err(err) => {
+            let valid_up_to = err.valid_up_to();
+            if valid_up_to > 0 && valid_up_to + 4 >= slice.len() {
+                std::str::from_utf8(&slice[..valid_up_to])
+                    .ok()
+                    .map(str::to_owned)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 fn strip_regex_prefix(s: &str) -> Option<&str> {
     if s.is_char_boundary(6) && s.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("regex:")) {
         s.get(6..)
@@ -455,10 +693,16 @@ mod tests {
             request_headers: Vec::new(),
             request_body_base64: String::new(),
             request_body_text: Some("{\"amount\":1000}".into()),
+            request_body_offloaded: false,
+            request_body_size: 15,
             response_status: None,
             response_headers: Vec::new(),
             response_body_base64: String::new(),
             response_body_text: None,
+            response_body_offloaded: false,
+            response_body_size: 0,
+            body_offloaded: false,
+            body_size: 15,
             process_name: Some("chrome.exe".into()),
             process_pid: Some(1234),
         };
@@ -589,10 +833,16 @@ mod tests {
             request_headers: Vec::new(),
             request_body_base64: String::new(),
             request_body_text: None,
+            request_body_offloaded: false,
+            request_body_size: 0,
             response_status: None,
             response_headers: Vec::new(),
             response_body_base64: String::new(),
             response_body_text: None,
+            response_body_offloaded: false,
+            response_body_size: 0,
+            body_offloaded: false,
+            body_size: 0,
             process_name: None,
             process_pid: None,
         };
@@ -635,5 +885,165 @@ mod tests {
         assert_eq!(disarmed_cb_called.load(Ordering::SeqCst), 0);
         assert_eq!(engine.list_paused().len(), 1);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn park_with_bodies_offloads_over_256kib_and_cleans_up_all_exit_paths() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!(
+            "fluxproxy_bp_offload_{}_{nanos}.sqlite",
+            std::process::id()
+        ));
+        let cleanup = |p: &std::path::Path| {
+            let _ = std::fs::remove_file(p);
+            for suffix in ["-wal", "-shm"] {
+                let mut sc = p.as_os_str().to_os_string();
+                sc.push(suffix);
+                let _ = std::fs::remove_file(sc);
+            }
+        };
+        cleanup(&db_path);
+
+        let store = Arc::new(TrafficStore::new(db_path.clone()).expect("init store"));
+        let engine = BreakpointEngine::new_with_store(None, Some(Arc::clone(&store)));
+
+        let heavy_req = vec![b'R'; BREAKPOINT_INLINE_BODY_LIMIT_BYTES + 4096];
+        let heavy_resp = vec![b'S'; BREAKPOINT_INLINE_BODY_LIMIT_BYTES + 8192];
+
+        let blank_item = |bp_id: &str, session_id: u64, stage: BreakpointStage| PausedBreakpointItem {
+            breakpoint_id: bp_id.into(),
+            session_id,
+            stage,
+            created_at: "2026-11-26T12:00:00Z".into(),
+            timeout_secs: 120,
+            scheme: "https".into(),
+            method: "POST".into(),
+            url: format!("https://example.com/{session_id}"),
+            host: "example.com".into(),
+            path: format!("/{session_id}"),
+            request_headers: Vec::new(),
+            request_body_base64: String::new(),
+            request_body_text: None,
+            request_body_offloaded: false,
+            request_body_size: 0,
+            response_status: (stage == BreakpointStage::Response).then_some(200),
+            response_headers: Vec::new(),
+            response_body_base64: String::new(),
+            response_body_text: None,
+            response_body_offloaded: false,
+            response_body_size: 0,
+            body_offloaded: false,
+            body_size: 0,
+            process_name: None,
+            process_pid: None,
+        };
+
+        // 1. Request stage > 256 KiB -> offloaded, inline cleared, lazy load works, resolve cleans up
+        let (_rx1, _) = engine.park_with_bodies(
+            blank_item("bp-1", 10, BreakpointStage::Request),
+            Some(&heavy_req),
+            None,
+        );
+        // 2. Response stage > 256 KiB -> remove_expired cleans up
+        let (_rx2, _) = engine.park_with_bodies(
+            blank_item("bp-2", 11, BreakpointStage::Response),
+            None,
+            Some(&heavy_resp),
+        );
+        // 3. Cancel pending -> cleans up
+        let (_rx3, _) = engine.park_with_bodies(
+            blank_item("bp-3", 12, BreakpointStage::Request),
+            Some(&heavy_req),
+            None,
+        );
+        // 4. Cancel session -> cleans up
+        let (_rx4, _) = engine.park_with_bodies(
+            blank_item("bp-4", 13, BreakpointStage::Request),
+            Some(&heavy_req),
+            None,
+        );
+        // 5. Resume all -> cleans up
+        let (_rx5, _) = engine.park_with_bodies(
+            blank_item("bp-5", 14, BreakpointStage::Response),
+            Some(&heavy_req),
+            Some(&heavy_resp),
+        );
+
+        let paused = engine.list_paused();
+        assert_eq!(paused.len(), 5);
+        assert!(paused[0].request_body_offloaded);
+        assert!(paused[0].body_offloaded);
+        assert_eq!(paused[0].request_body_size, heavy_req.len());
+        assert_eq!(paused[0].body_size, heavy_req.len());
+        assert!(paused[0].request_body_base64.is_empty());
+        assert!(paused[0].request_body_text.is_none());
+
+        assert!(paused[1].response_body_offloaded);
+        assert!(paused[1].body_offloaded);
+        assert_eq!(paused[1].response_body_size, heavy_resp.len());
+
+        let loaded1 = engine
+            .load_paused_body("bp-1", false)
+            .unwrap()
+            .expect("lazy request body loaded");
+        assert_eq!(loaded1.body_size, heavy_req.len());
+        assert_eq!(loaded1.body_text.as_deref().unwrap().len(), heavy_req.len());
+
+        let loaded2 = engine
+            .load_paused_body("bp-2", true)
+            .unwrap()
+            .expect("lazy response body loaded");
+        assert_eq!(loaded2.body_size, heavy_resp.len());
+
+        assert!(engine.resolve(BreakpointResolution {
+            breakpoint_id: "bp-1".into(),
+            action: BreakpointAction::Continue,
+            method: None,
+            url: None,
+            request_headers: None,
+            request_body_base64: None,
+            request_body_text: None,
+            status_code: None,
+            response_headers: None,
+            response_body_base64: None,
+            response_body_text: None,
+        }));
+        engine.remove_expired("bp-2");
+        assert!(engine.cancel_pending("bp-3"));
+        assert_eq!(engine.cancel_session(13), 1);
+        assert_eq!(engine.resume_all(BreakpointAction::Abort), 1);
+
+        store.flush_sqlite().unwrap();
+        assert_eq!(
+            store.load_breakpoint_offloaded_body(10, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.load_breakpoint_offloaded_body(11, true).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.load_breakpoint_offloaded_body(12, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.load_breakpoint_offloaded_body(13, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.load_breakpoint_offloaded_body(14, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.load_breakpoint_offloaded_body(14, true).unwrap(),
+            None
+        );
+
+        drop(engine);
+        drop(store);
+        cleanup(&db_path);
     }
 }

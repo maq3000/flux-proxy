@@ -4773,6 +4773,7 @@ const AppContent: React.FC = () => {
           <SanitizedExportModal
             open={sanitizedExportModalOpen}
             totalCount={sessions.length}
+            archivedCount={storageStats.archivedSessions ?? 0}
             selectedIds={effectiveSelectedIds}
             onClose={() => setSanitizedExportModalOpen(false)}
             onExport={exportSanitizedSessions}

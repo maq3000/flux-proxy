@@ -147,6 +147,7 @@ export interface SessionDetail {
 
 export interface StorageStats {
   ramSessions: number;
+  archivedSessions?: number;
   sqliteSizeBytes: number;
   droppedSessionsCount: number;
   sessionRetentionLimit: number | null;
@@ -556,10 +557,16 @@ export interface PausedBreakpointItem {
   requestHeaders: HeaderPair[];
   requestBodyBase64: string;
   requestBodyText?: string | null;
+  requestBodyOffloaded?: boolean;
+  requestBodySize?: number;
   responseStatus?: number | null;
   responseHeaders: HeaderPair[];
   responseBodyBase64: string;
   responseBodyText?: string | null;
+  responseBodyOffloaded?: boolean;
+  responseBodySize?: number;
+  bodyOffloaded?: boolean;
+  bodySize?: number;
   processName?: string | null;
   processPid?: number | null;
 }

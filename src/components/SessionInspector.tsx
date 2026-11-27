@@ -62,6 +62,14 @@ const SAFE_RASTER_IMAGE_MIMES = new Set([
 import { hexToRgba } from "../lib/sessionDiff";
 import { getMonacoThemeName } from "../lib/monaco";
 import {
+  estimateBase64ByteLength,
+  exceedsMonacoRenderLimit,
+  getUtf8ByteLength,
+  MAX_MONACO_RENDER_BYTES,
+  MONACO_MODEL_PATHS,
+} from "../lib/monacoLimits";
+import { MonacoSizeGuardNotice } from "./MonacoSizeGuardNotice";
+import {
   analyzeAuth,
   analyzeCaching,
   hasMultipartOrFormPayload,
@@ -1535,22 +1543,53 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   error={reqBodyError}
                   onLoad={() => void handleLoadRequestBody()}
                 />
-              ) : (
-                <Editor
-                  height="100%"
-                  language="http"
-                  theme={monacoTheme}
-                  loading={<EditorLoadingIndicator />}
-                  value={buildRawHttpRequest(effectiveDetail)}
-                  options={{
-                    readOnly: true,
-                    minimap: { enabled: false },
-                    fontSize: 12,
-                    wordWrap: "on",
-                    scrollBeyondLastLine: false,
-                  }}
-                />
-              ))}
+              ) : (() => {
+                const reqBodyBytes = Math.max(
+                  estimateBase64ByteLength(effectiveDetail.requestBodyBase64),
+                  getUtf8ByteLength(effectiveDetail.requestBodyText)
+                );
+                const rawReqValue =
+                  reqBodyBytes > MAX_MONACO_RENDER_BYTES
+                    ? null
+                    : buildRawHttpRequest(effectiveDetail);
+                if (
+                  rawReqValue === null ||
+                  exceedsMonacoRenderLimit(rawReqValue, reqBodyBytes)
+                ) {
+                  return (
+                    <MonacoSizeGuardNotice
+                      payloadLabel="сырой запрос"
+                      sizeBytes={Math.max(
+                        reqBodyBytes,
+                        getUtf8ByteLength(rawReqValue)
+                      )}
+                      onOpenHexViewer={() => setReqTab("hex")}
+                      onSaveToDisk={
+                        onSaveBodyFile
+                          ? () => onSaveBodyFile(summary.id, false)
+                          : undefined
+                      }
+                    />
+                  );
+                }
+                return (
+                  <Editor
+                    height="100%"
+                    path={MONACO_MODEL_PATHS.inspectorRequestRaw}
+                    language="http"
+                    theme={monacoTheme}
+                    loading={<EditorLoadingIndicator />}
+                    value={rawReqValue}
+                    options={{
+                      readOnly: true,
+                      minimap: { enabled: false },
+                      fontSize: 12,
+                      wordWrap: "on",
+                      scrollBeyondLastLine: false,
+                    }}
+                  />
+                );
+              })())}
             {reqTab === "json" &&
               (isReqOffloaded ? (
                 <OffloadedBodyNotice
@@ -1559,25 +1598,54 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   error={reqBodyError}
                   onLoad={() => void handleLoadRequestBody()}
                 />
-              ) : (
-                <Editor
-                  height="100%"
-                  language="json"
-                  theme={monacoTheme}
-                  loading={<EditorLoadingIndicator />}
-                  value={
-                    tryFormatJson(effectiveDetail.requestBodyText).formatted ||
-                    "// Empty or non-JSON request body"
-                  }
-                  options={{
-                    readOnly: true,
-                    minimap: { enabled: false },
-                    fontSize: 12,
-                    wordWrap: "on",
-                    scrollBeyondLastLine: false,
-                  }}
-                />
-              ))}
+              ) : (() => {
+                const reqBodyBytes = Math.max(
+                  estimateBase64ByteLength(effectiveDetail.requestBodyBase64),
+                  getUtf8ByteLength(effectiveDetail.requestBodyText)
+                );
+                const reqJsonValue =
+                  reqBodyBytes > MAX_MONACO_RENDER_BYTES
+                    ? null
+                    : tryFormatJson(effectiveDetail.requestBodyText).formatted ||
+                      "// Empty or non-JSON request body";
+                if (
+                  reqJsonValue === null ||
+                  exceedsMonacoRenderLimit(reqJsonValue, reqBodyBytes)
+                ) {
+                  return (
+                    <MonacoSizeGuardNotice
+                      payloadLabel="JSON запроса"
+                      sizeBytes={Math.max(
+                        reqBodyBytes,
+                        getUtf8ByteLength(reqJsonValue)
+                      )}
+                      onOpenHexViewer={() => setReqTab("hex")}
+                      onSaveToDisk={
+                        onSaveBodyFile
+                          ? () => onSaveBodyFile(summary.id, false)
+                          : undefined
+                      }
+                    />
+                  );
+                }
+                return (
+                  <Editor
+                    height="100%"
+                    path={MONACO_MODEL_PATHS.inspectorRequestJson}
+                    language="json"
+                    theme={monacoTheme}
+                    loading={<EditorLoadingIndicator />}
+                    value={reqJsonValue}
+                    options={{
+                      readOnly: true,
+                      minimap: { enabled: false },
+                      fontSize: 12,
+                      wordWrap: "on",
+                      scrollBeyondLastLine: false,
+                    }}
+                  />
+                );
+              })())}
             {reqTab === "xml" &&
               (isReqOffloaded ? (
                 <OffloadedBodyNotice
@@ -1586,25 +1654,49 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   error={reqBodyError}
                   onLoad={() => void handleLoadRequestBody()}
                 />
-              ) : (
-                <Editor
-                  height="100%"
-                  language="xml"
-                  theme={monacoTheme}
-                  loading={<EditorLoadingIndicator />}
-                  value={
-                    effectiveDetail.requestBodyText ||
-                    "<!-- Empty request body -->"
-                  }
-                  options={{
-                    readOnly: true,
-                    minimap: { enabled: false },
-                    fontSize: 12,
-                    wordWrap: "on",
-                    scrollBeyondLastLine: false,
-                  }}
-                />
-              ))}
+              ) : (() => {
+                const reqBodyBytes = Math.max(
+                  estimateBase64ByteLength(effectiveDetail.requestBodyBase64),
+                  getUtf8ByteLength(effectiveDetail.requestBodyText)
+                );
+                const reqXmlValue =
+                  effectiveDetail.requestBodyText ||
+                  "<!-- Empty request body -->";
+                if (exceedsMonacoRenderLimit(reqXmlValue, reqBodyBytes)) {
+                  return (
+                    <MonacoSizeGuardNotice
+                      payloadLabel="XML запроса"
+                      sizeBytes={Math.max(
+                        reqBodyBytes,
+                        getUtf8ByteLength(reqXmlValue)
+                      )}
+                      onOpenHexViewer={() => setReqTab("hex")}
+                      onSaveToDisk={
+                        onSaveBodyFile
+                          ? () => onSaveBodyFile(summary.id, false)
+                          : undefined
+                      }
+                    />
+                  );
+                }
+                return (
+                  <Editor
+                    height="100%"
+                    path={MONACO_MODEL_PATHS.inspectorRequestXml}
+                    language="xml"
+                    theme={monacoTheme}
+                    loading={<EditorLoadingIndicator />}
+                    value={reqXmlValue}
+                    options={{
+                      readOnly: true,
+                      minimap: { enabled: false },
+                      fontSize: 12,
+                      wordWrap: "on",
+                      scrollBeyondLastLine: false,
+                    }}
+                  />
+                );
+              })())}
             {reqTab === "hex" &&
               (isReqOffloaded ? (
                 <OffloadedBodyNotice
@@ -1844,22 +1936,54 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   error={respBodyError}
                   onLoad={() => void handleLoadResponseBody()}
                 />
-              ) : (
-                <Editor
-                  height="100%"
-                  language="http"
-                  theme={monacoTheme}
-                  loading={<EditorLoadingIndicator />}
-                  value={buildRawHttpResponse(effectiveDetail)}
-                  options={{
-                    readOnly: true,
-                    minimap: { enabled: false },
-                    fontSize: 12,
-                    wordWrap: "on",
-                    scrollBeyondLastLine: false,
-                  }}
-                />
-              ))}
+              ) : (() => {
+                const respBodyBytes = Math.max(
+                  summary.bodySize,
+                  estimateBase64ByteLength(effectiveDetail.responseBodyBase64),
+                  getUtf8ByteLength(effectiveDetail.responseBodyText)
+                );
+                const rawRespValue =
+                  respBodyBytes > MAX_MONACO_RENDER_BYTES
+                    ? null
+                    : buildRawHttpResponse(effectiveDetail);
+                if (
+                  rawRespValue === null ||
+                  exceedsMonacoRenderLimit(rawRespValue, respBodyBytes)
+                ) {
+                  return (
+                    <MonacoSizeGuardNotice
+                      payloadLabel="сырой ответ"
+                      sizeBytes={Math.max(
+                        respBodyBytes,
+                        getUtf8ByteLength(rawRespValue)
+                      )}
+                      onOpenHexViewer={() => setRespTab("hex")}
+                      onSaveToDisk={
+                        onSaveBodyFile
+                          ? () => onSaveBodyFile(summary.id, true)
+                          : undefined
+                      }
+                    />
+                  );
+                }
+                return (
+                  <Editor
+                    height="100%"
+                    path={MONACO_MODEL_PATHS.inspectorResponseRaw}
+                    language="http"
+                    theme={monacoTheme}
+                    loading={<EditorLoadingIndicator />}
+                    value={rawRespValue}
+                    options={{
+                      readOnly: true,
+                      minimap: { enabled: false },
+                      fontSize: 12,
+                      wordWrap: "on",
+                      scrollBeyondLastLine: false,
+                    }}
+                  />
+                );
+              })())}
             {respTab === "json" &&
               (isRespOffloaded ? (
                 <OffloadedBodyNotice
@@ -1869,25 +1993,55 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   error={respBodyError}
                   onLoad={() => void handleLoadResponseBody()}
                 />
-              ) : (
-                <Editor
-                  height="100%"
-                  language="json"
-                  theme={monacoTheme}
-                  loading={<EditorLoadingIndicator />}
-                  value={
-                    tryFormatJson(effectiveDetail.responseBodyText).formatted ||
-                    "// Empty response payload"
-                  }
-                  options={{
-                    readOnly: true,
-                    minimap: { enabled: false },
-                    fontSize: 12,
-                    wordWrap: "on",
-                    scrollBeyondLastLine: false,
-                  }}
-                />
-              ))}
+              ) : (() => {
+                const respBodyBytes = Math.max(
+                  summary.bodySize,
+                  estimateBase64ByteLength(effectiveDetail.responseBodyBase64),
+                  getUtf8ByteLength(effectiveDetail.responseBodyText)
+                );
+                const respJsonValue =
+                  respBodyBytes > MAX_MONACO_RENDER_BYTES
+                    ? null
+                    : tryFormatJson(effectiveDetail.responseBodyText)
+                        .formatted || "// Empty response payload";
+                if (
+                  respJsonValue === null ||
+                  exceedsMonacoRenderLimit(respJsonValue, respBodyBytes)
+                ) {
+                  return (
+                    <MonacoSizeGuardNotice
+                      payloadLabel="JSON ответа"
+                      sizeBytes={Math.max(
+                        respBodyBytes,
+                        getUtf8ByteLength(respJsonValue)
+                      )}
+                      onOpenHexViewer={() => setRespTab("hex")}
+                      onSaveToDisk={
+                        onSaveBodyFile
+                          ? () => onSaveBodyFile(summary.id, true)
+                          : undefined
+                      }
+                    />
+                  );
+                }
+                return (
+                  <Editor
+                    height="100%"
+                    path={MONACO_MODEL_PATHS.inspectorResponseJson}
+                    language="json"
+                    theme={monacoTheme}
+                    loading={<EditorLoadingIndicator />}
+                    value={respJsonValue}
+                    options={{
+                      readOnly: true,
+                      minimap: { enabled: false },
+                      fontSize: 12,
+                      wordWrap: "on",
+                      scrollBeyondLastLine: false,
+                    }}
+                  />
+                );
+              })())}
             {respTab === "xml" &&
               (isRespOffloaded ? (
                 <OffloadedBodyNotice
@@ -1897,25 +2051,50 @@ export const SessionInspector: React.FC<SessionInspectorProps> = ({
                   error={respBodyError}
                   onLoad={() => void handleLoadResponseBody()}
                 />
-              ) : (
-                <Editor
-                  height="100%"
-                  language="xml"
-                  theme={monacoTheme}
-                  loading={<EditorLoadingIndicator />}
-                  value={
-                    effectiveDetail.responseBodyText ||
-                    "<!-- Empty response payload -->"
-                  }
-                  options={{
-                    readOnly: true,
-                    minimap: { enabled: false },
-                    fontSize: 12,
-                    wordWrap: "on",
-                    scrollBeyondLastLine: false,
-                  }}
-                />
-              ))}
+              ) : (() => {
+                const respBodyBytes = Math.max(
+                  summary.bodySize,
+                  estimateBase64ByteLength(effectiveDetail.responseBodyBase64),
+                  getUtf8ByteLength(effectiveDetail.responseBodyText)
+                );
+                const respXmlValue =
+                  effectiveDetail.responseBodyText ||
+                  "<!-- Empty response payload -->";
+                if (exceedsMonacoRenderLimit(respXmlValue, respBodyBytes)) {
+                  return (
+                    <MonacoSizeGuardNotice
+                      payloadLabel="XML ответа"
+                      sizeBytes={Math.max(
+                        respBodyBytes,
+                        getUtf8ByteLength(respXmlValue)
+                      )}
+                      onOpenHexViewer={() => setRespTab("hex")}
+                      onSaveToDisk={
+                        onSaveBodyFile
+                          ? () => onSaveBodyFile(summary.id, true)
+                          : undefined
+                      }
+                    />
+                  );
+                }
+                return (
+                  <Editor
+                    height="100%"
+                    path={MONACO_MODEL_PATHS.inspectorResponseXml}
+                    language="xml"
+                    theme={monacoTheme}
+                    loading={<EditorLoadingIndicator />}
+                    value={respXmlValue}
+                    options={{
+                      readOnly: true,
+                      minimap: { enabled: false },
+                      fontSize: 12,
+                      wordWrap: "on",
+                      scrollBeyondLastLine: false,
+                    }}
+                  />
+                );
+              })())}
             {respTab === "image" &&
               (isRespOffloaded ? (
                 <OffloadedBodyNotice

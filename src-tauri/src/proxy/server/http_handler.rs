@@ -3233,12 +3233,13 @@ fn build_and_spawn_raw_stream_response(params: RawBodyStreamParams) -> Response<
                         {
                             last_emit = Instant::now();
                             let cur_elapsed = start.elapsed().as_millis() as u64;
-                            if let Some(mut detail) = stream_ctx.store.get(session_id) {
-                                detail.summary.body_size = total_bytes;
-                                detail.summary.duration_ms = cur_elapsed;
-                                detail.summary.wire_body_size = Some(total_bytes);
-                                let updated_summary = detail.summary.clone();
-                                stream_ctx.store.insert(detail);
+                            if let Some(updated_summary) =
+                                stream_ctx.store.update_streaming_progress(
+                                    session_id,
+                                    total_bytes,
+                                    cur_elapsed,
+                                )
+                            {
                                 let _ = stream_ctx.event_tx.send(updated_summary);
                             }
                         }
@@ -3682,8 +3683,7 @@ pub(super) async fn run_request_breakpoint_stage(
 ) -> Result<(), ()> {
     let bp_id = format!("bp-req-{}", input.session_id);
     let capped_req = &req_body[..req_body.len().min(MAX_CAPTURED_BODY_BYTES)];
-    let req_b64 = base64::engine::general_purpose::STANDARD.encode(capped_req);
-    let req_txt = std::str::from_utf8(capped_req).ok().map(str::to_owned);
+    let (store_req_b64, store_req_txt, _) = super::encode_inline_or_offload(capped_req);
 
     let paused_summary = SessionSummary {
         id: input.session_id,
@@ -3722,46 +3722,60 @@ pub(super) async fn run_request_breakpoint_stage(
         server_conn_reused: None,
         ws_open: None,
     };
-    ctx.store.insert(SessionDetail {
-        summary: paused_summary.clone(),
-        request_headers: req_headers.clone(),
-        response_headers: Vec::new(),
-        request_body_base64: req_b64.clone(),
-        response_body_base64: String::new(),
-        request_body_text: req_txt.clone(),
-        response_body_text: None,
-        tls_version: input.tls_version,
-        client_addr: input.client_addr,
-        websocket_frames: Vec::new(),
-        sse_events: Vec::new(),
-        body_offloaded: false,
-        request_body_offloaded: false,
-        timings: None,
-        transfer_stats: None,
-    });
+    ctx.store.insert_with_bodies(
+        SessionDetail {
+            summary: paused_summary.clone(),
+            request_headers: req_headers.clone(),
+            response_headers: Vec::new(),
+            request_body_base64: store_req_b64,
+            response_body_base64: String::new(),
+            request_body_text: store_req_txt,
+            response_body_text: None,
+            tls_version: input.tls_version,
+            client_addr: input.client_addr,
+            websocket_frames: Vec::new(),
+            sse_events: Vec::new(),
+            body_offloaded: false,
+            request_body_offloaded: false,
+            timings: None,
+            transfer_stats: None,
+        },
+        Some(capped_req),
+        None,
+    );
     let _ = ctx.event_tx.send(paused_summary);
 
-    let (bp_rx, timeout_secs) = ctx.breakpoints.park(PausedBreakpointItem {
-        breakpoint_id: bp_id.clone(),
-        session_id: input.session_id,
-        stage: BreakpointStage::Request,
-        created_at: Utc::now().to_rfc3339(),
-        timeout_secs: 120,
-        scheme: scheme_str.clone(),
-        method: method_str.clone(),
-        url: full_url.clone(),
-        host: host_header.clone(),
-        path: path_and_query.clone(),
-        request_headers: req_headers.clone(),
-        request_body_base64: req_b64,
-        request_body_text: req_txt,
-        response_status: None,
-        response_headers: Vec::new(),
-        response_body_base64: String::new(),
-        response_body_text: None,
-        process_name: input.process_name,
-        process_pid: input.process_pid,
-    });
+    let (bp_rx, timeout_secs) = ctx.breakpoints.park_with_bodies(
+        PausedBreakpointItem {
+            breakpoint_id: bp_id.clone(),
+            session_id: input.session_id,
+            stage: BreakpointStage::Request,
+            created_at: Utc::now().to_rfc3339(),
+            timeout_secs: 120,
+            scheme: scheme_str.clone(),
+            method: method_str.clone(),
+            url: full_url.clone(),
+            host: host_header.clone(),
+            path: path_and_query.clone(),
+            request_headers: req_headers.clone(),
+            request_body_base64: String::new(),
+            request_body_text: None,
+            request_body_offloaded: false,
+            request_body_size: capped_req.len(),
+            response_status: None,
+            response_headers: Vec::new(),
+            response_body_base64: String::new(),
+            response_body_text: None,
+            response_body_offloaded: false,
+            response_body_size: 0,
+            body_offloaded: false,
+            body_size: capped_req.len(),
+            process_name: input.process_name,
+            process_pid: input.process_pid,
+        },
+        Some(capped_req),
+        None,
+    );
     let mut bp_guard = make_breakpoint_guard(ctx, bp_id.clone(), input.session_id, input.start);
 
     let wait_res = tokio::time::timeout(Duration::from_secs(timeout_secs), bp_rx).await;
@@ -3848,12 +3862,10 @@ pub(super) async fn run_response_breakpoint_stage(
     let bp_id = format!("bp-resp-{}", input.session_id);
     let capped_req = &input.req_bytes[..input.req_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
     let capped_resp = &resp_bytes[..resp_bytes.len().min(MAX_CAPTURED_BODY_BYTES)];
-    let req_b64 = base64::engine::general_purpose::STANDARD.encode(capped_req);
-    let resp_b64 = base64::engine::general_purpose::STANDARD.encode(capped_resp);
-    let req_txt = std::str::from_utf8(capped_req).ok().map(str::to_owned);
-    let resp_txt = std::str::from_utf8(capped_resp).ok().map(str::to_owned);
 
     if input.insert_paused_summary {
+        let (store_req_b64, store_req_txt, _) = super::encode_inline_or_offload(capped_req);
+        let (store_resp_b64, store_resp_txt, _) = super::encode_inline_or_offload(capped_resp);
         let paused_summary = SessionSummary {
             id: input.session_id,
             status: *status,
@@ -3891,47 +3903,61 @@ pub(super) async fn run_response_breakpoint_stage(
             server_conn_reused: None,
             ws_open: None,
         };
-        ctx.store.insert(SessionDetail {
-            summary: paused_summary.clone(),
-            request_headers: input.req_headers.clone(),
-            response_headers: resp_headers.clone(),
-            request_body_base64: req_b64.clone(),
-            response_body_base64: resp_b64.clone(),
-            request_body_text: req_txt.clone(),
-            response_body_text: resp_txt.clone(),
-            tls_version: input.tls_version,
-            client_addr: input.client_addr,
-            websocket_frames: Vec::new(),
-            sse_events: Vec::new(),
-            body_offloaded: false,
-            request_body_offloaded: false,
-            timings: None,
-            transfer_stats: None,
-        });
+        ctx.store.insert_with_bodies(
+            SessionDetail {
+                summary: paused_summary.clone(),
+                request_headers: input.req_headers.clone(),
+                response_headers: resp_headers.clone(),
+                request_body_base64: store_req_b64,
+                response_body_base64: store_resp_b64,
+                request_body_text: store_req_txt,
+                response_body_text: store_resp_txt,
+                tls_version: input.tls_version,
+                client_addr: input.client_addr,
+                websocket_frames: Vec::new(),
+                sse_events: Vec::new(),
+                body_offloaded: false,
+                request_body_offloaded: false,
+                timings: None,
+                transfer_stats: None,
+            },
+            Some(capped_req),
+            Some(capped_resp),
+        );
         let _ = ctx.event_tx.send(paused_summary);
     }
 
-    let (bp_rx, timeout_secs) = ctx.breakpoints.park(PausedBreakpointItem {
-        breakpoint_id: bp_id.clone(),
-        session_id: input.session_id,
-        stage: BreakpointStage::Response,
-        created_at: Utc::now().to_rfc3339(),
-        timeout_secs: 120,
-        scheme: input.scheme,
-        method: input.method,
-        url: input.url,
-        host: input.host,
-        path: input.path,
-        request_headers: input.req_headers,
-        request_body_base64: req_b64,
-        request_body_text: req_txt,
-        response_status: Some(*status),
-        response_headers: resp_headers.clone(),
-        response_body_base64: resp_b64,
-        response_body_text: resp_txt,
-        process_name: input.process_name,
-        process_pid: input.process_pid,
-    });
+    let (bp_rx, timeout_secs) = ctx.breakpoints.park_with_bodies(
+        PausedBreakpointItem {
+            breakpoint_id: bp_id.clone(),
+            session_id: input.session_id,
+            stage: BreakpointStage::Response,
+            created_at: Utc::now().to_rfc3339(),
+            timeout_secs: 120,
+            scheme: input.scheme,
+            method: input.method,
+            url: input.url,
+            host: input.host,
+            path: input.path,
+            request_headers: input.req_headers,
+            request_body_base64: String::new(),
+            request_body_text: None,
+            request_body_offloaded: false,
+            request_body_size: capped_req.len(),
+            response_status: Some(*status),
+            response_headers: resp_headers.clone(),
+            response_body_base64: String::new(),
+            response_body_text: None,
+            response_body_offloaded: false,
+            response_body_size: capped_resp.len(),
+            body_offloaded: false,
+            body_size: capped_resp.len(),
+            process_name: input.process_name,
+            process_pid: input.process_pid,
+        },
+        Some(capped_req),
+        Some(capped_resp),
+    );
     let mut bp_guard = make_breakpoint_guard(ctx, bp_id.clone(), input.session_id, input.start);
 
     let wait_res = tokio::time::timeout(Duration::from_secs(timeout_secs), bp_rx).await;

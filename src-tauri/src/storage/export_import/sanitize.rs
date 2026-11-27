@@ -189,23 +189,24 @@ pub(super) fn is_likely_urlencoded_form(text: &str) -> bool {
         || trimmed.starts_with('{')
         || trimmed.starts_with('[')
         || trimmed.starts_with('<')
-        || trimmed.contains('\n')
-        || trimmed.contains('\r')
         || !trimmed.contains('=')
     {
         return false;
     }
     trimmed.split('&').all(|seg| {
-        if seg.is_empty() {
+        let seg_clean = seg.trim_matches(|c| c == '\r' || c == '\n');
+        if seg_clean.is_empty() {
             return true;
         }
-        match seg.split_once('=') {
+        match seg_clean.split_once('=') {
             Some((k, v)) => {
-                !k.trim().is_empty()
-                    && !k.chars().any(char::is_whitespace)
-                    && !v.chars().any(char::is_whitespace)
+                let k_clean = k.trim_matches(|c| c == '\r' || c == '\n');
+                let v_clean = v.trim_matches(|c| c == '\r' || c == '\n');
+                !k_clean.trim().is_empty()
+                    && !k_clean.chars().any(char::is_whitespace)
+                    && !v_clean.chars().any(char::is_whitespace)
             }
-            None => !seg.chars().any(char::is_whitespace),
+            None => !seg_clean.chars().any(char::is_whitespace),
         }
     })
 }
@@ -222,10 +223,21 @@ pub(super) fn sanitize_urlencoded_text(
     let mut modified = false;
     let mut parts: Vec<String> = Vec::new();
     for seg in text.split('&') {
-        if let Some((raw_k, _raw_v)) = seg.split_once('=') {
-            let decoded_norm = normalize_sensitive_key(&url_decode_component(raw_k));
+        if let Some((raw_k, raw_v)) = seg.split_once('=') {
+            let leading_ws: String = raw_k
+                .chars()
+                .take_while(|&c| c == '\r' || c == '\n')
+                .collect();
+            let k_clean = &raw_k[leading_ws.len()..];
+            let decoded_norm = normalize_sensitive_key(&url_decode_component(k_clean));
             if mask_keys_normalized.iter().any(|mk| mk == &decoded_norm) {
-                parts.push(format!("{raw_k}={safe_rep}"));
+                let trailing_ws_len = raw_v
+                    .bytes()
+                    .rev()
+                    .take_while(|&b| b == b'\r' || b == b'\n')
+                    .count();
+                let trailing_ws = &raw_v[raw_v.len() - trailing_ws_len..];
+                parts.push(format!("{raw_k}={safe_rep}{trailing_ws}"));
                 modified = true;
                 continue;
             }
@@ -239,18 +251,274 @@ pub(super) fn sanitize_urlencoded_text(
     }
 }
 
-pub(super) fn sanitize_body_payload(
+pub(super) fn extract_multipart_boundary(content_type: &str) -> Option<String> {
+    let mut parts = content_type.split(';');
+    let media_type = parts.next()?.trim().to_ascii_lowercase();
+    if !media_type.starts_with("multipart/") {
+        return None;
+    }
+    for param in parts {
+        let p = param.trim();
+        if let Some((k, v)) = p.split_once('=') {
+            if k.trim().eq_ignore_ascii_case("boundary") {
+                let unquoted = v.trim().trim_matches('"').trim();
+                if !unquoted.is_empty() {
+                    return Some(unquoted.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_multipart_disposition_name(headers_str: &str) -> Option<String> {
+    for line in headers_str.lines() {
+        let trimmed = line.trim_end_matches('\r');
+        if let Some((hname, hval)) = trimmed.split_once(':') {
+            if hname.trim().eq_ignore_ascii_case("content-disposition") {
+                for param in hval.split(';').skip(1) {
+                    if let Some((pk, pv)) = param.trim().split_once('=') {
+                        if pk.trim().eq_ignore_ascii_case("name") {
+                            let val = pv.trim().trim_matches('"').trim();
+                            if !val.is_empty() {
+                                return Some(val.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_multipart_part_content_type(headers_str: &str) -> Option<String> {
+    for line in headers_str.lines() {
+        let trimmed = line.trim_end_matches('\r');
+        if let Some((hname, hval)) = trimmed.split_once(':') {
+            if hname.trim().eq_ignore_ascii_case("content-type") {
+                let ct = hval.trim();
+                if !ct.is_empty() {
+                    return Some(ct.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn match_boundary_delimiter(
+    buf: &[u8],
+    dash_pos: usize,
+    dash_boundary: &[u8],
+) -> Option<(usize, bool)> {
+    let rest = buf.get(dash_pos..)?;
+    if !rest.starts_with(dash_boundary) {
+        return None;
+    }
+    let mut cursor = dash_pos + dash_boundary.len();
+    if buf.get(cursor..).is_some_and(|s| s.starts_with(b"--")) {
+        cursor += 2;
+        return Some((cursor, true));
+    }
+    while buf
+        .get(cursor)
+        .is_some_and(|&b| b == b' ' || b == b'\t')
+    {
+        cursor += 1;
+    }
+    if buf.get(cursor..).is_some_and(|s| s.starts_with(b"\r\n")) {
+        Some((cursor + 2, false))
+    } else if buf.get(cursor).is_some_and(|&b| b == b'\n') {
+        Some((cursor + 1, false))
+    } else {
+        None
+    }
+}
+
+fn find_first_boundary(buf: &[u8], dash_boundary: &[u8]) -> Option<(usize, bool)> {
+    if let Some((after, is_close)) = match_boundary_delimiter(buf, 0, dash_boundary) {
+        return Some((after, is_close));
+    }
+    let mut idx = 0;
+    while idx < buf.len() {
+        if buf[idx] == b'\n' {
+            if let Some((after, is_close)) = match_boundary_delimiter(buf, idx + 1, dash_boundary)
+            {
+                return Some((after, is_close));
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn find_next_boundary(
+    buf: &[u8],
+    body_start: usize,
+    dash_boundary: &[u8],
+) -> Option<(usize, usize, bool)> {
+    if let Some((after, is_close)) = match_boundary_delimiter(buf, body_start, dash_boundary) {
+        return Some((body_start, after, is_close));
+    }
+    let mut idx = body_start;
+    while idx < buf.len() {
+        if buf[idx] == b'\n' {
+            let body_end = if idx > body_start && buf[idx - 1] == b'\r' {
+                idx - 1
+            } else {
+                idx
+            };
+            if let Some((after, is_close)) = match_boundary_delimiter(buf, idx + 1, dash_boundary)
+            {
+                return Some((body_end, after, is_close));
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn find_part_header_separator(part: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i < part.len() {
+        if part[i..].starts_with(b"\r\n\r\n") {
+            return Some((i, i + 4));
+        }
+        if part[i..].starts_with(b"\n\n") {
+            return Some((i, i + 2));
+        }
+        i += 1;
+    }
+    None
+}
+
+pub(super) fn sanitize_multipart_bytes(
+    raw: &[u8],
+    content_type_hint: &str,
+    mask_keys_normalized: &[String],
+    replacement: &str,
+    redact_string_tokens: bool,
+    depth: usize,
+) -> Option<Vec<u8>> {
+    if depth >= 4 || raw.is_empty() || (mask_keys_normalized.is_empty() && !redact_string_tokens) {
+        return None;
+    }
+    let boundary = extract_multipart_boundary(content_type_hint)?;
+    let dash_boundary = format!("--{boundary}").into_bytes();
+
+    let (mut part_start, mut is_closing) = find_first_boundary(raw, &dash_boundary)?;
+    if is_closing {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(raw.len());
+    let mut copied_until = 0usize;
+    let mut modified = false;
+
+    while let Some((body_end_abs, next_part_start, next_closing)) =
+        find_next_boundary(raw, part_start, &dash_boundary)
+    {
+        let part_slice = &raw[part_start..body_end_abs];
+        if let Some((hdr_end_rel, body_start_rel)) = find_part_header_separator(part_slice) {
+            let hdr_bytes = &part_slice[..hdr_end_rel];
+            let body_slice = &part_slice[body_start_rel..];
+            let body_abs_start = part_start + body_start_rel;
+
+            let headers_str = String::from_utf8_lossy(hdr_bytes);
+            let field_name = extract_multipart_disposition_name(&headers_str);
+            let part_ct = extract_multipart_part_content_type(&headers_str);
+
+            let key_matched = field_name
+                .as_deref()
+                .map(normalize_sensitive_key)
+                .is_some_and(|norm| mask_keys_normalized.iter().any(|mk| mk == &norm));
+
+            let replacement_bytes: Option<Vec<u8>> = if key_matched {
+                if body_slice != replacement.as_bytes() {
+                    Some(replacement.as_bytes().to_vec())
+                } else {
+                    None
+                }
+            } else if let Some(nested_ct) = part_ct
+                .as_deref()
+                .filter(|ct| ct.to_ascii_lowercase().contains("multipart/"))
+            {
+                sanitize_multipart_bytes(
+                    body_slice,
+                    nested_ct,
+                    mask_keys_normalized,
+                    replacement,
+                    redact_string_tokens,
+                    depth + 1,
+                )
+            } else if let Ok(part_text) = std::str::from_utf8(body_slice) {
+                sanitize_body_payload_with_depth(
+                    part_text,
+                    part_ct.as_deref(),
+                    mask_keys_normalized,
+                    replacement,
+                    redact_string_tokens,
+                    depth + 1,
+                )
+                .map(|s| s.into_bytes())
+            } else {
+                None
+            };
+
+            if let Some(new_body) = replacement_bytes {
+                out.extend_from_slice(&raw[copied_until..body_abs_start]);
+                out.extend_from_slice(&new_body);
+                copied_until = body_end_abs;
+                modified = true;
+            }
+        }
+
+        part_start = next_part_start;
+        is_closing = next_closing;
+        if is_closing {
+            break;
+        }
+    }
+
+    if !modified {
+        return None;
+    }
+    out.extend_from_slice(&raw[copied_until..]);
+    Some(out)
+}
+
+fn sanitize_body_payload_with_depth(
     text: &str,
     content_type_hint: Option<&str>,
     mask_keys_normalized: &[String],
     replacement: &str,
     redact_string_tokens: bool,
+    depth: usize,
 ) -> Option<String> {
     if (mask_keys_normalized.is_empty() && !redact_string_tokens) || text.trim().is_empty() {
         return None;
     }
     let trimmed = text.trim_start();
     let ct_lower = content_type_hint.unwrap_or("").to_ascii_lowercase();
+
+    if ct_lower.contains("multipart/") {
+        if let Some(ct_raw) = content_type_hint {
+            if let Some(sanitized_bytes) = sanitize_multipart_bytes(
+                text.as_bytes(),
+                ct_raw,
+                mask_keys_normalized,
+                replacement,
+                redact_string_tokens,
+                depth,
+            ) {
+                if let Ok(utf8) = String::from_utf8(sanitized_bytes) {
+                    return Some(utf8);
+                }
+            }
+        }
+    }
+
     let is_json_hint =
         ct_lower.contains("json") || trimmed.starts_with('{') || trimmed.starts_with('[');
 
@@ -272,6 +540,23 @@ pub(super) fn sanitize_body_payload(
     }
 
     None
+}
+
+pub(super) fn sanitize_body_payload(
+    text: &str,
+    content_type_hint: Option<&str>,
+    mask_keys_normalized: &[String],
+    replacement: &str,
+    redact_string_tokens: bool,
+) -> Option<String> {
+    sanitize_body_payload_with_depth(
+        text,
+        content_type_hint,
+        mask_keys_normalized,
+        replacement,
+        redact_string_tokens,
+        0,
+    )
 }
 
 pub(super) fn split_socketio_prefix(payload: &str) -> Option<(&str, &str)> {
@@ -518,204 +803,248 @@ pub(super) fn sanitize_url_query(
 }
 
 /// Pure transformation that clones `sessions` and masks sensitive headers, JSON/form bodies,
-/// query parameters, URL credentials/fragments, SSE/WebSocket payloads, and client/process metadata
-/// according to `SanitizationOptions`.
-pub fn sanitize_sessions(
-    sessions: &[SessionDetail],
-    opts: &SanitizationOptions,
-) -> Vec<SessionDetail> {
-    let replacement = if opts.replacement_text.trim().is_empty() {
-        "[REDACTED]"
-    } else {
-        opts.replacement_text.as_str()
-    };
-    let custom_headers_lower = normalize_sanitization_tokens(&opts.custom_redacted_headers);
-    let mask_keys_normalized = normalize_sanitization_keys(&opts.mask_json_keys);
-    let strip_params_normalized = normalize_sanitization_keys(&opts.strip_query_params);
-    let redact_string_tokens = opts.redact_auth_headers || !mask_keys_normalized.is_empty();
+/// Precompiled sanitization configuration reusable across streamed single-session sanitization.
+pub struct CompiledSanitizationOptions {
+    replacement: String,
+    redact_auth_headers: bool,
+    anonymize_client_info: bool,
+    custom_headers_lower: Vec<String>,
+    mask_keys_normalized: Vec<String>,
+    strip_params_normalized: Vec<String>,
+    redact_string_tokens: bool,
+}
 
-    sessions
-        .iter()
-        .map(|orig| {
-            let mut detail = orig.clone();
+impl CompiledSanitizationOptions {
+    pub fn new(opts: &SanitizationOptions) -> Self {
+        let replacement = if opts.replacement_text.trim().is_empty() {
+            "[REDACTED]".to_string()
+        } else {
+            opts.replacement_text.clone()
+        };
+        let custom_headers_lower = normalize_sanitization_tokens(&opts.custom_redacted_headers);
+        let mask_keys_normalized = normalize_sanitization_keys(&opts.mask_json_keys);
+        let strip_params_normalized = normalize_sanitization_keys(&opts.strip_query_params);
+        let redact_string_tokens = opts.redact_auth_headers || !mask_keys_normalized.is_empty();
+        Self {
+            replacement,
+            redact_auth_headers: opts.redact_auth_headers,
+            anonymize_client_info: opts.anonymize_client_info,
+            custom_headers_lower,
+            mask_keys_normalized,
+            strip_params_normalized,
+            redact_string_tokens,
+        }
+    }
 
-            // 1. Redact sensitive request & response headers
-            if opts.redact_auth_headers || !custom_headers_lower.is_empty() {
-                redact_headers_in_place(
-                    &mut detail.request_headers,
-                    opts.redact_auth_headers,
-                    &custom_headers_lower,
-                    replacement,
-                );
-                redact_headers_in_place(
-                    &mut detail.response_headers,
-                    opts.redact_auth_headers,
-                    &custom_headers_lower,
-                    replacement,
+    fn sanitize_body_bytes(
+        &self,
+        raw_bytes: &[u8],
+        content_type_hint: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        if let Some(ct_raw) = content_type_hint {
+            if ct_raw.to_ascii_lowercase().contains("multipart/") {
+                return sanitize_multipart_bytes(
+                    raw_bytes,
+                    ct_raw,
+                    &self.mask_keys_normalized,
+                    &self.replacement,
+                    self.redact_string_tokens,
+                    0,
                 );
             }
+        }
+        let text = std::str::from_utf8(raw_bytes).ok()?;
+        sanitize_body_payload(
+            text,
+            content_type_hint,
+            &self.mask_keys_normalized,
+            &self.replacement,
+            self.redact_string_tokens,
+        )
+        .map(String::into_bytes)
+    }
 
-            // 2. Mask sensitive keys & embedded tokens in request/response bodies, SSE events, and WS frames
-            if redact_string_tokens {
-                let req_bytes = decode_detail_body_bytes(&detail, false);
-                if let Ok(req_text) = std::str::from_utf8(&req_bytes) {
-                    let req_ct = find_header_value(&detail.request_headers, "content-type")
-                        .map(str::to_string);
-                    if let Some(sanitized_req) = sanitize_body_payload(
-                        req_text,
-                        req_ct.as_deref(),
-                        &mask_keys_normalized,
-                        replacement,
-                        redact_string_tokens,
-                    ) {
-                        let new_len = sanitized_req.len();
-                        detail.request_body_base64 =
-                            base64::engine::general_purpose::STANDARD.encode(sanitized_req.as_bytes());
-                        detail.request_body_text = Some(sanitized_req);
-                        if detail.summary.request_size.is_some() {
-                            detail.summary.request_size = Some(new_len);
-                        }
-                        if let Some(ref mut stats) = detail.transfer_stats {
-                            stats.request_body_bytes = Some(new_len);
-                        }
-                        update_content_length_header(&mut detail.request_headers, new_len);
-                    }
+    pub fn sanitize_detail(&self, orig: &SessionDetail) -> SessionDetail {
+        let mut detail = orig.clone();
+        let replacement = self.replacement.as_str();
+
+        // 1. Redact sensitive request & response headers
+        if self.redact_auth_headers || !self.custom_headers_lower.is_empty() {
+            redact_headers_in_place(
+                &mut detail.request_headers,
+                self.redact_auth_headers,
+                &self.custom_headers_lower,
+                replacement,
+            );
+            redact_headers_in_place(
+                &mut detail.response_headers,
+                self.redact_auth_headers,
+                &self.custom_headers_lower,
+                replacement,
+            );
+        }
+
+        // 2. Mask sensitive keys & embedded tokens in request/response bodies, SSE events, and WS frames
+        if self.redact_string_tokens {
+            let req_bytes = decode_detail_body_bytes(&detail, false);
+            let req_ct =
+                find_header_value(&detail.request_headers, "content-type").map(str::to_string);
+            if let Some(sanitized_req) = self.sanitize_body_bytes(&req_bytes, req_ct.as_deref()) {
+                let new_len = sanitized_req.len();
+                detail.request_body_base64 =
+                    base64::engine::general_purpose::STANDARD.encode(&sanitized_req);
+                detail.request_body_text =
+                    std::str::from_utf8(&sanitized_req).ok().map(str::to_owned);
+                if detail.summary.request_size.is_some() {
+                    detail.summary.request_size = Some(new_len);
                 }
-
-                let resp_bytes = decode_detail_body_bytes(&detail, true);
-                let resp_ct = if !detail.summary.content_type.trim().is_empty() {
-                    Some(detail.summary.content_type.clone())
-                } else {
-                    find_header_value(&detail.response_headers, "content-type").map(str::to_string)
-                };
-                if let Ok(resp_text) = std::str::from_utf8(&resp_bytes) {
-                    if let Some(sanitized_resp) = sanitize_body_payload(
-                        resp_text,
-                        resp_ct.as_deref(),
-                        &mask_keys_normalized,
-                        replacement,
-                        redact_string_tokens,
-                    ) {
-                        let new_len = sanitized_resp.len();
-                        detail.response_body_base64 =
-                            base64::engine::general_purpose::STANDARD.encode(sanitized_resp.as_bytes());
-                        detail.response_body_text = Some(sanitized_resp);
-                        detail.summary.body_size = new_len;
-                        if let Some(ref mut stats) = detail.transfer_stats {
-                            stats.response_body_bytes = Some(new_len);
-                        }
-                        update_content_length_header(&mut detail.response_headers, new_len);
-                    }
+                if let Some(ref mut stats) = detail.transfer_stats {
+                    stats.request_body_bytes = Some(new_len);
                 }
+                update_content_length_header(&mut detail.request_headers, new_len);
+            }
 
-                let mut sse_modified = false;
-                for ev in detail.sse_events.iter_mut() {
-                    let sanitized_ev = sanitize_json_text(
-                        &ev.data,
-                        &mask_keys_normalized,
-                        replacement,
-                        redact_string_tokens,
-                    )
-                    .or_else(|| redact_bearer_and_jwt_in_text(&ev.data, replacement));
-                    if let Some(sanitized_data) = sanitized_ev {
-                        ev.byte_length = sanitized_data.len();
-                        ev.data = sanitized_data;
-                        sse_modified = true;
-                    }
+            let resp_bytes = decode_detail_body_bytes(&detail, true);
+            let resp_ct = if !detail.summary.content_type.trim().is_empty() {
+                Some(detail.summary.content_type.clone())
+            } else {
+                find_header_value(&detail.response_headers, "content-type").map(str::to_string)
+            };
+            if let Some(sanitized_resp) = self.sanitize_body_bytes(&resp_bytes, resp_ct.as_deref())
+            {
+                let new_len = sanitized_resp.len();
+                detail.response_body_base64 =
+                    base64::engine::general_purpose::STANDARD.encode(&sanitized_resp);
+                detail.response_body_text =
+                    std::str::from_utf8(&sanitized_resp).ok().map(str::to_owned);
+                detail.summary.body_size = new_len;
+                if let Some(ref mut stats) = detail.transfer_stats {
+                    stats.response_body_bytes = Some(new_len);
                 }
+                update_content_length_header(&mut detail.response_headers, new_len);
+            }
 
-                let is_sse_response = resp_ct
-                    .as_deref()
-                    .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"));
-                if !detail.sse_events.is_empty() && (sse_modified || is_sse_response) {
-                    let rebuilt_sse = rebuild_sse_response_body(&detail.sse_events);
-                    let new_len = rebuilt_sse.len();
+            let mut sse_modified = false;
+            for ev in detail.sse_events.iter_mut() {
+                let sanitized_ev = sanitize_json_text(
+                    &ev.data,
+                    &self.mask_keys_normalized,
+                    replacement,
+                    self.redact_string_tokens,
+                )
+                .or_else(|| redact_bearer_and_jwt_in_text(&ev.data, replacement));
+                if let Some(sanitized_data) = sanitized_ev {
+                    ev.byte_length = sanitized_data.len();
+                    ev.data = sanitized_data;
+                    sse_modified = true;
+                }
+            }
+
+            let is_sse_response = resp_ct
+                .as_deref()
+                .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"));
+            if !detail.sse_events.is_empty() && (sse_modified || is_sse_response) {
+                let rebuilt_sse = rebuild_sse_response_body(&detail.sse_events);
+                let new_len = rebuilt_sse.len();
+                detail.response_body_base64 =
+                    base64::engine::general_purpose::STANDARD.encode(rebuilt_sse.as_bytes());
+                detail.response_body_text = Some(rebuilt_sse);
+                detail.summary.body_size = new_len;
+                if let Some(ref mut stats) = detail.transfer_stats {
+                    stats.response_body_bytes = Some(new_len);
+                }
+                update_content_length_header(&mut detail.response_headers, new_len);
+            }
+
+            let mut ws_modified = false;
+            for frame in detail.websocket_frames.iter_mut() {
+                if let Some(sanitized_payload) = sanitize_ws_frame_payload(
+                    &frame.payload_preview,
+                    &self.mask_keys_normalized,
+                    replacement,
+                    self.redact_string_tokens,
+                ) {
+                    frame.byte_length = sanitized_payload.len();
+                    frame.payload_preview = sanitized_payload;
+                    ws_modified = true;
+                }
+            }
+
+            let is_ws_session = detail.summary.status == 101
+                || detail.summary.scheme.eq_ignore_ascii_case("ws")
+                || detail.summary.scheme.eq_ignore_ascii_case("wss")
+                || detail.summary.protocol.to_ascii_uppercase().contains("WS");
+            if !detail.websocket_frames.is_empty() && (ws_modified || is_ws_session) {
+                if let Ok(rebuilt_ws) = serde_json::to_string_pretty(&detail.websocket_frames) {
+                    let new_len = rebuilt_ws.len();
                     detail.response_body_base64 =
-                        base64::engine::general_purpose::STANDARD.encode(rebuilt_sse.as_bytes());
-                    detail.response_body_text = Some(rebuilt_sse);
+                        base64::engine::general_purpose::STANDARD.encode(rebuilt_ws.as_bytes());
+                    detail.response_body_text = Some(rebuilt_ws);
                     detail.summary.body_size = new_len;
                     if let Some(ref mut stats) = detail.transfer_stats {
                         stats.response_body_bytes = Some(new_len);
                     }
                     update_content_length_header(&mut detail.response_headers, new_len);
                 }
-
-                let mut ws_modified = false;
-                for frame in detail.websocket_frames.iter_mut() {
-                    if let Some(sanitized_payload) = sanitize_ws_frame_payload(
-                        &frame.payload_preview,
-                        &mask_keys_normalized,
-                        replacement,
-                        redact_string_tokens,
-                    ) {
-                        frame.byte_length = sanitized_payload.len();
-                        frame.payload_preview = sanitized_payload;
-                        ws_modified = true;
-                    }
-                }
-
-                let is_ws_session = detail.summary.status == 101
-                    || detail.summary.scheme.eq_ignore_ascii_case("ws")
-                    || detail.summary.scheme.eq_ignore_ascii_case("wss")
-                    || detail.summary.protocol.to_ascii_uppercase().contains("WS");
-                if !detail.websocket_frames.is_empty() && (ws_modified || is_ws_session) {
-                    if let Ok(rebuilt_ws) = serde_json::to_string_pretty(&detail.websocket_frames) {
-                        let new_len = rebuilt_ws.len();
-                        detail.response_body_base64 =
-                            base64::engine::general_purpose::STANDARD.encode(rebuilt_ws.as_bytes());
-                        detail.response_body_text = Some(rebuilt_ws);
-                        detail.summary.body_size = new_len;
-                        if let Some(ref mut stats) = detail.transfer_stats {
-                            stats.response_body_bytes = Some(new_len);
-                        }
-                        update_content_length_header(&mut detail.response_headers, new_len);
-                    }
-                }
             }
+        }
 
-            // 3. Redact userinfo, sensitive query parameters, and fragments in URL, path, Location & Referer
-            if opts.redact_auth_headers || !strip_params_normalized.is_empty() {
-                detail.summary.url = sanitize_url_query(
-                    &detail.summary.url,
-                    &strip_params_normalized,
-                    replacement,
-                );
-                detail.summary.path = sanitize_url_query(
-                    &detail.summary.path,
-                    &strip_params_normalized,
-                    replacement,
-                );
-                for hdr in detail
-                    .request_headers
-                    .iter_mut()
-                    .chain(detail.response_headers.iter_mut())
+        // 3. Redact userinfo, sensitive query parameters, and fragments in URL, path, Location & Referer
+        if self.redact_auth_headers || !self.strip_params_normalized.is_empty() {
+            detail.summary.url =
+                sanitize_url_query(&detail.summary.url, &self.strip_params_normalized, replacement);
+            detail.summary.path = sanitize_url_query(
+                &detail.summary.path,
+                &self.strip_params_normalized,
+                replacement,
+            );
+            for hdr in detail
+                .request_headers
+                .iter_mut()
+                .chain(detail.response_headers.iter_mut())
+            {
+                if hdr.name.trim().eq_ignore_ascii_case("location")
+                    || hdr.name.trim().eq_ignore_ascii_case("referer")
                 {
-                    if hdr.name.trim().eq_ignore_ascii_case("location")
-                        || hdr.name.trim().eq_ignore_ascii_case("referer")
-                    {
-                        let sanitized_val =
-                            sanitize_url_query(&hdr.value, &strip_params_normalized, replacement);
-                        if sanitized_val != hdr.value {
-                            hdr.value = sanitized_val;
-                            hdr.raw_bytes_b64 = None;
-                        }
+                    let sanitized_val = sanitize_url_query(
+                        &hdr.value,
+                        &self.strip_params_normalized,
+                        replacement,
+                    );
+                    if sanitized_val != hdr.value {
+                        hdr.value = sanitized_val;
+                        hdr.raw_bytes_b64 = None;
                     }
                 }
             }
+        }
 
-            // 4. Anonymize client address, IP, and local process info
-            if opts.anonymize_client_info {
-                detail.client_addr = "0.0.0.0:0".to_string();
-                detail.summary.client_ip = Some("0.0.0.0".to_string());
-                detail.summary.process_name = Some("redacted-process".to_string());
-                detail.summary.process_pid = None;
-                if let Some(ref mut stats) = detail.transfer_stats {
-                    stats.client_conn_id = None;
-                }
+        // 4. Anonymize client address, IP, and local process info
+        if self.anonymize_client_info {
+            detail.client_addr = "0.0.0.0:0".to_string();
+            detail.summary.client_ip = Some("0.0.0.0".to_string());
+            detail.summary.process_name = Some("redacted-process".to_string());
+            detail.summary.process_pid = None;
+            if let Some(ref mut stats) = detail.transfer_stats {
+                stats.client_conn_id = None;
             }
+        }
 
-            detail
-        })
+        detail
+    }
+}
+
+/// Deep-clones and sanitizes captured sessions by redacting sensitive headers, JSON/form/multipart keys,
+/// query parameters, URL credentials/fragments, SSE/WebSocket payloads, and client/process metadata
+/// according to `SanitizationOptions`.
+pub fn sanitize_sessions(
+    sessions: &[SessionDetail],
+    opts: &SanitizationOptions,
+) -> Vec<SessionDetail> {
+    let compiled = CompiledSanitizationOptions::new(opts);
+    sessions
+        .iter()
+        .map(|orig| compiled.sanitize_detail(orig))
         .collect()
 }
 

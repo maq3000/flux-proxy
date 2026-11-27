@@ -527,11 +527,13 @@ export class BrowserPreviewEngine {
     DEFAULT_SESSION_RETENTION_LIMIT;
   private droppedSessionsCount = 0;
   private evictedSqliteBytes = 0;
+  private evictedSessionsArchive = new Map<number, SessionDetail>();
   private clearDbOnExit = DEFAULT_CLEAR_DB_ON_EXIT;
   private offloadedBodies = new Map<
     string,
     { bodyBase64: string; bodyText: string | null; bodySize: number }
   >();
+  private breakpointOffloadedBodies = new Map<string, LoadedSessionBody>();
   private autoResponderEnabled = true;
   private rules: AutoResponderRule[] = [...DEFAULT_AUTORESPONDER_RULES];
   private filterConfig: ProxyFilterBackendConfig = structuredClone(
@@ -799,6 +801,7 @@ export class BrowserPreviewEngine {
       const evicted = this.store.get(sortedIds[i]);
       if (evicted) {
         this.evictedSqliteBytes += Math.max(512, evicted.summary.bodySize);
+        this.evictedSessionsArchive.set(sortedIds[i], evicted);
         this.store.delete(sortedIds[i]);
       }
     }
@@ -888,16 +891,86 @@ export class BrowserPreviewEngine {
   private parkOnBreakpoint(
     draft: Omit<PausedBreakpointItem, "breakpointId" | "createdAt" | "timeoutSecs">
   ): Promise<BreakpointResolution> {
+    const BREAKPOINT_INLINE_LIMIT_BYTES = 256 * 1024;
     const breakpointId = `bp-${this.nextBpSeq++}`;
     const timeoutSecs = Math.max(
       5,
       Math.min(600, this.breakpointConfig.timeoutSecs || 120)
     );
+
+    const prepareBody = (
+      isResponse: boolean,
+      base64: string,
+      text: string | null | undefined
+    ): {
+      base64: string;
+      text: string | null;
+      offloaded: boolean;
+      size: number;
+    } => {
+      const rawTextBytes = text ? new TextEncoder().encode(text) : null;
+      const estimatedSize = rawTextBytes
+        ? rawTextBytes.length
+        : Math.floor((base64.trim().length * 3) / 4);
+      if (estimatedSize > BREAKPOINT_INLINE_LIMIT_BYTES) {
+        this.breakpointOffloadedBodies.set(
+          `${breakpointId}:${isResponse ? "resp" : "req"}`,
+          {
+            id: draft.sessionId,
+            isResponse,
+            bodyBase64: base64 || (text ? encodeTextToBase64(text) : ""),
+            bodyText: text ?? null,
+            bodySize: estimatedSize,
+          }
+        );
+        return {
+          base64: "",
+          text: null,
+          offloaded: true,
+          size: estimatedSize,
+        };
+      }
+      return {
+        base64,
+        text: text ?? null,
+        offloaded: false,
+        size: estimatedSize,
+      };
+    };
+
+    const reqPrepared = prepareBody(
+      false,
+      draft.requestBodyBase64,
+      draft.requestBodyText
+    );
+    const respPrepared = prepareBody(
+      true,
+      draft.responseBodyBase64,
+      draft.responseBodyText
+    );
+
     const item: PausedBreakpointItem = {
       ...draft,
+      requestBodyBase64: reqPrepared.base64,
+      requestBodyText: reqPrepared.text,
+      requestBodyOffloaded: reqPrepared.offloaded,
+      requestBodySize: reqPrepared.size,
+      responseBodyBase64: respPrepared.base64,
+      responseBodyText: respPrepared.text,
+      responseBodyOffloaded: respPrepared.offloaded,
+      responseBodySize: respPrepared.size,
+      bodyOffloaded:
+        draft.stage === "response" ? respPrepared.offloaded : reqPrepared.offloaded,
+      bodySize:
+        draft.stage === "response" ? respPrepared.size : reqPrepared.size,
       breakpointId,
       createdAt: new Date().toISOString(),
       timeoutSecs,
+    };
+
+    const cleanupBreakpointOffload = () => {
+      this.breakpointOffloadedBodies.delete(`${breakpointId}:req`);
+      this.breakpointOffloadedBodies.delete(`${breakpointId}:resp`);
     };
 
     return new Promise<BreakpointResolution>((resolve) => {
@@ -905,6 +978,7 @@ export class BrowserPreviewEngine {
         typeof window !== "undefined"
           ? window.setTimeout(() => {
               if (this.pausedBreakpoints.delete(breakpointId)) {
+                cleanupBreakpointOffload();
                 this.emitBreakpointsSnapshot();
                 resolve({
                   breakpointId,
@@ -1503,6 +1577,8 @@ export class BrowserPreviewEngine {
     const entry = this.pausedBreakpoints.get(resolution.breakpointId);
     if (!entry) return false;
     this.pausedBreakpoints.delete(resolution.breakpointId);
+    this.breakpointOffloadedBodies.delete(`${resolution.breakpointId}:req`);
+    this.breakpointOffloadedBodies.delete(`${resolution.breakpointId}:resp`);
     if (entry.timerId) window.clearTimeout(entry.timerId);
     this.emitBreakpointsSnapshot();
     entry.resolve(resolution);
@@ -1512,12 +1588,43 @@ export class BrowserPreviewEngine {
   resumeAllBreakpoints(action: BreakpointAction = "continue"): number {
     const entries = Array.from(this.pausedBreakpoints.entries());
     this.pausedBreakpoints.clear();
+    this.breakpointOffloadedBodies.clear();
     this.emitBreakpointsSnapshot();
     for (const [breakpointId, entry] of entries) {
       if (entry.timerId) window.clearTimeout(entry.timerId);
       entry.resolve({ breakpointId, action });
     }
     return entries.length;
+  }
+
+  loadBreakpointBody(
+    breakpointId: string,
+    isResponse: boolean
+  ): LoadedSessionBody | null {
+    const offloaded = this.breakpointOffloadedBodies.get(
+      `${breakpointId}:${isResponse ? "resp" : "req"}`
+    );
+    if (offloaded) {
+      return structuredClone(offloaded);
+    }
+    const entry = this.pausedBreakpoints.get(breakpointId);
+    if (!entry) return null;
+    const base64 = isResponse
+      ? entry.item.responseBodyBase64
+      : entry.item.requestBodyBase64;
+    const text = isResponse
+      ? (entry.item.responseBodyText ?? null)
+      : (entry.item.requestBodyText ?? null);
+    const size = text
+      ? new TextEncoder().encode(text).length
+      : Math.floor((base64.trim().length * 3) / 4);
+    return {
+      id: entry.item.sessionId,
+      isResponse,
+      bodyBase64: base64,
+      bodyText: text,
+      bodySize: size,
+    };
   }
 
   private getBoundIps(): string[] {
@@ -1858,6 +1965,7 @@ export class BrowserPreviewEngine {
     }
     return {
       ramSessions: this.store.size,
+      archivedSessions: this.evictedSessionsArchive.size,
       sqliteSizeBytes: persistedBytes,
       droppedSessionsCount: this.droppedSessionsCount,
       sessionRetentionLimit: this.sessionRetentionLimit,
@@ -1867,6 +1975,7 @@ export class BrowserPreviewEngine {
 
   clearSqliteDatabase(): StorageStats {
     this.evictedSqliteBytes = 0;
+    this.evictedSessionsArchive.clear();
     this.offloadedBodies.clear();
     if (typeof window !== "undefined") {
       try {
@@ -2685,15 +2794,27 @@ export class BrowserPreviewEngine {
     sessionIds: number[],
     format: string,
     filePath: string,
-    sanitization?: SanitizationOptions | null
+    sanitization?: SanitizationOptions | null,
+    includeEvictedSqlite = false
   ): number {
     const targetIds =
       sessionIds.length > 0
         ? sessionIds
-        : Array.from(this.store.keys()).sort((a, b) => a - b);
+        : includeEvictedSqlite
+          ? Array.from(
+              new Set([
+                ...Array.from(this.evictedSessionsArchive.keys()),
+                ...Array.from(this.store.keys()),
+              ])
+            ).sort((a, b) => a - b)
+          : Array.from(this.store.keys()).sort((a, b) => a - b);
     const list: SessionDetail[] = [];
     for (const id of targetIds) {
-      const detail = this.getDetail(id);
+      const detail =
+        this.getDetail(id) ??
+        (sessionIds.length > 0 || includeEvictedSqlite
+          ? this.evictedSessionsArchive.get(id) ?? null
+          : null);
       if (!detail) continue;
       const hydrated = structuredClone(detail);
       if (hydrated.requestBodyOffloaded) {

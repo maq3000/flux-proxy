@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { DiffEditor, type MonacoDiffEditor } from "@monaco-editor/react";
 import {
   ArrowDownAz,
@@ -26,14 +26,22 @@ import {
 import { formatBytes, formatDuration } from "../lib/formatters";
 import { getMonacoThemeName } from "../lib/monaco";
 import {
+  exceedsMonacoRenderLimit,
+  getUtf8ByteLength,
+  MONACO_MODEL_PATHS,
+} from "../lib/monacoLimits";
+import {
   buildSessionDiffBundle,
   type DiffNormalizationOptions,
 } from "../lib/sessionDiff";
+import { proxyBridge } from "../lib/tauriBridge";
 import type {
   DiffTabId,
   SessionDetail,
   SessionSummary,
 } from "../types/proxy";
+import { HexViewer } from "./HexViewer";
+import { MonacoSizeGuardNotice } from "./MonacoSizeGuardNotice";
 import { SectionHeader } from "./ui/SectionHeader";
 
 const DIFF_TABS: { id: DiffTabId; label: string; hint: string }[] = [
@@ -100,9 +108,8 @@ export const SessionDiffView: React.FC<SessionDiffViewProps> = ({
   onNotify,
 }) => {
   const { openContextMenu } = useContextMenu();
-  const instanceUid = useId().replace(/[^a-zA-Z0-9_-]/g, "");
-  const origModelPath = `inmemory://fluxproxy-diff/${instanceUid}/original`;
-  const modModelPath = `inmemory://fluxproxy-diff/${instanceUid}/modified`;
+  const origModelPath = MONACO_MODEL_PATHS.diffOriginal;
+  const modModelPath = MONACO_MODEL_PATHS.diffModified;
 
   const diffEditorRef = useRef<MonacoDiffEditor | null>(null);
   const [activeTab, setActiveTab] = useState<DiffTabId>("full");
@@ -112,6 +119,7 @@ export const SessionDiffView: React.FC<SessionDiffViewProps> = ({
   const [wordWrap, setWordWrap] = useState<"on" | "off">("on");
   const [diffHunkCount, setDiffHunkCount] = useState<number>(0);
   const [copiedSide, setCopiedSide] = useState<"left" | "right" | null>(null);
+  const [hexFallbackSide, setHexFallbackSide] = useState<"left" | "right" | null>(null);
 
   const monacoTheme = getMonacoThemeName(resolvedTheme);
 
@@ -510,48 +518,140 @@ export const SessionDiffView: React.FC<SessionDiffViewProps> = ({
 
       {/* Monaco DiffEditor Surface */}
       <div className="flex-1 overflow-hidden bg-canvas">
-        <DiffEditor
-          height="100%"
-          theme={monacoTheme}
-          language={activeSection.language}
-          original={activeSection.original}
-          modified={activeSection.modified}
-          originalModelPath={origModelPath}
-          modifiedModelPath={modModelPath}
-          keepCurrentOriginalModel
-          keepCurrentModifiedModel
-          onMount={(editor, monaco) => {
-            diffEditorRef.current = editor;
-            setDiffHunkCount(editor.getLineChanges()?.length ?? 0);
-            const sub = editor.onDidUpdateDiff(() => {
-              setDiffHunkCount(editor.getLineChanges()?.length ?? 0);
-            });
-            editor.onDidDispose(() => {
-              sub.dispose();
-              diffEditorRef.current = null;
-              // Dispose text models strictly AFTER DiffEditorWidget has detached them
-              monaco.editor
-                .getModel(monaco.Uri.parse(origModelPath))
-                ?.dispose();
-              monaco.editor
-                .getModel(monaco.Uri.parse(modModelPath))
-                ?.dispose();
-            });
-          }}
-          options={{
-            readOnly: true,
-            originalEditable: false,
-            renderSideBySide: sideBySide,
-            useInlineViewWhenSpaceIsLimited: true,
-            minimap: { enabled: false },
-            fontSize: 12,
-            wordWrap,
-            diffWordWrap: wordWrap,
-            scrollBeyondLastLine: false,
-            renderIndicators: true,
-            ignoreTrimWhitespace: false,
-          }}
-        />
+        {(() => {
+          const origBytes = getUtf8ByteLength(activeSection.original);
+          const modBytes = getUtf8ByteLength(activeSection.modified);
+          const largestBytes = Math.max(origBytes, modBytes);
+          const exceedsLimit =
+            exceedsMonacoRenderLimit(activeSection.original) ||
+            exceedsMonacoRenderLimit(activeSection.modified);
+          const hexIsReq = activeTab === "request";
+          const largerSide: "left" | "right" =
+            origBytes >= modBytes ? "left" : "right";
+          const handleSaveLargerSide = async () => {
+            const target = largerSide === "left" ? leftDetail : rightDetail;
+            const isResp = !hexIsReq;
+            try {
+              const path = await proxyBridge.pickSaveFileDialog({
+                title: `Save ${isResp ? "Response" : "Request"} Body (#${target.summary.id})`,
+                defaultName: `session_${target.summary.id}_${isResp ? "response" : "request"}.bin`,
+                filters: [{ name: "All Files (*.*)", extensions: ["*"] }],
+              });
+              if (!path) return;
+              const bytes = await proxyBridge.saveSessionBodyFile(
+                target.summary.id,
+                isResp,
+                path
+              );
+              onNotify?.(
+                `Сохранено тело #${target.summary.id} (${formatBytes(bytes)})`
+              );
+            } catch (err) {
+              onNotify?.(
+                `Ошибка сохранения: ${err instanceof Error ? err.message : String(err)}`
+              );
+            }
+          };
+
+          if (exceedsLimit && hexFallbackSide) {
+            const target = hexFallbackSide === "left" ? leftDetail : rightDetail;
+            const hexB64 = hexIsReq
+              ? target.requestBodyBase64
+              : target.responseBodyBase64;
+            return (
+              <div className="flex h-full flex-col overflow-hidden">
+                <div className="flex items-center justify-between border-b border-hairline bg-elevated/60 px-3 py-1.5 text-[11px]">
+                  <span className="font-mono text-fg">
+                    HexViewer • Сессия {hexFallbackSide === "left" ? "A" : "B"} (#{target.summary.id})
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setHexFallbackSide((prev) =>
+                          prev === "left" ? "right" : "left"
+                        )
+                      }
+                      className="rounded border border-hairline bg-surface px-2 py-0.5 text-muted hover:text-fg"
+                    >
+                      Переключить на {hexFallbackSide === "left" ? "B" : "A"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setHexFallbackSide(null)}
+                      className="rounded border border-hairline bg-surface px-2 py-0.5 text-muted hover:text-fg"
+                    >
+                      Назад
+                    </button>
+                  </div>
+                </div>
+                <div className="min-h-0 flex-1 overflow-hidden">
+                  <HexViewer
+                    base64Data={hexB64}
+                    onSaveBodyAs={() => void handleSaveLargerSide()}
+                    onNotify={onNotify}
+                  />
+                </div>
+              </div>
+            );
+          }
+
+          if (exceedsLimit) {
+            return (
+              <MonacoSizeGuardNotice
+                payloadLabel="сравнение сессий"
+                sizeBytes={largestBytes}
+                onOpenHexViewer={() => setHexFallbackSide(largerSide)}
+                onSaveToDisk={() => void handleSaveLargerSide()}
+              />
+            );
+          }
+
+          return (
+            <DiffEditor
+              height="100%"
+              theme={monacoTheme}
+              language={activeSection.language}
+              original={activeSection.original}
+              modified={activeSection.modified}
+              originalModelPath={origModelPath}
+              modifiedModelPath={modModelPath}
+              keepCurrentOriginalModel
+              keepCurrentModifiedModel
+              onMount={(editor, monaco) => {
+                diffEditorRef.current = editor;
+                setDiffHunkCount(editor.getLineChanges()?.length ?? 0);
+                const sub = editor.onDidUpdateDiff(() => {
+                  setDiffHunkCount(editor.getLineChanges()?.length ?? 0);
+                });
+                editor.onDidDispose(() => {
+                  sub.dispose();
+                  diffEditorRef.current = null;
+                  // Dispose text models strictly AFTER DiffEditorWidget has detached them
+                  monaco.editor
+                    .getModel(monaco.Uri.parse(origModelPath))
+                    ?.dispose();
+                  monaco.editor
+                    .getModel(monaco.Uri.parse(modModelPath))
+                    ?.dispose();
+                });
+              }}
+              options={{
+                readOnly: true,
+                originalEditable: false,
+                renderSideBySide: sideBySide,
+                useInlineViewWhenSpaceIsLimited: true,
+                minimap: { enabled: false },
+                fontSize: 12,
+                wordWrap,
+                diffWordWrap: wordWrap,
+                scrollBeyondLastLine: false,
+                renderIndicators: true,
+                ignoreTrimWhitespace: false,
+              }}
+            />
+          );
+        })()}
       </div>
     </div>
   );

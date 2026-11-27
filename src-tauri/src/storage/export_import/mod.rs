@@ -4,7 +4,7 @@ pub mod sanitize;
 pub mod saz;
 
 use std::fs::File;
-use std::io::{Cursor, Read};
+use std::io::{BufWriter, Cursor, Read};
 use std::path::Path;
 
 use crate::models::{ProxyError, SessionDetail};
@@ -13,14 +13,21 @@ pub use har::{
     deserialize_har_1_2, deserialize_json_or_har, serialize_har_1_2, serialize_json_archive,
     FluxProxyHarExt, HarCache, HarContent, HarCookie, HarCreator, HarEntry, HarLog, HarNameValue,
     HarPage, HarPageTimings, HarPostData, HarPostParam, HarRequest, HarResponse, HarRoot,
-    HarTimings, HarWebSocketMessage,
+    HarStreamWriter, HarTimings, HarWebSocketMessage, JsonStreamWriter,
 };
-pub use raw::{decode_detail_body_bytes, serialize_full_raw_http, write_raw_bytes_to_file};
-pub use sanitize::sanitize_sessions;
-pub use saz::{read_saz_file, read_saz_from_reader, write_saz_file, write_saz_to_writer};
+pub use raw::{
+    decode_detail_body_bytes, serialize_full_raw_http, write_raw_bytes_to_file, RawHttpStreamWriter,
+};
+pub use sanitize::{sanitize_sessions, CompiledSanitizationOptions};
+pub use saz::{
+    read_saz_file, read_saz_from_reader, write_saz_file, write_saz_to_writer, SazStreamWriter,
+};
 
 /// Maximum allowed archive/JSON import file size on disk or in memory (256 MiB).
 pub const MAX_IMPORT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Maximum number of ZIP directory entries permitted inside an imported `.saz` archive.
+pub const MAX_SAZ_ARCHIVE_ENTRIES: usize = 50_000;
 
 /// Maximum uncompressed size allowed for a single `.saz` ZIP entry or decompressed wire payload (64 MiB).
 pub const MAX_SAZ_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
@@ -31,6 +38,65 @@ pub const MAX_SAZ_TOTAL_UNCOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 /// Maximum number of stacked `Content-Encoding` layers decoded per HTTP message during `.saz` import.
 pub const MAX_SAZ_CONTENT_ENCODING_LAYERS: usize = 2;
 
+/// Streaming exporter writing one hydrated/sanitized `SessionDetail` at a time to disk.
+pub enum StreamingSessionExporter {
+    Saz(Box<SazStreamWriter<BufWriter<File>>>),
+    Har(HarStreamWriter<BufWriter<File>>),
+    Json(JsonStreamWriter<BufWriter<File>>),
+    Raw(RawHttpStreamWriter<BufWriter<File>>),
+}
+
+impl StreamingSessionExporter {
+    pub fn create(path: &Path, format: &str, estimated_count: usize) -> Result<Self, ProxyError> {
+        let fmt = normalize_export_format(format, path);
+        match fmt.as_str() {
+            "saz" => {
+                ensure_parent_dir(path)?;
+                let file = BufWriter::new(File::create(path)?);
+                Ok(Self::Saz(Box::new(SazStreamWriter::new(
+                    file,
+                    estimated_count,
+                )?)))
+            }
+            "har" => {
+                ensure_parent_dir(path)?;
+                let file = BufWriter::new(File::create(path)?);
+                Ok(Self::Har(HarStreamWriter::new(file)))
+            }
+            "json" => {
+                ensure_parent_dir(path)?;
+                let file = BufWriter::new(File::create(path)?);
+                Ok(Self::Json(JsonStreamWriter::new(file)?))
+            }
+            "raw" | "txt" => {
+                ensure_parent_dir(path)?;
+                let file = BufWriter::new(File::create(path)?);
+                Ok(Self::Raw(RawHttpStreamWriter::new(file)))
+            }
+            other => Err(ProxyError::Custom(format!(
+                "Неподдерживаемый формат экспорта: '{other}' (ожидается har, saz, json или txt)"
+            ))),
+        }
+    }
+
+    pub fn write_session(&mut self, detail: &SessionDetail) -> Result<(), ProxyError> {
+        match self {
+            Self::Saz(w) => w.write_session(detail),
+            Self::Har(w) => w.write_session(detail),
+            Self::Json(w) => w.write_session(detail),
+            Self::Raw(w) => w.write_session(detail),
+        }
+    }
+
+    pub fn finish(self) -> Result<usize, ProxyError> {
+        match self {
+            Self::Saz(w) => (*w).finish(),
+            Self::Har(w) => w.finish(),
+            Self::Json(w) => w.finish(),
+            Self::Raw(w) => w.finish(),
+        }
+    }
+}
 
 /// Unified exporter supporting `"har"`, `"saz"`, `"json"`, and `"raw"` / `"txt"` formats.
 pub fn export_sessions_to_path(
@@ -38,28 +104,11 @@ pub fn export_sessions_to_path(
     format: &str,
     path: &Path,
 ) -> Result<usize, ProxyError> {
-    let fmt = normalize_export_format(format, path);
-    match fmt.as_str() {
-        "saz" => write_saz_file(path, sessions),
-        "har" => {
-            let har_json = serialize_har_1_2(sessions)?;
-            write_raw_bytes_to_file(path, har_json.as_bytes())?;
-            Ok(sessions.len())
-        }
-        "json" => {
-            let raw_json = serialize_json_archive(sessions)?;
-            write_raw_bytes_to_file(path, raw_json.as_bytes())?;
-            Ok(sessions.len())
-        }
-        "raw" | "txt" => {
-            let raw_http = serialize_full_raw_http(sessions);
-            write_raw_bytes_to_file(path, &raw_http)?;
-            Ok(sessions.len())
-        }
-        other => Err(ProxyError::Custom(format!(
-            "Неподдерживаемый формат экспорта: '{other}' (ожидается har, saz, json или txt)"
-        ))),
+    let mut exporter = StreamingSessionExporter::create(path, format, sessions.len())?;
+    for detail in sessions {
+        exporter.write_session(detail)?;
     }
+    exporter.finish()
 }
 
 /// Reads up to `max_bytes` from `path` after verifying file metadata length to avoid unbounded allocation.
@@ -1397,5 +1446,125 @@ mod tests {
         assert_eq!(stats.client_conn_id, None);
         assert_eq!(stats.server_ip.as_deref(), Some("93.184.216.34"));
         assert!(sanitized[0].timings.is_some());
+    }
+
+    #[test]
+    fn sanitize_multipart_form_data_masks_fields_nested_json_and_preserves_binary() {
+        let png_bytes: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0xFF, 0xFE];
+        let mut raw_body = Vec::new();
+        raw_body.extend_from_slice(
+            b"--B123\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nmy-secret-pw\r\n",
+        );
+        raw_body.extend_from_slice(
+            b"--B123\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n{\"api_key\":\"k_live_999\",\"public\":\"ok\"}\r\n",
+        );
+        raw_body.extend_from_slice(
+            b"--B123\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"pic.png\"\r\nContent-Type: image/png\r\n\r\n",
+        );
+        raw_body.extend_from_slice(png_bytes);
+        raw_body.extend_from_slice(b"\r\n--B123--\r\n");
+
+        let mut detail = sample_sessions().remove(0);
+        detail.request_headers = vec![
+            HeaderPair {
+                name: "Content-Type".into(),
+                value: "multipart/form-data; boundary=B123".into(),
+                raw_bytes_b64: None,
+            },
+            HeaderPair {
+                name: "Content-Length".into(),
+                value: raw_body.len().to_string(),
+                raw_bytes_b64: None,
+            },
+        ];
+        detail.request_body_base64 = base64::engine::general_purpose::STANDARD.encode(&raw_body);
+        detail.request_body_text = None;
+
+        let sanitized = sanitize_sessions(
+            &[detail],
+            &SanitizationOptions {
+                redact_auth_headers: true,
+                custom_redacted_headers: Vec::new(),
+                mask_json_keys: vec!["password".into(), "api_key".into()],
+                strip_query_params: Vec::new(),
+                anonymize_client_info: false,
+                replacement_text: "[MASKED]".into(),
+            },
+        );
+        let out_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&sanitized[0].request_body_base64)
+            .unwrap();
+        let needle_pw = b"my-secret-pw";
+        assert!(!out_bytes.windows(needle_pw.len()).any(|w| w == needle_pw));
+        assert!(!out_bytes.windows(b"k_live_999".len()).any(|w| w == b"k_live_999"));
+        assert!(out_bytes.windows(b"[MASKED]".len()).any(|w| w == b"[MASKED]"));
+        assert!(out_bytes.windows(b"public".len()).any(|w| w == b"public"));
+        assert!(
+            out_bytes.windows(png_bytes.len()).any(|w| w == png_bytes),
+            "binary attachment bytes must stay untouched"
+        );
+    }
+
+    #[test]
+    fn sanitize_urlencoded_handles_crlf_line_endings() {
+        let masked = sanitize::sanitize_body_payload(
+            "user=alice&password=secret123\r\n",
+            Some("application/x-www-form-urlencoded"),
+            &["password".into()],
+            "[REDACTED]",
+            true,
+        )
+        .expect("should mask password with CRLF");
+        assert_eq!(masked, "user=alice&password=[REDACTED]\r\n");
+
+        let auto_detected = sanitize::sanitize_body_payload(
+            "foo=bar&\r\npassword=top_secret",
+            None,
+            &["password".into()],
+            "[REDACTED]",
+            true,
+        )
+        .expect("is_likely_urlencoded_form must accept CRLF");
+        assert_eq!(auto_detected, "foo=bar&\r\npassword=[REDACTED]");
+    }
+
+    #[test]
+    fn read_saz_rejects_archive_over_50000_entries() {
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        {
+            let mut zw = ZipWriter::new(&mut cursor);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            for i in 0..=MAX_SAZ_ARCHIVE_ENTRIES {
+                zw.start_file(format!("raw/e{i}.txt"), opts).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        cursor.set_position(0);
+        let err = read_saz_from_reader(cursor).expect_err("must reject > 50_000 SAZ entries");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("50000") || msg.contains("слишком много"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn streaming_exporter_roundtrips_har_saz_json_and_raw() {
+        let sessions = sample_sessions();
+        for ext in ["har", "saz", "json", "txt"] {
+            let path = unique_temp_path(&format!("stream_roundtrip.{ext}"));
+            let _ = std::fs::remove_file(&path);
+            let count = export_sessions_to_path(&sessions, ext, &path).expect("export");
+            assert_eq!(count, sessions.len());
+            if ext != "txt" {
+                let reimported = import_sessions_from_path(&path).expect("reimport");
+                assert_eq!(reimported.len(), sessions.len());
+            } else {
+                let raw = std::fs::read(&path).unwrap();
+                let txt = String::from_utf8_lossy(&raw);
+                assert!(txt.contains("auth.fluxproxy.dev"));
+            }
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }

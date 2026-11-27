@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { formatBytes } from "../lib/formatters";
 import { getMonacoThemeName } from "../lib/monaco";
+import { MONACO_MODEL_PATHS } from "../lib/monacoLimits";
 import {
   buildOpenApiDocument,
   type OpenApiFormat,
@@ -231,6 +232,7 @@ export const OpenApiExportModal: React.FC<OpenApiExportModalProps> = ({
 
               if (
                 detail.requestBodyOffloaded &&
+                (detail.summary.requestSize ?? 0) <= MAX_HYDRATE_BODY_BYTES &&
                 !isBinaryContentType(getRequestContentType(detail))
               ) {
                 try {
@@ -622,6 +624,7 @@ export const OpenApiExportModal: React.FC<OpenApiExportModalProps> = ({
           open && (
             <Editor
               height="100%"
+              path={MONACO_MODEL_PATHS.openApiSpec}
               language={format}
               theme={monacoTheme}
               value={serialized}

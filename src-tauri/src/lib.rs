@@ -140,6 +140,7 @@ pub fn run() {
             commands::list_paused_breakpoints,
             commands::resolve_breakpoint,
             commands::resume_all_breakpoints,
+            commands::load_breakpoint_body,
             commands::codec_transform,
             commands::set_session_retention_limit,
             commands::set_drop_non_matching,

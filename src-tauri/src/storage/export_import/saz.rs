@@ -19,11 +19,92 @@ use super::raw::{
     find_header_value, parse_http_request_line, parse_http_status_line, split_raw_http_message,
 };
 use super::{
-    ensure_parent_dir, MAX_IMPORT_FILE_BYTES, MAX_SAZ_ENTRY_BYTES, MAX_SAZ_TOTAL_UNCOMPRESSED_BYTES,
+    ensure_parent_dir, MAX_IMPORT_FILE_BYTES, MAX_SAZ_ARCHIVE_ENTRIES, MAX_SAZ_ENTRY_BYTES,
+    MAX_SAZ_TOTAL_UNCOMPRESSED_BYTES,
 };
 
 /// Initial buffer allocation cap when reading an untrusted ZIP entry whose header size could be spoofed.
 pub(super) const MAX_SAZ_INITIAL_PREALLOC_BYTES: usize = 64 * 1024;
+
+/// Streams Fiddler Classic `.saz` entries (`raw/{seq}_c.txt`, `_s.txt`, `_m.xml`, `_w.txt`) directly
+/// to a `ZipWriter` one session at a time without retaining session bodies in memory.
+pub struct SazStreamWriter<W: Write + Seek> {
+    zip: ZipWriter<W>,
+    options: SimpleFileOptions,
+    pad_width: usize,
+    index_rows: String,
+    count: usize,
+}
+
+impl<W: Write + Seek> SazStreamWriter<W> {
+    pub fn new(writer: W, estimated_count: usize) -> Result<Self, ProxyError> {
+        let mut zip = ZipWriter::new(writer);
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+
+        zip.start_file("[Content_Types].xml", options)
+            .map_err(|e| ProxyError::Custom(format!("SAZ zip error ([Content_Types].xml): {e}")))?;
+        zip.write_all(SAZ_CONTENT_TYPES_XML.as_bytes())?;
+
+        Ok(Self {
+            zip,
+            options,
+            pad_width: estimated_count.max(1).to_string().len().max(4),
+            index_rows: String::new(),
+            count: 0,
+        })
+    }
+
+    pub fn write_session(&mut self, detail: &SessionDetail) -> Result<(), ProxyError> {
+        let seq = self.count + 1;
+        let prefix = format!("raw/{seq:0width$}", width = self.pad_width);
+
+        append_saz_index_row(&mut self.index_rows, detail, seq, self.pad_width);
+
+        let raw_client = build_raw_http_request_bytes(detail);
+        self.zip
+            .start_file(format!("{prefix}_c.txt"), self.options)
+            .map_err(|e| ProxyError::Custom(format!("SAZ zip error ({prefix}_c.txt): {e}")))?;
+        self.zip.write_all(&raw_client)?;
+
+        let raw_server = build_raw_http_response_bytes(detail);
+        self.zip
+            .start_file(format!("{prefix}_s.txt"), self.options)
+            .map_err(|e| ProxyError::Custom(format!("SAZ zip error ({prefix}_s.txt): {e}")))?;
+        self.zip.write_all(&raw_server)?;
+
+        let meta_xml = build_saz_metadata_xml(detail, seq);
+        self.zip
+            .start_file(format!("{prefix}_m.xml"), self.options)
+            .map_err(|e| ProxyError::Custom(format!("SAZ zip error ({prefix}_m.xml): {e}")))?;
+        self.zip.write_all(meta_xml.as_bytes())?;
+
+        if !detail.websocket_frames.is_empty() {
+            let ws_txt = build_saz_websocket_log(&detail.websocket_frames);
+            self.zip
+                .start_file(format!("{prefix}_w.txt"), self.options)
+                .map_err(|e| ProxyError::Custom(format!("SAZ zip error ({prefix}_w.txt): {e}")))?;
+            self.zip.write_all(ws_txt.as_bytes())?;
+        }
+
+        self.count = seq;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<usize, ProxyError> {
+        let index_html = wrap_saz_index_html(&self.index_rows);
+        self.zip
+            .start_file("_index.htm", self.options)
+            .map_err(|e| ProxyError::Custom(format!("SAZ zip error (_index.htm): {e}")))?;
+        self.zip.write_all(index_html.as_bytes())?;
+
+        self.zip
+            .finish()
+            .map_err(|e| ProxyError::Custom(format!("SAZ finalize error: {e}")))?;
+        Ok(self.count)
+    }
+}
 
 
 pub fn write_saz_to_writer<W: Write + Seek>(
@@ -133,6 +214,14 @@ pub(super) fn read_bounded_saz_entry<R: Read>(
 pub fn read_saz_from_reader<R: Read + Seek>(reader: R) -> Result<Vec<SessionDetail>, ProxyError> {
     let mut archive = ZipArchive::new(reader)
         .map_err(|e| ProxyError::Custom(format!("Не удалось открыть архив SAZ (.zip): {e}")))?;
+
+    if archive.len() > MAX_SAZ_ARCHIVE_ENTRIES {
+        return Err(ProxyError::Custom(format!(
+            "Архив SAZ содержит слишком много записей ({} > лимит {})",
+            archive.len(),
+            MAX_SAZ_ARCHIVE_ENTRIES
+        )));
+    }
 
     #[derive(Default)]
     struct RawSazParts {
@@ -260,29 +349,35 @@ pub(super) const SAZ_CONTENT_TYPES_XML: &str = r#"<?xml version="1.0" encoding="
   <Default Extension="xml" ContentType="application/xml" />
 </Types>"#;
 
-pub(super) fn build_saz_index_html(sessions: &[SessionDetail], pad_width: usize) -> String {
-    let mut rows = String::new();
-    for (idx, detail) in sessions.iter().enumerate() {
-        let seq = idx + 1;
-        let s = &detail.summary;
-        let padded = format!("{seq:0width$}", width = pad_width);
-        rows.push_str(&format!(
-            "<tr><td><a href=\"raw/{padded}_c.txt\">C</a>&nbsp;<a href=\"raw/{padded}_s.txt\">S</a>&nbsp;<a href=\"raw/{padded}_m.xml\">M</a></td><td>{seq}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\r\n",
-            s.status,
-            xml_escape(&s.protocol),
-            xml_escape(&s.host),
-            xml_escape(&s.path),
-            s.body_size,
-            xml_escape(&s.content_type),
-            xml_escape(s.process_name.as_deref().unwrap_or("")),
-        ));
-    }
+fn append_saz_index_row(rows: &mut String, detail: &SessionDetail, seq: usize, pad_width: usize) {
+    let s = &detail.summary;
+    let padded = format!("{seq:0width$}", width = pad_width);
+    rows.push_str(&format!(
+        "<tr><td><a href=\"raw/{padded}_c.txt\">C</a>&nbsp;<a href=\"raw/{padded}_s.txt\">S</a>&nbsp;<a href=\"raw/{padded}_m.xml\">M</a></td><td>{seq}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\r\n",
+        s.status,
+        xml_escape(&s.protocol),
+        xml_escape(&s.host),
+        xml_escape(&s.path),
+        s.body_size,
+        xml_escape(&s.content_type),
+        xml_escape(s.process_name.as_deref().unwrap_or("")),
+    ));
+}
 
+fn wrap_saz_index_html(rows: &str) -> String {
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>FluxProxy SAZ Archive</title>\
         <style>body{{font-family:Segoe UI,sans-serif;font-size:12px}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ccc;padding:4px 6px;text-align:left}}</style></head>\
         <body><table><thead><tr><th>Raw</th><th>#</th><th>Result</th><th>Protocol</th><th>Host</th><th>URL</th><th>Body</th><th>Content-Type</th><th>Process</th></tr></thead><tbody>\r\n{rows}</tbody></table></body></html>"
     )
+}
+
+pub(super) fn build_saz_index_html(sessions: &[SessionDetail], pad_width: usize) -> String {
+    let mut rows = String::new();
+    for (idx, detail) in sessions.iter().enumerate() {
+        append_saz_index_row(&mut rows, detail, idx + 1, pad_width);
+    }
+    wrap_saz_index_html(&rows)
 }
 
 

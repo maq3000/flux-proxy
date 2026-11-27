@@ -537,6 +537,19 @@ export const proxyBridge = {
     return getPreviewEngine().resumeAllBreakpoints(action);
   },
 
+  async loadBreakpointBody(
+    breakpointId: string,
+    isResponse: boolean
+  ): Promise<LoadedSessionBody | null> {
+    if (isTauriRuntime()) {
+      return invoke<LoadedSessionBody | null>("load_breakpoint_body", {
+        breakpointId,
+        isResponse,
+      });
+    }
+    return getPreviewEngine().loadBreakpointBody(breakpointId, isResponse);
+  },
+
   async subscribeBreakpointsChanged(
     onChanged: (items: PausedBreakpointItem[]) => void
   ): Promise<UnlistenFn> {
@@ -695,7 +708,8 @@ export const proxyBridge = {
     sessionIds: number[],
     format: string,
     filePath: string,
-    sanitization?: SanitizationOptions | null
+    sanitization?: SanitizationOptions | null,
+    includeEvictedSqlite = false
   ): Promise<number> {
     if (isTauriRuntime()) {
       return invoke<number>("export_sessions_file", {
@@ -703,13 +717,15 @@ export const proxyBridge = {
         format,
         filePath,
         sanitization: sanitization ?? null,
+        includeEvictedSqlite,
       });
     }
     return getPreviewEngine().exportPreviewSessions(
       sessionIds,
       format,
       filePath,
-      sanitization
+      sanitization,
+      includeEvictedSqlite
     );
   },
 

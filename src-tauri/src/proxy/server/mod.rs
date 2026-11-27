@@ -1477,7 +1477,10 @@ impl ProxyEngineController {
             .map_err(ProxyError::Custom)?,
         );
 
-        let breakpoints = Arc::new(BreakpointEngine::new(Some(bp_tx)));
+        let breakpoints = Arc::new(BreakpointEngine::new_with_store(
+            Some(bp_tx),
+            Some(Arc::clone(&store)),
+        ));
         let script_runner = Arc::new(PythonScriptRunner::new(app_handle.clone()));
         let active_ws_channels = Arc::new(DashMap::new());
 
@@ -2967,15 +2970,18 @@ mod tests {
         let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
         let rules = Arc::new(RuleEngine::new());
         let filters = Arc::new(ProxyFilterEngine::new());
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("bp.sqlite")).unwrap());
         let (bp_tx, mut bp_rx) = mpsc::unbounded_channel();
-        let breakpoints = Arc::new(BreakpointEngine::new(Some(bp_tx)));
+        let breakpoints = Arc::new(BreakpointEngine::new_with_store(
+            Some(bp_tx),
+            Some(Arc::clone(&store)),
+        ));
         breakpoints.update_config(BreakpointConfig {
             break_before_request: true,
             break_after_response: true,
             timeout_secs: 15,
             rules: Vec::new(),
         });
-        let store = Arc::new(TrafficStore::new(tmp_dir.join("bp.sqlite")).unwrap());
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
         let ctx = Arc::new(SharedProxyContext {
@@ -5705,15 +5711,18 @@ def on_response(response, request):
         let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
         let rules = Arc::new(RuleEngine::new());
         let filters = Arc::new(ProxyFilterEngine::new());
+        let store = Arc::new(TrafficStore::new(tmp_dir.join("bp-guard.sqlite")).unwrap());
         let (bp_tx, mut bp_rx) = mpsc::unbounded_channel();
-        let breakpoints = Arc::new(BreakpointEngine::new(Some(bp_tx)));
+        let breakpoints = Arc::new(BreakpointEngine::new_with_store(
+            Some(bp_tx),
+            Some(Arc::clone(&store)),
+        ));
         breakpoints.update_config(BreakpointConfig {
             break_before_request: true,
             break_after_response: false,
             timeout_secs: 60,
             rules: Vec::new(),
         });
-        let store = Arc::new(TrafficStore::new(tmp_dir.join("bp-guard.sqlite")).unwrap());
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
         let os_backend = RecordingOsProxyBackend::new();
@@ -7061,9 +7070,12 @@ def on_response(response, request):
         let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
         let rules = Arc::new(RuleEngine::new());
         let filters = Arc::new(ProxyFilterEngine::new());
-        let (bp_tx, mut bp_rx) = mpsc::unbounded_channel();
-        let breakpoints = Arc::new(BreakpointEngine::new(Some(bp_tx)));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("bpmock.sqlite")).unwrap());
+        let (bp_tx, mut bp_rx) = mpsc::unbounded_channel();
+        let breakpoints = Arc::new(BreakpointEngine::new_with_store(
+            Some(bp_tx),
+            Some(Arc::clone(&store)),
+        ));
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
 

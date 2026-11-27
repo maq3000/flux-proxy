@@ -34,12 +34,14 @@ import { SectionHeader } from "./ui/SectionHeader";
 interface SanitizedExportModalProps {
   open: boolean;
   totalCount: number;
+  archivedCount?: number;
   selectedIds: number[];
   onClose: () => void;
   onExport: (
     targetIds: number[],
     format: ExportArchiveFormat,
-    options: SanitizationOptions
+    options: SanitizationOptions,
+    includeEvictedSqlite?: boolean
   ) => Promise<boolean>;
 }
 
@@ -200,6 +202,7 @@ function inferPresetId(opts: SanitizationOptions): SanitizationPresetId {
 export const SanitizedExportModal: React.FC<SanitizedExportModalProps> = ({
   open,
   totalCount,
+  archivedCount = 0,
   selectedIds,
   onClose,
   onExport,
@@ -209,6 +212,7 @@ export const SanitizedExportModal: React.FC<SanitizedExportModalProps> = ({
 
   const [format, setFormat] = useState<ExportArchiveFormat>("har");
   const [scope, setScope] = useState<"all" | "selected">("all");
+  const [includeEvictedSqlite, setIncludeEvictedSqlite] = useState(false);
   const [options, setOptions] = useState<SanitizationOptions>(() =>
     loadPersistedSanitizationOptions()
   );
@@ -359,10 +363,14 @@ export const SanitizedExportModal: React.FC<SanitizedExportModalProps> = ({
 
   const effectiveTargetIds =
     scope === "selected" && selectedIds.length > 0 ? selectedIds : [];
+  const effectiveIncludeEvictedSqlite =
+    scope === "all" && archivedCount > 0 && includeEvictedSqlite;
   const exportSessionCount =
     scope === "selected" && selectedIds.length > 0
       ? selectedIds.length
-      : totalCount;
+      : effectiveIncludeEvictedSqlite
+        ? totalCount + archivedCount
+        : totalCount;
 
   const handleSubmitExport = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -382,7 +390,8 @@ export const SanitizedExportModal: React.FC<SanitizedExportModalProps> = ({
       const saved = await onExport(
         effectiveTargetIds,
         format,
-        normalizedOptions
+        normalizedOptions,
+        effectiveIncludeEvictedSqlite
       );
       if (saved) {
         dialogRef.current?.close();
@@ -436,7 +445,7 @@ export const SanitizedExportModal: React.FC<SanitizedExportModalProps> = ({
                 <button
                   type="button"
                   onClick={() => setScope("all")}
-                  disabled={totalCount === 0}
+                  disabled={totalCount === 0 && archivedCount === 0}
                   className={`flex flex-col items-start rounded-md border px-2.5 py-2 text-left transition-colors ${
                     scope === "all"
                       ? "border-accent bg-selected text-fg"
@@ -445,7 +454,10 @@ export const SanitizedExportModal: React.FC<SanitizedExportModalProps> = ({
                 >
                   <span className="font-semibold text-fg">All Sessions</span>
                   <span className="font-mono text-[10px] text-subtle">
-                    {totalCount.toLocaleString()} сессий
+                    {totalCount.toLocaleString()} в RAM
+                    {effectiveIncludeEvictedSqlite
+                      ? ` + ${archivedCount.toLocaleString()} SQLite`
+                      : ""}
                   </span>
                 </button>
                 <button
@@ -466,6 +478,19 @@ export const SanitizedExportModal: React.FC<SanitizedExportModalProps> = ({
                   </span>
                 </button>
               </div>
+              <label className="mt-1.5 flex cursor-pointer items-center gap-2 text-[11px] text-muted select-none">
+                <input
+                  type="checkbox"
+                  checked={effectiveIncludeEvictedSqlite}
+                  disabled={scope === "selected" || archivedCount === 0}
+                  onChange={(e) => setIncludeEvictedSqlite(e.target.checked)}
+                  className="h-3.5 w-3.5 rounded border-hairline accent-accent disabled:opacity-45"
+                />
+                <span>
+                  Включить вытесненные в SQLite (
+                  {archivedCount.toLocaleString()})
+                </span>
+              </label>
             </div>
 
             <div className="space-y-1.5 rounded-lg border border-hairline bg-canvas p-3">
