@@ -15,9 +15,9 @@
 | `src-tauri/Cargo.toml` | `version = "X.Y.Z"` в `[package]` | Правка вручную |
 | `src-tauri/Cargo.lock` | `version = "X.Y.Z"` у пакета `flux-proxy` | `cargo check --manifest-path src-tauri/Cargo.toml` |
 | `src-tauri/tauri.conf.json` | `"version": "X.Y.Z"` | Правка вручную |
-| `src/lib/tauriBridge.ts` | `creator: { name: "FluxProxy", version: "X.Y.Z" }` | Правка вручную |
+| `src/lib/previewEngine.ts` | `creator: { name: "FluxProxy", version: "X.Y.Z" }` | Правка вручную |
 
-> **Примечание:** `src-tauri/src/storage/export_import.rs` читает версию автоматически через `env!("CARGO_PKG_VERSION")`, поэтому отдельной правки не требует.
+> **Примечание:** `src-tauri/src/storage/export_import/har.rs` читает версию автоматически через `env!("CARGO_PKG_VERSION")`, поэтому отдельной правки не требует.
 
 ### Поиск остаточных упоминаний прошлой версии
 

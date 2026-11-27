@@ -36,7 +36,9 @@ use crate::proxy::upstream_client::{
     estimate_response_headers_bytes, extract_peer_cert_subject_issuer, format_rfc3339_micros,
     format_tls_cipher, format_tls_protocol, timestamp_at_instant,
 };
-use crate::proxy::upstream_proxy::{connect_tunnel_via_upstream, format_via_proxy_telemetry};
+use crate::proxy::upstream_proxy::{
+    connect_tunnel_via_upstream_with_tls, format_via_proxy_telemetry,
+};
 
 use super::http_handler::format_error_chain;
 use super::{
@@ -221,34 +223,32 @@ fn build_ws_tls_config(
     client_addr: SocketAddr,
     ws_scheme: &str,
 ) -> Result<(Arc<rustls::ClientConfig>, Option<String>), String> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|err| format!("WebSocket TLS config error: {err}"))?
-        .with_root_certificates(default_root_store());
-
-    let (mut tls_cfg, mtls_cn) = if should_use_host_mtls_for_peer(client_addr, ws_scheme) {
+    if should_use_host_mtls_for_peer(client_addr, ws_scheme) {
         match ctx.client_certs.load_rustls_client_auth_for_host(target_host) {
             Ok(Some((certs, key, entry))) => {
-                let cfg = builder.with_client_auth_cert(certs, key).map_err(|err| {
-                    format!("WebSocket mTLS client certificate error for '{target_host}': {err}")
-                })?;
-                (cfg, Some(entry.common_name))
+                let _ = rustls::crypto::ring::default_provider().install_default();
+                let provider = Arc::new(rustls::crypto::ring::default_provider());
+                let mut tls_cfg = rustls::ClientConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .map_err(|err| format!("WebSocket TLS config error: {err}"))?
+                    .with_root_certificates(default_root_store())
+                    .with_client_auth_cert(certs, key)
+                    .map_err(|err| {
+                        format!("WebSocket mTLS client certificate error for '{target_host}': {err}")
+                    })?;
+                tls_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+                return Ok((Arc::new(tls_cfg), Some(entry.common_name)));
             }
-            Ok(None) => (builder.with_no_client_auth(), None),
+            Ok(None) => {}
             Err(err) => {
                 return Err(format!(
                     "WebSocket mTLS client certificate error for '{target_host}': {err}"
                 ));
             }
         }
-    } else {
-        (builder.with_no_client_auth(), None)
-    };
+    }
 
-    tls_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok((Arc::new(tls_cfg), mtls_cn))
+    Ok((Arc::clone(&ctx.shared_http1_tls_config), None))
 }
 
 #[allow(clippy::type_complexity)]
@@ -1263,11 +1263,12 @@ pub(super) async fn handle_websocket_intercept(
 
     if let Some(proxy_cfg) = active_upstream_proxy {
         let deadline = Instant::now() + connect_timeout;
-        let tunnel_res = match connect_tunnel_via_upstream(
+        let tunnel_res = match connect_tunnel_via_upstream_with_tls(
             &proxy_cfg,
             &connect_host,
             connect_port,
             connect_timeout,
+            Some(&ctx.shared_http1_tls_config),
         )
         .await
         {
@@ -2255,5 +2256,44 @@ mod tests {
             local_res.is_ok(),
             "local loopback peer must connect cleanly"
         );
+    }
+
+    #[tokio::test]
+    async fn perf05_build_ws_tls_config_reuses_shared_client_config() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "fluxproxy_ws_tls_reuse_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let ca = Arc::new(
+            crate::proxy::ca::CertificateAuthority::init_or_load(&tmp_dir).unwrap(),
+        );
+        let rules = Arc::new(crate::proxy::rules::RuleEngine::new());
+        let filters = Arc::new(crate::proxy::filters::ProxyFilterEngine::new());
+        let store = Arc::new(
+            crate::storage::TrafficStore::new(tmp_dir.join("ws-tls.sqlite")).unwrap(),
+        );
+        let sysproxy = Arc::new(crate::proxy::sysproxy::SystemProxyManager::new(&tmp_dir));
+        let controller = super::super::ProxyEngineController::new_for_test(
+            ca, rules, filters, store, sysproxy,
+        )
+        .unwrap();
+
+        let local_peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let remote_peer: SocketAddr = "192.168.1.45:50000".parse().unwrap();
+
+        let (cfg_a, mtls_a) =
+            build_ws_tls_config(&controller.context, "echo.example.com", local_peer, "wss")
+                .expect("shared WS TLS config for local peer");
+        let (cfg_b, mtls_b) =
+            build_ws_tls_config(&controller.context, "other.example.com", remote_peer, "wss")
+                .expect("shared WS TLS config for remote peer");
+
+        assert!(mtls_a.is_none());
+        assert!(mtls_b.is_none());
+        assert!(Arc::ptr_eq(&cfg_a, &controller.context.shared_http1_tls_config));
+        assert!(Arc::ptr_eq(&cfg_a, &cfg_b));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

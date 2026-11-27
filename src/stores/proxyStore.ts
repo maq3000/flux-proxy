@@ -4,8 +4,8 @@ import {
   DEFAULT_HOST_REMAP_RULES,
   DEFAULT_PYTHON_SCRIPT_CODE,
   PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
-} from "../lib/mockTraffic";
-import { DEFAULT_BREAKPOINT_CONFIG } from "../lib/tauriBridge";
+} from "../lib/appDefaults";
+import { DEFAULT_BREAKPOINT_CONFIG } from "../types/proxy";
 import {
   DEFAULT_SESSION_RETENTION_LIMIT,
   DEFAULT_THROTTLE_CONFIG,
@@ -384,10 +384,40 @@ function readPersistedProxyConfigFromLocalStorage() {
   };
 }
 
+export function buildSessionIndexById(
+  sessions: readonly SessionSummary[]
+): Map<number, number> {
+  const indexById = new Map<number, number>();
+  for (let i = 0; i < sessions.length; i += 1) {
+    indexById.set(sessions[i].id, i);
+  }
+  return indexById;
+}
+
+export function findSessionById(
+  sessions: readonly SessionSummary[],
+  sessionIndexById: ReadonlyMap<number, number>,
+  id: number
+): SessionSummary | undefined {
+  const idx = sessionIndexById.get(id);
+  if (idx !== undefined) {
+    const match = sessions[idx];
+    if (match && match.id === id) {
+      return match;
+    }
+  }
+  // Fallback if a test calls raw `useProxyStore.setState({ sessions })` without updating the index.
+  if (sessionIndexById.size !== sessions.length) {
+    return sessions.find((s) => s.id === id);
+  }
+  return undefined;
+}
+
 function readInitialProxySlice() {
   const persisted = readPersistedProxyConfigFromLocalStorage();
   return {
     sessions: [] as SessionSummary[],
+    sessionIndexById: new Map<number, number>() as ReadonlyMap<number, number>,
     selectedId: null as number | null,
     selectedIds: [] as number[],
     selectedDetail: null as SessionDetail | null,
@@ -416,6 +446,7 @@ function resolveUpdater<T>(updater: Updater<T>, prev: T): T {
 
 export interface ProxyStoreState {
   sessions: SessionSummary[];
+  sessionIndexById: ReadonlyMap<number, number>;
   selectedId: number | null;
   selectedIds: number[];
   selectedDetail: SessionDetail | null;
@@ -447,6 +478,10 @@ export interface ProxyStoreState {
   isApplyingScript: boolean;
 
   setSessions: (updater: Updater<SessionSummary[]>) => void;
+  mergeSessionBatch: (
+    incoming: readonly SessionSummary[],
+    retentionLimit?: number | null
+  ) => void;
   setSelectedIdState: (updater: Updater<number | null>) => void;
   setSelectedIds: (updater: Updater<number[]>) => void;
   setSelectedDetail: (updater: Updater<SessionDetail | null>) => void;
@@ -493,7 +528,61 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
   isApplyingScript: false,
 
   setSessions: (updater) => {
-    set((state) => ({ sessions: resolveUpdater(updater, state.sessions) }));
+    set((state) => {
+      const nextSessions = resolveUpdater(updater, state.sessions);
+      if (nextSessions === state.sessions) {
+        return state;
+      }
+      return {
+        sessions: nextSessions,
+        sessionIndexById: buildSessionIndexById(nextSessions),
+      };
+    });
+  },
+  mergeSessionBatch: (incoming, retentionLimit) => {
+    if (incoming.length === 0) return;
+    set((state) => {
+      const prev = state.sessions;
+      const next = prev.slice();
+      const baseIndex =
+        state.sessionIndexById.size === prev.length
+          ? state.sessionIndexById
+          : buildSessionIndexById(prev);
+      // Reuse existing index Map when updating only existing session IDs; clone lazily on first append.
+      let clonedIndex: Map<number, number> | null =
+        baseIndex === state.sessionIndexById
+          ? null
+          : (baseIndex as Map<number, number>);
+
+      for (let i = 0; i < incoming.length; i += 1) {
+        const item = incoming[i];
+        const existingIdx = clonedIndex
+          ? clonedIndex.get(item.id)
+          : baseIndex.get(item.id);
+        if (existingIdx !== undefined) {
+          next[existingIdx] = item;
+        } else {
+          if (!clonedIndex) {
+            clonedIndex = new Map(baseIndex);
+          }
+          clonedIndex.set(item.id, next.length);
+          next.push(item);
+        }
+      }
+
+      if (retentionLimit && next.length > retentionLimit) {
+        next.splice(0, next.length - retentionLimit);
+        return {
+          sessions: next,
+          sessionIndexById: buildSessionIndexById(next),
+        };
+      }
+
+      return {
+        sessions: next,
+        sessionIndexById: clonedIndex ?? baseIndex,
+      };
+    });
   },
 
   setSelectedIdState: (updater) => {
@@ -799,6 +888,10 @@ export const useProxyStore = create<ProxyStoreState>((set) => ({
         followTail: nextFollowTail,
         sessionRetentionLimit: nextRetention,
         sessions: nextSessions,
+        sessionIndexById:
+          nextSessions === state.sessions
+            ? state.sessionIndexById
+            : buildSessionIndexById(nextSessions),
         dropNonMatching: nextDropNonMatching,
         clearDbOnExit: nextClearDbOnExit,
         status: nextStatusOptimistic,

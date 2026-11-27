@@ -356,7 +356,7 @@ pub(super) fn prepare_remapped_upstream_target(
     host_header: &str,
     scheme_str: &str,
 ) -> PreparedUpstreamTarget {
-    let Ok(parsed) = reqwest::Url::parse(full_url) else {
+    let Ok(parsed) = url::Url::parse(full_url) else {
         return PreparedUpstreamTarget {
             upstream_url: full_url.to_string(),
             host_header_override: None,
@@ -3361,7 +3361,7 @@ pub(super) fn rewrite_request_url_fields(
     if trimmed_u.is_empty() || trimmed_u == full_url.as_str() {
         return false;
     }
-    let Ok(parsed) = reqwest::Url::parse(trimmed_u) else {
+    let Ok(parsed) = url::Url::parse(trimmed_u) else {
         return false;
     };
     *scheme_str = parsed.scheme().to_string();

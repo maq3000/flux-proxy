@@ -506,6 +506,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       if (!dialog.open) {
         dialog.showModal();
       }
+      inputRef.current?.focus();
       window.requestAnimationFrame(() => inputRef.current?.focus());
     } else if (dialog.open) {
       dialog.close();
@@ -622,7 +623,6 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
           ref={inputRef}
           type="text"
           autoFocus
-          {...({ autofocus: "" } as Record<string, string>)}
           value={query}
           onChange={(e) => {
             setQuery(e.target.value);

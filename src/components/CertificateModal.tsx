@@ -55,6 +55,7 @@ export const CertificateModal: React.FC<CertificateModalProps> = ({
   onNotify,
 }) => {
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const closeBtnRef = useRef<HTMLButtonElement>(null);
   const titleId = useId();
   const [caInfo, setCaInfo] = useState<CaCertificateInfo | null>(null);
   const [busyAction, setBusyAction] = useState<"install" | "uninstall" | null>(
@@ -79,6 +80,7 @@ export const CertificateModal: React.FC<CertificateModalProps> = ({
       if (!dialog.open) {
         dialog.showModal();
       }
+      closeBtnRef.current?.focus();
       void refreshCaInfo();
     } else if (dialog.open) {
       dialog.close();
@@ -322,9 +324,9 @@ export const CertificateModal: React.FC<CertificateModalProps> = ({
       <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline bg-elevated/40 px-4 py-3">
         <form method="dialog">
           <button
+            ref={closeBtnRef}
             value="cancel"
             autoFocus
-            {...({ autofocus: "" } as Record<string, string>)}
             className="rounded-md border border-strong bg-surface px-3 py-1.5 text-xs font-medium text-muted hover:text-fg"
           >
             Close

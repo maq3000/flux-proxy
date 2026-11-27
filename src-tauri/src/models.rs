@@ -949,8 +949,6 @@ pub enum ProxyError {
     Rustls(#[from] rustls::Error),
     #[error("SQLite storage error: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("HTTP upstream error: {0}")]
-    Reqwest(#[from] reqwest::Error),
     #[error("{0}")]
     Custom(String),
 }

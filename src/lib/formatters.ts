@@ -375,3 +375,14 @@ export function suggestSessionBodyFileName(
     ext,
   };
 }
+
+export function encodeUint8ArrayToBase64(bytes: Uint8Array): string {
+  if (bytes.length === 0) return "";
+  const chunkSize = 0x8000;
+  const parts: string[] = [];
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const sub = bytes.subarray(i, i + chunkSize);
+    parts.push(String.fromCharCode(...sub));
+  }
+  return btoa(parts.join(""));
+}

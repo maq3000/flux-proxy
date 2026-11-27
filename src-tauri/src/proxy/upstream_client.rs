@@ -27,14 +27,17 @@ use crate::models::{HeaderPair, UpstreamProxyProtocol};
 use crate::proxy::hosts::HostRemapRegistry;
 use crate::proxy::server::{is_loopback_or_unspecified_host, validate_resolved_addrs_for_peer};
 use crate::proxy::upstream_proxy::{
-    connect_http_proxy_direct, connect_tunnel_via_upstream, format_via_proxy_telemetry,
-    proxy_authorization_header_value, UpstreamProxyManager, UpstreamTransportStream,
+    connect_http_proxy_direct_with_tls, connect_tunnel_via_upstream_with_tls,
+    format_via_proxy_telemetry, proxy_authorization_header_value, UpstreamProxyManager,
+    UpstreamTransportStream,
 };
 
 const MAX_REDIRECT_HOPS: usize = 10;
 
 static NEXT_UPSTREAM_CONN_ID: AtomicU64 = AtomicU64::new(1);
 static NATIVE_ROOT_STORE: OnceLock<Arc<rustls::RootCertStore>> = OnceLock::new();
+static SHARED_HTTP1_TLS_CONFIG: OnceLock<Result<Arc<rustls::ClientConfig>, String>> =
+    OnceLock::new();
 
 #[inline]
 pub fn round_ms(ms: f64) -> f64 {
@@ -158,6 +161,22 @@ pub(crate) fn default_root_store() -> Arc<rustls::RootCertStore> {
         }
         Arc::new(store)
     }))
+}
+
+pub(crate) fn shared_http1_tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
+    SHARED_HTTP1_TLS_CONFIG
+        .get_or_init(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let mut tls_cfg = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| format!("Shared HTTP/1.1 TLS config error: {e}"))?
+                .with_root_certificates(default_root_store())
+                .with_no_client_auth();
+            tls_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+            Ok(Arc::new(tls_cfg))
+        })
+        .clone()
 }
 
 #[derive(Debug)]
@@ -371,6 +390,7 @@ pub(crate) struct HostRemapAlreadyApplied;
 #[derive(Clone)]
 pub struct InstrumentedConnector {
     tls_config: Arc<rustls::ClientConfig>,
+    upstream_proxy_tls_config: Arc<rustls::ClientConfig>,
     host_remap: Option<Arc<HostRemapRegistry>>,
     upstream_proxy: Option<Arc<UpstreamProxyManager>>,
     connect_timeout_sec: Arc<AtomicU64>,
@@ -405,9 +425,11 @@ impl InstrumentedConnector {
             None => (builder.with_no_client_auth(), None),
         };
         tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let upstream_proxy_tls_config = shared_http1_tls_config()?;
 
         Ok(Self {
             tls_config: Arc::new(tls_config),
+            upstream_proxy_tls_config,
             host_remap,
             upstream_proxy,
             connect_timeout_sec,
@@ -517,6 +539,7 @@ impl Service<Uri> for InstrumentedConnector {
 
     fn call(&mut self, dst: Uri) -> Self::Future {
         let tls_config = Arc::clone(&self.tls_config);
+        let upstream_proxy_tls_config = Arc::clone(&self.upstream_proxy_tls_config);
         let host_remap = self.host_remap.clone();
         let upstream_proxy = self.upstream_proxy.clone();
         let connect_timeout_sec = self.connect_timeout_sec.load(Ordering::Relaxed).max(1);
@@ -602,13 +625,19 @@ impl Service<Uri> for InstrumentedConnector {
                     );
                     let tunnel_timeout = remaining_connect_budget("Upstream proxy connect")?;
                     let tunnel = if is_http_proxy {
-                        connect_http_proxy_direct(&proxy_cfg, tunnel_timeout).await
+                        connect_http_proxy_direct_with_tls(
+                            &proxy_cfg,
+                            tunnel_timeout,
+                            Some(&upstream_proxy_tls_config),
+                        )
+                        .await
                     } else {
-                        connect_tunnel_via_upstream(
+                        connect_tunnel_via_upstream_with_tls(
                             &proxy_cfg,
                             &connect_host,
                             connect_port,
                             tunnel_timeout,
+                            Some(&upstream_proxy_tls_config),
                         )
                         .await
                     }
@@ -646,11 +675,12 @@ impl Service<Uri> for InstrumentedConnector {
 
                 // HTTPS over upstream proxy (`CONNECT` or `SOCKS5` tunnel + inner TLS with original SNI & mTLS)
                 let tunnel_timeout = remaining_connect_budget("Upstream proxy tunnel")?;
-                let tunnel = connect_tunnel_via_upstream(
+                let tunnel = connect_tunnel_via_upstream_with_tls(
                     &proxy_cfg,
                     &connect_host,
                     connect_port,
                     tunnel_timeout,
+                    Some(&upstream_proxy_tls_config),
                 )
                 .await
                 .map_err(UpstreamConnectorError::new)?;

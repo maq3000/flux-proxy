@@ -565,7 +565,7 @@ pub(super) fn extract_session_port(summary: &SessionSummary) -> u16 {
             return p;
         }
     }
-    if let Ok(parsed) = reqwest::Url::parse(&summary.url) {
+    if let Ok(parsed) = url::Url::parse(&summary.url) {
         if let Some(p) = parsed.port_or_known_default() {
             return p;
         }

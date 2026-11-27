@@ -21,21 +21,28 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use crate::models::{
-    BindHostMode, BreakpointAction, HeaderPair, PausedBreakpointItem, ProxyError, ProxyStatus,
-    SessionDetail, SessionSummary, SessionTimings, SessionTransferStats, StorageStats,
-    UpstreamProxyConfig, WebSocketFrameRecord, WsInjectDirection, WsInjectOpcode,
+    BindHostMode, BreakpointAction, HeaderPair, ProxyError, ProxyStatus, SessionDetail,
+    SessionSummary, SessionTimings, SessionTransferStats, StorageStats, UpstreamProxyConfig,
+    WebSocketFrameRecord, WsInjectDirection, WsInjectOpcode,
 };
 use crate::proxy::breakpoints::{BreakpointEngine, PendingBreakpointGuard};
 use crate::proxy::ca::CertificateAuthority;
 use crate::proxy::client_certs::ClientCertificateStore;
 use crate::proxy::filters::ProxyFilterEngine;
 use crate::proxy::hosts::HostRemapRegistry;
+use crate::proxy::ipc_channels::{
+    breakpoint_snapshot_channel, removed_ids_channel, session_event_channel,
+    BreakpointSnapshotSender, RemovedIdsSender, SessionEventSender, DEFAULT_EVENT_CHANNEL_CAPACITY,
+    DEFAULT_REMOVED_CHANNEL_CAPACITY,
+};
 use crate::proxy::network::normalize_client_ip;
 use crate::proxy::process::{resolve_client_process_async, ClientProcessInfo};
 use crate::proxy::rules::RuleEngine;
 use crate::proxy::sysproxy::{resolve_sysproxy_host_for_bind, SystemProxyManager};
 use crate::proxy::throttle::ThrottleEngine;
-use crate::proxy::upstream_client::{format_rfc3339_micros, UpstreamHttpClient};
+use crate::proxy::upstream_client::{
+    format_rfc3339_micros, shared_http1_tls_config, UpstreamHttpClient,
+};
 use crate::proxy::upstream_proxy::UpstreamProxyManager;
 use crate::scripting::PythonScriptRunner;
 use crate::storage::{TrafficStore, BODY_OFFLOAD_THRESHOLD_BYTES};
@@ -584,11 +591,12 @@ pub struct SharedProxyContext {
     pub store: Arc<TrafficStore>,
     pub upstream_http_client: std::sync::RwLock<Arc<UpstreamHttpClient>>,
     pub remote_upstream_http_client: std::sync::RwLock<Arc<UpstreamHttpClient>>,
+    pub shared_http1_tls_config: Arc<rustls::ClientConfig>,
     pub client_certs: Arc<ClientCertificateStore>,
     pub script_runner: Arc<PythonScriptRunner>,
     pub active_ws_channels: Arc<DashMap<u64, mpsc::UnboundedSender<WsInjectCommand>>>,
-    pub event_tx: mpsc::UnboundedSender<SessionSummary>,
-    pub removed_tx: mpsc::UnboundedSender<Vec<u64>>,
+    pub event_tx: SessionEventSender,
+    pub removed_tx: RemovedIdsSender,
     pub active_port: AtomicU16,
     pub connect_timeout_sec: Arc<std::sync::atomic::AtomicU64>,
     pub response_header_timeout_sec: Arc<std::sync::atomic::AtomicU64>,
@@ -1289,43 +1297,77 @@ impl ProxyEngineController {
         client_certs: Arc<ClientCertificateStore>,
         app_handle: AppHandle,
     ) -> Result<Self, ProxyError> {
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SessionSummary>();
-        let (removed_tx, mut removed_rx) = mpsc::unbounded_channel::<Vec<u64>>();
-        let (bp_tx, mut bp_rx) = mpsc::unbounded_channel::<Vec<PausedBreakpointItem>>();
+        let (event_tx, mut event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, mut removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
+        let (bp_tx, mut bp_rx) = breakpoint_snapshot_channel();
         let stats_dirty = Arc::new(AtomicBool::new(false));
         let ipc_stats_dirty = stats_dirty.clone();
         let ipc_app = app_handle.clone();
-        let ipc_store = store.clone();
-        let ipc_filters = filters.clone();
 
-        // 60 FPS (16 ms) micro-batching IPC loop for sessions + zero-latency push for Live Breakpoints
-        // + coalesced storage-stats push notifications every 500ms when stats changed
+        let (stats_stop_tx, mut stats_stop_rx) = oneshot::channel::<()>();
+        let stats_app = app_handle.clone();
+        let stats_store = store.clone();
+        let stats_filters = filters.clone();
+        let stats_dirty_bg = stats_dirty.clone();
+
+        // Dedicated background task for coalesced storage-stats computation so heavy SQLite queries
+        // or VACUUM never stall the 60 FPS `summary_rx` IPC micro-batching loop (`PERF-05`).
         tauri::async_runtime::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_millis(16));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut stats_ticker = tokio::time::interval(Duration::from_millis(500));
             stats_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = &mut stats_stop_rx => break,
+                    _ = stats_ticker.tick() => {
+                        if stats_dirty_bg.swap(false, Ordering::Relaxed) {
+                            let app = stats_app.clone();
+                            let store = stats_store.clone();
+                            let filters = stats_filters.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let stats = store.storage_stats(filters.is_drop_non_matching_enabled());
+                                let _ = app.emit("proxy://storage-stats-changed", stats);
+                            })
+                            .await;
+                        }
+                    }
+                }
+            }
+        });
+
+        // 60 FPS (16 ms) micro-batching IPC loop for sessions + zero-latency push for Live Breakpoints
+        tauri::async_runtime::spawn(async move {
+            let _stats_stop_guard = stats_stop_tx;
+            let mut ticker = tokio::time::interval(Duration::from_millis(16));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut buffer: Vec<SessionSummary> = Vec::with_capacity(256);
+            let mut bp_closed = false;
+            let mut removed_closed = false;
 
             loop {
                 tokio::select! {
-                    maybe_bp = bp_rx.recv() => {
-                        if let Some(snapshot) = maybe_bp {
-                            let _ = ipc_app.emit("proxy://breakpoints-changed", snapshot);
+                    maybe_bp = bp_rx.recv(), if !bp_closed => {
+                        match maybe_bp {
+                            Some(snapshot) => {
+                                let _ = ipc_app.emit("proxy://breakpoints-changed", snapshot);
+                            }
+                            None => bp_closed = true,
                         }
                     }
-                    maybe_removed = removed_rx.recv() => {
-                        if let Some(removed_ids) = maybe_removed {
-                            if !removed_ids.is_empty() {
-                                // Drain any buffered/queued Phase 1 events sent before removal so a
-                                // removed session can never be flushed to the UI after `sessions-removed`.
-                                while let Ok(item) = event_rx.try_recv() {
-                                    push_or_replace_summary(&mut buffer, item);
+                    maybe_removed = removed_rx.recv(), if !removed_closed => {
+                        match maybe_removed {
+                            Some(removed_ids) => {
+                                if !removed_ids.is_empty() {
+                                    // Drain any buffered/queued Phase 1 events sent before removal so a
+                                    // removed session can never be flushed to the UI after `sessions-removed`.
+                                    while let Ok(item) = event_rx.try_recv() {
+                                        push_or_replace_summary(&mut buffer, item);
+                                    }
+                                    buffer.retain(|s| !removed_ids.contains(&s.id));
+                                    let _ = ipc_app.emit("proxy://sessions-removed", removed_ids);
+                                    ipc_stats_dirty.store(true, Ordering::Relaxed);
                                 }
-                                buffer.retain(|s| !removed_ids.contains(&s.id));
-                                let _ = ipc_app.emit("proxy://sessions-removed", removed_ids);
-                                ipc_stats_dirty.store(true, Ordering::Relaxed);
                             }
+                            None => removed_closed = true,
                         }
                     }
                     maybe_item = event_rx.recv() => {
@@ -1346,18 +1388,6 @@ impl ProxyEngineController {
                             let batch = std::mem::take(&mut buffer);
                             let _ = ipc_app.emit("proxy://sessions-batch", batch);
                             ipc_stats_dirty.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    _ = stats_ticker.tick() => {
-                        if ipc_stats_dirty.swap(false, Ordering::Relaxed) {
-                            let app = ipc_app.clone();
-                            let store = ipc_store.clone();
-                            let filters = ipc_filters.clone();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                let stats = store.storage_stats(filters.is_drop_non_matching_enabled());
-                                let _ = app.emit("proxy://storage-stats-changed", stats);
-                            })
-                            .await;
                         }
                     }
                 }
@@ -1387,21 +1417,29 @@ impl ProxyEngineController {
         store: Arc<TrafficStore>,
         sysproxy: Arc<SystemProxyManager>,
     ) -> Result<Self, ProxyError> {
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SessionSummary>();
-        let (removed_tx, mut removed_rx) = mpsc::unbounded_channel::<Vec<u64>>();
-        let (bp_tx, mut bp_rx) = mpsc::unbounded_channel::<Vec<PausedBreakpointItem>>();
+        let (event_tx, mut event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, mut removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
+        let (bp_tx, mut bp_rx) = breakpoint_snapshot_channel();
 
         tokio::spawn(async move {
+            let mut bp_closed = false;
+            let mut removed_closed = false;
             loop {
                 tokio::select! {
-                    maybe_bp = bp_rx.recv() => {
-                        if maybe_bp.is_none() && event_rx.is_closed() && removed_rx.is_closed() {
-                            break;
+                    maybe_bp = bp_rx.recv(), if !bp_closed => {
+                        if maybe_bp.is_none() {
+                            bp_closed = true;
+                            if event_rx.is_closed() && removed_rx.is_closed() {
+                                break;
+                            }
                         }
                     }
-                    maybe_removed = removed_rx.recv() => {
-                        if maybe_removed.is_none() && event_rx.is_closed() && bp_rx.is_closed() {
-                            break;
+                    maybe_removed = removed_rx.recv(), if !removed_closed => {
+                        if maybe_removed.is_none() {
+                            removed_closed = true;
+                            if event_rx.is_closed() && bp_rx.is_closed() {
+                                break;
+                            }
                         }
                     }
                     maybe_item = event_rx.recv() => {
@@ -1436,9 +1474,9 @@ impl ProxyEngineController {
         store: Arc<TrafficStore>,
         sysproxy: Arc<SystemProxyManager>,
         client_certs: Arc<ClientCertificateStore>,
-        event_tx: mpsc::UnboundedSender<SessionSummary>,
-        removed_tx: mpsc::UnboundedSender<Vec<u64>>,
-        bp_tx: mpsc::UnboundedSender<Vec<PausedBreakpointItem>>,
+        event_tx: SessionEventSender,
+        removed_tx: RemovedIdsSender,
+        bp_tx: BreakpointSnapshotSender,
         app_handle: Option<AppHandle>,
         stats_dirty: Arc<AtomicBool>,
     ) -> Result<Self, ProxyError> {
@@ -1477,6 +1515,8 @@ impl ProxyEngineController {
             .map_err(ProxyError::Custom)?,
         );
 
+        let shared_http1_tls_config = shared_http1_tls_config().map_err(ProxyError::Custom)?;
+
         let breakpoints = Arc::new(BreakpointEngine::new_with_store(
             Some(bp_tx),
             Some(Arc::clone(&store)),
@@ -1496,6 +1536,7 @@ impl ProxyEngineController {
             store,
             upstream_http_client: std::sync::RwLock::new(upstream_http_client),
             remote_upstream_http_client: std::sync::RwLock::new(remote_upstream_http_client),
+            shared_http1_tls_config,
             client_certs,
             script_runner,
             active_ws_channels,
@@ -2720,7 +2761,7 @@ fn parse_ip_including_mapped_and_shorthand(host_clean: &str) -> Option<IpAddr> {
     } else {
         host_clean.to_string()
     };
-    let parsed = reqwest::Url::parse(&format!("http://{bracketed}/")).ok()?;
+    let parsed = url::Url::parse(&format!("http://{bracketed}/")).ok()?;
     let h = parsed.host_str()?.trim_matches(['[', ']']);
     h.parse::<IpAddr>().ok()
 }
@@ -2748,7 +2789,7 @@ fn request_targets_loopback_or_unspecified(host_header: &str, full_url: &str) ->
     if is_loopback_or_unspecified_host(host_header) {
         return true;
     }
-    if let Ok(parsed) = reqwest::Url::parse(full_url) {
+    if let Ok(parsed) = url::Url::parse(full_url) {
         if let Some(url_host) = parsed.host_str() {
             if is_loopback_or_unspecified_host(url_host) {
                 return true;
@@ -2857,8 +2898,8 @@ mod tests {
             ..crate::proxy::filters::default_backend_config()
         });
         let store = Arc::new(TrafficStore::new(tmp_dir.join("test.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
         let ctx = Arc::new(SharedProxyContext {
             ca,
             rules,
@@ -2870,6 +2911,7 @@ mod tests {
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -2975,7 +3017,7 @@ mod tests {
         let rules = Arc::new(RuleEngine::new());
         let filters = Arc::new(ProxyFilterEngine::new());
         let store = Arc::new(TrafficStore::new(tmp_dir.join("bp.sqlite")).unwrap());
-        let (bp_tx, mut bp_rx) = mpsc::unbounded_channel();
+        let (bp_tx, mut bp_rx) = breakpoint_snapshot_channel();
         let breakpoints = Arc::new(BreakpointEngine::new_with_store(
             Some(bp_tx),
             Some(Arc::clone(&store)),
@@ -2986,8 +3028,8 @@ mod tests {
             timeout_secs: 15,
             rules: Vec::new(),
         });
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
         let ctx = Arc::new(SharedProxyContext {
             ca,
             rules,
@@ -2999,6 +3041,7 @@ mod tests {
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -3246,8 +3289,8 @@ mod tests {
         let filters = Arc::new(ProxyFilterEngine::new());
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("signalr.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
         let ctx = Arc::new(SharedProxyContext {
             ca,
             rules,
@@ -3259,6 +3302,7 @@ mod tests {
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -3401,8 +3445,8 @@ mod tests {
         });
 
         let store = Arc::new(TrafficStore::new(tmp_dir.join("targeted.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
         let ctx = Arc::new(SharedProxyContext {
             ca: ca.clone(),
             rules: rules.clone(),
@@ -3414,6 +3458,7 @@ mod tests {
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -3540,8 +3585,8 @@ mod tests {
         let filters = Arc::new(ProxyFilterEngine::new());
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("mobile.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         // Bind on 0.0.0.0:0 ("Allow remote connections / Listen on all network interfaces")
         let proxy_listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
@@ -3558,6 +3603,7 @@ mod tests {
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -3727,8 +3773,8 @@ mod tests {
         let filters = Arc::new(ProxyFilterEngine::new());
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("altsvc.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         // Mock rule for HTTPS/2 `https://localhost:9443/...` carrying Alt-Svc & Alternate-Protocol
         rules.upsert_rule(crate::models::AutoResponderRule {
@@ -3763,6 +3809,7 @@ mod tests {
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -3911,8 +3958,8 @@ mod tests {
         let filters = Arc::new(ProxyFilterEngine::new());
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("capdrop.sqlite")).unwrap());
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         // Enable `drop_non_matching_on_capture` + hide 304 Not Modified + path filter `/api/*`
         let mut cfg = filters.get_config();
@@ -3938,6 +3985,7 @@ mod tests {
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -4057,16 +4105,12 @@ mod tests {
         assert_eq!(store.len(), 1);
         assert_eq!(store.dropped_sessions_count(), 3);
 
-        let emitted_phase1 = event_rx.try_recv().expect("phase 1 in-flight session emitted");
-        assert_eq!(emitted_phase1.path, "/api/orders");
-        assert_eq!(emitted_phase1.status, 0);
-        let emitted_phase2 = event_rx.try_recv().expect("phase 2 completed session emitted");
-        assert_eq!(emitted_phase2.id, emitted_phase1.id);
-        assert_eq!(emitted_phase2.path, "/api/orders");
-        assert_eq!(emitted_phase2.status, 200);
+        let emitted = event_rx.try_recv().expect("matching session emitted");
+        assert_eq!(emitted.path, "/api/orders");
+        assert_eq!(emitted.status, 200);
         while let Ok(extra) = event_rx.try_recv() {
             assert_eq!(
-                extra.id, emitted_phase1.id,
+                extra.id, emitted.id,
                 "no dropped session may be emitted (unexpected session {} path={})",
                 extra.id, extra.path
             );
@@ -4138,8 +4182,8 @@ mod tests {
         let filters = Arc::new(ProxyFilterEngine::new());
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("twophase.sqlite")).unwrap());
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, mut removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, mut removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         // Enable `drop_non_matching_on_capture` + `hide_304_not_modified` + matrix include `status == 200`
         let mut cfg = filters.get_config();
@@ -4170,6 +4214,7 @@ mod tests {
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -4448,8 +4493,8 @@ mod tests {
         let filters = Arc::new(ProxyFilterEngine::new());
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("zstd.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -4464,6 +4509,7 @@ mod tests {
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -4958,8 +5004,8 @@ mod tests {
         let filters = Arc::new(ProxyFilterEngine::new());
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("video-stream.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
         let ctx = Arc::new(SharedProxyContext {
             ca,
             rules,
@@ -4971,6 +5017,7 @@ mod tests {
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -5327,8 +5374,8 @@ def on_response(response, request):
         let status = script_runner.set_script(py_code.to_string(), true).await.unwrap();
         assert!(status.enabled && status.has_on_request && status.has_on_response);
 
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
         let ctx = Arc::new(SharedProxyContext {
             ca,
             rules,
@@ -5340,6 +5387,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: script_runner.clone(),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -5549,8 +5597,8 @@ def on_response(response, request):
         });
 
         let store = Arc::new(TrafficStore::new(tmp_dir.join("sec03.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
 
@@ -5565,6 +5613,7 @@ def on_response(response, request):
             store,
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -5716,7 +5765,7 @@ def on_response(response, request):
         let rules = Arc::new(RuleEngine::new());
         let filters = Arc::new(ProxyFilterEngine::new());
         let store = Arc::new(TrafficStore::new(tmp_dir.join("bp-guard.sqlite")).unwrap());
-        let (bp_tx, mut bp_rx) = mpsc::unbounded_channel();
+        let (bp_tx, mut bp_rx) = breakpoint_snapshot_channel();
         let breakpoints = Arc::new(BreakpointEngine::new_with_store(
             Some(bp_tx),
             Some(Arc::clone(&store)),
@@ -5727,8 +5776,8 @@ def on_response(response, request):
             timeout_secs: 60,
             rules: Vec::new(),
         });
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
         let os_backend = RecordingOsProxyBackend::new();
         let sysproxy = Arc::new(SystemProxyManager::with_backend(&tmp_dir, os_backend));
 
@@ -5743,6 +5792,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -5821,9 +5871,11 @@ def on_response(response, request):
         assert!(saw_499_event, "TrafficStore update event with status 499 must be emitted");
 
         // 2. Composer Abort at Request Breakpoint must update session to 502 with breakpoint_paused = None
-        let (comp_bp_tx, mut comp_bp_rx) = mpsc::unbounded_channel();
-        let (comp_event_tx, _comp_event_rx) = mpsc::unbounded_channel();
-        let (comp_removed_tx, _comp_removed_rx) = mpsc::unbounded_channel();
+        let (comp_bp_tx, mut comp_bp_rx) = breakpoint_snapshot_channel();
+        let (comp_event_tx, _comp_event_rx) =
+            session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (comp_removed_tx, _comp_removed_rx) =
+            removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
         let controller = ProxyEngineController::new_with_channels(
             ca,
             rules,
@@ -5945,8 +5997,8 @@ def on_response(response, request):
         let filters = Arc::new(ProxyFilterEngine::new());
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("ws-deadlock.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         let ctx = Arc::new(SharedProxyContext {
             ca,
@@ -5959,6 +6011,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -6150,8 +6203,8 @@ def on_response(response, request):
         let filters = Arc::new(ProxyFilterEngine::new());
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("head-ce.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         let ctx = Arc::new(SharedProxyContext {
             ca,
@@ -6164,6 +6217,7 @@ def on_response(response, request):
             store,
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -6391,8 +6445,8 @@ def on_response(response, request):
         let host_remap = Arc::new(HostRemapRegistry::new());
         let throttle = Arc::new(ThrottleEngine::new());
         let store = Arc::new(TrafficStore::new(tmp_dir.join("hosts-http.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         host_remap
             .set_rules(vec![crate::models::HostRemapRule {
@@ -6419,6 +6473,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(Some(resolver)),
             remote_upstream_http_client: test_remote_upstream_http_client(Some(Arc::clone(&host_remap))),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -6613,8 +6668,8 @@ def on_response(response, request):
         let store = Arc::new(
             TrafficStore::new(tmp_dir.join("remap-connect-offline.sqlite")).unwrap(),
         );
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         filters.update_config(ProxyFilterBackendConfig {
             tls_intercept_mode: TlsInterceptMode::InterceptAll,
@@ -6657,6 +6712,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -6792,8 +6848,8 @@ def on_response(response, request):
         let filters = Arc::new(ProxyFilterEngine::new());
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("pool.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         let ctx = Arc::new(SharedProxyContext {
             ca,
@@ -6806,6 +6862,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -6948,8 +7005,8 @@ def on_response(response, request):
         ));
         let ca = Arc::new(CertificateAuthority::init_or_load(&tmp_dir).unwrap());
         let store = Arc::new(TrafficStore::new(tmp_dir.join("comp.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
         let ctx = Arc::new(SharedProxyContext {
             ca,
             rules: Arc::new(RuleEngine::new()),
@@ -6961,6 +7018,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -7075,13 +7133,13 @@ def on_response(response, request):
         let rules = Arc::new(RuleEngine::new());
         let filters = Arc::new(ProxyFilterEngine::new());
         let store = Arc::new(TrafficStore::new(tmp_dir.join("bpmock.sqlite")).unwrap());
-        let (bp_tx, mut bp_rx) = mpsc::unbounded_channel();
+        let (bp_tx, mut bp_rx) = breakpoint_snapshot_channel();
         let breakpoints = Arc::new(BreakpointEngine::new_with_store(
             Some(bp_tx),
             Some(Arc::clone(&store)),
         ));
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         rules.upsert_rule(crate::models::AutoResponderRule {
             id: "mock-delayed".into(),
@@ -7109,6 +7167,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -7270,8 +7329,8 @@ def on_response(response, request):
         let filters = Arc::new(ProxyFilterEngine::new());
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("ws-inject.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         let ctx = Arc::new(SharedProxyContext {
             ca,
@@ -7284,6 +7343,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -7679,8 +7739,8 @@ def on_response(response, request):
             })
             .unwrap();
 
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
         let ctx = Arc::new(SharedProxyContext {
             ca,
             rules,
@@ -7692,6 +7752,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -8062,8 +8123,8 @@ def on_response(response, request):
             ])
             .unwrap();
         let store = Arc::new(TrafficStore::new(tmp_dir.join("ws-remap.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         let ctx = Arc::new(SharedProxyContext {
             ca: ca.clone(),
@@ -8076,6 +8137,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(Some(Arc::clone(&host_remap))),
             remote_upstream_http_client: test_remote_upstream_http_client(Some(host_remap)),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -8547,8 +8609,8 @@ def on_response(response, request):
         let filters = Arc::new(ProxyFilterEngine::new());
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("oom-cap.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         let ctx = Arc::new(SharedProxyContext {
             ca,
@@ -8561,6 +8623,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -8672,8 +8735,8 @@ def on_response(response, request):
             }])
             .unwrap();
         let store = Arc::new(TrafficStore::new(tmp_dir.join("ip-remap.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         let ctx = Arc::new(SharedProxyContext {
             ca,
@@ -8686,6 +8749,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(Some(Arc::clone(&host_remap))),
             remote_upstream_http_client: test_remote_upstream_http_client(Some(host_remap)),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -8795,8 +8859,8 @@ def on_response(response, request):
         let filters = Arc::new(ProxyFilterEngine::new());
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("ttfb.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         let ctx = Arc::new(SharedProxyContext {
             ca,
@@ -8809,6 +8873,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -8918,8 +8983,8 @@ def on_response(response, request):
         let filters = Arc::new(ProxyFilterEngine::new());
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("499.sqlite")).unwrap());
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
 
         let ctx = Arc::new(SharedProxyContext {
             ca,
@@ -8932,6 +8997,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -9023,9 +9089,9 @@ def on_response(response, request):
         let store = Arc::new(TrafficStore::new(tmp_dir.join("connect.sqlite")).unwrap());
         let sysproxy = Arc::new(SystemProxyManager::new(&tmp_dir));
         let client_certs = Arc::new(ClientCertificateStore::in_memory());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
-        let (bp_tx, _bp_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
+        let (bp_tx, _bp_rx) = breakpoint_snapshot_channel();
 
         let controller = ProxyEngineController::new_with_channels(
             ca,
@@ -9174,9 +9240,9 @@ def on_response(response, request):
         let store = Arc::new(TrafficStore::new(tmp_dir.join("composer-cancel.sqlite")).unwrap());
         let sysproxy = Arc::new(SystemProxyManager::new(&tmp_dir));
         let client_certs = Arc::new(ClientCertificateStore::in_memory());
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
-        let (bp_tx, _bp_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
+        let (bp_tx, _bp_rx) = breakpoint_snapshot_channel();
 
         let controller = Arc::new(
             ProxyEngineController::new_with_channels(
@@ -9256,8 +9322,8 @@ def on_response(response, request):
 
         let breakpoints = Arc::new(BreakpointEngine::new(None));
         let store = Arc::new(TrafficStore::new(tmp_dir.join("lan-allowlist.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
 
@@ -9272,6 +9338,7 @@ def on_response(response, request):
             store: store.clone(),
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -9520,8 +9587,8 @@ def on_response(response, request):
             .unwrap();
 
         let store = Arc::new(TrafficStore::new(tmp_dir.join("sec01.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
 
@@ -9536,6 +9603,7 @@ def on_response(response, request):
             store,
             upstream_http_client: test_upstream_http_client(Some(Arc::clone(&host_remap))),
             remote_upstream_http_client: test_remote_upstream_http_client(Some(host_remap)),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),
@@ -9680,8 +9748,8 @@ def on_response(response, request):
         });
 
         let store = Arc::new(TrafficStore::new(tmp_dir.join("sec03_ia.sqlite")).unwrap());
-        let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        let (removed_tx, _removed_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = session_event_channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
+        let (removed_tx, _removed_rx) = removed_ids_channel(DEFAULT_REMOVED_CHANNEL_CAPACITY);
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
 
@@ -9696,6 +9764,7 @@ def on_response(response, request):
             store,
             upstream_http_client: test_upstream_http_client(None),
             remote_upstream_http_client: test_remote_upstream_http_client(None),
+            shared_http1_tls_config: shared_http1_tls_config().unwrap(),
             client_certs: Arc::new(ClientCertificateStore::in_memory()),
             script_runner: Arc::new(PythonScriptRunner::new(None)),
             active_ws_channels: Arc::new(DashMap::new()),

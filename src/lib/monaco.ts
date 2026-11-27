@@ -82,9 +82,7 @@ import "monaco-editor/languages/definitions/typescript/register.js";
 import "monaco-editor/languages/definitions/xml/register.js";
 import "monaco-editor/languages/definitions/yaml/register.js";
 
-// Rich language workers (CSS, HTML, JSON) — JS/TS falls back to editorWorker without ts.worker
-import "monaco-editor/languages/features/css/register.js";
-import "monaco-editor/languages/features/html/register.js";
+// JSON rich language worker — JS/TS/CSS/HTML fall back to editorWorker without dedicated workers
 import "monaco-editor/languages/features/json/register.js";
 
 import {
@@ -93,22 +91,20 @@ import {
   type ThemeTokenKey,
 } from "./themePresets";
 
+// Enable custom web workers in Electron/Tauri offline environment via ?worker query
+// Notice TypeScript's ts.worker is intentionally NOT bundled here: FluxProxy uses Python scripting + HTTP/JSON/cURL,
+// and Vite splits workers automatically so the main startup bundle stays small.
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore — Vite handles `?worker` suffix natively
 import editorWorker from "monaco-editor/editor/editor.worker.js?worker";
+// @ts-ignore
 import jsonWorker from "monaco-editor/language/json/json.worker.js?worker";
-import cssWorker from "monaco-editor/language/css/css.worker.js?worker";
-import htmlWorker from "monaco-editor/language/html/html.worker.js?worker";
 
 // Configure web workers for Monaco in Vite without external CDN dependency
 self.MonacoEnvironment = {
   getWorker(_: unknown, label: string) {
     if (label === "json") {
       return new jsonWorker();
-    }
-    if (label === "css" || label === "scss" || label === "less") {
-      return new cssWorker();
-    }
-    if (label === "html" || label === "handlebars" || label === "razor") {
-      return new htmlWorker();
     }
     return new editorWorker();
   },

@@ -63,6 +63,7 @@ export const TlsBypassTab: React.FC<TlsBypassTabProps> = ({
 }) => {
   const tlsImportInputRef = useRef<HTMLInputElement>(null);
   const quickPasteDialogRef = useRef<HTMLDialogElement>(null);
+  const quickPasteTextareaRef = useRef<HTMLTextAreaElement>(null);
   const quickPasteTitleId = useId();
   const quickPasteTextareaId = useId();
 
@@ -107,6 +108,7 @@ export const TlsBypassTab: React.FC<TlsBypassTabProps> = ({
       if (!dialog.open) {
         dialog.showModal();
       }
+      quickPasteTextareaRef.current?.focus();
     } else if (dialog.open) {
       dialog.close();
     }
@@ -2261,9 +2263,9 @@ export const TlsBypassTab: React.FC<TlsBypassTabProps> = ({
           </div>
 
           <textarea
+            ref={quickPasteTextareaRef}
             id={quickPasteTextareaId}
             autoFocus
-            {...({ autofocus: "" } as Record<string, string>)}
             value={quickPasteText}
             onChange={(e) => setQuickPasteText(e.target.value)}
             autoCorrect="off"

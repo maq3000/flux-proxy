@@ -15,7 +15,7 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
 use crate::models::ProxyError;
-use crate::proxy::upstream_client::{default_root_store, elapsed_ms};
+use crate::proxy::upstream_client::{elapsed_ms, shared_http1_tls_config};
 
 pub use crate::models::{UpstreamProxyConfig, UpstreamProxyProtocol};
 
@@ -747,6 +747,7 @@ async fn connect_proxy_tcp(
 async fn connect_proxy_transport(
     cfg: &UpstreamProxyConfig,
     deadline: Instant,
+    shared_tls_config: Option<&Arc<rustls::ClientConfig>>,
 ) -> Result<(UpstreamTransportStream, SocketAddr, f64, f64), String> {
     let (tcp, proxy_addr, dns_ms, tcp_connect_ms) =
         connect_proxy_tcp(&cfg.host, cfg.port, deadline).await?;
@@ -760,14 +761,10 @@ async fn connect_proxy_transport(
         ));
     }
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut tls_cfg = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("Upstream HTTPS proxy TLS config error: {e}"))?
-        .with_root_certificates(default_root_store())
-        .with_no_client_auth();
-    tls_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tls_cfg = match shared_tls_config {
+        Some(cfg_arc) => Arc::clone(cfg_arc),
+        None => shared_http1_tls_config()?,
+    };
 
     let sni = cfg.host.trim().trim_matches(['[', ']']).to_string();
     let server_name = ServerName::try_from(sni.clone()).map_err(|_| {
@@ -782,7 +779,7 @@ async fn connect_proxy_transport(
     }
     let tls_stream = tokio::time::timeout(
         remaining,
-        TlsConnector::from(Arc::new(tls_cfg)).connect(server_name, tcp),
+        TlsConnector::from(tls_cfg).connect(server_name, tcp),
     )
     .await
     .map_err(|_| {
@@ -812,6 +809,14 @@ pub async fn connect_http_proxy_direct(
     cfg: &UpstreamProxyConfig,
     timeout: Duration,
 ) -> Result<UpstreamTunnelResult, String> {
+    connect_http_proxy_direct_with_tls(cfg, timeout, None).await
+}
+
+pub async fn connect_http_proxy_direct_with_tls(
+    cfg: &UpstreamProxyConfig,
+    timeout: Duration,
+    shared_tls_config: Option<&Arc<rustls::ClientConfig>>,
+) -> Result<UpstreamTunnelResult, String> {
     if cfg.protocol == UpstreamProxyProtocol::Socks5 {
         return Err(
             "connect_http_proxy_direct only supports HTTP/HTTPS upstream proxies".to_string(),
@@ -819,7 +824,7 @@ pub async fn connect_http_proxy_direct(
     }
     let deadline = Instant::now() + timeout;
     let (stream, proxy_addr, dns_ms, tcp_connect_ms) =
-        connect_proxy_transport(cfg, deadline).await?;
+        connect_proxy_transport(cfg, deadline, shared_tls_config).await?;
     Ok(UpstreamTunnelResult {
         stream,
         proxy_addr,
@@ -1114,11 +1119,21 @@ pub async fn connect_tunnel_via_upstream(
     target_port: u16,
     timeout: Duration,
 ) -> Result<UpstreamTunnelResult, String> {
+    connect_tunnel_via_upstream_with_tls(cfg, target_host, target_port, timeout, None).await
+}
+
+pub async fn connect_tunnel_via_upstream_with_tls(
+    cfg: &UpstreamProxyConfig,
+    target_host: &str,
+    target_port: u16,
+    timeout: Duration,
+    shared_tls_config: Option<&Arc<rustls::ClientConfig>>,
+) -> Result<UpstreamTunnelResult, String> {
     let deadline = Instant::now() + timeout;
     match cfg.protocol {
         UpstreamProxyProtocol::Http | UpstreamProxyProtocol::Https => {
             let (mut stream, proxy_addr, dns_ms, tcp_connect_ms) =
-                connect_proxy_transport(cfg, deadline).await?;
+                connect_proxy_transport(cfg, deadline, shared_tls_config).await?;
             perform_http_connect_handshake(&mut stream, cfg, target_host, target_port, deadline)
                 .await?;
             Ok(UpstreamTunnelResult {

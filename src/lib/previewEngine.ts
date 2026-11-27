@@ -35,6 +35,7 @@ import type {
   WsInjectOpcode,
 } from "../types/proxy";
 import {
+  DEFAULT_BREAKPOINT_CONFIG,
   DEFAULT_SESSION_RETENTION_LIMIT,
   DEFAULT_THROTTLE_CONFIG,
   DEFAULT_UPSTREAM_PROXY_BYPASS_LIST,
@@ -55,18 +56,14 @@ import {
   buildFullRawHttpMessage,
   decodeBase64ToBytes,
   encodeTextToBase64,
+  encodeUint8ArrayToBase64,
   parseQueryParams,
 } from "./formatters";
 import {
-  buildDefaultPreviewClientCertificates,
-  buildInFlightSnapshot,
-  buildPreviewDoctorChecks,
-  buildSimulatedSession,
   DEFAULT_AUTORESPONDER_RULES,
   DEFAULT_CLEAR_DB_ON_EXIT,
   DEFAULT_HOST_REMAP_RULES,
   DEFAULT_PYTHON_SCRIPT_CODE,
-  getSimulatedTwoPhaseDelayMs,
   PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
   PREVIEW_CLIENT_CERTS_STORAGE_KEY,
   PREVIEW_HOST_REMAP_RULES_STORAGE_KEY,
@@ -76,19 +73,18 @@ import {
   PREVIEW_THROTTLE_CONFIG_STORAGE_KEY,
   PREVIEW_UPSTREAM_PROXY_CONFIG_STORAGE_KEY,
   PREVIEW_UPSTREAM_TIMEOUTS_STORAGE_KEY,
+  previewPickedFiles,
+} from "./appDefaults";
+import {
+  buildDefaultPreviewClientCertificates,
+  buildInFlightSnapshot,
+  buildPreviewDoctorChecks,
+  buildSimulatedSession,
+  getSimulatedTwoPhaseDelayMs,
   sanitizeSessionsInPreview,
 } from "./mockTraffic";
 
-export function encodeUint8ArrayToBase64(bytes: Uint8Array): string {
-  if (bytes.length === 0) return "";
-  const chunkSize = 0x8000;
-  const parts: string[] = [];
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const sub = bytes.subarray(i, i + chunkSize);
-    parts.push(String.fromCharCode(...sub));
-  }
-  return btoa(parts.join(""));
-}
+export { DEFAULT_BREAKPOINT_CONFIG, encodeUint8ArrayToBase64, previewPickedFiles };
 
 export function triggerBrowserDownload(
   bytes: Uint8Array,
@@ -109,15 +105,6 @@ export function triggerBrowserDownload(
   a.remove();
   window.setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
-
-export const previewPickedFiles = new Map<string, File>();
-
-export const DEFAULT_BREAKPOINT_CONFIG: BreakpointConfig = {
-  breakBeforeRequest: false,
-  breakAfterResponse: false,
-  timeoutSecs: 120,
-  rules: [],
-};
 
 function matchesBreakpointPattern(pattern: string, url: string): boolean {
   const pat = pattern.trim();

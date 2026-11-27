@@ -34,14 +34,22 @@ import type {
   WsInjectOpcode,
 } from "../types/proxy";
 import { browserPreviewCodecTransform } from "./textWizard";
-import {
-  DEFAULT_BREAKPOINT_CONFIG,
-  encodeUint8ArrayToBase64,
-  getPreviewEngine,
-  previewPickedFiles,
-} from "./previewEngine";
+import { DEFAULT_BREAKPOINT_CONFIG } from "../types/proxy";
+import { encodeUint8ArrayToBase64 } from "./formatters";
+import { previewPickedFiles } from "./appDefaults";
+import type { BrowserPreviewEngine } from "./previewEngine";
 
-export { DEFAULT_BREAKPOINT_CONFIG, getPreviewEngine };
+export { DEFAULT_BREAKPOINT_CONFIG };
+
+let previewEnginePromise: Promise<BrowserPreviewEngine> | null = null;
+function loadPreviewEngine(): Promise<BrowserPreviewEngine> {
+  if (!previewEnginePromise) {
+    previewEnginePromise = import("./previewEngine").then((mod) =>
+      mod.getPreviewEngine()
+    );
+  }
+  return previewEnginePromise;
+}
 
 export interface FileDialogFilter {
   name: string;
@@ -66,7 +74,7 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<ProxyStatus>("get_proxy_status");
     }
-    return getPreviewEngine().getStatus();
+    return (await loadPreviewEngine()).getStatus();
   },
 
   async startProxy(host?: string, port = 8888): Promise<ProxyStatus> {
@@ -76,21 +84,21 @@ export const proxyBridge = {
         port,
       });
     }
-    return getPreviewEngine().setRunning(true, host, port);
+    return (await loadPreviewEngine()).setRunning(true, host, port);
   },
 
   async stopProxy(): Promise<ProxyStatus> {
     if (isTauriRuntime()) {
       return invoke<ProxyStatus>("stop_proxy");
     }
-    return getPreviewEngine().setRunning(false);
+    return (await loadPreviewEngine()).setRunning(false);
   },
 
   async setAllowRemote(allow: boolean): Promise<ProxyStatus> {
     if (isTauriRuntime()) {
       return invoke<ProxyStatus>("set_allow_remote", { allow });
     }
-    return getPreviewEngine().setAllowRemote(allow);
+    return (await loadPreviewEngine()).setAllowRemote(allow);
   },
 
   async setBindConfiguration(
@@ -105,7 +113,7 @@ export const proxyBridge = {
         alsoBindLoopback,
       });
     }
-    return getPreviewEngine().setBindConfiguration(
+    return (await loadPreviewEngine()).setBindConfiguration(
       bindMode,
       specificBindIp,
       alsoBindLoopback
@@ -120,56 +128,56 @@ export const proxyBridge = {
         includeVirtual,
       });
     }
-    return getPreviewEngine().getNetworkInterfaces(includeVirtual);
+    return (await loadPreviewEngine()).getNetworkInterfaces(includeVirtual);
   },
 
   async setSystemProxy(enabled: boolean): Promise<ProxyStatus> {
     if (isTauriRuntime()) {
       return invoke<ProxyStatus>("set_system_proxy", { enabled });
     }
-    return getPreviewEngine().setSystemProxy(enabled);
+    return (await loadPreviewEngine()).setSystemProxy(enabled);
   },
 
   async setAutoSystemProxy(auto: boolean): Promise<ProxyStatus> {
     if (isTauriRuntime()) {
       return invoke<ProxyStatus>("set_auto_system_proxy", { auto });
     }
-    return getPreviewEngine().setAutoSystemProxy(auto);
+    return (await loadPreviewEngine()).setAutoSystemProxy(auto);
   },
 
   async runProxyDoctor(): Promise<DoctorCheckResult[]> {
     if (isTauriRuntime()) {
       return invoke<DoctorCheckResult[]>("run_proxy_doctor");
     }
-    return getPreviewEngine().runProxyDoctor();
+    return (await loadPreviewEngine()).runProxyDoctor();
   },
 
   async fixDoctorIssue(issueId: string): Promise<DoctorCheckResult[]> {
     if (isTauriRuntime()) {
       return invoke<DoctorCheckResult[]>("fix_doctor_issue", { issueId });
     }
-    return getPreviewEngine().fixDoctorIssue(issueId);
+    return (await loadPreviewEngine()).fixDoctorIssue(issueId);
   },
 
   async setPreviewPort(port: number): Promise<ProxyStatus> {
     if (isTauriRuntime()) {
       return invoke<ProxyStatus>("set_proxy_port", { port });
     }
-    return getPreviewEngine().setPort(port);
+    return (await loadPreviewEngine()).setPort(port);
   },
 
   async getSessions(): Promise<SessionSummary[]> {
     if (isTauriRuntime()) {
       return invoke<SessionSummary[]>("get_sessions");
     }
-    return getPreviewEngine().getSummaries();
+    return (await loadPreviewEngine()).getSummaries();
   },
 
   async getSessionDetail(id: number): Promise<SessionDetail | null> {
     if (isTauriRuntime()) {
       return invoke<SessionDetail | null>("get_session_detail", { id });
     }
-    return getPreviewEngine().getDetail(id);
+    return (await loadPreviewEngine()).getDetail(id);
   },
 
   async setSessionRetentionLimit(limit: number | null): Promise<void> {
@@ -177,7 +185,7 @@ export const proxyBridge = {
       await invoke("set_session_retention_limit", { limit });
       return;
     }
-    getPreviewEngine().setSessionRetentionLimit(limit);
+    (await loadPreviewEngine()).setSessionRetentionLimit(limit);
   },
 
   async setDropNonMatching(enabled: boolean): Promise<void> {
@@ -185,35 +193,35 @@ export const proxyBridge = {
       await invoke("set_drop_non_matching", { enabled });
       return;
     }
-    getPreviewEngine().setDropNonMatching(enabled);
+    (await loadPreviewEngine()).setDropNonMatching(enabled);
   },
 
   async getMemoryStorageStats(): Promise<StorageStats> {
     if (isTauriRuntime()) {
       return invoke<StorageStats>("get_memory_storage_stats");
     }
-    return getPreviewEngine().getMemoryStorageStats();
+    return (await loadPreviewEngine()).getMemoryStorageStats();
   },
 
   async clearSqliteDatabase(): Promise<StorageStats> {
     if (isTauriRuntime()) {
       return invoke<StorageStats>("clear_sqlite_database");
     }
-    return getPreviewEngine().clearSqliteDatabase();
+    return (await loadPreviewEngine()).clearSqliteDatabase();
   },
 
   async getClearDbOnExit(): Promise<boolean> {
     if (isTauriRuntime()) {
       return invoke<boolean>("get_clear_db_on_exit");
     }
-    return getPreviewEngine().getClearDbOnExit();
+    return (await loadPreviewEngine()).getClearDbOnExit();
   },
 
   async setClearDbOnExit(enabled: boolean): Promise<boolean> {
     if (isTauriRuntime()) {
       return invoke<boolean>("set_clear_db_on_exit", { enabled });
     }
-    return getPreviewEngine().setClearDbOnExit(enabled);
+    return (await loadPreviewEngine()).setClearDbOnExit(enabled);
   },
 
   async loadSessionBody(
@@ -226,7 +234,7 @@ export const proxyBridge = {
         isResponse,
       });
     }
-    return getPreviewEngine().loadSessionBody(id, isResponse);
+    return (await loadPreviewEngine()).loadSessionBody(id, isResponse);
   },
 
   async clearSessions(): Promise<void> {
@@ -234,7 +242,7 @@ export const proxyBridge = {
       await invoke("clear_sessions");
       return;
     }
-    getPreviewEngine().clear();
+    (await loadPreviewEngine()).clear();
   },
 
   async deleteSessions(ids: number[]): Promise<number> {
@@ -242,21 +250,21 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<number>("delete_sessions", { ids });
     }
-    return getPreviewEngine().deleteMany(ids);
+    return (await loadPreviewEngine()).deleteMany(ids);
   },
 
   async saveSessionsSqlite(): Promise<number> {
     if (isTauriRuntime()) {
       return invoke<number>("save_sessions_sqlite");
     }
-    return getPreviewEngine().saveArchiveToPreviewStorage();
+    return (await loadPreviewEngine()).saveArchiveToPreviewStorage();
   },
 
   async loadSessionsSqlite(): Promise<SessionSummary[]> {
     if (isTauriRuntime()) {
       return invoke<SessionSummary[]>("load_sessions_sqlite");
     }
-    return getPreviewEngine().loadArchiveFromPreviewStorage();
+    return (await loadPreviewEngine()).loadArchiveFromPreviewStorage();
   },
 
   async updateSessionAnnotations(
@@ -271,35 +279,35 @@ export const proxyBridge = {
         markedColor,
       });
     }
-    return getPreviewEngine().updateAnnotations(ids, comment, markedColor);
+    return (await loadPreviewEngine()).updateAnnotations(ids, comment, markedColor);
   },
 
   async getCaInfo(): Promise<CaCertificateInfo> {
     if (isTauriRuntime()) {
       return invoke<CaCertificateInfo>("get_ca_info");
     }
-    return getPreviewEngine().getCaInfo();
+    return (await loadPreviewEngine()).getCaInfo();
   },
 
   async installRootCa(): Promise<string> {
     if (isTauriRuntime()) {
       return invoke<string>("install_root_ca");
     }
-    return getPreviewEngine().installRootCa();
+    return (await loadPreviewEngine()).installRootCa();
   },
 
   async uninstallRootCa(): Promise<string> {
     if (isTauriRuntime()) {
       return invoke<string>("uninstall_root_ca");
     }
-    return getPreviewEngine().uninstallRootCa();
+    return (await loadPreviewEngine()).uninstallRootCa();
   },
 
   async listClientCertificates(): Promise<ClientCertificateEntry[]> {
     if (isTauriRuntime()) {
       return invoke<ClientCertificateEntry[]>("list_client_certificates");
     }
-    return getPreviewEngine().listClientCertificates();
+    return (await loadPreviewEngine()).listClientCertificates();
   },
 
   async addClientCertificate(
@@ -310,7 +318,7 @@ export const proxyBridge = {
         request,
       });
     }
-    return getPreviewEngine().addClientCertificate(request);
+    return (await loadPreviewEngine()).addClientCertificate(request);
   },
 
   async toggleClientCertificate(
@@ -323,7 +331,7 @@ export const proxyBridge = {
         enabled,
       });
     }
-    return getPreviewEngine().toggleClientCertificate(id, enabled);
+    return (await loadPreviewEngine()).toggleClientCertificate(id, enabled);
   },
 
   async removeClientCertificate(
@@ -334,21 +342,21 @@ export const proxyBridge = {
         id,
       });
     }
-    return getPreviewEngine().removeClientCertificate(id);
+    return (await loadPreviewEngine()).removeClientCertificate(id);
   },
 
   async listRules(): Promise<AutoResponderRule[]> {
     if (isTauriRuntime()) {
       return invoke<AutoResponderRule[]>("list_rules");
     }
-    return getPreviewEngine().listRules();
+    return (await loadPreviewEngine()).listRules();
   },
 
   async getAutoResponderEnabled(): Promise<boolean> {
     if (isTauriRuntime()) {
       return invoke<boolean>("get_autoresponder_enabled");
     }
-    return getPreviewEngine().isAutoResponderEnabled();
+    return (await loadPreviewEngine()).isAutoResponderEnabled();
   },
 
   async setAutoResponderEnabled(enabled: boolean): Promise<boolean> {
@@ -357,7 +365,7 @@ export const proxyBridge = {
         enabled,
       });
     }
-    return getPreviewEngine().setAutoResponderEnabled(enabled);
+    return (await loadPreviewEngine()).setAutoResponderEnabled(enabled);
   },
 
   async setAutoResponderConfig(
@@ -386,7 +394,7 @@ export const proxyBridge = {
         return cloned;
       }
     }
-    getPreviewEngine().setAutoResponderConfig(enabled, cloned);
+    (await loadPreviewEngine()).setAutoResponderConfig(enabled, cloned);
     return cloned;
   },
 
@@ -396,21 +404,21 @@ export const proxyBridge = {
         rule,
       });
     }
-    return getPreviewEngine().upsertRule(rule);
+    return (await loadPreviewEngine()).upsertRule(rule);
   },
 
   async deleteRule(id: string): Promise<AutoResponderRule[]> {
     if (isTauriRuntime()) {
       return invoke<AutoResponderRule[]>("delete_rule", { id });
     }
-    return getPreviewEngine().deleteRule(id);
+    return (await loadPreviewEngine()).deleteRule(id);
   },
 
   async getFilterBackendConfig(): Promise<ProxyFilterBackendConfig> {
     if (isTauriRuntime()) {
       return invoke<ProxyFilterBackendConfig>("get_filter_backend_config");
     }
-    return getPreviewEngine().getFilterBackendConfig();
+    return (await loadPreviewEngine()).getFilterBackendConfig();
   },
 
   async updateFilterBackendConfig(
@@ -421,26 +429,13 @@ export const proxyBridge = {
         config,
       });
     }
-    return getPreviewEngine().updateFilterBackendConfig(config);
+    return (await loadPreviewEngine()).updateFilterBackendConfig(config);
   },
 
   async updateProxyFilterConfig(
     config: ProxyFilterBackendConfig
   ): Promise<ProxyFilterBackendConfig> {
-    if (isTauriRuntime()) {
-      try {
-        return await invoke<ProxyFilterBackendConfig>(
-          "update_proxy_filter_config",
-          { config }
-        );
-      } catch {
-        return invoke<ProxyFilterBackendConfig>(
-          "update_filter_backend_config",
-          { config }
-        );
-      }
-    }
-    return getPreviewEngine().updateFilterBackendConfig(config);
+    return this.updateFilterBackendConfig(config);
   },
 
   async getTlsRuleHitCounts(): Promise<Record<string, number>> {
@@ -451,7 +446,7 @@ export const proxyBridge = {
         return {};
       }
     }
-    return getPreviewEngine().getTlsRuleHitCounts();
+    return (await loadPreviewEngine()).getTlsRuleHitCounts();
   },
 
   async resetTlsBypassRulesToRecommended(): Promise<ProxyFilterBackendConfig> {
@@ -460,14 +455,14 @@ export const proxyBridge = {
         "reset_tls_bypass_rules_to_recommended"
       );
     }
-    return getPreviewEngine().resetTlsBypassRulesToRecommended();
+    return (await loadPreviewEngine()).resetTlsBypassRulesToRecommended();
   },
 
   async getBreakpointConfig(): Promise<BreakpointConfig> {
     if (isTauriRuntime()) {
       return invoke<BreakpointConfig>("get_breakpoint_config");
     }
-    return getPreviewEngine().getBreakpointConfig();
+    return (await loadPreviewEngine()).getBreakpointConfig();
   },
 
   async updateBreakpointConfig(
@@ -476,21 +471,21 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<BreakpointConfig>("update_breakpoint_config", { config });
     }
-    return getPreviewEngine().updateBreakpointConfig(config);
+    return (await loadPreviewEngine()).updateBreakpointConfig(config);
   },
 
   async listPausedBreakpoints(): Promise<PausedBreakpointItem[]> {
     if (isTauriRuntime()) {
       return invoke<PausedBreakpointItem[]>("list_paused_breakpoints");
     }
-    return getPreviewEngine().listPausedBreakpoints();
+    return (await loadPreviewEngine()).listPausedBreakpoints();
   },
 
   async resolveBreakpoint(resolution: BreakpointResolution): Promise<boolean> {
     if (isTauriRuntime()) {
       return invoke<boolean>("resolve_breakpoint", { resolution });
     }
-    return getPreviewEngine().resolveBreakpoint(resolution);
+    return (await loadPreviewEngine()).resolveBreakpoint(resolution);
   },
 
   async resumeAllBreakpoints(
@@ -499,7 +494,7 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<number>("resume_all_breakpoints", { action });
     }
-    return getPreviewEngine().resumeAllBreakpoints(action);
+    return (await loadPreviewEngine()).resumeAllBreakpoints(action);
   },
 
   async loadBreakpointBody(
@@ -512,7 +507,7 @@ export const proxyBridge = {
         isResponse,
       });
     }
-    return getPreviewEngine().loadBreakpointBody(breakpointId, isResponse);
+    return (await loadPreviewEngine()).loadBreakpointBody(breakpointId, isResponse);
   },
 
   async subscribeBreakpointsChanged(
@@ -528,7 +523,7 @@ export const proxyBridge = {
         }
       );
     }
-    return getPreviewEngine().subscribeBreakpoints(onChanged);
+    return (await loadPreviewEngine()).subscribeBreakpoints(onChanged);
   },
 
   async codecTransform(
@@ -560,7 +555,7 @@ export const proxyBridge = {
         request: req,
       });
     }
-    return getPreviewEngine().executeComposed(req);
+    return (await loadPreviewEngine()).executeComposed(req);
   },
 
   async subscribeSessionBatches(
@@ -573,7 +568,7 @@ export const proxyBridge = {
         }
       });
     }
-    return getPreviewEngine().subscribe(onBatch);
+    return (await loadPreviewEngine()).subscribe(onBatch);
   },
 
   async subscribeSessionsRemoved(
@@ -586,7 +581,7 @@ export const proxyBridge = {
         }
       });
     }
-    return getPreviewEngine().subscribeRemoved(onRemoved);
+    return (await loadPreviewEngine()).subscribeRemoved(onRemoved);
   },
 
   async subscribeStatusChanged(
@@ -599,7 +594,7 @@ export const proxyBridge = {
         }
       });
     }
-    return getPreviewEngine().subscribeStatus(onChanged);
+    return (await loadPreviewEngine()).subscribeStatus(onChanged);
   },
 
   async subscribeStorageStatsChanged(
@@ -612,7 +607,7 @@ export const proxyBridge = {
         }
       });
     }
-    return getPreviewEngine().subscribeStorageStats(onChanged);
+    return (await loadPreviewEngine()).subscribeStorageStats(onChanged);
   },
 
   async pickSaveFileDialog(options: {
@@ -685,7 +680,7 @@ export const proxyBridge = {
         includeEvictedSqlite,
       });
     }
-    return getPreviewEngine().exportPreviewSessions(
+    return (await loadPreviewEngine()).exportPreviewSessions(
       sessionIds,
       format,
       filePath,
@@ -709,7 +704,7 @@ export const proxyBridge = {
       );
     }
     const text = await file.text();
-    return getPreviewEngine().importPreviewText(text);
+    return (await loadPreviewEngine()).importPreviewText(text);
   },
 
   async importSessionsBytes(
@@ -728,7 +723,7 @@ export const proxyBridge = {
       );
     }
     const text = new TextDecoder().decode(bytes);
-    return getPreviewEngine().importPreviewText(text);
+    return (await loadPreviewEngine()).importPreviewText(text);
   },
 
   async saveSessionBodyFile(
@@ -743,7 +738,7 @@ export const proxyBridge = {
         filePath,
       });
     }
-    return getPreviewEngine().savePreviewBody(sessionId, isResponse, filePath);
+    return (await loadPreviewEngine()).savePreviewBody(sessionId, isResponse, filePath);
   },
 
   async exportSettingsJsonFile(
@@ -757,7 +752,7 @@ export const proxyBridge = {
       });
       return;
     }
-    getPreviewEngine().exportPreviewTextFile(
+    (await loadPreviewEngine()).exportPreviewTextFile(
       filePath,
       jsonContent,
       "application/json;charset=utf-8"
@@ -776,7 +771,7 @@ export const proxyBridge = {
       });
       return;
     }
-    getPreviewEngine().exportPreviewTextFile(filePath, contents, mimeType);
+    (await loadPreviewEngine()).exportPreviewTextFile(filePath, contents, mimeType);
   },
 
   async readSettingsJsonFile(filePath: string): Promise<string> {
@@ -819,14 +814,14 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<PythonRunnerStatus>("set_python_script", { code, enabled });
     }
-    return getPreviewEngine().setPythonScript(code, enabled);
+    return (await loadPreviewEngine()).setPythonScript(code, enabled);
   },
 
   async getPythonRunnerStatus(): Promise<PythonRunnerStatus> {
     if (isTauriRuntime()) {
       return invoke<PythonRunnerStatus>("get_python_runner_status");
     }
-    return getPreviewEngine().getPythonRunnerStatus();
+    return (await loadPreviewEngine()).getPythonRunnerStatus();
   },
 
   async subscribeScriptConsoleLogs(
@@ -842,21 +837,21 @@ export const proxyBridge = {
         }
       );
     }
-    return getPreviewEngine().subscribeScriptLogs(onLog);
+    return (await loadPreviewEngine()).subscribeScriptLogs(onLog);
   },
 
   async generateStressTestSessions(count = 10_000): Promise<number> {
     if (isTauriRuntime()) {
       return invoke<number>("generate_stress_sessions", { count });
     }
-    return getPreviewEngine().generateBulkStressSessions(count).length;
+    return (await loadPreviewEngine()).generateBulkStressSessions(count).length;
   },
 
   async getHostRemapRules(): Promise<HostRemapRule[]> {
     if (isTauriRuntime()) {
       return invoke<HostRemapRule[]>("get_host_remap_rules");
     }
-    return getPreviewEngine().getHostRemapRules();
+    return (await loadPreviewEngine()).getHostRemapRules();
   },
 
   async updateHostRemapRules(
@@ -865,28 +860,28 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<HostRemapRule[]>("update_host_remap_rules", { rules });
     }
-    return getPreviewEngine().updateHostRemapRules(rules);
+    return (await loadPreviewEngine()).updateHostRemapRules(rules);
   },
 
   async getThrottleConfig(): Promise<ThrottleConfig> {
     if (isTauriRuntime()) {
       return invoke<ThrottleConfig>("get_throttle_config");
     }
-    return getPreviewEngine().getThrottleConfig();
+    return (await loadPreviewEngine()).getThrottleConfig();
   },
 
   async setThrottleConfig(config: ThrottleConfig): Promise<ThrottleConfig> {
     if (isTauriRuntime()) {
       return invoke<ThrottleConfig>("set_throttle_config", { config });
     }
-    return getPreviewEngine().setThrottleConfig(config);
+    return (await loadPreviewEngine()).setThrottleConfig(config);
   },
 
   async getUpstreamProxyConfig(): Promise<UpstreamProxyConfig> {
     if (isTauriRuntime()) {
       return invoke<UpstreamProxyConfig>("get_upstream_proxy_config");
     }
-    return getPreviewEngine().getUpstreamProxyConfig();
+    return (await loadPreviewEngine()).getUpstreamProxyConfig();
   },
 
   async setUpstreamProxyConfig(
@@ -897,14 +892,14 @@ export const proxyBridge = {
         config,
       });
     }
-    return getPreviewEngine().setUpstreamProxyConfig(config);
+    return (await loadPreviewEngine()).setUpstreamProxyConfig(config);
   },
 
   async getUpstreamTimeouts(): Promise<UpstreamTimeoutConfig> {
     if (isTauriRuntime()) {
       return invoke<UpstreamTimeoutConfig>("get_upstream_timeouts");
     }
-    return getPreviewEngine().getUpstreamTimeouts();
+    return (await loadPreviewEngine()).getUpstreamTimeouts();
   },
 
   async setUpstreamTimeouts(
@@ -913,14 +908,14 @@ export const proxyBridge = {
     if (isTauriRuntime()) {
       return invoke<UpstreamTimeoutConfig>("set_upstream_timeouts", { config });
     }
-    return getPreviewEngine().setUpstreamTimeouts(config);
+    return (await loadPreviewEngine()).setUpstreamTimeouts(config);
   },
 
   async cancelComposedRequest(requestId: string): Promise<boolean> {
     if (isTauriRuntime()) {
       return invoke<boolean>("cancel_composed_request", { requestId });
     }
-    return getPreviewEngine().cancelComposedRequest(requestId);
+    return (await loadPreviewEngine()).cancelComposedRequest(requestId);
   },
 
   async injectWebSocketFrame(
@@ -937,7 +932,7 @@ export const proxyBridge = {
         payload,
       });
     }
-    return getPreviewEngine().injectWebSocketFrame(
+    return (await loadPreviewEngine()).injectWebSocketFrame(
       sessionId,
       direction,
       opcode,
@@ -947,7 +942,9 @@ export const proxyBridge = {
 
   triggerSimulatedTrafficHit(): void {
     if (!isTauriRuntime()) {
-      void getPreviewEngine().simulateLiveSessionFlow();
+      void loadPreviewEngine().then((engine) =>
+        engine.simulateLiveSessionFlow()
+      );
     }
   },
 };

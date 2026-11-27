@@ -97,6 +97,7 @@ export const ShortcutsModal: React.FC<ShortcutsModalProps> = ({
   onClose,
 }) => {
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const closeBtnRef = useRef<HTMLButtonElement>(null);
   const titleId = useId();
 
   useEffect(() => {
@@ -104,6 +105,7 @@ export const ShortcutsModal: React.FC<ShortcutsModalProps> = ({
     if (!dialog) return;
     if (open) {
       if (!dialog.open) dialog.showModal();
+      closeBtnRef.current?.focus();
     } else if (dialog.open) {
       dialog.close();
     }
@@ -127,9 +129,9 @@ export const ShortcutsModal: React.FC<ShortcutsModalProps> = ({
         icon={<Keyboard className="h-4 w-4 text-accent" />}
         actions={
           <button
+            ref={closeBtnRef}
             type="button"
             autoFocus
-            {...({ autofocus: "" } as Record<string, string>)}
             onClick={() => dialogRef.current?.close()}
             aria-label="Закрыть Shortcuts"
             className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-hairline bg-canvas text-muted hover:border-strong hover:bg-hover hover:text-fg"

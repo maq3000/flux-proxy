@@ -169,14 +169,14 @@
 | **Кодеки и сжатие** | Сжатие/распаковка и кодировки | `flate2` (Gzip/Deflate), `brotli`, `zstd`, `base64`, `hex`, `sha2` |
 | **Frontend UI и State** | Модульный интерфейс, 8 тем-пресетов, state-сторы и `React.lazy()` | `React 18`, `TypeScript 5.6`, `Zustand 5`, `Vite 6`, `Tailwind CSS` |
 | **Виртуализация и код** | Скроллинг 60 FPS, редакторы, OpenAPI и diff-сравнение | `@tanstack/react-virtual 3`, `@monaco-editor/react` |
-| **Тестирование и CI** | 167 frontend-тестов (29 файлов) + 170 Rust-тестов, матрица Windows/Linux/macOS | `Vitest 3`, `@testing-library/react`, `cargo clippy`, GitHub Actions |
+| **Тестирование и CI** | 188 frontend-тестов (38 файлов) + 214 Rust-тестов, матрица Windows/Linux/macOS, MSRV 1.80 и security audit | `Vitest 3`, `@testing-library/react`, `cargo clippy --locked`, `cargo-audit`, GitHub Actions |
 
 ---
 
 ## 📁 Структура проекта
 
 ```text
-├── .github/workflows/ci.yml             # Кроссплатформенный CI (typecheck, Vitest, build, clippy, cargo test)
+├── .github/workflows/ci.yml             # Кроссплатформенный CI (typecheck, Vitest, Vite build, clippy/test --locked, --no-bundle, MSRV 1.80, audit)
 ├── index.html                           # HTML точка входа Vite
 ├── package.json                         # Зависимости и npm-скрипты фронтенда
 ├── USER_GUIDE.md                        # Подробная инструкция для пользователей
@@ -214,9 +214,9 @@
 │   │   ├── Sidebar.tsx                  # Боковая навигация по 7 рабочим вкладкам и Settings
 │   │   ├── TopToolbar.tsx               # Панель управления, Slim Toolbar, видимый Throttle + Routing и пресеты
 │   │   └── MenuBar.tsx                  # Главное меню приложения (File / Edit / Rules / View / Tools / Help)
-│   ├── stores/                          # Zustand-сторы (proxyStore.ts, filterStore.ts, uiStore.ts) и тесты
+│   ├── stores/                          # Zustand-сторы (proxyStore.ts с O(1) sessionIndexById, filterStore.ts, uiStore.ts) и тесты
 │   ├── hooks/                           # Хуки (useProxySessions, useGlobalShortcuts, useContextMenu, useTheme, useUiPreferences)
-│   ├── lib/                             # sectionRegistry, contextMenuBuilders, requestStatistics, filterEngine, previewEngine, tauriBridge и тесты
+│   ├── lib/                             # appDefaults, sectionRegistry, contextMenuBuilders, requestStatistics, filterEngine, lazy previewEngine, tauriBridge и тесты
 │   └── types/                           # TypeScript-интерфейсы сессий, таймингов, правил и схемы настроек
 │
 └── src-tauri/                           # Исходный код Core & MITM Proxy (Rust)
@@ -228,14 +228,15 @@
         ├── models.rs                    # Модели сессий, SessionTimings, SessionTransferStats, фильтров и статистики
         ├── proxy/                       # Асинхронное ядро MITM-прокси
         │   ├── server/                  # Модульный прокси-сервер (mod, http_handler, connect_tunnel, websocket_relay, composer_exec, mobile_portal)
+        │   ├── ipc_channels.rs          # Ограниченные коалесцирующие IPC-каналы (events / removed / breakpoints)
         │   ├── filters/                 # Selective MITM 2.0 (hit counters), LAN Client Allowlist, парсеры и тесты
-        │   ├── upstream_client.rs       # Инструментированный hyper-util + tokio-rustls транспорт с замером фаз
+        │   ├── upstream_client.rs       # Инструментированный hyper-util + tokio-rustls транспорт с замером фаз и общим TLS ClientConfig
         │   ├── upstream_proxy.rs        # Каскадирование HTTP / HTTPS CONNECT / SOCKS5 и bypass_list
         │   ├── hosts.rs                 # Виртуальный DNS (HostRemapRegistry) с сохранением TLS SNI
         │   ├── throttle.rs              # Шейпинг пропускной способности и эмуляция RTT / Offline 503
-        │   ├── doctor.rs                # Самодиагностика порта, Root CA, SysProxy, VPN, Firewall и /health
+        │   ├── doctor.rs                # Самодиагностика порта, Root CA, SysProxy, VPN, Firewall, GPO и /health
         │   ├── dpapi.rs                 # Windows DPAPI-шифрование приватных ключей (FLUX_DPAPI_V1) и автомиграция
-        │   ├── ca.rs                    # Генерация Root CA, сертификатов доменов и управление хранилищем ОС
+        │   ├── ca.rs                    # Генерация Root CA, однопоточная коалесценция листовых сертификатов (try_get_with) и хранилище ОС
         │   ├── client_certs.rs          # Хранилище mTLS (PKCS#12 / PEM), DPAPI и режим Session-only (In-Memory)
         │   ├── breakpoints.rs           # Менеджер живых точек останова
         │   ├── rules.rs                 # Движок правил AutoResponder
@@ -318,7 +319,7 @@ npx @tauri-apps/cli build
 2. В окне отобразится текущий статус доверия в вашей ОС и отпечаток SHA-256. Нажмите **Trust Root CA in OS Store**:
    - **Windows**: сертификат добавится в хранилище *«Доверенные корневые центры сертификации»* текущего пользователя (`CurrentUser\Root`).
    - **macOS**: сертификат добавится в пользовательскую связку ключей *Login Keychain* (`~/Library/Keychains/login.keychain-db`) с доверием SSL.
-   - **Linux**: сертификат скопируется в системное хранилище с обновлением `update-ca-certificates`.
+   - **Linux**: сертификат устанавливается в системное хранилище вашего дистрибутива: Debian / Ubuntu (`/usr/local/share/ca-certificates/` + `update-ca-certificates`), Fedora / RHEL / CentOS (`/etc/pki/ca-trust/source/anchors/` + `update-ca-trust extract`) или Arch Linux (`/etc/ca-certificates/trust-source/anchors/` + `trust anchor` / `trust extract-compat`).
    *(Проверка статуса доверия на Windows, macOS и Linux сверяет отпечаток SHA-256 активного Root CA.)*
 3. Для браузеров со своим изолированным хранилищем (например, **Mozilla Firefox**) скопируйте путь к файлу сертификата из этого же окна и импортируйте его в настройках браузера (*Настройки → Приватность и защита → Сертификаты → Просмотр сертификатов → Импортировать*).
 4. Когда отладка завершена и вы хотите полностью убрать сертификат из системы, в том же окне нажмите **«Удалить сертификат из доверенных ОС»**.
@@ -425,13 +426,14 @@ curl -x http://127.0.0.1:8888 https://httpbin.org/get -k
 - ✅ **Аудит безопасности, целостности и надёжности (`v0.4.1`)**: защита импорта профилей настроек от скрытого RCE (`SEC-01`), изоляция файлового IPC и лимит 16 MiB (`SEC-02`), блокировка LAN SSRF и утечки хозяйских mTLS (`SEC-03`), полная санитизация `camelCase` JSON / SSE / WebSocket (включая SignalR/Socket.IO/Bearer/JWT) / `Location` / `Referer` (`SEC-04`), лимиты декомпрессии и поддержка `zstd` в `.saz` (`SEC-05`, `BUG-12`), консистентность `next_id` и выгруженных тел при рестарте и `VACUUM` (`BUG-01`, `BUG-03`, `BUG-11`), устойчивый bootstrap UI (`BUG-02`, `BUG-08`, `PERF-01`), RAII-очистка Breakpoints (`BUG-04`), конкурентный релей WebSocket (`BUG-05`), сверка SHA-256 Root CA (`BUG-06`), фиксы `HEAD` / `Content-Encoding` (`BUG-07`), предкомпиляция Regex + IPv6 / `.domain.com` (`BUG-09`, `PERF-03`), откат `sysproxy` (`BUG-10`) и неразрушающий fail-open очереди Python-воркера (`PERF-04`).
 - ✅ **Архитектурная декомпозиция и оптимизация бандла (`v0.5.0`, `ARCH-01`, `PERF-05`)**: модульное разбиение Rust-ядра (`proxy/server/`, `proxy/filters/`, `storage/export_import/`) и UI-компонентов, внедрение **Zustand 5**, `React.lazy()` + `Suspense`, ленивый `getPreviewEngine()` и удаление чанка `ts.worker` (7.05 МБ).
 - ✅ **Fiddler-тайминги, статистика запросов и сетевая маршрутизация (`v0.5.0`)**: инструментированный `UpstreamHttpClient` (`hyper-util` + `tokio-rustls`), панель **`Statistics`** (Single & Multi-Selection с SVG-диаграммами и *Estimated Worldwide Performance*), колонки `TTFB` / `Server IP`, реальный round-trip таймингов HAR/SAZ, **HOSTS Remapping (`Ctrl+Shift+H`)**, **Bandwidth Throttling**, **Upstream Proxy Chaining (`Ctrl+Shift+U`)** (`HTTP`/`HTTPS`/`SOCKS5`) и **ручная инъекция WebSocket-фреймов**.
-- ✅ **Стабилизация ядра, раздельные таймауты и защита ключей (`v0.6.0`, Этапы 35, 39, 36)**: унификация маршрутизации `HOSTS Remapping` + `Upstream Proxy` (`via <proxy>` в `Server IP`) + WebSocket, атомарное сохранение инъектированных WS-фреймов, лимит `64 MiB` ответа, раздельные `Upstream Timeouts` (`Connect` / `TTFB Unlimited` / `Composer`) с кнопкой `Cancel` и RAII-гардом `499`, Windows **DPAPI** (`FLUX_DPAPI_V1`) + режим **`Session-only (In-Memory)`**, **`LAN Client Allowlist`** (`403 Forbidden`), запрет SVG в превью Multipart (`SEC-02`), чистота `syncFromLocalStorage` (`CONC-01`), оптимизация `selectedSessions` (`PERF-03`), очистка мёртвого кода `reqwest` (`ARCH-01`) и вынос `previewEngine.ts` / `useGlobalShortcuts.ts` (`ARCH-02`).
+- ✅ **Стабилизация ядра, раздельные таймауты и защита ключей (`v0.6.0`, Этапы 35, 39, 36)**: унификация маршрутизации `HOSTS Remapping` + `Upstream Proxy` (`via <proxy>` в `Server IP`) + WebSocket, атомарное сохранение инъектированных WS-фреймов, лимит `64 MiB` ответа, раздельные `Upstream Timeouts` (`Connect` / `TTFB Unlimited` / `Composer`) с кнопкой `Cancel` и RAII-гардом `499`, Windows **DPAPI** (`FLUX_DPAPI_V1`) без сохранения сырых `.p12`/`.pfx` + режим **`Session-only (In-Memory)`**, **`LAN Client Allowlist`** (`403 Forbidden`) с защитой от DNS rebinding (`[SEC-01]`), запрет SVG в превью Multipart (`[SEC-02]`), чистота `syncFromLocalStorage` (`[CONC-01]`) и вынос `previewEngine.ts` / `useGlobalShortcuts.ts`.
+- ✅ **Оптимизация TLS/IPC/UI, ленивый бандл и техдолг (`v0.6.0`, Этап 47)**: коалесцирующая генерация листовых TLS-сертификатов (`moka::try_get_with` + `spawn_blocking`), развязка расчёта `storage_stats()` от цикла IPC-батчера, ограниченные коалесцирующие каналы (`ipc_channels.rs`), кэшированный общий `rustls::ClientConfig` для `wss://` и HTTPS upstream-прокси, $O(1)$ индекс `sessionIndexById` в `proxyStore`, динамический `import("./previewEngine")` вне Tauri, удаление неиспользуемых `css.worker`/`html.worker`, перенос `reqwest` в `[dev-dependencies]` (замена на `url::Url::parse`), удаление `clsx`/`tailwind-merge`/`HostFiltersTab.tsx`/дубля `update_proxy_filter_config`, замена `autofocus` на программный `ref.current?.focus()`, усиление CI (`--locked`, `--no-bundle`, MSRV `1.80`, `audit`) и Doc-vs-Code Sync.
 - ✅ **Редизайн UX, 3-уровневая архитектура экранов и Settings Hub (`v0.6.0`, Этапы 37, 38, 40, 42)**: фиксы колонковой сетки `HexViewer` и оверлей-тултипа `TIMING BREAKDOWN`, **Command Palette 2.0 (`Ctrl+K`)**, единый полноэкранный **`Settings Hub`** (`Ctrl+,`) с 6 разделами и сквозным поиском, дедупликация навигации с видимым `Throttle` + `Routing` и `HelpTooltip`, Fiddler-style хоткей **`E`** для вкладки `Composer`, `CollapsedInspectorBar`, 7 неблокирующих вкладок (`Traffic`, `Composer`, `AutoResponder`, `Breakpoints` `Alt+6`, `Scripts`, `Session Diff`, `TextWizard`) и единые заголовки `SECTION_REGISTRY` + `SectionHeader`.
 - ✅ **Единая система контекстных ПКМ-меню (`v0.6.0`, Этап 41)**: декларативный `ContextMenuProvider` с auto-flip / clamping и клавиатурной навигацией во всех рабочих областях (таблица, `Waterfall`, все вкладки инспектора, выделенный текст, `Composer`, `AutoResponder`, консоль `Scripts`, `Breakpoints`, `Session Diff`, `TextWizard`, тулбар, сайдбар, сплиттеры и футер) при сохранении штатного меню Monaco Editor.
 - ✅ **Виртуализированный многофазный Waterfall Timeline и Traffic Statistics (`v0.6.0`, Этап 12)**: переключение `Grid` ↔ `Waterfall` для 10 000+ сессий с разбивкой фаз `DNS`/`TCP`/`TLS`/`TTFB`/`Download`, зумом и синхронизацией инспектора, а также модальный сводный отчёт `Traffic Statistics` (P95 Latency/TTFB, статусы, MIME, хосты, топ-5 URL, **Copy Markdown Report**).
 
 ### Дальнейшее развитие:
-- Все запланированные этапы Спринтов 1–6 выполнены в релизах `v0.1.0` – `v0.6.0` (см. [**ROADMAP.md**](ROADMAP.md)). В будущих релизах планируются автоматизированные релизные сборки под macOS (`.dmg`) и Linux (`.AppImage` / `.deb`) и новые этапы Спринта 7.
+- Все запланированные этапы Спринтов 1–6 и оптимизации Этапа 47 выполнены в `v0.6.0` (см. [**ROADMAP.md**](ROADMAP.md)). В будущих релизах планируются автоматизированные релизные сборки под macOS (`.dmg`) и Linux (`.AppImage` / `.deb`) и оставшиеся этапы Спринта 7.
 
 ---
 
@@ -443,8 +445,8 @@ curl -x http://127.0.0.1:8888 https://httpbin.org/get -k
    npm run typecheck
    npm run test
    npm run build
-   cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
-   cargo test --manifest-path src-tauri/Cargo.toml
+   cargo clippy --locked --manifest-path src-tauri/Cargo.toml -- -D warnings
+   cargo test --locked --manifest-path src-tauri/Cargo.toml
    ```
 3. Сделайте коммит и откройте **Pull Request**.
 

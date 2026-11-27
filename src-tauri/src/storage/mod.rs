@@ -1390,7 +1390,7 @@ impl TrafficStore {
         &self,
         count: usize,
         filters: &ProxyFilterEngine,
-        event_tx: &tokio::sync::mpsc::UnboundedSender<SessionSummary>,
+        event_tx: &crate::proxy::ipc_channels::SessionEventSender,
     ) -> usize {
         if count == 0 {
             return 0;
@@ -2106,7 +2106,9 @@ mod tests {
         store.set_retention_limit(Some(25)).expect("set limit 25");
 
         let filters = ProxyFilterEngine::new();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::proxy::ipc_channels::session_event_channel(
+            crate::proxy::ipc_channels::DEFAULT_EVENT_CHANNEL_CAPACITY,
+        );
 
         let generated = store.generate_stress_sessions(60, &filters, &tx);
         assert_eq!(generated, 60);
@@ -2474,7 +2476,9 @@ mod tests {
         store.set_retention_limit(Some(2_000)).unwrap();
 
         let filters = ProxyFilterEngine::new();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = crate::proxy::ipc_channels::session_event_channel(
+            crate::proxy::ipc_channels::DEFAULT_EVENT_CHANNEL_CAPACITY,
+        );
         let created = store.generate_stress_sessions(10_000, &filters, &tx);
         assert_eq!(created, 10_000);
         store.flush_sqlite().unwrap();

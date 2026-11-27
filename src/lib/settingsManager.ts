@@ -42,9 +42,10 @@ import {
   PREVIEW_CLEAR_DB_ON_EXIT_STORAGE_KEY,
   PREVIEW_PYTHON_SCRIPT_STORAGE_KEY,
   PREVIEW_SANITIZATION_OPTIONS_STORAGE_KEY,
-} from "./mockTraffic";
-import { DEFAULT_BREAKPOINT_CONFIG, proxyBridge } from "./tauriBridge";
+} from "./appDefaults";
+import { proxyBridge } from "./tauriBridge";
 import {
+  DEFAULT_BREAKPOINT_CONFIG,
   DEFAULT_MASK_JSON_KEYS,
   DEFAULT_SANITIZATION_OPTIONS,
   DEFAULT_SANITIZATION_REPLACEMENT,
@@ -3208,7 +3209,7 @@ export async function applySettingsProfile(
   try {
     // 2. Apply all IPC updates BEFORE persisting to localStorage or broadcasting SETTINGS_APPLIED_EVENT
     await Promise.all([
-      proxyBridge.updateProxyFilterConfig(backendConfig),
+      proxyBridge.updateFilterBackendConfig(backendConfig),
       proxyBridge.updateBreakpointConfig(nextBreakpoints),
       proxyBridge.setAutoResponderConfig(
         normalizedWithBreakpoints.autoResponder.enabled,
@@ -3295,7 +3296,7 @@ export async function applySettingsProfile(
     const rollbackErrors: string[] = [];
 
     const configRollback = await Promise.allSettled([
-      proxyBridge.updateProxyFilterConfig(prevFilterCfg),
+      proxyBridge.updateFilterBackendConfig(prevFilterCfg),
       proxyBridge.updateBreakpointConfig(prevBpCfg),
       proxyBridge.setAutoResponderConfig(
         prevAutoRespEnabled,

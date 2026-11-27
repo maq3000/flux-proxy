@@ -55,6 +55,7 @@ export const SessionAnnotationModal: React.FC<SessionAnnotationModalProps> = ({
       if (!dialog.open) {
         dialog.showModal();
       }
+      inputRef.current?.focus();
       // Select existing text so user can immediately type or overwrite after pressing `M`
       window.requestAnimationFrame(() => {
         inputRef.current?.focus();
@@ -207,7 +208,6 @@ export const SessionAnnotationModal: React.FC<SessionAnnotationModalProps> = ({
             onChange={(e) => setComment(e.target.value)}
             placeholder="Например: Кейс с протухшим токеном..."
             autoFocus
-            {...({ autofocus: "" } as Record<string, string>)}
             className="h-9 w-full rounded-lg border border-strong bg-canvas px-3 text-xs text-fg placeholder:text-subtle focus:border-sky-500 focus:outline-none"
           />
 

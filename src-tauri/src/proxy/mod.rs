@@ -6,6 +6,7 @@ pub mod doctor;
 pub mod dpapi;
 pub mod filters;
 pub mod hosts;
+pub mod ipc_channels;
 pub mod network;
 pub mod process;
 pub mod rules;

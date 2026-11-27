@@ -20,7 +20,7 @@ import {
   copyTextToClipboard,
   formatScriptConsoleLogLine,
 } from "../lib/contextMenuBuilders";
-import { PYTHON_SCRIPT_PRESETS } from "../lib/mockTraffic";
+import { PYTHON_SCRIPT_PRESETS } from "../lib/appDefaults";
 import { getMonacoThemeName } from "../lib/monaco";
 import type {
   PythonRunnerStatus,

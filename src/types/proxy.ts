@@ -887,3 +887,10 @@ export const UPSTREAM_TIMEOUT_LIMITS = {
 
 export type WsInjectDirection = "server" | "client";
 export type WsInjectOpcode = "text" | "binary";
+
+export const DEFAULT_BREAKPOINT_CONFIG: BreakpointConfig = {
+  breakBeforeRequest: false,
+  breakAfterResponse: false,
+  timeoutSecs: 120,
+  rules: [],
+};

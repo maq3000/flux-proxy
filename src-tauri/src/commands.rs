@@ -339,14 +339,6 @@ pub async fn update_filter_backend_config(
 }
 
 #[tauri::command]
-pub async fn update_proxy_filter_config(
-    config: ProxyFilterBackendConfig,
-    state: State<'_, AppState>,
-) -> Result<ProxyFilterBackendConfig, ProxyError> {
-    Ok(state.controller.context.filters.update_config(config))
-}
-
-#[tauri::command]
 pub async fn get_tls_rule_hit_counts(
     state: State<'_, AppState>,
 ) -> Result<std::collections::HashMap<String, u64>, ProxyError> {

@@ -51,6 +51,7 @@ export const CodeSnippetModal: React.FC<CodeSnippetModalProps> = ({
   onNotify,
 }) => {
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const copyBtnRef = useRef<HTMLButtonElement>(null);
   const titleId = useId();
   const copyTimerRef = useRef<number | null>(null);
 
@@ -105,6 +106,7 @@ export const CodeSnippetModal: React.FC<CodeSnippetModalProps> = ({
       if (!dialog.open) {
         dialog.showModal();
       }
+      copyBtnRef.current?.focus();
     } else if (dialog.open) {
       dialog.close();
     }
@@ -301,9 +303,9 @@ export const CodeSnippetModal: React.FC<CodeSnippetModalProps> = ({
         </div>
 
         <button
+          ref={copyBtnRef}
           type="button"
           autoFocus
-          {...({ autofocus: "" } as Record<string, string>)}
           disabled={!generatedCode}
           onClick={() => void handleCopyCode()}
           className="inline-flex h-8 items-center gap-1.5 rounded-md bg-sky-600 px-3 text-xs font-semibold text-white transition-colors hover:bg-sky-500 disabled:opacity-50"

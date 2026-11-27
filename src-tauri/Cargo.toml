@@ -42,16 +42,8 @@ pem = "3.0"
 p12-keystore = "0.1"
 time = "0.3"
 
-# WebSockets Interception & Upstream HTTP/1.1 + HTTP/2 Client
+# WebSockets Interception
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
-reqwest = { version = "0.12", default-features = false, features = [
-  "rustls-tls",
-  "rustls-tls-native-roots",
-  "http2",
-  "gzip",
-  "brotli",
-  "deflate",
-] }
 
 # Storage, Caching, Archives & Native File Dialogs
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -77,4 +69,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_Security_Cryptography",
+] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "rustls-tls-native-roots",
+  "http2",
+  "gzip",
+  "brotli",
+  "deflate",
 ] }

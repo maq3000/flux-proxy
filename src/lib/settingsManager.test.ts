@@ -18,7 +18,7 @@ import {
   type FluxUserSettingsProfile,
 } from "../types/settings";
 import { DEFAULT_BACKEND_FILTER_CONFIG } from "./filterEngine";
-import { DEFAULT_AUTORESPONDER_RULES, DEFAULT_PYTHON_SCRIPT_CODE } from "./mockTraffic";
+import { DEFAULT_AUTORESPONDER_RULES, DEFAULT_PYTHON_SCRIPT_CODE } from "./appDefaults";
 
 const { mockState, mockProxyBridge, mockDefaultBpConfig } = vi.hoisted(() => {
   const defaultBp: BreakpointConfig = {
@@ -145,7 +145,7 @@ const { mockState, mockProxyBridge, mockDefaultBpConfig } = vi.hoisted(() => {
     injectWebSocketFrame: vi.fn(async () => {
       throw new Error("not implemented in settingsManager mock");
     }),
-    updateProxyFilterConfig: vi.fn(async (cfg: ProxyFilterBackendConfig) => {
+    updateFilterBackendConfig: vi.fn(async (cfg: ProxyFilterBackendConfig) => {
       state.filterCfg = structuredClone(cfg);
       return structuredClone(cfg);
     }),

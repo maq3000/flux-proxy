@@ -3,12 +3,13 @@ use std::sync::{Arc, RwLock};
 use base64::Engine as _;
 use dashmap::DashMap;
 use regex::Regex;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 use crate::models::{
     BreakpointAction, BreakpointConfig, BreakpointResolution, BreakpointRule, BreakpointStage,
     LoadedSessionBody, PausedBreakpointItem, ProxyError,
 };
+use crate::proxy::ipc_channels::BreakpointSnapshotSender;
 use crate::storage::TrafficStore;
 
 /// Maximum decoded body size inlined directly inside `PausedBreakpointItem` snapshots (256 KiB).
@@ -172,7 +173,7 @@ impl CompiledBreakpointState {
 pub struct BreakpointEngine {
     state: RwLock<CompiledBreakpointState>,
     pending: DashMap<String, PendingBreakpoint>,
-    snapshot_tx: Option<mpsc::UnboundedSender<Vec<PausedBreakpointItem>>>,
+    snapshot_tx: Option<BreakpointSnapshotSender>,
     store: Option<Arc<TrafficStore>>,
 }
 
@@ -183,12 +184,12 @@ impl Default for BreakpointEngine {
 }
 
 impl BreakpointEngine {
-    pub fn new(snapshot_tx: Option<mpsc::UnboundedSender<Vec<PausedBreakpointItem>>>) -> Self {
+    pub fn new(snapshot_tx: Option<BreakpointSnapshotSender>) -> Self {
         Self::new_with_store(snapshot_tx, None)
     }
 
     pub fn new_with_store(
-        snapshot_tx: Option<mpsc::UnboundedSender<Vec<PausedBreakpointItem>>>,
+        snapshot_tx: Option<BreakpointSnapshotSender>,
         store: Option<Arc<TrafficStore>>,
     ) -> Self {
         Self {
@@ -816,7 +817,7 @@ mod tests {
     fn pending_breakpoint_guard_cleans_up_on_drop_unless_disarmed() {
         use std::sync::atomic::{AtomicU64, Ordering};
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::proxy::ipc_channels::breakpoint_snapshot_channel();
         let engine = Arc::new(BreakpointEngine::new(Some(tx)));
 
         let make_item = |bp_id: &str, session_id: u64| PausedBreakpointItem {

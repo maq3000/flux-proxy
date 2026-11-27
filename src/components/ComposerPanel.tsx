@@ -156,6 +156,7 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
       if (!dialog.open) {
         dialog.showModal();
       }
+      curlTextareaRef.current?.focus();
       window.requestAnimationFrame(() => {
         curlTextareaRef.current?.focus();
       });
@@ -1019,7 +1020,6 @@ export const ComposerPanel: React.FC<ComposerPanelProps> = ({
               }}
               rows={8}
               autoFocus
-              {...({ autofocus: "" } as Record<string, string>)}
               placeholder={`curl -X POST 'https://api.example.com/v1/items' \\\n  -H 'Authorization: Bearer token' \\\n  --json '{"name":"demo"}'`}
               className="w-full resize-y rounded-lg border border-strong bg-canvas p-3 font-mono text-xs text-fg placeholder:text-subtle focus:border-sky-500 focus:outline-none"
             />

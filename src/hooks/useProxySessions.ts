@@ -38,6 +38,7 @@ import {
   LS_PROXY_PORT_KEY,
   LS_RETENTION_LIMIT_KEY,
   persistBindConfigToLocalStorage,
+  findSessionById,
   useProxyStore,
 } from "../stores/proxyStore";
 import { DEFAULT_SESSION_RETENTION_LIMIT } from "../types/proxy";
@@ -69,7 +70,9 @@ import type {
 
 export function useProxySessions() {
   const sessions = useProxyStore((s) => s.sessions);
+  const sessionIndexById = useProxyStore((s) => s.sessionIndexById);
   const setSessions = useProxyStore((s) => s.setSessions);
+  const mergeSessionBatch = useProxyStore((s) => s.mergeSessionBatch);
   const selectedId = useProxyStore((s) => s.selectedId);
   const setSelectedIdState = useProxyStore((s) => s.setSelectedIdState);
   const selectedIds = useProxyStore((s) => s.selectedIds);
@@ -314,29 +317,7 @@ export function useProxySessions() {
     if (incoming.length === 0) return;
     pendingQueueRef.current = [];
 
-    setSessions((prev) => {
-      // Fast O(N) merge supporting both append of new sessions and in-place updates (e.g. WebSocket frames / TLS Bypass byte totals),
-      // including deduplication when multiple events for the same ID arrive in the very first batch.
-      const indexById = new Map<number, number>();
-      const next = prev.slice();
-      for (let i = 0; i < next.length; i++) {
-        indexById.set(next[i].id, i);
-      }
-      for (const item of incoming) {
-        const existingIdx = indexById.get(item.id);
-        if (existingIdx !== undefined) {
-          next[existingIdx] = item;
-        } else {
-          indexById.set(item.id, next.length);
-          next.push(item);
-        }
-      }
-      const limit = sessionRetentionLimitRef.current;
-      if (limit && next.length > limit) {
-        next.splice(0, next.length - limit);
-      }
-      return next;
-    });
+    mergeSessionBatch(incoming, sessionRetentionLimitRef.current);
     if (
       (typeof document === "undefined" ||
         document.visibilityState !== "hidden") &&
@@ -344,7 +325,7 @@ export function useProxySessions() {
     ) {
       void refreshStorageStats();
     }
-  }, [refreshStorageStats]);
+  }, [mergeSessionBatch, refreshStorageStats]);
 
   // Initial load + Sync backend filter config (TLS Bypass + Header Mutations + Ring Buffer + Drop Non-Matching) + Real-time Tauri IPC subscription
   useEffect(() => {
@@ -803,10 +784,10 @@ export function useProxySessions() {
 
   const selectedSummarySignature = useMemo(() => {
     if (selectedId === null) return "";
-    const found = sessions.find((s) => s.id === selectedId);
+    const found = findSessionById(sessions, sessionIndexById, selectedId);
     if (!found) return "";
     return `${found.status}:${found.bodySize}:${found.durationMs}:${found.contentType}:${found.error ?? ""}:${found.breakpointPaused ?? ""}:${found.breakpointModified ? "1" : "0"}:${found.comment ?? ""}:${found.markedColor ?? ""}:${found.wsOpen ? "1" : "0"}`;
-  }, [selectedId, sessions]);
+  }, [selectedId, sessionIndexById, sessions]);
 
   const selectedIdRef = useRef<number | null>(selectedId);
   selectedIdRef.current = selectedId;
@@ -847,14 +828,14 @@ export function useProxySessions() {
 
   const diffPairSignature = useMemo(() => {
     if (diffLeftId === null || diffRightId === null) return "";
-    const l = sessions.find((s) => s.id === diffLeftId);
-    const r = sessions.find((s) => s.id === diffRightId);
+    const l = findSessionById(sessions, sessionIndexById, diffLeftId);
+    const r = findSessionById(sessions, sessionIndexById, diffRightId);
     const sig = (s?: SessionSummary) =>
       s
         ? `${s.status}:${s.bodySize}:${s.durationMs}:${s.contentType}:${s.error ?? ""}:${s.comment ?? ""}:${s.markedColor ?? ""}`
         : "none";
     return `${diffLeftId}(${sig(l)})|${diffRightId}(${sig(r)})`;
-  }, [diffLeftId, diffRightId, sessions]);
+  }, [diffLeftId, diffRightId, sessionIndexById, sessions]);
 
   // Fetch full SessionDetails for both compared sessions when 2+ rows are selected
   useEffect(() => {
@@ -2727,7 +2708,7 @@ export function useProxySessions() {
               )?.value ?? null;
           }
         } else if (isResponse) {
-          const summary = sessions.find((s) => s.id === sessionId);
+          const summary = findSessionById(sessions, sessionIndexById, sessionId);
           mimeType = summary?.contentType ?? null;
         }
 
@@ -2766,7 +2747,7 @@ export function useProxySessions() {
         );
       }
     },
-    [selectedDetail, sessions, showToast]
+    [selectedDetail, sessionIndexById, sessions, showToast]
   );
 
   const generateStress10k = useCallback(async () => {
@@ -2946,6 +2927,7 @@ export function useProxySessions() {
 
   return {
     sessions,
+    sessionIndexById,
     filteredSessions,
     selectedId,
     setSelectedId,

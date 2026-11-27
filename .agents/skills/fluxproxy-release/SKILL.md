@@ -53,14 +53,14 @@ description: >-
    - `package.json` и `package-lock.json`
    - `src-tauri/Cargo.toml` и `src-tauri/Cargo.lock`
    - `src-tauri/tauri.conf.json`
-   - `src/lib/tauriBridge.ts` (`creator.version`) и любые другие места, найденные на этапе 1.
+   - `src/lib/previewEngine.ts` (`creator.version`; Rust-экспорт в `src-tauri/src/storage/export_import/har.rs` читает `env!("CARGO_PKG_VERSION")` автоматически) и любые другие места, найденные на этапе 1.
 2. Запусти полный набор проверок (идентично `.github/workflows/ci.yml`):
    ```powershell
    npm run typecheck
    npm run test
-   npm run build
-   cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
-   cargo test --manifest-path src-tauri/Cargo.toml
+   npx vite build
+   cargo clippy --locked --manifest-path src-tauri/Cargo.toml -- -D warnings
+   cargo test --locked --manifest-path src-tauri/Cargo.toml
    ```
 3. **Стоп-условие:** не переходи к сборке установщиков, пока все 5 команд не завершатся с кодом `0` без ошибок и предупреждений.
 

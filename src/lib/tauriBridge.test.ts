@@ -22,20 +22,15 @@ vi.mock("@tauri-apps/api/webview", () => ({
   }),
 }));
 
-vi.mock("./previewEngine", () => ({
-  DEFAULT_BREAKPOINT_CONFIG: {
-    breakBeforeRequest: false,
-    breakAfterResponse: false,
-    timeoutSecs: 120,
-    rules: [],
-  },
-  encodeUint8ArrayToBase64: vi.fn(() => ""),
-  previewPickedFiles: new Map(),
-  getPreviewEngine: () => ({
-    exportPreviewTextFile: mockExportPreviewTextFile,
-  }),
+const mockGetPreviewEngine = vi.fn(() => ({
+  exportPreviewTextFile: mockExportPreviewTextFile,
 }));
 
+vi.mock("./previewEngine", () => ({
+  getPreviewEngine: mockGetPreviewEngine,
+}));
+
+import { DEFAULT_BACKEND_FILTER_CONFIG } from "./filterEngine";
 import { proxyBridge } from "./tauriBridge";
 
 describe("proxyBridge file export IPC [SEC-04]", () => {
@@ -103,5 +98,41 @@ describe("proxyBridge file export IPC [SEC-04]", () => {
       "{\"v\":1}",
       "application/json;charset=utf-8"
     );
+  });
+
+  it("never initializes previewEngine in Tauri runtime and consolidates updateProxyFilterConfig onto update_filter_backend_config", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
+    mockInvoke.mockResolvedValueOnce({
+      running: true,
+      bindAddr: "127.0.0.1",
+      port: 8888,
+      activeSessions: 0,
+      systemProxyEnabled: false,
+      autoSystemProxy: true,
+      systemProxyError: null,
+      allowRemote: false,
+      bindMode: "loopback",
+      specificBindIp: null,
+      alsoBindLoopback: true,
+      boundIps: ["127.0.0.1"],
+    });
+
+    await proxyBridge.getStatus();
+    expect(mockGetPreviewEngine).not.toHaveBeenCalled();
+
+    const filterCfg = {
+      ...structuredClone(DEFAULT_BACKEND_FILTER_CONFIG),
+      headerMutations: {
+        ...structuredClone(DEFAULT_BACKEND_FILTER_CONFIG.headerMutations),
+        stripAltSvc: true,
+      },
+    };
+    mockInvoke.mockResolvedValueOnce(filterCfg);
+
+    await proxyBridge.updateProxyFilterConfig(filterCfg);
+    expect(mockInvoke).toHaveBeenLastCalledWith("update_filter_backend_config", {
+      config: filterCfg,
+    });
+    expect(mockGetPreviewEngine).not.toHaveBeenCalled();
   });
 });

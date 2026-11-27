@@ -111,6 +111,7 @@ export const OpenApiExportModal: React.FC<OpenApiExportModalProps> = ({
   onNotify,
 }) => {
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const saveBtnRef = useRef<HTMLButtonElement>(null);
   const titleId = useId();
   const titleInputId = useId();
   const versionInputId = useId();
@@ -144,6 +145,7 @@ export const OpenApiExportModal: React.FC<OpenApiExportModalProps> = ({
       if (!dialog.open) {
         dialog.showModal();
       }
+      saveBtnRef.current?.focus();
     } else if (dialog.open) {
       dialog.close();
     }
@@ -694,9 +696,9 @@ export const OpenApiExportModal: React.FC<OpenApiExportModalProps> = ({
           </button>
 
           <button
+            ref={saveBtnRef}
             type="button"
             autoFocus
-            {...({ autofocus: "" } as Record<string, string>)}
             disabled={!canExport || isSaving}
             onClick={() => void handleSaveSpec()}
             className="inline-flex h-8 items-center gap-1.5 rounded bg-sky-600 px-3 text-xs font-semibold text-white transition-colors hover:bg-sky-500 disabled:opacity-45"

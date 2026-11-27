@@ -417,6 +417,8 @@ pub struct CertificateAuthority {
     sha256_fingerprint: String,
     valid_until: String,
     leaf_cache: Cache<String, Arc<ServerConfig>>,
+    #[cfg(test)]
+    leaf_gen_count: std::sync::atomic::AtomicUsize,
 }
 
 impl CertificateAuthority {
@@ -532,6 +534,8 @@ impl CertificateAuthority {
             sha256_fingerprint,
             valid_until,
             leaf_cache,
+            #[cfg(test)]
+            leaf_gen_count: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -717,26 +721,29 @@ impl CertificateAuthority {
         )
     }
 
-    /// Returns a cached or freshly signed TLS `ServerConfig` for the target authority host,
-    /// advertising both `h2` (HTTP/2) and `http/1.1` via ALPN.
-    pub fn server_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>, ProxyError> {
+    /// Fast lock-free cache lookup for a previously generated per-host TLS `ServerConfig`.
+    pub fn cached_server_config_for_host(&self, host: &str) -> Option<Arc<ServerConfig>> {
         let normalized_host = host.trim().to_ascii_lowercase();
-        if let Some(cached) = self.leaf_cache.get(&normalized_host) {
-            return Ok(cached);
-        }
+        self.leaf_cache.get(&normalized_host)
+    }
+
+    fn build_leaf_server_config(&self, normalized_host: &str) -> Result<Arc<ServerConfig>, ProxyError> {
+        #[cfg(test)]
+        self.leaf_gen_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let mut params = CertificateParams::default();
         params.use_authority_key_identifier_extension = true;
 
         let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, normalized_host.clone());
+        dn.push(DnType::CommonName, normalized_host.to_string());
         params.distinguished_name = dn;
 
         if let Ok(ip) = normalized_host.parse::<IpAddr>() {
             params.subject_alt_names = vec![SanType::IpAddress(ip)];
         } else {
             let ia5 = normalized_host
-                .clone()
+                .to_string()
                 .try_into()
                 .map_err(|e| ProxyError::Custom(format!("Invalid DNS host '{normalized_host}': {e}")))?;
             params.subject_alt_names = vec![SanType::DnsName(ia5)];
@@ -765,9 +772,21 @@ impl CertificateAuthority {
         // Advertise HTTP/2 and HTTP/1.1 over TLS ALPN
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-        let arc_cfg = Arc::new(server_config);
-        self.leaf_cache.insert(normalized_host, arc_cfg.clone());
-        Ok(arc_cfg)
+        Ok(Arc::new(server_config))
+    }
+
+    /// Returns a cached or freshly signed TLS `ServerConfig` for the target authority host
+    /// using coalescing singleflight (`try_get_with`), advertising both `h2` and `http/1.1` via ALPN.
+    pub fn server_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>, ProxyError> {
+        let normalized_host = host.trim().to_ascii_lowercase();
+        self.leaf_cache
+            .try_get_with(normalized_host.clone(), || {
+                self.build_leaf_server_config(&normalized_host)
+            })
+            .map_err(|arc_err| match Arc::try_unwrap(arc_err) {
+                Ok(err) => err,
+                Err(shared) => ProxyError::Custom(shared.to_string()),
+            })
     }
 
     pub(crate) fn manual_install_command_for_os_and_store(
@@ -1700,5 +1719,48 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn server_config_for_host_coalesces_concurrent_leaf_generation() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxproxy_ca_singleflight_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let ca = Arc::new(CertificateAuthority::init_or_load(&dir).expect("init CA"));
+
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let mut handles = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let ca_ref = Arc::clone(&ca);
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                ca_ref
+                    .server_config_for_host("singleflight.fluxproxy.test")
+                    .expect("generate leaf cert")
+            }));
+        }
+
+        let configs: Vec<Arc<ServerConfig>> = handles
+            .into_iter()
+            .map(|h| h.join().expect("worker join"))
+            .collect();
+        assert_eq!(
+            ca.leaf_gen_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "concurrent leaf generation for the same host must coalesce into a single build"
+        );
+        for cfg in &configs[1..] {
+            assert!(Arc::ptr_eq(&configs[0], cfg));
+        }
+
+        let cached = ca
+            .cached_server_config_for_host("  SINGLEFLIGHT.FLUXPROXY.TEST ")
+            .expect("cached entry should exist");
+        assert!(Arc::ptr_eq(&configs[0], &cached));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -103,7 +103,7 @@ import {
   type CodeGenRequest,
 } from "./lib/codeGenerators";
 import { buildCurlCommand, buildHeadersBlock } from "./lib/formatters";
-import { DEFAULT_PYTHON_SCRIPT_CODE } from "./lib/mockTraffic";
+import { DEFAULT_PYTHON_SCRIPT_CODE } from "./lib/appDefaults";
 import {
   applySettingsProfile,
   buildSettingsImportPreview,
@@ -118,7 +118,7 @@ import {
 } from "./lib/settingsManager";
 import { getSectionMeta } from "./lib/sectionRegistry";
 import { isTauriRuntime, proxyBridge } from "./lib/tauriBridge";
-import { useProxyStore } from "./stores/proxyStore";
+import { findSessionById, useProxyStore } from "./stores/proxyStore";
 import { useUiStore } from "./stores/uiStore";
 import { THEME_PRESETS } from "./lib/themePresets";
 import { THROTTLE_PRESET_DEFINITIONS } from "./types/proxy";
@@ -188,6 +188,7 @@ const AppContent: React.FC = () => {
 
   const {
     sessions,
+    sessionIndexById,
     filteredSessions,
     selectedId,
     setSelectedId,
@@ -1764,7 +1765,7 @@ const AppContent: React.FC = () => {
 
       const anchor =
         pool.find((s) => s.id === anchorId) ??
-        sessions.find((s) => s.id === anchorId) ??
+        findSessionById(sessions, sessionIndexById, anchorId) ??
         null;
       const anchorBasePath = anchor ? anchor.path.split("?")[0] : "";
 
@@ -1805,6 +1806,7 @@ const AppContent: React.FC = () => {
       filteredSessions,
       selectedId,
       selectedIds,
+      sessionIndexById,
       sessions,
       setActiveSection,
       setComparePairIds,
@@ -3048,27 +3050,21 @@ const AppContent: React.FC = () => {
     selectedIds.length === 2 && !inlineDiffDismissed;
   const selectedSessions = useMemo(() => {
     if (selectedIds.length === 0) return [];
-    if (selectedIds.length <= 2) {
-      const out: SessionSummary[] = [];
-      for (const id of selectedIds) {
-        const match = sessions.find((s) => s.id === id);
-        if (match) out.push(match);
-      }
-      return out;
+    const out: SessionSummary[] = [];
+    for (let i = 0; i < selectedIds.length; i += 1) {
+      const match = findSessionById(sessions, sessionIndexById, selectedIds[i]);
+      if (match) out.push(match);
     }
-    const byId = new Map(sessions.map((s) => [s.id, s]));
-    return selectedIds
-      .map((id) => byId.get(id))
-      .filter((s): s is SessionSummary => Boolean(s));
-  }, [sessions, selectedIds]);
+    return out;
+  }, [sessionIndexById, sessions, selectedIds]);
 
   const selectedSummary = useMemo(
     () =>
       selectedDetail?.summary ??
       (selectedId !== null
-        ? sessions.find((s) => s.id === selectedId) ?? null
+        ? findSessionById(sessions, sessionIndexById, selectedId) ?? null
         : null),
-    [selectedDetail, selectedId, sessions]
+    [selectedDetail, selectedId, sessionIndexById, sessions]
   );
 
   const handleQuickFilterByQuery = useCallback(

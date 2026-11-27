@@ -29,7 +29,7 @@ use crate::proxy::upstream_client::{
     format_rfc3339_micros, format_tls_cipher, format_tls_protocol, timestamp_at_instant,
 };
 use crate::proxy::upstream_proxy::{
-    connect_tunnel_via_upstream, format_via_proxy_telemetry, UpstreamTransportStream,
+    connect_tunnel_via_upstream_with_tls, format_via_proxy_telemetry, UpstreamTransportStream,
 };
 
 use super::http_handler::handle_intercepted_request;
@@ -228,11 +228,12 @@ pub(super) async fn handle_outer_proxy_request(
                 Option<String>,
                 Option<(String, String)>,
             ) = if let Some(proxy_cfg) = active_upstream_proxy {
-                let tunnel_res = match connect_tunnel_via_upstream(
+                let tunnel_res = match connect_tunnel_via_upstream_with_tls(
                     &proxy_cfg,
                     &connect_host,
                     connect_port,
                     connect_timeout,
+                    Some(&ctx.shared_http1_tls_config),
                 )
                 .await
                 {
@@ -866,11 +867,21 @@ async fn serve_mitm_tls_connection(
         }
     };
 
-    let server_cfg = match ctx.ca.server_config_for_host(&host) {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            tracing::error!("Failed to generate MITM cert for {host}: {err}");
-            return;
+    let server_cfg = if let Some(cached) = ctx.ca.cached_server_config_for_host(&host) {
+        cached
+    } else {
+        let ca = Arc::clone(&ctx.ca);
+        let cert_host = host.clone();
+        match tokio::task::spawn_blocking(move || ca.server_config_for_host(&cert_host)).await {
+            Ok(Ok(cfg)) => cfg,
+            Ok(Err(err)) => {
+                tracing::error!("Failed to generate MITM cert for {host}: {err}");
+                return;
+            }
+            Err(err) => {
+                tracing::error!("MITM cert generation task panicked for {host}: {err}");
+                return;
+            }
         }
     };
 
