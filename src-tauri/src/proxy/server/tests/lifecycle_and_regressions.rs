@@ -1869,11 +1869,32 @@ async fn conc01_conc02_graceful_drain_hard_abort_and_live_policy_reactivity() {
 
     controller.stop().await;
 
-    // Listener socket must be released immediately after stop() (avoids Windows ~2s connect SYN-retry eating the 450ms drain window)
-    let probe_listener = TcpListener::bind(("127.0.0.1", port1))
+    // Verify listener socket is closed immediately after stop() without colliding with
+    // BSD/macOS EADDRINUSE rules while draining connections are still ESTABLISHED.
+    #[cfg(unix)]
+    {
+        let probe_err = tokio::time::timeout(
+            Duration::from_millis(200),
+            TcpStream::connect(("127.0.0.1", port1)),
+        )
         .await
-        .expect("listener must be closed after stop()");
-    drop(probe_listener);
+        .expect("connect probe must complete immediately after stop()")
+        .expect_err("listener must refuse new connections after stop()");
+        assert_eq!(
+            probe_err.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "expected ConnectionRefused after stop(), got: {probe_err:?}"
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        // On Windows, TcpStream::connect() to a closed loopback port retries SYN for ~1-2s
+        // (eating the 450ms drain window); re-binding proves immediately the listener closed.
+        let probe_listener = TcpListener::bind(("127.0.0.1", port1))
+            .await
+            .expect("listener must be closed after stop()");
+        drop(probe_listener);
+    }
 
     // Keep-alive follow-up request during drain receives 503 (or closes) and never reaches upstream
     if keepalive_sock
@@ -2128,5 +2149,112 @@ async fn conc01_conc02_graceful_drain_hard_abort_and_live_policy_reactivity() {
     );
 
     controller.shutdown_sync();
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn start_after_stop_rebinds_same_port_during_graceful_drain() {
+    let up_http_ws = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_addr = up_http_ws.local_addr().unwrap();
+    let up_srv_task = tokio::spawn(async move {
+        while let Ok((stream, _)) = up_http_ws.accept().await {
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(move |req: Request<Incoming>| async move {
+                    let is_ws = req
+                        .headers()
+                        .get(http::header::UPGRADE)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+                    if is_ws {
+                        let key = req
+                            .headers()
+                            .get("sec-websocket-key")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        let accept =
+                            tokio_tungstenite::tungstenite::handshake::derive_accept_key(
+                                key.as_bytes(),
+                            );
+                        tokio::spawn(async move {
+                            if let Ok(up) = hyper::upgrade::on(req).await {
+                                let mut ws = WebSocketStream::from_raw_socket(
+                                    TokioIo::new(up),
+                                    Role::Server,
+                                    None,
+                                )
+                                .await;
+                                while let Some(Ok(msg)) = ws.next().await {
+                                    if msg.is_close() || ws.send(msg).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                        return Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::SWITCHING_PROTOCOLS)
+                                .header(http::header::CONNECTION, "Upgrade")
+                                .header(http::header::UPGRADE, "websocket")
+                                .header("Sec-WebSocket-Accept", accept)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        );
+                    }
+                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                });
+                let _ = AutoConnBuilder::new(TokioExecutor::new())
+                    .serve_connection_with_upgrades(io, svc)
+                    .await;
+            });
+        }
+    });
+
+    let (controller, _rules, _filters, _store, tmp_dir) = make_stage44_controller("rebind_drain");
+    controller.set_drain_deadline_for_test(Duration::from_secs(5));
+
+    let status = controller.start("127.0.0.1".into(), 0).await.unwrap();
+    let port = status.port;
+
+    let mut ws = open_proxied_ws(port, &format!("ws://{up_addr}/ws-rebind")).await;
+    ws.send(tokio_tungstenite::tungstenite::Message::Text("ping".into()))
+        .await
+        .unwrap();
+    let reply = ws.next().await.unwrap().unwrap();
+    assert_eq!(reply.to_text().unwrap(), "ping");
+
+    // Keep the WebSocket open across stop() so the connection remains ESTABLISHED
+    // until either the drain deadline expires or restart hard-aborts draining lifecycles.
+    let ws_task = tokio::spawn(async move {
+        while let Some(Ok(_)) = ws.next().await {}
+    });
+
+    controller.stop().await;
+
+    let restarted = controller
+        .start("127.0.0.1".into(), port)
+        .await
+        .expect("start() must rebind same port even during active graceful drain");
+    assert!(restarted.running);
+    assert_eq!(restarted.port, port);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    client
+        .write_all(
+            format!(
+                "GET http://{up_addr}/after-rebind HTTP/1.1\r\nHost: {up_addr}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let (_head, body) = read_raw_http_head_and_body(&mut client).await;
+    assert_eq!(body, b"ok");
+
+    controller.shutdown_sync();
+    ws_task.abort();
+    let _ = ws_task.await;
+    up_srv_task.abort();
+    let _ = up_srv_task.await;
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

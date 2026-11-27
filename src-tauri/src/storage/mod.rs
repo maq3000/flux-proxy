@@ -1727,6 +1727,7 @@ mod tests {
         assert_eq!(summaries.first().map(|s| s.id), Some(224));
         assert_eq!(summaries.last().map(|s| s.id), Some(1_000));
 
+        store.flush_sqlite().unwrap();
         let stats = store.storage_stats(true);
         assert_eq!(stats.ram_sessions, 777);
         assert_eq!(stats.session_retention_limit, Some(777));
@@ -1922,6 +1923,7 @@ mod tests {
         }
         assert_eq!(store.len(), 2);
 
+        store.flush_sqlite().unwrap();
         let before = store.storage_stats(false);
         assert!(before.sqlite_size_bytes > 2 * 1024 * 1024);
 

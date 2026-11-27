@@ -1441,6 +1441,48 @@ impl ProxyEngineController {
             .await
     }
 
+    fn abort_draining_lifecycles(&self) -> bool {
+        let draining = {
+            let mut guard = self.lock_runtime();
+            guard.draining_lifecycles.retain(|h| !h.is_finished());
+            std::mem::take(&mut guard.draining_lifecycles)
+        };
+        if draining.is_empty() {
+            return false;
+        }
+        for lc in draining {
+            lc.abort_now();
+        }
+        true
+    }
+
+    async fn bind_listeners_with_drain_fallback(
+        &self,
+        target_ips: &[String],
+        port: u16,
+        retry_attempts: usize,
+    ) -> Result<(Vec<(TcpListener, String)>, u16), ProxyError> {
+        match bind_listeners_with_cleanup(target_ips, port, retry_attempts).await {
+            Ok(bound) => Ok(bound),
+            Err(err) => {
+                // On macOS (BSD/XNU), re-binding the exact same (ip, port) while prior
+                // graceful-drain connections are still ESTABLISHED returns EADDRINUSE
+                // despite SO_REUSEADDR and the old TcpListener already being closed.
+                // If draining connections from an earlier stop/rebind exist, hard-abort
+                // them and retry binding so Stop -> Start or non-narrowing rebind succeeds.
+                let is_addr_in_use = matches!(
+                    &err,
+                    ProxyError::Custom(msg) if msg.contains("AddrInUse")
+                );
+                if is_addr_in_use && self.abort_draining_lifecycles() {
+                    bind_listeners_with_cleanup(target_ips, port, retry_attempts.max(12)).await
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
     async fn start_internal(
         &self,
         bind_mode: BindHostMode,
@@ -1467,7 +1509,7 @@ impl ProxyEngineController {
         }
 
         let (listeners, actual_port) =
-            match bind_listeners_with_cleanup(&target_ips, port, 1).await {
+            match self.bind_listeners_with_drain_fallback(&target_ips, port, 1).await {
                 Ok(bound) => bound,
                 Err(err) => {
                     self.sysproxy.rollback_if_dirty();
@@ -1655,7 +1697,7 @@ impl ProxyEngineController {
         // Stop previous TCP listener(s) synchronously before rebinding the same port on the new interface(s)
         shutdown_listeners(old_tx, old_handles).await;
 
-        match bind_listeners_with_cleanup(&target_ips, port, 8).await {
+        match self.bind_listeners_with_drain_fallback(&target_ips, port, 8).await {
             Ok((listeners, actual_port)) => {
                 let (tx, handles, lifecycle_handle) =
                     self.spawn_listeners_for_bind(listeners, actual_port);
