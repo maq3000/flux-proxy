@@ -1867,24 +1867,85 @@ async fn conc01_conc02_graceful_drain_hard_abort_and_live_policy_reactivity() {
     assert_eq!(b1, b"ok");
     let hits_before_stop = up_hits.load(Ordering::Relaxed);
 
-    controller.stop().await;
+    let stop_status = controller.stop().await;
+    assert!(
+        !stop_status.running,
+        "controller must report running=false after stop()"
+    );
 
     // Verify listener socket is closed immediately after stop() without colliding with
     // BSD/macOS EADDRINUSE rules while draining connections are still ESTABLISHED.
     #[cfg(unix)]
     {
-        let probe_err = tokio::time::timeout(
+        let probe_res = tokio::time::timeout(
             Duration::from_millis(200),
             TcpStream::connect(("127.0.0.1", port1)),
         )
         .await
-        .expect("connect probe must complete immediately after stop()")
-        .expect_err("listener must refuse new connections after stop()");
-        assert_eq!(
-            probe_err.kind(),
-            std::io::ErrorKind::ConnectionRefused,
-            "expected ConnectionRefused after stop(), got: {probe_err:?}"
-        );
+        .expect("connect probe must complete immediately after stop()");
+        match probe_res {
+            Err(probe_err) => {
+                assert_eq!(
+                    probe_err.kind(),
+                    std::io::ErrorKind::ConnectionRefused,
+                    "expected ConnectionRefused after stop(), got: {probe_err:?}"
+                );
+            }
+            Ok(mut unexpected_stream) => {
+                let local = unexpected_stream.local_addr().ok();
+                let peer = unexpected_stream.peer_addr().ok();
+                let mut probe_buf = [0u8; 64];
+                let read_res = tokio::time::timeout(
+                    Duration::from_millis(50),
+                    unexpected_stream.read(&mut probe_buf),
+                )
+                .await;
+                let lsof_now = std::process::Command::new("lsof")
+                    .args(["-n", "-P", "-i", &format!("TCP:{port1}")])
+                    .output()
+                    .map(|o| {
+                        format!(
+                            "status={} stdout={:?} stderr={:?}",
+                            o.status,
+                            String::from_utf8_lossy(&o.stdout),
+                            String::from_utf8_lossy(&o.stderr)
+                        )
+                    })
+                    .unwrap_or_else(|e| format!("lsof err: {e}"));
+                drop(unexpected_stream);
+                let bind_res = TcpListener::bind(("127.0.0.1", port1))
+                    .await
+                    .map(|l| l.local_addr().ok());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let lsof_100ms = std::process::Command::new("lsof")
+                    .args(["-n", "-P", "-i", &format!("TCP:{port1}")])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                    .unwrap_or_else(|e| format!("lsof err: {e}"));
+                let connect_100ms = tokio::time::timeout(
+                    Duration::from_millis(200),
+                    TcpStream::connect(("127.0.0.1", port1)),
+                )
+                .await
+                .map(|r| r.map(|s| (s.local_addr().ok(), s.peer_addr().ok())));
+                panic!(
+                    "listener must refuse new connections after stop() \
+                     [self_pid={}, port1={}, stop_running={}, local={:?}, peer={:?}, \
+                      read_50ms={:?}, bind_now={:?}, connect_100ms={:?}]\n\
+                     --- lsof now ---\n{}\n--- lsof +100ms ---\n{}",
+                    std::process::id(),
+                    port1,
+                    stop_status.running,
+                    local,
+                    peer,
+                    read_res,
+                    bind_res,
+                    connect_100ms,
+                    lsof_now,
+                    lsof_100ms,
+                );
+            }
+        }
     }
     #[cfg(not(unix))]
     {
