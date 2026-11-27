@@ -243,7 +243,10 @@ pub fn read_saz_from_reader<R: Read + Seek>(reader: R) -> Result<Vec<SessionDeta
             continue;
         }
 
-        let normalized = entry.name().replace('\\', "/");
+        let raw_name = entry
+            .name()
+            .map_err(|e| ProxyError::Custom(format!("Некорректное имя записи SAZ #{i}: {e}")))?;
+        let normalized = raw_name.replace('\\', "/");
         let Some(rest) = normalized
             .strip_prefix("raw/")
             .or_else(|| normalized.strip_prefix("/raw/"))
@@ -1295,14 +1298,18 @@ pub(super) fn decode_xml_bytes(buf: &[u8]) -> String {
         String::from_utf8_lossy(&buf[3..]).into_owned()
     } else if buf.starts_with(&[0xFF, 0xFE]) {
         let u16s: Vec<u16> = buf[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
             .collect();
         String::from_utf16_lossy(&u16s)
     } else if buf.starts_with(&[0xFE, 0xFF]) {
         let u16s: Vec<u16> = buf[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_be_bytes(c))
             .collect();
         String::from_utf16_lossy(&u16s)
     } else {

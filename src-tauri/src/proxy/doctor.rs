@@ -642,8 +642,10 @@ where
 
         if reg_type == WIN32_REG_SZ && data_len >= 2 {
             let wide_slice: Vec<u16> = data_buf[..(data_len as usize).min(data_buf.len())]
-                .chunks_exact(2)
-                .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&p| u16::from_le_bytes(p))
                 .collect();
             let rule_str = String::from_utf16_lossy(&wide_slice)
                 .trim_end_matches('\0')

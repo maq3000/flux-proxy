@@ -1,9 +1,23 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { SectionHeader } from "./SectionHeader";
 import { getSectionMeta } from "../../lib/sectionRegistry";
 
 describe("SectionHeader", () => {
+  let popoverStyleEl: HTMLStyleElement | null = null;
+
+  beforeAll(() => {
+    // jsdom 29 applies `[popover]:not(:popover-open) { display: none }` without implementing showPopover()
+    popoverStyleEl = document.createElement("style");
+    popoverStyleEl.textContent = '[popover][data-open="true"] { display: block !important; }';
+    document.head.appendChild(popoverStyleEl);
+  });
+
+  afterAll(() => {
+    popoverStyleEl?.remove();
+    popoverStyleEl = null;
+  });
+
   afterEach(() => {
     cleanup();
   });

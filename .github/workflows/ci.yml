@@ -82,7 +82,7 @@ jobs:
         run: npx @tauri-apps/cli build --no-bundle --config '{"build":{"beforeBuildCommand":""}}' -- --locked
 
   msrv:
-    name: MSRV Check (Rust 1.80)
+    name: MSRV Check (Rust 1.90)
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -101,8 +101,8 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev
 
-      - name: Setup Rust 1.80 (MSRV)
-        uses: dtolnay/rust-toolchain@1.80
+      - name: Setup Rust 1.90 (MSRV)
+        uses: dtolnay/rust-toolchain@1.90
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2

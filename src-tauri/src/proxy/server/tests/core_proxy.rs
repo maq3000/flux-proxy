@@ -448,7 +448,7 @@ async fn targeted_only_mode_tunnels_unlisted_hosts_as_passthrough_and_decrypts_a
     let reqwest_ca = reqwest::Certificate::from_pem(&root_pem).unwrap();
     let https_client = reqwest::Client::builder()
         .proxy(reqwest::Proxy::https(format!("http://{proxy_addr}")).unwrap())
-        .add_root_certificate(reqwest_ca)
+        .tls_certs_only([reqwest_ca])
         .build()
         .unwrap();
 
@@ -758,7 +758,7 @@ async fn strips_alt_svc_and_alternate_protocol_across_http1_and_http2_responses(
     let reqwest_ca = reqwest::Certificate::from_pem(&root_pem).unwrap();
     let client = reqwest::Client::builder()
         .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap())
-        .add_root_certificate(reqwest_ca)
+        .tls_certs_only([reqwest_ca])
         .build()
         .unwrap();
 
@@ -1347,6 +1347,7 @@ async fn formats_full_reqwest_error_source_chain() {
     let dead_port = dead_probe.local_addr().unwrap().port();
     drop(dead_probe);
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()

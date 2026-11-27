@@ -935,7 +935,7 @@ mod tests {
                     assert!(
                         !text.contains(secret),
                         "SAZ entry '{}' leaked secret: {secret}",
-                        entry.name()
+                        entry.name().unwrap()
                     );
                 }
             }

@@ -5,10 +5,10 @@
 [![Latest Release](https://img.shields.io/github/v/release/maq3000/flux-proxy?color=blue&logo=github)](https://github.com/maq3000/flux-proxy/releases/latest)
 [![CI](https://github.com/maq3000/flux-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/maq3000/flux-proxy/actions/workflows/ci.yml)
 [![Downloads](https://img.shields.io/github/downloads/maq3000/flux-proxy/total?color=success&logo=github)](https://github.com/maq3000/flux-proxy/releases)
-[![Tauri v2](https://img.shields.io/badge/Tauri-v2.2-blue?logo=tauri&logoColor=white)](https://tauri.app/)
-[![Rust](https://img.shields.io/badge/Rust-2021_%281.80%2B%29-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Tauri v2](https://img.shields.io/badge/Tauri-v2.12-blue?logo=tauri&logoColor=white)](https://tauri.app/)
+[![Rust](https://img.shields.io/badge/Rust-2021_%281.90%2B%29-orange?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![React 18](https://img.shields.io/badge/React-18.3-61dafb?logo=react&logoColor=black)](https://react.dev/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-3.4-38bdf8?logo=tailwindcss&logoColor=white)](https://tailwindcss.com/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
@@ -167,16 +167,16 @@
 | **Python Scripting** | Долгоживущий IPC-раннер хуков `on_request` / `on_response` | Python 3 subprocess (`JSON Lines`, fail-open 1500 ms) |
 | **Хранилище и архивы** | Ring Buffer в RAM, база SQLite, экспорт/импорт HAR/SAZ с таймингами | `DashMap` + `rusqlite` (WAL) + `zip` |
 | **Кодеки и сжатие** | Сжатие/распаковка и кодировки | `flate2` (Gzip/Deflate), `brotli`, `zstd`, `base64`, `hex`, `sha2` |
-| **Frontend UI и State** | Модульный интерфейс, 8 тем-пресетов, state-сторы и `React.lazy()` | `React 18`, `TypeScript 5.6`, `Zustand 5`, `Vite 6`, `Tailwind CSS` |
+| **Frontend UI и State** | Модульный интерфейс, 8 тем-пресетов, state-сторы и `React.lazy()` | `React 18`, `TypeScript 5.9`, `Zustand 5`, `Vite 7`, `Tailwind CSS` |
 | **Виртуализация и код** | Скроллинг 60 FPS, редакторы, OpenAPI и diff-сравнение | `@tanstack/react-virtual 3`, `@monaco-editor/react` |
-| **Тестирование и CI** | 210 frontend-тестов (41 файл) + 216 Rust-тестов, матрица Windows/Linux/macOS, MSRV 1.80 и security audit | `Vitest 3`, `@testing-library/react`, `cargo clippy --locked`, `cargo-audit`, GitHub Actions |
+| **Тестирование и CI** | 210 frontend-тестов (41 файл) + 216 Rust-тестов, матрица Windows/Linux/macOS, MSRV 1.90 и security audit | `Vitest 5`, `@testing-library/react`, `cargo clippy --locked`, `cargo-audit`, GitHub Actions |
 
 ---
 
 ## 📁 Структура проекта
 
 ```text
-├── .github/workflows/ci.yml             # Кроссплатформенный CI (typecheck, Vitest, Vite build, clippy/test --locked, --no-bundle, MSRV 1.80, audit)
+├── .github/workflows/ci.yml             # Кроссплатформенный CI (typecheck, Vitest, Vite build, clippy/test --locked, --no-bundle, MSRV 1.90, audit)
 ├── index.html                           # HTML точка входа Vite
 ├── package.json                         # Зависимости и npm-скрипты фронтенда
 ├── USER_GUIDE.md                        # Подробная инструкция для пользователей
@@ -261,8 +261,8 @@
 ## 🚀 Быстрый старт
 
 ### Требования к окружению
-- **Node.js**: версии `18.x` или новее.
-- **Rust**: версия `1.80+` (устанавливается через [rustup.rs](https://rustup.rs/)).
+- **Node.js**: версии `22.12+`.
+- **Rust**: версия `1.90+` (устанавливается через [rustup.rs](https://rustup.rs/)).
 - **Системные пакеты для сборки Tauri**:
   - **Windows**: Microsoft C++ Build Tools (пакет *Desktop development with C++*) и WebView2.
   - **macOS**: Xcode Command Line Tools (`xcode-select --install`).
@@ -425,7 +425,7 @@ curl -x http://127.0.0.1:8888 https://httpbin.org/get -k
 - ✅ **Клиентские сертификаты (mTLS, `Ctrl+Shift+C`)**: хранилище PKCS#12 (`.p12`/`.pfx`) и PEM с масками доменов (`*.corp.local`), прозрачным шифрованием ключей Windows DPAPI (`FLUX_DPAPI_V1`) и режимом **`Session-only (In-Memory)`** (`RAM ONLY`).
 - ✅ **Composer 2.0 & Кодогенератор**: умный импорт / вставка команд **cURL** (Bash / cmd / PowerShell), паритет Python-хуков (`Run Python Scripts`), кнопка отмены **`Cancel`** и генератор клиентского кода на 5 языках (8 вариантов: JS, Python, Go, Rust, cURL).
 - ✅ **Генератор OpenAPI 3.0.3 / Swagger**: автоматический вывод контракта (`YAML` / `JSON`) с параметризацией `{id}` / `{uuid}`, слиянием JSON Schema и безопасными `components.securitySchemes`.
-- ✅ **Тестирование и CI/CD (`v0.4.0` – `v0.7.0`)**: 41 набор Vitest (210 frontend-тестов) + 216 Rust-тестов и кроссплатформенный GitHub Actions CI (`ubuntu-latest`, `windows-latest`, `macos-latest`, `clippy --locked -D warnings`, `cargo test --locked`, `--no-bundle`, MSRV `1.80`, `audit`).
+- ✅ **Тестирование и CI/CD (`v0.4.0` – `v0.7.0`)**: 41 набор Vitest (210 frontend-тестов) + 216 Rust-тестов и кроссплатформенный GitHub Actions CI (`ubuntu-latest`, `windows-latest`, `macos-latest`, `clippy --locked -D warnings`, `cargo test --locked`, `--no-bundle`, MSRV `1.90`, `audit`).
 - ✅ **Аудит безопасности, целостности и надёжности (`v0.4.1`)**: защита импорта профилей настроек от скрытого RCE (`SEC-01`), изоляция файлового IPC и лимит 16 MiB (`SEC-02`), блокировка LAN SSRF и утечки хозяйских mTLS (`SEC-03`), полная санитизация `camelCase` JSON / SSE / WebSocket (включая SignalR/Socket.IO/Bearer/JWT) / `Location` / `Referer` (`SEC-04`), лимиты декомпрессии и поддержка `zstd` в `.saz` (`SEC-05`, `BUG-12`), консистентность `next_id` и выгруженных тел при рестарте и `VACUUM` (`BUG-01`, `BUG-03`, `BUG-11`), устойчивый bootstrap UI (`BUG-02`, `BUG-08`, `PERF-01`), RAII-очистка Breakpoints (`BUG-04`), конкурентный релей WebSocket (`BUG-05`), сверка SHA-256 Root CA (`BUG-06`), фиксы `HEAD` / `Content-Encoding` (`BUG-07`), предкомпиляция Regex + IPv6 / `.domain.com` (`BUG-09`, `PERF-03`), откат `sysproxy` (`BUG-10`) и неразрушающий fail-open очереди Python-воркера (`PERF-04`).
 - ✅ **Архитектурная декомпозиция и оптимизация бандла (`v0.5.0`, `ARCH-01`, `PERF-05`)**: модульное разбиение Rust-ядра (`proxy/server/`, `proxy/filters/`, `storage/export_import/`) и UI-компонентов, внедрение **Zustand 5**, `React.lazy()` + `Suspense`, ленивый `getPreviewEngine()` и удаление чанка `ts.worker` (7.05 МБ).
 - ✅ **Fiddler-тайминги, статистика запросов и сетевая маршрутизация (`v0.5.0`)**: инструментированный `UpstreamHttpClient` (`hyper-util` + `tokio-rustls`), панель **`Statistics`** (Single & Multi-Selection с SVG-диаграммами и *Estimated Worldwide Performance*), колонки `TTFB` / `Server IP`, реальный round-trip таймингов HAR/SAZ, **HOSTS Remapping (`Ctrl+Shift+H`)**, **Bandwidth Throttling**, **Upstream Proxy Chaining (`Ctrl+Shift+U`)** (`HTTP`/`HTTPS`/`SOCKS5`) и **ручная инъекция WebSocket-фреймов**.

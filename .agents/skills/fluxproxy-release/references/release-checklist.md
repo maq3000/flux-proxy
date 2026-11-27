@@ -1,6 +1,6 @@
 # Чеклист и шаблоны релиза FluxProxy
 
-Справочник для скилла `fluxproxy-release`. Используй точные шаблоны и команды ниже при выполнении этапов 1–5.
+Справочник для скилла `fluxproxy-release`. Используй точные шаблоны и команды ниже при выполнении этапов 1–6.
 
 ---
 
@@ -35,7 +35,44 @@ git grep "<prev-version>" -- ':!package-lock.json' ':!src-tauri/Cargo.lock'
 
 ---
 
-## 2. Шаблоны для `README.md`
+## 2. Чеклист проверки и обновления зависимостей (npm & Cargo)
+
+### Команды аудита и проверки актуальности
+
+```powershell
+# Frontend (npm)
+npm outdated
+npm audit --audit-level=moderate
+npm ls --depth=0
+
+# Backend (Cargo / Rust)
+cargo update --manifest-path src-tauri/Cargo.toml --dry-run --verbose
+cargo audit --file src-tauri/Cargo.lock   # если установлен cargo-audit
+
+# Проверка фактического максимального MSRV среди всех пакетов Cargo.lock
+$meta = cargo metadata --manifest-path src-tauri/Cargo.toml --format-version 1 | ConvertFrom-Json
+$meta.packages |
+  Where-Object { $_.rust_version } |
+  Select-Object name, version, rust_version, edition |
+  Sort-Object { [version](($_.rust_version -replace '^\D*','') + $(if ($_.rust_version -notmatch '\.\d+\.') { '.0' } else { '' })) } -Descending |
+  Select-Object -First 10 |
+  Format-Table -AutoSize
+```
+
+### Политика обновлений при подготовке релиза
+
+| Категория | Что делать | На что обратить внимание |
+| :--- | :--- | :--- |
+| **Безопасность (`npm audit`, RustSec)** | Обновлять в обязательном порядке | Не использовать `npm audit fix --force` вслепую; проверять breaking changes |
+| **Совместимые миноры/патчи** | Обновлять (`npm install`, `cargo update`) | Проверить `npm ls --depth=0` (`extraneous` / `peerDependencies`) |
+| **Чувствительные пакеты UI/сборки** | Обновлять с проверкой совместимости | `engines.node` vs CI Node, импорты и воркеры `monaco-editor` в `src/lib/monaco.ts`, специфика `jsdom` в Vitest |
+| **Чувствительные крейты Rust** | Обновлять с проверкой feature-флагов | На Windows избегать `aws-lc-rs` (например, `rustls-no-provider` для `reqwest`), проверять `clippy` для нового MSRV |
+| **Ломающие мажорные миграции** | Не выполнять автоматически | React, Tailwind CSS, Vite/Rolldown, TypeScript, крупные мажоры Rust — только по явному запросу пользователя |
+| **MSRV (`rust-version`)** | Синхронизировать при росте максимума | `src-tauri/Cargo.toml`, `.github/workflows/ci.yml` (`msrv`), `README.md` |
+
+---
+
+## 3. Шаблоны для `README.md`
 
 ### Верхняя плашка (под описанием проекта)
 
@@ -64,7 +101,7 @@ git grep "<prev-version>" -- ':!package-lock.json' ':!src-tauri/Cargo.lock'
 
 ---
 
-## 3. Шаблон для `USER_GUIDE.md`
+## 4. Шаблон для `USER_GUIDE.md`
 
 ### Раздел `### Шаг 0. Скачайте и установите программу`
 
@@ -83,7 +120,7 @@ git grep "<prev-version>" -- ':!package-lock.json' ':!src-tauri/Cargo.lock'
 
 ---
 
-## 4. Правила обновления `ROADMAP.md`
+## 5. Правила обновления `ROADMAP.md`
 
 1. **Перенос в `## ✅ Реализованные этапы (Verified Milestones)`**:
    - Для каждого полностью закрытого в `vX.Y.Z` этапа добавь нумерованный пункт в формате:
@@ -100,7 +137,7 @@ git grep "<prev-version>" -- ':!package-lock.json' ':!src-tauri/Cargo.lock'
 
 ---
 
-## 5. Шаблон GitHub Release Notes
+## 6. Шаблон GitHub Release Notes
 
 Используй этот шаблон для `gh release create ... --notes-file` или в качестве готового Markdown-блока при ручной публикации на `https://github.com/maq3000/flux-proxy/releases/new?tag=v<X.Y.Z>`:
 

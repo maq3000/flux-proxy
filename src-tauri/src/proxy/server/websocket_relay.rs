@@ -85,7 +85,7 @@ pub fn parse_hex_payload(raw: &str) -> Result<Vec<u8>, ProxyError> {
     if hex_chars.is_empty() {
         return Ok(Vec::new());
     }
-    if hex_chars.len() % 2 != 0 {
+    if !hex_chars.len().is_multiple_of(2) {
         return Err(ProxyError::Custom(
             "Некорректный Hex payload: ожидается чётное количество hex-символов.".into(),
         ));
@@ -984,7 +984,7 @@ where
                 };
                 let now = Instant::now();
                 if force
-                    || guard.map_or(true, |prev| {
+                    || guard.is_none_or(|prev| {
                         now.saturating_duration_since(prev)
                             >= Duration::from_millis(WS_IPC_THROTTLE_MS)
                     })

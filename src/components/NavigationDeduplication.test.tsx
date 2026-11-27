@@ -205,19 +205,25 @@ describe("Stage 38 Navigation & Panel Deduplication", () => {
 
     // HelpTooltips present across popovers
     expect(
-      screen.getByRole("button", { name: "Ring Buffer (Keep)" })
+      screen.getByRole("button", { name: "Ring Buffer (Keep)", hidden: true })
     ).toBeTruthy();
     expect(
-      screen.getByRole("button", { name: "Подробнее об OS System Proxy" })
+      screen.getByRole("button", {
+        name: "Подробнее об OS System Proxy",
+        hidden: true,
+      })
     ).toBeTruthy();
     expect(
-      screen.getByRole("button", { name: "Selective TLS MITM" })
+      screen.getByRole("button", { name: "Selective TLS MITM", hidden: true })
     ).toBeTruthy();
     expect(
-      screen.getByRole("button", { name: "Bandwidth Throttling & Latency" })
+      screen.getByRole("button", {
+        name: "Bandwidth Throttling & Latency",
+        hidden: true,
+      })
     ).toBeTruthy();
     expect(
-      screen.getByRole("button", { name: "Session Columns" })
+      screen.getByRole("button", { name: "Session Columns", hidden: true })
     ).toBeTruthy();
 
     // Removed duplicates & overflow

@@ -169,7 +169,7 @@ fn decode_base64_or_hex(raw: &str) -> Result<Vec<u8>, ProxyError> {
         .filter(|c| !c.is_whitespace() && *c != ':')
         .collect();
     if stripped_hex.len() >= 4
-        && stripped_hex.len() % 2 == 0
+        && stripped_hex.len().is_multiple_of(2)
         && stripped_hex.chars().all(|c| c.is_ascii_hexdigit())
         && !trimmed.contains('=')
         && !trimmed.contains('+')

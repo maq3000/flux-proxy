@@ -1,6 +1,18 @@
 import React from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+// jsdom 29 applies `[popover]:not(:popover-open) { display: none }` without implementing showPopover()
+let popoverStyleEl: HTMLStyleElement | null = null;
+beforeAll(() => {
+  popoverStyleEl = document.createElement("style");
+  popoverStyleEl.textContent = '[popover][data-open="true"] { display: block !important; }';
+  document.head.appendChild(popoverStyleEl);
+});
+afterAll(() => {
+  popoverStyleEl?.remove();
+  popoverStyleEl = null;
+});
 
 vi.mock("../../lib/monaco", () => ({
   FLUX_MONACO_THEME: "fluxproxy-active",

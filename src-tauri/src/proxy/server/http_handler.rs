@@ -2929,7 +2929,7 @@ pub(super) fn record_sse_chunk(
         },
     ) {
         let should_emit = last_emit
-            .map_or(true, |prev| prev.elapsed() >= Duration::from_millis(SSE_IPC_THROTTLE_MS));
+            .is_none_or(|prev| prev.elapsed() >= Duration::from_millis(SSE_IPC_THROTTLE_MS));
         if should_emit {
             *last_emit = Some(Instant::now());
             let _ = sse_ctx.event_tx.send(updated_summary);
