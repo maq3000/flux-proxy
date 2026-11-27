@@ -2,11 +2,11 @@
 
 > **FluxProxy** — кроссплатформенный локальный отладочный HTTP/HTTPS/WebSocket-прокси на базе **Tauri v2 (Rust)** и **React 18 (TypeScript) + Zustand 5**.
 >
-> Документ содержит актуальный статус реализованных подсистем (`v0.1.0` – `v0.7.0`) по итогам Спринтов 1–7 (Этапы 1–49, включая устранение находок комплексного аудита `v0.6.0` из `PROJECT_CONTEXT_AND_AUDIT.md`), принятые архитектурные решения (`ADR-01`–`ADR-04`), зоны проверки (`VER-01`–`VER-03`), матрицу приоритетов и инженерные ограничения кодовой базы.
+> Документ содержит актуальный статус реализованных подсистем (`v0.1.0` – `v0.7.1`) по итогам Спринтов 1–7 (Этапы 1–49, включая устранение находок комплексного аудита `v0.6.0` из `PROJECT_CONTEXT_AND_AUDIT.md`, а также релиз актуализации зависимостей `v0.7.1`), принятые архитектурные решения (`ADR-01`–`ADR-04`), зоны проверки (`VER-01`–`VER-03`), матрицу приоритетов и инженерные ограничения кодовой базы.
 
 ---
 
-## ✅ Реализованные этапы (Verified Milestones `v0.1.0` – `v0.7.0`)
+## ✅ Реализованные этапы (Verified Milestones `v0.1.0` – `v0.7.1`)
 
 Следующие подсистемы **полностью реализованы, покрыты тестами в кодовой базе (`210` тестов Vitest в 41 файле + `216` тестов Rust) и не требуют повторной разработки** *(примечание по путям: после архитектурной декомпозиции в Этапе 11 / п. 34, Этапе 36 / п. 40 и Этапе 48 / п. 53 бывшие монолиты `server.rs`, `filters.rs`, `export_import.rs`, `tauriBridge.ts`, `settingsManager.ts` и `App.tsx` разнесены по модулям `src-tauri/src/proxy/server/` (`pipeline_stages.rs`, `tests/`), `src-tauri/src/proxy/filters/`, `src-tauri/src/storage/export_import/`, `src/lib/previewEngine.ts`, `src/lib/settings/{schema,migrations,applyProfile}.ts`, `src/lib/trafficFilter.ts`, `src/components/workspaces/`, `src/hooks/useGlobalShortcuts.ts`, `src/hooks/useStoreGlobalSync.ts` и `src/hooks/useAutomationSync.ts`; в Этапе 38 / п. 42 разрозненные модальные экраны настроек консолидированы в полноэкранный `src/components/SettingsModal.tsx` и подпанели `src/components/settings/`; в Этапе 42 / п. 44 модальные окна `BreakpointModal.tsx` и `TextWizardModal.tsx` заменены неблокирующими панелями `BreakpointsPanel.tsx` и `TextWizardPanel.tsx`)*:
 
@@ -162,12 +162,15 @@
     - В Rust вынесены `6 600+` строк тестов из `src-tauri/src/proxy/server/mod.rs` в `src-tauri/src/proxy/server/tests/{mod,core_proxy,lifecycle_and_regressions,routing_and_security,streaming_and_codecs,websocket_and_composer}.rs`, выделены общие стадии в `src-tauri/src/proxy/server/pipeline_stages.rs` для `http_handler.rs` и `composer_exec.rs`, а также унифицирован транспорт в `websocket_relay.rs`.
     - На фронтенде `src/lib/settingsManager.ts` декомпозирован на `src/lib/settings/{schema,migrations,applyProfile}.ts` (с barrel-реэкспортом), из `src/App.tsx` извлечены `src/components/workspaces/{TrafficWorkspace,CommandPaletteContainer,AppModals,SecondaryWorkspaces,SessionDiffWorkspace,StatusFooter,TrafficCountBadges}.tsx`, `src/hooks/useAutomationSync.ts`, `src/lib/trafficFilter.ts` и `src/stores/trafficTelemetryStore.ts` (изоляция подписки `sessions` в `TrafficWorkspace`), а глобальные слушатели перенесены в `src/hooks/useStoreGlobalSync.ts`.
     - Выделена общая типизированная фабрика `src/test/mockProxyBridge.ts` и добавлены тесты `src/lib/tauriBridge.test.ts`, `src/hooks/useStoreGlobalSync.test.tsx`, `src/components/TrafficGrid.test.tsx`, `src/components/SessionInspector.test.tsx` и `src/components/BreakpointsPanel.test.tsx`.
+54. **[v0.7.1 — Выполнено] Актуализация зависимостей, устранение уязвимостей `npm audit` / RustSec и синхронизация MSRV `1.90`:**
+    - Закрыты все уязвимости фронтенда (`vitest 5.1.2`, `monaco-editor 0.58.0`, `vite 7.3.8`, `@vitejs/plugin-react 5.2.0`, `lucide-react 1.82.0`, `jsdom 29.1.1`, `typescript 5.9.3`, `@tauri-apps/api 2.12.5`, `@tanstack/react-virtual 3.14.28`) с адаптацией тестов `NavigationDeduplication.test.tsx`, `SectionHeader.test.tsx` и `ContextMenu.test.tsx` под поведение `[popover]` в `jsdom@29`.
+    - Закрыты RustSec-бюллетени 2026 года и дедуплицированы крейты (`zip 9.8.2`, `rusqlite 0.43.0` / `libsqlite3-sys 0.40.0`, `zstd 0.14.5`, `tauri 2.12.7`, `hyper 1.13.0`, `h2 0.4.21`, `rustls-webpki 0.103.17`, `webpki-roots 1.0.12`, `base64 0.23.1`, `windows-sys 0.61.2`, `reqwest 0.13.5` с `rustls-no-provider`); обновлены `saz.rs`, `export_import/mod.rs` и `core_proxy.rs`, синхронизирован MSRV `1.90` (`Cargo.toml`, `.github/workflows/ci.yml`, `README.md`) с исправлением Clippy-линтов уровня `1.90`, а в регламент `.agents/skills/fluxproxy-release/` добавлен обязательный этап проверки и обновления зависимостей.
 
 ---
 
 ## 📋 Матрица приоритетов и порядок выполнения
 
-> *Все запланированные этапы Спринтов 1–7 (Этапы 1–49) полностью выполнены в релизах `v0.1.0` – `v0.7.0` и перенесены в раздел реализованных этапов выше.*
+> *Все запланированные этапы Спринтов 1–7 (Этапы 1–49) полностью выполнены в релизах `v0.1.0` – `v0.7.1` и перенесены в раздел реализованных этапов выше.*
 
 ---
 

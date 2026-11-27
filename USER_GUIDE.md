@@ -41,9 +41,9 @@
 ## 2. Быстрый старт за 3 минуты
 
 ### Шаг 0. Скачайте и установите программу
-Для Windows доступны готовые официальные установщики из [**GitHub Releases v0.7.0**](https://github.com/maq3000/flux-proxy/releases/tag/v0.7.0):
-- [📥 **FluxProxy Setup (.exe)**](https://github.com/maq3000/flux-proxy/releases/download/v0.7.0/FluxProxy_0.7.0_x64-setup.exe) — стандартный установщик для домашнего и рабочего использования (автоматически создает ярлыки и деинсталлятор).
-- [📥 **FluxProxy Package (.msi)**](https://github.com/maq3000/flux-proxy/releases/download/v0.7.0/FluxProxy_0.7.0_x64_en-US.msi) — MSI-пакет для корпоративного развертывания (GPO / Active Directory).
+Для Windows доступны готовые официальные установщики из [**GitHub Releases v0.7.1**](https://github.com/maq3000/flux-proxy/releases/tag/v0.7.1):
+- [📥 **FluxProxy Setup (.exe)**](https://github.com/maq3000/flux-proxy/releases/download/v0.7.1/FluxProxy_0.7.1_x64-setup.exe) — стандартный установщик для домашнего и рабочего использования (автоматически создает ярлыки и деинсталлятор).
+- [📥 **FluxProxy Package (.msi)**](https://github.com/maq3000/flux-proxy/releases/download/v0.7.1/FluxProxy_0.7.1_x64_en-US.msi) — MSI-пакет для корпоративного развертывания (GPO / Active Directory).
 
 Запустите скачанный файл и завершите простую установку.
 

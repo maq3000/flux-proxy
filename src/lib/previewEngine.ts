@@ -2943,7 +2943,7 @@ export class BrowserPreviewEngine {
     const har = {
       log: {
         version: "1.2",
-        creator: { name: "FluxProxy", version: "0.7.0" },
+        creator: { name: "FluxProxy", version: "0.7.1" },
         pages: effectiveList.length
           ? [
               {
